@@ -27,5 +27,9 @@ void reader_reset_labels(void);
 // Get current reader position for error messages
 int reader_get_line(void);
 int reader_get_col(void);
+const char *reader_get_filename(void);
+
+// Set current filename (for error messages)
+void reader_set_filename(const char *name);
 
 #endif // READER_H

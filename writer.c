@@ -36,8 +36,8 @@
 
 static struct {
     unsigned cell;
-    int label;      // -1 = visited once, >= 0 = assigned label
-    bool printed;   // true if we've printed the #n= prefix
+    int label;    // -1 = visited once, >= 0 = assigned label
+    bool printed; // true if we've printed the #n= prefix
 } visited[MAX_VISITED];
 static int visited_count = 0;
 static int next_label = 0;

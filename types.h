@@ -53,31 +53,31 @@
  * - Compound: car/cdr point to other cells (pairs, functions, continuations)
  */
 enum lisp_type {
-    BT_FREE,        // Unused cell (on free list)
-    BT_READY,       // Allocated but not yet typed
-    BT_ATOM,        // Symbol: id = index into atom table
-    BT_NUM,         // Exact integer: id = int64_t value
-    BT_BIGNUM,      // Arbitrary precision integer: id = bignum* pointer
-    BT_INEXACT,     // Floating point: id reinterpreted as double
-    BT_RATIONAL,    // Exact rational: car = numerator cell, cdr = denominator cell
-    BT_COMPLEX,     // Complex number: car = real part cell, cdr = imag part cell
-    BT_STRING,      // Mutable string: id = char* pointer
-    BT_CHAR,        // Character: id = Unicode code point
-    BT_VECTOR,      // Vector: id = vector_data* pointer
-    BT_CONS,        // Pair: car = first element, cdr = rest
-    BT_FUNCTION,    // Lambda closure: car = params, cdr = (body . env)
-    BT_MACRO,       // Legacy macro (not hygienic)
-    BT_SYNTAX,      // Hygienic macro: syntax-rules transformer object
-    BT_CONT,        // First-class continuation (captured by call/cc)
-    BT_INPORT,      // Input file port: id = FILE* pointer
-    BT_OUTPORT,     // Output file port: id = FILE* pointer
-    BT_STRINPORT,   // String input port: id = string_port* pointer
-    BT_STROUTPORT,  // String output port: id = string_port* pointer
-    BT_MULTIVAL,    // Multiple return values: car = list of values
-    BT_FORM,        // Special form (unused)
-    BT_BUILTIN,     // Built-in primitive: id = primitive_id enum value
-    BT_DYNAMIC,     // Dynamic binding (unused)
-    BT_BROKENHEART = -1  // GC forwarding pointer: car = new location
+    BT_FREE,     // Unused cell (on free list)
+    BT_READY,    // Allocated but not yet typed
+    BT_ATOM,     // Symbol: id = index into atom table
+    BT_NUM,      // Exact integer: id = int64_t value
+    BT_BIGNUM,   // Arbitrary precision integer: id = bignum* pointer
+    BT_INEXACT,  // Floating point: id reinterpreted as double
+    BT_RATIONAL, // Exact rational: car = numerator cell, cdr = denominator cell
+    BT_COMPLEX,  // Complex number: car = real part cell, cdr = imag part cell
+    BT_STRING,   // Mutable string: id = char* pointer
+    BT_CHAR,     // Character: id = Unicode code point
+    BT_VECTOR,   // Vector: id = vector_data* pointer
+    BT_CONS,     // Pair: car = first element, cdr = rest
+    BT_FUNCTION, // Lambda closure: car = params, cdr = (body . env)
+    BT_MACRO,    // Legacy macro (not hygienic)
+    BT_SYNTAX,   // Hygienic macro: syntax-rules transformer object
+    BT_CONT,     // First-class continuation (captured by call/cc)
+    BT_INPORT,   // Input file port: id = FILE* pointer
+    BT_OUTPORT,  // Output file port: id = FILE* pointer
+    BT_STRINPORT,       // String input port: id = string_port* pointer
+    BT_STROUTPORT,      // String output port: id = string_port* pointer
+    BT_MULTIVAL,        // Multiple return values: car = list of values
+    BT_FORM,            // Special form (unused)
+    BT_BUILTIN,         // Built-in primitive: id = primitive_id enum value
+    BT_DYNAMIC,         // Dynamic binding (unused)
+    BT_BROKENHEART = -1 // GC forwarding pointer: car = new location
 };
 
 // Continuation frame types for full CPS evaluator
@@ -153,10 +153,10 @@ typedef struct __attribute__((packed)) {
     enum lisp_type type;
     union {
         struct {
-            unsigned car;  // First element / head
-            unsigned cdr;  // Rest / tail
+            unsigned car; // First element / head
+            unsigned cdr; // Rest / tail
         };
-        int64_t id;  // Immediate value or pointer (reinterpret cast)
+        int64_t id; // Immediate value or pointer (reinterpret cast)
     };
 } cons_cell;
 
@@ -175,10 +175,10 @@ typedef struct __attribute__((packed)) {
  */
 typedef struct {
     enum tramp_mode mode;
-    unsigned expr;   // Expression to evaluate (TRAMP_EVAL mode)
-    unsigned env;    // Current environment
-    unsigned cont;   // Current continuation (stack of pending operations)
-    unsigned value;  // Value to apply to continuation (TRAMP_APPLY mode)
+    unsigned expr;  // Expression to evaluate (TRAMP_EVAL mode)
+    unsigned env;   // Current environment
+    unsigned cont;  // Current continuation (stack of pending operations)
+    unsigned value; // Value to apply to continuation (TRAMP_APPLY mode)
 } tramp_state;
 
 // Vector data structure (stored in id pointer)
@@ -189,20 +189,19 @@ typedef struct {
 
 // String port structure (for string I/O with fast appending)
 typedef struct {
-    char *data;    // Buffer data
-    size_t len;    // Current length
-    size_t cap;    // Allocated capacity
-    size_t pos;    // Read position (for input ports)
+    char *data; // Buffer data
+    size_t len; // Current length
+    size_t cap; // Allocated capacity
+    size_t pos; // Read position (for input ports)
 } string_port;
 
 // ============================================================================
 // Constants
 // ============================================================================
 
-#define TABLE_SIZE 999983         // Size of atom table (prime for hashing)
+#define TABLE_SIZE 999983             // Size of atom table (prime for hashing)
 #define SEMISPACE_SIZE (16384 * 1024) // Size of each GC semispace
-#define HEAP_RESERVED 15      // Reserved cells at start of heap (0-14)
-#define INITIAL_STRING_CAP 32 // Initial capacity for string buffers
+#define INITIAL_STRING_CAP 32         // Initial capacity for string buffers
 
 // Reserved cell IDs for permanent atoms (never garbage collected)
 #define CELL_ATOM_TRUE 10
@@ -210,6 +209,12 @@ typedef struct {
 #define CELL_ATOM_QUASIQUOTE 12
 #define CELL_ATOM_UNQUOTE 13
 #define CELL_ATOM_UNQUOTE_SPLICING 14
+
+// Small integer cache: cells 15-270 hold integers 0-255
+#define INT_CACHE_MIN 0
+#define INT_CACHE_MAX 255
+#define INT_CACHE_START 15    // First cell for cached integers
+#define HEAP_RESERVED 271     // Reserved cells (0-270)
 #define NUMBER_BUF_SIZE 128   // Buffer size for number->string conversion
 #define CHAR_NAME_BUF_SIZE 16 // Buffer size for character name parsing
 
@@ -218,7 +223,7 @@ typedef struct {
     unsigned hptr;
     unsigned mmin;
     unsigned nmin;
-    cons_cell *cons_cells;  // Dynamically allocated heap
+    cons_cell *cons_cells;   // Dynamically allocated heap
     const char **atom_table; // Dynamically allocated atom table
     unsigned atom_count;     // Number of atoms in table (for load factor)
     unsigned atom_quote;
@@ -463,18 +468,21 @@ void lisp_panic(const char *msg);
 // Reader position accessors (defined in reader.c)
 int reader_get_line(void);
 int reader_get_col(void);
+const char *reader_get_filename(void);
 
-// Error with location info
+// Error with location info (file:line:col format)
 #define show_error(...)                                                        \
     do {                                                                       \
-        fprintf(stderr, "Error [line %d]: ", reader_get_line());               \
+        fprintf(stderr, "%s:%d:%d: error: ", reader_get_filename(),            \
+                reader_get_line(), reader_get_col());                          \
         fprintf(stderr, __VA_ARGS__);                                          \
         fprintf(stderr, "\n");                                                 \
     } while (0)
 
 #define show_warning(...)                                                      \
     do {                                                                       \
-        fprintf(stderr, "Warning: ");                                          \
+        fprintf(stderr, "%s:%d:%d: warning: ", reader_get_filename(),          \
+                reader_get_line(), reader_get_col());                          \
         fprintf(stderr, __VA_ARGS__);                                          \
         fprintf(stderr, "\n");                                                 \
     } while (0)
@@ -501,7 +509,8 @@ int reader_get_col(void);
 #define IS_ATOM(c) ((c) != 0 && CELL_TYPE(c) == BT_ATOM)
 #define IS_NUM(c) ((c) != 0 && CELL_TYPE(c) == BT_NUM)
 #define IS_BIGNUM(c) ((c) != 0 && CELL_TYPE(c) == BT_BIGNUM)
-#define IS_EXACT_INT(c) ((c) != 0 && (CELL_TYPE(c) == BT_NUM || CELL_TYPE(c) == BT_BIGNUM))
+#define IS_EXACT_INT(c)                                                        \
+    ((c) != 0 && (CELL_TYPE(c) == BT_NUM || CELL_TYPE(c) == BT_BIGNUM))
 #define IS_STRING(c) ((c) != 0 && CELL_TYPE(c) == BT_STRING)
 #define IS_CHAR(c) ((c) != 0 && CELL_TYPE(c) == BT_CHAR)
 #define IS_VECTOR(c) ((c) != 0 && CELL_TYPE(c) == BT_VECTOR)

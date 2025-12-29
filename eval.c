@@ -102,7 +102,8 @@ static inline unsigned make_syntax_transformer(unsigned transformer_form,
 static bool bind_syntax_rules(unsigned bindings, unsigned def_env,
                               unsigned closure_env, const char *context)
 {
-    FORLIST(b, bindings) {
+    FORLIST(b, bindings)
+    {
         unsigned binding = car(b);
         unsigned name = car(binding);
         unsigned transformer_form = cadr(binding);
@@ -380,7 +381,8 @@ static void eval_step(void)
                 unsigned body = cddr(id);
                 unsigned vars = 0, vals = 0;
                 unsigned vars_tail = 0, vals_tail = 0;
-                FORLIST(b, bindings) {
+                FORLIST(b, bindings)
+                {
                     unsigned var = caar(b);
                     unsigned vc = alloc_cons(var, 0);
                     unsigned vlc = alloc_cons(0, 0);
@@ -424,8 +426,8 @@ static void eval_step(void)
                 unsigned name = car(sig);
                 unsigned params = cdr(sig);
                 unsigned mbody = cddr(id);
-                unsigned p = make_typed_cell(BT_MACRO, params,
-                                             alloc_cons(mbody, env));
+                unsigned p =
+                    make_typed_cell(BT_MACRO, params, alloc_cons(mbody, env));
                 defvar(name, p, env);
                 tramp_apply(name, cont);
                 return;
@@ -749,9 +751,7 @@ static void apply_cont_step(void)
             // Protect fn from GC during argument reversal allocations
             gc_protect(&fn);
             unsigned args = 0;
-            FORLIST(l, new_evaled_rev) {
-                args = alloc_cons(car(l), args);
-            }
+            FORLIST(l, new_evaled_rev) { args = alloc_cons(car(l), args); }
             gc_unprotect(1);
             apply_function(fn, args, env, next);
         } else {

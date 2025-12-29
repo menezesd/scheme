@@ -64,7 +64,8 @@ static numeric_level classify_args(unsigned args, bool *all_exact_out)
     numeric_level level = NUM_INTEGER;
     bool all_ex = true;
 
-    FORLIST(a, args) {
+    FORLIST(a, args)
+    {
         unsigned x = car(a);
         if (x == 0)
             continue;
@@ -180,7 +181,8 @@ static unsigned prim_plus(unsigned args)
 
     // Fast path: try pure integer arithmetic with builtin overflow detection
     int64_t v = 0;
-    FORLIST(a, args) {
+    FORLIST(a, args)
+    {
         unsigned x = car(a);
         if (!IS_NUM(x))
             goto slow_path;
@@ -196,7 +198,8 @@ slow_path:;
     switch (level) {
     case NUM_COMPLEX: {
         double real = 0.0, imag = 0.0;
-        FORLIST(a, args) {
+        FORLIST(a, args)
+        {
             double r, i;
             get_complex_parts(car(a), &r, &i);
             real += r;
@@ -207,13 +210,14 @@ slow_path:;
     case NUM_INEXACT: {
         double sum = 0.0;
         FORLIST(a, args)
-            sum += to_double(car(a));
+        sum += to_double(car(a));
         return store_inexact(sum);
     }
     case NUM_RATIONAL: {
         // Rational addition: a/b + c/d = (ad + bc) / bd
         int64_t num = 0, denom = 1;
-        FORLIST(a, args) {
+        FORLIST(a, args)
+        {
             int64_t n, d;
             get_rational_parts(car(a), &n, &d);
             num = num * d + n * denom;
@@ -223,7 +227,8 @@ slow_path:;
     }
     case NUM_BIGNUM: {
         bignum *result = bn_from_int(0);
-        FORLIST(a, args) {
+        FORLIST(a, args)
+        {
             bignum *operand = to_bignum(car(a));
             bn_add_ip(result, operand);
             bn_free(operand);
@@ -233,7 +238,8 @@ slow_path:;
     case NUM_INTEGER: {
         // Pure integer arithmetic with builtin overflow detection
         int64_t sum = 0;
-        FORLIST(a, args) {
+        FORLIST(a, args)
+        {
             int64_t x = CELL_ID(car(a));
             int64_t new_sum;
             if (__builtin_add_overflow(sum, x, &new_sum)) {
@@ -264,7 +270,8 @@ static unsigned prim_mult(unsigned args)
 
     // Fast path: try pure integer arithmetic with builtin overflow detection
     int64_t v = 1;
-    FORLIST(a, args) {
+    FORLIST(a, args)
+    {
         unsigned x = car(a);
         if (!IS_NUM(x))
             goto slow_path;
@@ -280,7 +287,8 @@ slow_path:;
     switch (level) {
     case NUM_COMPLEX: {
         double real = 1.0, imag = 0.0;
-        FORLIST(a, args) {
+        FORLIST(a, args)
+        {
             double r, i;
             get_complex_parts(car(a), &r, &i);
             double nr = real * r - imag * i;
@@ -293,13 +301,14 @@ slow_path:;
     case NUM_INEXACT: {
         double prod = 1.0;
         FORLIST(a, args)
-            prod *= to_double(car(a));
+        prod *= to_double(car(a));
         return store_inexact(prod);
     }
     case NUM_RATIONAL: {
         // Rational multiplication: a/b * c/d = ac/bd
         int64_t num = 1, denom = 1;
-        FORLIST(a, args) {
+        FORLIST(a, args)
+        {
             int64_t n, d;
             get_rational_parts(car(a), &n, &d);
             num *= n;
@@ -311,7 +320,8 @@ slow_path:;
     case NUM_INTEGER: {
         // Use bignum for safety with large numbers
         bignum *result = bn_from_int(1);
-        FORLIST(a, args) {
+        FORLIST(a, args)
+        {
             bignum *operand = to_bignum(car(a));
             if (!operand) {
                 show_error("*: not a number");
@@ -642,7 +652,7 @@ typedef enum { CMP_EQ, CMP_LT, CMP_GT, CMP_LE, CMP_GE } cmp_op;
 
 // Apply comparison operation to two values
 #define APPLY_CMP_OP(op, a, b)                                                 \
-    ((op) == CMP_EQ  ? ((a) == (b))                                            \
+    ((op) == CMP_EQ   ? ((a) == (b))                                           \
      : (op) == CMP_LT ? ((a) < (b))                                            \
      : (op) == CMP_GT ? ((a) > (b))                                            \
      : (op) == CMP_LE ? ((a) <= (b))                                           \
@@ -792,7 +802,8 @@ static unsigned prim_string_append(unsigned args)
 {
     // First pass: validate and compute total length
     size_t total = 0;
-    FORLIST(a, args) {
+    FORLIST(a, args)
+    {
         CHECK_STRING(car(a), "string-append");
         total += strlen(GET_STRING_PTR(car(a)));
     }
@@ -805,7 +816,8 @@ static unsigned prim_string_append(unsigned args)
 
     // Second pass: copy strings (use pointer arithmetic to avoid strlen)
     char *pos = result;
-    FORLIST(a, args) {
+    FORLIST(a, args)
+    {
         char *s = GET_STRING_PTR(car(a));
         while (*s)
             *pos++ = *s++;
@@ -1223,9 +1235,9 @@ typedef struct {
 } math_func_entry;
 
 static const math_func_entry math_funcs[] = {
-    {PSIN, sin, "sin"},   {PCOS, cos, "cos"},   {PTAN, tan, "tan"},
+    {PSIN, sin, "sin"},    {PCOS, cos, "cos"},    {PTAN, tan, "tan"},
     {PASIN, asin, "asin"}, {PACOS, acos, "acos"}, {PLOG, log, "log"},
-    {PEXP, exp, "exp"},   {0, NULL, NULL}};
+    {PEXP, exp, "exp"},    {0, NULL, NULL}};
 
 // Math functions
 static unsigned apply_math_primitive(unsigned prim_id, unsigned args)
@@ -1359,9 +1371,7 @@ unsigned apply_primitive(unsigned prim_id, unsigned args)
         case BT_FUNCTION:
         case BT_BUILTIN:
         case BT_ATOM:
-            return CELL_ID(arg1) == CELL_ID(arg2)
-                       ? ctx.atom_true
-                       : 0;
+            return CELL_ID(arg1) == CELL_ID(arg2) ? ctx.atom_true : 0;
         default:
             return arg1 == arg2 ? ctx.atom_true : 0;
         }
@@ -1581,8 +1591,7 @@ unsigned apply_primitive(unsigned prim_id, unsigned args)
         REQUIRE_ARGS(args, 1, 1, "eof-object?");
         unsigned arg = car(args);
         return (CELL_TYPE(arg) == BT_ATOM &&
-                strcmp(ctx.atom_table[CELL_ID(arg)], "eof-object") ==
-                    0)
+                strcmp(ctx.atom_table[CELL_ID(arg)], "eof-object") == 0)
                    ? ctx.atom_true
                    : 0;
     }
@@ -1927,7 +1936,8 @@ unsigned apply_primitive(unsigned prim_id, unsigned args)
     // Misc
     case PERROR: {
         fprintf(stderr, "error: ");
-        FORLIST(a, args) {
+        FORLIST(a, args)
+        {
             display_obj(car(a));
             if (cdr(a))
                 fprintf(stderr, " ");
@@ -2081,8 +2091,8 @@ unsigned apply_primitive(unsigned prim_id, unsigned args)
         }
 
         // Continued fraction approximation (Stern-Brocot)
-        int64_t lo_n = 0, lo_d = 1;  // 0/1
-        int64_t hi_n = 1, hi_d = 0;  // 1/0 = infinity
+        int64_t lo_n = 0, lo_d = 1; // 0/1
+        int64_t hi_n = 1, hi_d = 0; // 1/0 = infinity
         int64_t mid_n, mid_d;
 
         for (int iter = 0; iter < 100; iter++) {

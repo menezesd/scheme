@@ -92,9 +92,11 @@ static unsigned syntax_lookup(unsigned var, unsigned bindings)
 // Find ellipsis binding that contains a given variable in its pattern
 static unsigned find_ellipsis_binding(unsigned var, unsigned bindings)
 {
-    unsigned cons_match = 0; // Remember first cons pattern match (lower priority)
+    unsigned cons_match =
+        0; // Remember first cons pattern match (lower priority)
 
-    FORLIST(b, bindings) {
+    FORLIST(b, bindings)
+    {
         unsigned binding = car(b);
         unsigned pvar = car(binding);
         unsigned val = cdr(binding);
@@ -341,7 +343,8 @@ unsigned syntax_expand(unsigned tmpl, unsigned bindings, unsigned mark)
                 ellipsis_values = cdr(ellipsis_binding);
             } else {
                 // Fallback: look for any list-valued binding
-                FORLIST(b, bindings) {
+                FORLIST(b, bindings)
+                {
                     unsigned binding = car(b);
                     unsigned val = cdr(binding);
                     if (IS_PAIR(val)) {
@@ -363,7 +366,8 @@ unsigned syntax_expand(unsigned tmpl, unsigned bindings, unsigned mark)
                     unsigned sub_bindings =
                         syntax_match(ellipsis_pattern, current_value, 0, 0);
                     if (sub_bindings != TOK_ERROR) {
-                        FORLIST(sb, sub_bindings) {
+                        FORLIST(sb, sub_bindings)
+                        {
                             iter_bindings = alloc_cons(car(sb), iter_bindings);
                         }
                     }
@@ -436,9 +440,7 @@ unsigned syntax_expand(unsigned tmpl, unsigned bindings, unsigned mark)
 
             // Count expanded elements
             unsigned expanded_count = pre_count + post_count;
-            FORLIST(ev, ellipsis_values) {
-                expanded_count++;
-            }
+            FORLIST(ev, ellipsis_values) { expanded_count++; }
 
             unsigned result = make_vector(expanded_count, 0);
             unsigned *result_data = vector_data_ptr(result);
@@ -452,7 +454,8 @@ unsigned syntax_expand(unsigned tmpl, unsigned bindings, unsigned mark)
             // Expand repeated element for each ellipsis value
             unsigned ellipsis_pattern =
                 ellipsis_binding ? car(ellipsis_binding) : 0;
-            FORLIST(ev, ellipsis_values) {
+            FORLIST(ev, ellipsis_values)
+            {
                 unsigned current_value = car(ev);
                 unsigned iter_bindings = bindings;
 
@@ -461,7 +464,8 @@ unsigned syntax_expand(unsigned tmpl, unsigned bindings, unsigned mark)
                     unsigned sub_bindings =
                         syntax_match(ellipsis_pattern, current_value, 0, 0);
                     if (sub_bindings != TOK_ERROR) {
-                        FORLIST(sb, sub_bindings) {
+                        FORLIST(sb, sub_bindings)
+                        {
                             iter_bindings = alloc_cons(car(sb), iter_bindings);
                         }
                     }

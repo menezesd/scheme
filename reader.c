@@ -37,9 +37,10 @@
 // Current input port for reading (NULL means use stdin)
 static FILE *reader_port = NULL;
 
-// Line number tracking for error messages
+// Source location tracking for error messages
 static int reader_line = 1;
 static int reader_col = 0;
+static const char *reader_filename = "<stdin>";
 
 // ============================================================================
 // Datum Labels (#n= and #n#)
@@ -54,10 +55,7 @@ static struct {
 } datum_labels[MAX_DATUM_LABELS];
 static int datum_label_count = 0;
 
-static void reset_datum_labels(void)
-{
-    datum_label_count = 0;
-}
+static void reset_datum_labels(void) { datum_label_count = 0; }
 
 static int find_datum_label(int label)
 {
@@ -71,7 +69,7 @@ static int find_datum_label(int label)
 static int add_datum_label(int label)
 {
     if (datum_label_count >= MAX_DATUM_LABELS) {
-        show_error("line %d: too many datum labels", reader_line);
+        show_error("too many datum labels");
         return -1;
     }
     int idx = datum_label_count++;
@@ -115,6 +113,11 @@ void reader_reset_position(void)
 // Get current reader position for error messages
 int reader_get_line(void) { return reader_line; }
 int reader_get_col(void) { return reader_col; }
+const char *reader_get_filename(void) { return reader_filename; }
+void reader_set_filename(const char *name)
+{
+    reader_filename = name ? name : "<stdin>";
+}
 
 // ============================================================================
 // String Buffer - eliminates repeated malloc/realloc pattern
@@ -234,7 +237,7 @@ static unsigned read_string_literal(void)
     for (;;) {
         int c = reader_getchar();
         if (c == EOF) {
-            show_error("line %d: unterminated string", reader_line);
+            show_error("unterminated string");
             sb_free(&sb);
             return TOK_ERROR;
         }
@@ -309,7 +312,7 @@ unsigned read_token(void)
                 fflush(stdout);
                 while ((c = reader_getchar()) != '\n' && c != EOF)
                     ;
-                continue;  // Continue reading next expression
+                continue; // Continue reading next expression
             } else {
                 while ((c = reader_getchar()) != '\n' && c != EOF)
                     ;
@@ -388,8 +391,7 @@ unsigned read_token(void)
                     // Define label: #n=<datum>
                     int idx = find_datum_label(label);
                     if (idx >= 0 && datum_labels[idx].defined) {
-                        show_error("line %d: duplicate datum label #%d=",
-                                   reader_line, label);
+                        show_error("duplicate datum label #%d=", label);
                         return TOK_ERROR;
                     }
                     // Pre-allocate a cell for forward references
@@ -418,18 +420,16 @@ unsigned read_token(void)
                     // Reference label: #n#
                     int idx = find_datum_label(label);
                     if (idx < 0) {
-                        show_error("line %d: undefined datum label #%d#",
-                                   reader_line, label);
+                        show_error("undefined datum label #%d#", label);
                         return TOK_ERROR;
                     }
                     return datum_labels[idx].value;
                 } else {
-                    show_error("line %d: expected = or # after #%d",
-                               reader_line, label);
+                    show_error("expected = or # after #%d", label);
                     return TOK_ERROR;
                 }
             }
-            show_error("line %d: unknown # syntax: #%c", reader_line, c);
+            show_error("unknown # syntax: #%c", c);
             return TOK_ERROR;
         }
         case '"':
@@ -494,7 +494,7 @@ unsigned read_vector(void)
         if (elem == TOK_ERROR)
             return TOK_ERROR;
         if (elem == TOK_DOT) {
-            show_error("line %d: dot not allowed in vector literal", reader_line);
+            show_error("dot not allowed in vector literal");
             return TOK_ERROR;
         }
 
@@ -505,9 +505,7 @@ unsigned read_vector(void)
     unsigned vec = make_vector(count, 0);
     unsigned *data = vector_data_ptr(vec);
     unsigned i = 0;
-    FORLIST(l, head) {
-        data[i++] = car(l);
-    }
+    FORLIST(l, head) { data[i++] = car(l); }
     return vec;
 }
 
@@ -575,14 +573,14 @@ unsigned read_list(void)
             return TOK_ERROR;
         case TOK_DOT:
         case TOK_CLOSE:
-            show_error("line %d: a dot must be followed by an object", reader_line);
+            show_error("a dot must be followed by an object");
             return TOK_ERROR;
         }
         st = read_list();
         if (st == TOK_ERROR)
             return TOK_ERROR;
         if (st != 0) {
-            show_error("line %d: only one object may follow a dot", reader_line);
+            show_error("only one object may follow a dot");
             return TOK_ERROR;
         }
         return sh;

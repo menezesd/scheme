@@ -135,8 +135,7 @@ TEST(match_list_length_mismatch)
 TEST(match_ellipsis_zero)
 {
     // Pattern (x ...) matches empty input ()
-    unsigned pattern =
-        alloc_cons(atom("x"), alloc_cons(atom("..."), 0));
+    unsigned pattern = alloc_cons(atom("x"), alloc_cons(atom("..."), 0));
     unsigned input = 0;
     unsigned bindings = syntax_match(pattern, input, 0, 0);
     ASSERT(bindings != TOK_ERROR);
@@ -146,8 +145,7 @@ TEST(match_ellipsis_zero)
 TEST(match_ellipsis_multiple)
 {
     // Pattern (x ...) matches input (1 2 3)
-    unsigned pattern =
-        alloc_cons(atom("x"), alloc_cons(atom("..."), 0));
+    unsigned pattern = alloc_cons(atom("x"), alloc_cons(atom("..."), 0));
     unsigned input =
         alloc_cons(store(1), alloc_cons(store(2), alloc_cons(store(3), 0)));
     unsigned bindings = syntax_match(pattern, input, 0, 0);

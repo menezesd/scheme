@@ -62,7 +62,7 @@ unsigned alloc_cons(unsigned car_val, unsigned cdr_val);
 
 // Allocate a typed cell with given car and cdr
 static inline unsigned make_typed_cell(enum lisp_type type, unsigned car_val,
-                                        unsigned cdr_val)
+                                       unsigned cdr_val)
 {
     unsigned p = alloc();
     ctx.cons_cells[p].type = type;
@@ -135,7 +135,10 @@ unsigned make_cont(enum cont_type type, unsigned data, unsigned env,
                    unsigned next);
 
 // Continuation accessors
-static inline enum cont_type cont_type(unsigned k) { return (enum cont_type)caar(k); }
+static inline enum cont_type cont_type(unsigned k)
+{
+    return (enum cont_type)caar(k);
+}
 static inline unsigned cont_data(unsigned k) { return cdar(k); }
 static inline unsigned cont_env(unsigned k) { return cadr(k); }
 static inline unsigned cont_next(unsigned k) { return cddr(k); }

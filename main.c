@@ -24,8 +24,13 @@ static bool is_eof_object(unsigned expr)
 
 // Load and evaluate expressions from a port
 // Returns true on success, false on error
-static bool load_from_port(FILE *f, unsigned *env, bool warn_on_error)
+static bool load_from_port(FILE *f, unsigned *env, bool warn_on_error,
+                           const char *filename)
 {
+    const char *old_filename = reader_get_filename();
+    reader_set_filename(filename);
+    reader_reset_position();
+
     for (;;) {
         // Skip whitespace
         int c;
@@ -56,6 +61,7 @@ static bool load_from_port(FILE *f, unsigned *env, bool warn_on_error)
     }
     // Final GC
     *env = gc(*env);
+    reader_set_filename(old_filename);
     return true;
 }
 
@@ -68,7 +74,7 @@ static void load_stdlib(unsigned *env)
     // Try external file first (for development)
     FILE *f = fopen("./stdlib.scm", "r");
     if (f) {
-        load_from_port(f, env, false);
+        load_from_port(f, env, false, "stdlib.scm");
         fclose(f);
         return;
     }
@@ -79,7 +85,7 @@ static void load_stdlib(unsigned *env)
         fprintf(stderr, "Warning: could not load embedded stdlib\n");
         return;
     }
-    load_from_port(f, env, true);
+    load_from_port(f, env, true, "<stdlib>");
     fclose(f);
 }
 
@@ -111,12 +117,13 @@ int main(int argc, char **argv)
             fprintf(stderr, "Cannot open file: %s\n", argv[1]);
             return 1;
         }
-        load_from_port(f, &env, false);
+        load_from_port(f, &env, false, argv[1]);
         fclose(f);
         return 0;
     }
 
     // REPL with error recovery
+    reader_set_filename("<stdin>");
     panic_jmp_set = true;
     if (setjmp(panic_jmp) != 0) {
         // Recovered from a fatal error - reset and continue
@@ -129,6 +136,7 @@ int main(int argc, char **argv)
         fflush(stdout);
 
         reader_reset_labels();
+        reader_reset_position(); // Reset line/col for each REPL input
         unsigned expr = read_obj();
         // Re-read env after read_obj() since :g escape can trigger GC
         unsigned x = eval_obj(expr, env);

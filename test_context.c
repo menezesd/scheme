@@ -220,7 +220,8 @@ TEST(list_length_empty)
 
 TEST(list_length_three)
 {
-    unsigned lst = alloc_cons(store(1), alloc_cons(store(2), alloc_cons(store(3), 0)));
+    unsigned lst =
+        alloc_cons(store(1), alloc_cons(store(2), alloc_cons(store(3), 0)));
     ASSERT_EQ(list_length(lst), 3);
     PASS();
 }
@@ -359,8 +360,8 @@ TEST(setvar_updates)
 
 TEST(bind_params_simple)
 {
-    unsigned params = alloc_cons(atom_from_string("a"),
-                     alloc_cons(atom_from_string("b"), 0));
+    unsigned params =
+        alloc_cons(atom_from_string("a"), alloc_cons(atom_from_string("b"), 0));
     unsigned args = alloc_cons(store(1), alloc_cons(store(2), 0));
 
     unsigned frame = bind_params(params, args);
@@ -409,9 +410,8 @@ TEST(gc_preserves_root)
 
 TEST(gc_preserves_list)
 {
-    unsigned lst = alloc_cons(store(1),
-                  alloc_cons(store(2),
-                  alloc_cons(store(3), 0)));
+    unsigned lst =
+        alloc_cons(store(1), alloc_cons(store(2), alloc_cons(store(3), 0)));
     unsigned preserved = gc(lst);
     ASSERT_EQ(list_length(preserved), 3);
     ASSERT_EQ(CELL_ID(car(preserved)), 1);
@@ -511,7 +511,7 @@ TEST(gc_maybe_gc_threshold)
 {
     unsigned root = alloc_cons(store(1), 0);
     // With low threshold, should trigger GC
-    root = maybe_gc(root, 0);  // 0% threshold = always GC
+    root = maybe_gc(root, 0); // 0% threshold = always GC
     ASSERT(root != 0);
     ASSERT_EQ(CELL_ID(car(root)), 1);
     PASS();

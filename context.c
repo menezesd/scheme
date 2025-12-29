@@ -161,6 +161,10 @@ unsigned alloc_cons(unsigned car_val, unsigned cdr_val)
 
 unsigned store(int64_t val)
 {
+    // Return cached cell for small integers
+    if (val >= INT_CACHE_MIN && val <= INT_CACHE_MAX) {
+        return INT_CACHE_START + (unsigned)(val - INT_CACHE_MIN);
+    }
     unsigned p = alloc();
     CELL_TYPE(p) = BT_NUM;
     CELL_ID(p) = val;
@@ -211,8 +215,9 @@ bignum *to_bignum(unsigned x)
         return bn_copy(bn);
     }
     // Debug: report unexpected type
-    fprintf(stderr, "Warning: to_bignum called with non-integer cell %u type %d\n",
-            x, CELL_TYPE(x));
+    fprintf(stderr,
+            "Warning: to_bignum called with non-integer cell %u type %d\n", x,
+            CELL_TYPE(x));
     return NULL;
 }
 
@@ -292,8 +297,7 @@ unsigned store_rational(int64_t num, int64_t denom)
 unsigned store_complex(unsigned real_part, unsigned imag_part)
 {
     // If imaginary part is zero, return just the real part
-    if (CELL_TYPE(imag_part) == BT_NUM &&
-        CELL_ID(imag_part) == 0) {
+    if (CELL_TYPE(imag_part) == BT_NUM && CELL_ID(imag_part) == 0) {
         return real_part;
     }
     unsigned p = alloc();
@@ -367,8 +371,7 @@ bool is_exact(unsigned x)
     case BT_INEXACT:
         return false;
     case BT_COMPLEX:
-        return is_exact(CELL_CAR(x)) &&
-               is_exact(CELL_CDR(x));
+        return is_exact(CELL_CAR(x)) && is_exact(CELL_CDR(x));
     default:
         return false;
     }
@@ -483,8 +486,7 @@ int intern(const char *s)
 
         // Warn once when load factor exceeds threshold
         if (ctx.atom_count == ATOM_TABLE_LOAD_WARN) {
-            fprintf(stderr,
-                    "Warning: atom table %.0f%% full (%u/%d symbols)\n",
+            fprintf(stderr, "Warning: atom table %.0f%% full (%u/%d symbols)\n",
                     100.0 * ctx.atom_count / TABLE_SIZE, ctx.atom_count,
                     TABLE_SIZE);
         }
@@ -858,7 +860,8 @@ unsigned gc(unsigned root)
     ctx.nmin = ctx.mmin;
     ctx.mmin = tmp;
 
-    // Note: ctx.atom_* are in reserved space (< HEAP_RESERVED) and don't need collection
+    // Note: ctx.atom_* are in reserved space (< HEAP_RESERVED) and don't need
+    // collection
 
     // Update alloc_gc_root before freeing old space (broken hearts still valid)
     alloc_gc_root = saved_gc_root;
@@ -935,6 +938,14 @@ void init_keywords(void)
     ctx.current_input = stdin;
     ctx.current_output = stdout;
     ctx.transcript = NULL;
+
+    // Initialize small integer cache (cells INT_CACHE_START to
+    // INT_CACHE_START+255)
+    for (int i = INT_CACHE_MIN; i <= INT_CACHE_MAX; i++) {
+        unsigned cell = INT_CACHE_START + (i - INT_CACHE_MIN);
+        CELL_TYPE(cell) = BT_NUM;
+        CELL_ID(cell) = i;
+    }
 
     // Initialize permanent atoms in reserved cells (never GC'd)
     init_permanent_atom(CELL_ATOM_TRUE, "t");
