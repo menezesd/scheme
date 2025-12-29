@@ -56,10 +56,11 @@ slow_path:;
             get_rational_cells(car(a), &n, &d);
             // num = num * d + n * denom
             unsigned ad = multiply_cells(num, d);
-            unsigned bc = multiply_cells(n, denom);
             gc_protect(&ad);
+            unsigned bc = multiply_cells(n, denom);
+            gc_protect(&bc);
             unsigned new_num = add_cells(ad, bc);
-            gc_unprotect(1);
+            gc_unprotect(2);
             num = new_num;
             // denom = denom * d
             denom = multiply_cells(denom, d);
@@ -260,10 +261,11 @@ slow_path:;
             get_rational_cells(car(rargs), &n, &d);
             // num = num * d - n * denom
             unsigned ad = multiply_cells(num, d);
-            unsigned bc = multiply_cells(n, denom);
             gc_protect(&ad);
+            unsigned bc = multiply_cells(n, denom);
+            gc_protect(&bc);
             unsigned new_num = subtract_cells(ad, bc);
-            gc_unprotect(1);
+            gc_unprotect(2);
             num = new_num;
             // denom = denom * d
             denom = multiply_cells(denom, d);

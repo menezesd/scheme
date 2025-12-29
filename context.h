@@ -60,11 +60,18 @@ unsigned alloc(void);
 // Allocate a cons cell with given car and cdr
 unsigned alloc_cons(unsigned car_val, unsigned cdr_val);
 
+// Forward declarations for GC protection (defined below)
+void gc_protect(unsigned *ptr);
+void gc_unprotect(int count);
+
 // Allocate a typed cell with given car and cdr
 static inline unsigned make_typed_cell(enum lisp_type type, unsigned car_val,
                                        unsigned cdr_val)
 {
+    gc_protect(&car_val);
+    gc_protect(&cdr_val);
     unsigned p = alloc();
+    gc_unprotect(2);
     ctx.cons_cells[p].type = type;
     ctx.cons_cells[p].car = car_val;
     ctx.cons_cells[p].cdr = cdr_val;
@@ -246,8 +253,7 @@ void trigger_gc(void);
 // Shadow stack for protecting local C variables during nested allocations.
 // Use gc_protect before a sequence of allocations that depend on local vars,
 // then gc_unprotect when done. This ensures GC updates the variables in place.
-void gc_protect(unsigned *ptr);
-void gc_unprotect(int count);
+// (gc_protect and gc_unprotect declared above for inline functions)
 
 // Alternative: mark/release for safer scope-based protection.
 // gc_mark() returns current stack position, gc_release() restores it.

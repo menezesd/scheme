@@ -294,11 +294,16 @@ unsigned normalize_rational(int64_t num, int64_t denom)
     if (denom == 1) {
         return store(num);
     }
-    // Create rational
+    // Create rational - store components first, then allocate cell
+    unsigned num_cell = store(num);
+    gc_protect(&num_cell);
+    unsigned denom_cell = store(denom);
+    gc_protect(&denom_cell);
     unsigned p = alloc();
+    gc_unprotect(2);
     CELL_TYPE(p) = BT_RATIONAL;
-    CELL_CAR(p) = store(num);
-    CELL_CDR(p) = store(denom);
+    CELL_CAR(p) = num_cell;
+    CELL_CDR(p) = denom_cell;
     return p;
 }
 
@@ -544,12 +549,14 @@ unsigned make_cont(enum cont_type type, unsigned data, unsigned env,
     gc_protect(&env);
     gc_protect(&next);
     unsigned type_data = alloc_cons(type, data);
+    gc_protect(&type_data);
     unsigned env_next = alloc_cons(env, next);
+    gc_protect(&env_next);
     unsigned p = alloc();
+    gc_unprotect(5);
     CELL_TYPE(p) = BT_CONT;
     CELL_CAR(p) = type_data;
     CELL_CDR(p) = env_next;
-    gc_unprotect(3);
     return p;
 }
 
@@ -663,10 +670,12 @@ unsigned atom_from_string(const char *s)
                 double real_val = strtod(s, &endptr);
                 unsigned real_part =
                     (endptr == sep) ? store_inexact(real_val) : store(0);
+                gc_protect(&real_part);
 
                 // Parse imaginary part (without the trailing i)
                 double imag_val = strtod(sep, &endptr);
                 unsigned imag_part = store_inexact(imag_val);
+                gc_unprotect(1);
 
                 return store_complex(real_part, imag_part);
             }
