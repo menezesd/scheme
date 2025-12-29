@@ -17,15 +17,21 @@ static inline unsigned make_frame(unsigned vars, unsigned vals)
 // Extend environment with a new frame
 static inline unsigned extend_env(unsigned vars, unsigned vals, unsigned env)
 {
+    gc_protect(&env);
     unsigned frame = make_frame(vars, vals);
-    return alloc_cons(frame, env);
+    unsigned result = alloc_cons(frame, env);
+    gc_unprotect(1);
+    return result;
 }
 
 // Extend environment with an empty frame
 static inline unsigned extend_env_empty(unsigned env)
 {
+    gc_protect(&env);
     unsigned frame = alloc_cons(0, 0);
-    return alloc_cons(frame, env);
+    unsigned result = alloc_cons(frame, env);
+    gc_unprotect(1);
+    return result;
 }
 
 // ============================================================================
@@ -41,8 +47,11 @@ unsigned defvar(unsigned var, unsigned aval, unsigned env);
 // Set an existing variable (error if not found)
 unsigned setvar(int64_t var, unsigned aval, unsigned env);
 
-// Look up a variable
+// Look up a variable (prints error if not found)
 unsigned lookup(int64_t var, unsigned env);
+
+// Look up a variable silently (no error if not found)
+unsigned lookup_silent(int64_t var, unsigned env);
 
 // Bind parameters to arguments, supporting variadic (a b . rest) syntax
 unsigned bind_params(unsigned params, unsigned args);

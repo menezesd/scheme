@@ -8,10 +8,10 @@ LDFLAGS = -lm
 SRCS = main.c context.c reader.c writer.c env.c primitives.c macros.c eval.c bignum.c \
        prim_numeric.c prim_compare.c prim_list.c prim_string.c prim_type.c \
        prim_char.c prim_vector.c prim_math.c prim_io.c prim_port.c prim_numtower.c \
-       eval_forms.c eval_cont.c
+       eval_forms.c eval_cont.c compile.c vm.c
 OBJS = $(SRCS:.c=.o)
 HEADERS = types.h context.h reader.h writer.h env.h primitives.h macros.h eval.h bignum.h \
-          prim_internal.h eval_internal.h
+          prim_internal.h eval_internal.h bytecode.h
 GENERATED = stdlib_data.h
 
 # Target executable
@@ -58,6 +58,8 @@ eval.o: eval.c eval.h eval_internal.h context.h env.h primitives.h macros.h read
 eval_forms.o: eval_forms.c eval_internal.h context.h env.h macros.h types.h
 eval_cont.o: eval_cont.c eval_internal.h context.h env.h types.h
 bignum.o: bignum.c bignum.h
+compile.o: compile.c bytecode.h context.h env.h macros.h types.h
+vm.o: vm.c bytecode.h context.h env.h primitives.h macros.h types.h
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -86,7 +88,7 @@ TEST_BINS = $(TEST_SRCS:.c=)
 INTERP_OBJS = context.o reader.o writer.o env.o primitives.o macros.o eval.o bignum.o \
               prim_numeric.o prim_compare.o prim_list.o prim_string.o prim_type.o \
               prim_char.o prim_vector.o prim_math.o prim_io.o prim_port.o prim_numtower.o \
-              eval_forms.o eval_cont.o
+              eval_forms.o eval_cont.o compile.o vm.o
 
 test-c: $(TEST_BINS)
 	@for t in $(TEST_BINS); do ./$$t || exit 1; done

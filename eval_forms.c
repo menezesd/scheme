@@ -21,17 +21,30 @@ bool handle_quote(unsigned id, unsigned env, unsigned cont)
 
 bool handle_lambda(unsigned id, unsigned env, unsigned cont)
 {
-    unsigned p =
-        make_typed_cell(BT_FUNCTION, cadr(id), alloc_cons(cddr(id), env));
+    // Extract values before allocations and protect everything
+    unsigned params = cadr(id);
+    unsigned body = cddr(id);
+    gc_protect(&params);
+    gc_protect(&env);
+    gc_protect(&cont);
+    unsigned body_env = alloc_cons(body, env);
+    unsigned p = make_typed_cell(BT_FUNCTION, params, body_env);
+    gc_unprotect(3);
     tramp_apply(p, cont);
     return true;
 }
 
 bool handle_if(unsigned id, unsigned env, unsigned cont)
 {
+    // Extract test expression before allocations, protect all used after
+    unsigned test = cadr(id);
+    gc_protect(&test);
+    gc_protect(&env);
+    gc_protect(&cont);
     unsigned branches = alloc_cons(caddr(id), cadddr(id));
     unsigned k = make_cont(CONT_IF, branches, env, cont);
-    tramp_eval(cadr(id), env, k);
+    gc_unprotect(3);
+    tramp_eval(test, env, k);
     return true;
 }
 
@@ -46,7 +59,12 @@ bool handle_begin(unsigned id, unsigned env, unsigned cont)
         tramp_eval(car(seq), env, cont);
         return true;
     }
+    // Protect seq, env and cont across make_cont
+    gc_protect(&seq);
+    gc_protect(&env);
+    gc_protect(&cont);
     unsigned k = make_cont(CONT_BEGIN, cdr(seq), env, cont);
+    gc_unprotect(3);
     tramp_eval(car(seq), env, k);
     return true;
 }
@@ -54,8 +72,13 @@ bool handle_begin(unsigned id, unsigned env, unsigned cont)
 bool handle_set(unsigned id, unsigned env, unsigned cont)
 {
     unsigned var = cadr(id);
+    unsigned val_expr = caddr(id);
+    gc_protect(&val_expr);
+    gc_protect(&env);
+    gc_protect(&cont);
     unsigned k = make_cont(CONT_SET, var, env, cont);
-    tramp_eval(caddr(id), env, k);
+    gc_unprotect(3);
+    tramp_eval(val_expr, env, k);
     return true;
 }
 
@@ -63,15 +86,28 @@ bool handle_define(unsigned id, unsigned env, unsigned cont)
 {
     unsigned vid = cadr(id);
     if (IS_PAIR(vid)) {
-        // Function definition shorthand
-        unsigned p =
-            make_typed_cell(BT_FUNCTION, cdr(vid), alloc_cons(cddr(id), env));
-        defvar(car(vid), p, env);
-        tramp_apply(car(vid), cont);
+        // Function definition shorthand - extract all values before allocations
+        unsigned name = car(vid);
+        unsigned params = cdr(vid);
+        unsigned body = cddr(id);
+        gc_protect(&name);
+        gc_protect(&params);
+        gc_protect(&env);
+        gc_protect(&cont);
+        unsigned body_env = alloc_cons(body, env);
+        unsigned p = make_typed_cell(BT_FUNCTION, params, body_env);
+        defvar(name, p, env);
+        gc_unprotect(4);
+        tramp_apply(name, cont);
         return true;
     }
+    unsigned val_expr = caddr(id);
+    gc_protect(&val_expr);
+    gc_protect(&env);
+    gc_protect(&cont);
     unsigned k = make_cont(CONT_DEFINE, vid, env, cont);
-    tramp_eval(caddr(id), env, k);
+    gc_unprotect(3);
+    tramp_eval(val_expr, env, k);
     return true;
 }
 
@@ -86,7 +122,11 @@ bool handle_and(unsigned id, unsigned env, unsigned cont)
         tramp_eval(car(seq), env, cont);
         return true;
     }
+    gc_protect(&seq);
+    gc_protect(&env);
+    gc_protect(&cont);
     unsigned k = make_cont(CONT_AND, cdr(seq), env, cont);
+    gc_unprotect(3);
     tramp_eval(car(seq), env, k);
     return true;
 }
@@ -102,7 +142,11 @@ bool handle_or(unsigned id, unsigned env, unsigned cont)
         tramp_eval(car(seq), env, cont);
         return true;
     }
+    gc_protect(&seq);
+    gc_protect(&env);
+    gc_protect(&cont);
     unsigned k = make_cont(CONT_OR, cdr(seq), env, cont);
+    gc_unprotect(3);
     tramp_eval(car(seq), env, k);
     return true;
 }
@@ -125,13 +169,24 @@ bool handle_cond(unsigned id, unsigned env, unsigned cont)
         } else if (!cdr(conseq)) {
             tramp_eval(car(conseq), env, cont);
         } else {
+            unsigned first_conseq = car(conseq);
+            gc_protect(&conseq);
+            gc_protect(&env);
+            gc_protect(&first_conseq);
+            gc_protect(&cont);
             unsigned k = make_cont(CONT_BEGIN, cdr(conseq), env, cont);
-            tramp_eval(car(conseq), env, k);
+            gc_unprotect(4);
+            tramp_eval(first_conseq, env, k);
         }
         return true;
     }
+    // Protect test, env and cont across allocations
+    gc_protect(&test);
+    gc_protect(&env);
+    gc_protect(&cont);
     unsigned data = alloc_cons(cdr(clause), rest_clauses);
     unsigned k = make_cont(CONT_COND_TEST, data, env, cont);
+    gc_unprotect(3);
     tramp_eval(test, env, k);
     return true;
 }
@@ -145,17 +200,21 @@ bool handle_let(unsigned id, unsigned env, unsigned cont)
         return true;
     }
     unsigned first_binding = car(bindings);
+    unsigned first_val_expr = cadr(first_binding);
+    // Protect first_val_expr, env and cont across all allocations
+    gc_protect(&first_val_expr);
+    gc_protect(&env);
+    gc_protect(&cont);
     unsigned vars = alloc_cons(car(first_binding), 0);
     unsigned vals = alloc_cons(0, 0);
-    // Protect vars/vals from GC during nested allocations
     gc_protect(&vars);
     gc_protect(&vals);
     unsigned inner = alloc_cons(cdr(bindings), body);
     unsigned middle = alloc_cons(vals, inner);
     unsigned data = alloc_cons(vars, middle);
-    gc_unprotect(2);
     unsigned k = make_cont(CONT_LET_VALS, data, env, cont);
-    tramp_eval(cadr(first_binding), env, k);
+    gc_unprotect(5);
+    tramp_eval(first_val_expr, env, k);
     return true;
 }
 
@@ -167,10 +226,16 @@ bool handle_letstar(unsigned id, unsigned env, unsigned cont)
         eval_body(body, env, cont);
         return true;
     }
-    unsigned data = alloc_cons(bindings, body);
+    // Extract value expression before allocations
     unsigned first = car(bindings);
+    unsigned first_val_expr = cadr(first);
+    gc_protect(&first_val_expr);
+    gc_protect(&env);
+    gc_protect(&cont);
+    unsigned data = alloc_cons(bindings, body);
     unsigned k = make_cont(CONT_LETSTAR_VALS, data, env, cont);
-    tramp_eval(cadr(first), env, k);
+    gc_unprotect(3);
+    tramp_eval(first_val_expr, env, k);
     return true;
 }
 
@@ -178,10 +243,28 @@ bool handle_letrec(unsigned id, unsigned env, unsigned cont)
 {
     unsigned bindings = cadr(id);
     unsigned body = cddr(id);
+
+    if (!bindings) {
+        eval_body(body, env, cont);
+        return true;
+    }
+
+    // Protect bindings, body, env and cont across all allocations
+    gc_protect(&bindings);
+    gc_protect(&body);
+    gc_protect(&env);
+    gc_protect(&cont);
+
     unsigned vars = 0, vals = 0;
     unsigned vars_tail = 0, vals_tail = 0;
-    FORLIST(b, bindings)
-    {
+    gc_protect(&vars);
+    gc_protect(&vals);
+    gc_protect(&vars_tail);
+    gc_protect(&vals_tail);
+
+    // Build vars and vals lists
+    for (unsigned b = bindings; b; b = cdr(b)) {
+        gc_protect(&b);
         unsigned var = caar(b);
         unsigned vc = alloc_cons(var, 0);
         unsigned vlc = alloc_cons(0, 0);
@@ -194,19 +277,19 @@ bool handle_letrec(unsigned id, unsigned env, unsigned cont)
         }
         vars_tail = vc;
         vals_tail = vlc;
+        gc_unprotect(1); // b
     }
+
     unsigned new_env = extend_env(vars, vals, env);
-    if (!bindings) {
-        eval_body(body, new_env, cont);
-        return true;
-    }
-    // Protect bindings from GC during nested allocation
-    gc_protect(&bindings);
+    gc_protect(&new_env);
+
+    unsigned first_val_expr = cadr(car(bindings)); // bindings is protected
+    gc_protect(&first_val_expr);
     unsigned inner = alloc_cons(vals, body);
     unsigned data = alloc_cons(bindings, inner);
-    gc_unprotect(1);
     unsigned k = make_cont(CONT_LETREC_INIT, data, new_env, cont);
-    tramp_eval(cadr(car(bindings)), new_env, k);
+    gc_unprotect(10); // bindings, body, env, cont, vars, vals, vars_tail, vals_tail, new_env, first_val_expr
+    tramp_eval(first_val_expr, new_env, k);
     return true;
 }
 
@@ -227,8 +310,15 @@ bool handle_define_macro(unsigned id, unsigned env, unsigned cont)
     unsigned name = car(sig);
     unsigned params = cdr(sig);
     unsigned mbody = cddr(id);
-    unsigned p = make_typed_cell(BT_MACRO, params, alloc_cons(mbody, env));
+    // Protect all values used after allocations
+    gc_protect(&name);
+    gc_protect(&params);
+    gc_protect(&env);
+    gc_protect(&cont);
+    unsigned mbody_env = alloc_cons(mbody, env);
+    unsigned p = make_typed_cell(BT_MACRO, params, mbody_env);
     defvar(name, p, env);
+    gc_unprotect(4);
     tramp_apply(name, cont);
     return true;
 }

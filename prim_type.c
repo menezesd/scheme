@@ -4,6 +4,7 @@
  */
 
 #include "prim_internal.h"
+#include "bytecode.h"
 
 unsigned apply_type_predicate(unsigned prim_id, unsigned args)
 {
@@ -40,6 +41,9 @@ unsigned apply_type_predicate(unsigned prim_id, unsigned args)
                    ? ctx.atom_true
                    : 0;
     case PPROCP:
+        // Check for bytecode closures: cons cell with BT_CLOSURE marker in car
+        if (IS_PAIR(arg) && CELL_TYPE(car(arg)) == BT_CLOSURE)
+            return ctx.atom_true;
         return (IS_FUNCTION(arg) || IS_BUILTIN(arg) || IS_CONT(arg))
                    ? ctx.atom_true
                    : 0;

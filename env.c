@@ -86,8 +86,13 @@ unsigned defvar(unsigned var, unsigned aval, unsigned env)
 
     vars = car(frame);
     vals = cdr(frame);
+    // Protect frame, aval, vals across allocations
+    gc_protect(&frame);
+    gc_protect(&aval);
+    gc_protect(&vals);
     CELL_CAR(frame) = alloc_cons(var, vars);
     CELL_CDR(frame) = alloc_cons(aval, vals);
+    gc_unprotect(3);
     return var;
 }
 
@@ -123,7 +128,8 @@ unsigned setvar(int64_t var, unsigned aval, unsigned env)
     return TOK_ERROR;
 }
 
-unsigned lookup(int64_t var, unsigned env)
+// Internal lookup - returns TOK_ERROR if not found (no error message)
+static unsigned lookup_internal(int64_t var, unsigned env)
 {
     while (env) {
         unsigned frame = car(env);
@@ -144,14 +150,37 @@ unsigned lookup(int64_t var, unsigned env)
         env = cdr(env);
     }
 
-    show_error("undefined variable: %s", ctx.atom_table[var]);
     return TOK_ERROR;
+}
+
+unsigned lookup(int64_t var, unsigned env)
+{
+    unsigned result = lookup_internal(var, env);
+    if (result == TOK_ERROR) {
+        show_error("undefined variable: %s", ctx.atom_table[var]);
+    }
+    return result;
+}
+
+// Silent lookup - returns TOK_ERROR if not found (no error message)
+// Used by the compiler to check for macros
+unsigned lookup_silent(int64_t var, unsigned env)
+{
+    return lookup_internal(var, env);
 }
 
 unsigned bind_params(unsigned params, unsigned args)
 {
     unsigned vars = 0, vals = 0;
     unsigned vars_tail = 0, vals_tail = 0;
+
+    // Protect all loop-carried variables
+    gc_protect(&vars);
+    gc_protect(&vals);
+    gc_protect(&vars_tail);
+    gc_protect(&vals_tail);
+    gc_protect(&params);
+    gc_protect(&args);
 
     while (params && CELL_TYPE(params) == BT_CONS) {
         unsigned var = car(params);
@@ -186,7 +215,9 @@ unsigned bind_params(unsigned params, unsigned args)
         }
     }
 
-    return alloc_cons(vars, vals);
+    unsigned result = alloc_cons(vars, vals);
+    gc_unprotect(6);
+    return result;
 }
 
 unsigned mk_primop(int64_t id)

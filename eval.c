@@ -65,26 +65,37 @@ unsigned qq_expand_cps(unsigned x, unsigned env)
         return TOK_ERROR;
     }
 
-    // Recursively process list
+    // Recursively process list; protect loop vars across allocations
     unsigned result = 0, tail = 0;
+    gc_protect(&result);
+    gc_protect(&tail);
     for (unsigned l = x; IS_PAIR(l); l = cdr(l)) {
+        gc_protect(&l);
         unsigned elem = car(l);
 
         // Check if element is (unquote-splicing expr)
         if (IS_PAIR(elem) && IS_KEYWORD(car(elem), ctx.kw_unquote_splicing)) {
             unsigned spliced = eval_cps(cadr(elem), env);
-            if (spliced == TOK_ERROR)
+            if (spliced == TOK_ERROR) {
+                gc_unprotect(3);
                 return spliced;
+            }
+            gc_protect(&spliced);
             for (; IS_PAIR(spliced); spliced = cdr(spliced)) {
                 list_append(&result, &tail, car(spliced));
             }
+            gc_unprotect(1); // spliced
         } else {
             unsigned expanded = qq_expand_cps(elem, env);
-            if (expanded == TOK_ERROR)
+            if (expanded == TOK_ERROR) {
+                gc_unprotect(3);
                 return expanded;
+            }
             list_append(&result, &tail, expanded);
         }
+        gc_unprotect(1); // l
     }
+    gc_unprotect(2); // tail, result
     return result;
 }
 
@@ -140,7 +151,12 @@ static void eval_step(void)
         }
 
         // Not a special form - evaluate function position first
+        // Protect head, env and cont across make_cont (which may trigger GC)
+        gc_protect(&head);
+        gc_protect(&env);
+        gc_protect(&cont);
         unsigned k = make_cont(CONT_EVAL_FN, cdr(id), env, cont);
+        gc_unprotect(3);
         tramp_eval(head, env, k);
         return;
     }
@@ -202,7 +218,11 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
                 return;
             }
             unsigned proc = car(args);
+            gc_protect(&proc);
+            gc_protect(&cont);
+            gc_protect(&env);
             unsigned cont_args = alloc_cons(cont, 0);
+            gc_unprotect(3);
             apply_function(proc, cont_args, env, cont);
             return;
         }
@@ -229,8 +249,14 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
             }
             unsigned producer = car(args);
             unsigned consumer = cadr(args);
+            // Protect producer, consumer, env and cont across make_cont
+            gc_protect(&producer);
+            gc_protect(&consumer);
+            gc_protect(&env);
+            gc_protect(&cont);
             // Create continuation to handle producer's result
             unsigned k = make_cont(CONT_CALLWITHVALUES, consumer, env, cont);
+            gc_unprotect(4);
             // Call producer with no arguments
             apply_function(producer, 0, env, k);
             return;
@@ -325,8 +351,13 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
             if (!cdr(exprs)) {
                 tramp_eval(car(exprs), env, cont);
             } else {
+                unsigned first_expr = car(exprs);
+                gc_protect(&first_expr);
+                gc_protect(&env);
+                gc_protect(&cont);
                 unsigned k = make_cont(CONT_BEGIN, cdr(exprs), env, cont);
-                tramp_eval(car(exprs), env, k);
+                gc_unprotect(3);
+                tramp_eval(first_expr, env, k);
             }
             return;
         }
@@ -346,14 +377,23 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
         unsigned body = car(body_env);
         unsigned def_env = cdr(body_env);
 
+        // Protect body, def_env and cont across allocations
+        gc_protect(&body);
+        gc_protect(&def_env);
+        gc_protect(&cont);
         unsigned frame = bind_params(params, args);
         unsigned new_env = alloc_cons(frame, def_env);
 
         if (!cdr(body)) {
+            gc_unprotect(3);
             tramp_eval(car(body), new_env, cont);
         } else {
+            unsigned first_expr = car(body);
+            gc_protect(&first_expr);
+            gc_protect(&new_env);
             unsigned k = make_cont(CONT_APPLY_FUNC, cdr(body), new_env, cont);
-            tramp_eval(car(body), new_env, k);
+            gc_unprotect(5); // first_expr, new_env, cont, def_env, body
+            tramp_eval(first_expr, new_env, k);
         }
         return;
     }

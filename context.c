@@ -25,6 +25,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "context.h"
 #include "bignum.h"
+#include "bytecode.h"
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
@@ -1053,6 +1054,10 @@ unsigned gc(unsigned root)
         }
     }
 
+    // Collect code object constants BEFORE scan phase so their
+    // CAR/CDR are recursively processed
+    gc_update_all_code_objects();
+
     while (scan != ctx.hptr) {
         enum lisp_type t = CELL_TYPE(scan);
         if (t == BT_CONS || t == BT_FUNCTION || t == BT_MACRO ||
@@ -1076,6 +1081,10 @@ unsigned gc(unsigned root)
     if (alloc_gc_root && *alloc_gc_root >= HEAP_RESERVED) {
         *alloc_gc_root = collect(*alloc_gc_root);
     }
+
+    // Note: gc_sweep_code_objects() is NOT called here because the VM may
+    // still be executing code objects that have no closures in the heap
+    // (e.g., toplevel code). Call it explicitly when the VM is idle.
 
     // Sweep phase: Free heap-allocated data in old memory region (now at nmin
     // after the swap). This is safe because:

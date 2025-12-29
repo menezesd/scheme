@@ -40,8 +40,14 @@ static inline void eval_body(unsigned body, unsigned env, unsigned cont)
     } else if (!cdr(body)) {
         tramp_eval(car(body), env, cont);
     } else {
+        // Extract first expr before allocation, protect all used after
+        unsigned first_expr = car(body);
+        gc_protect(&first_expr);
+        gc_protect(&env);
+        gc_protect(&cont);
         unsigned k = make_cont(CONT_LET_BODY, cdr(body), env, cont);
-        tramp_eval(car(body), env, k);
+        gc_unprotect(3);
+        tramp_eval(first_expr, env, k);
     }
 }
 
@@ -52,8 +58,14 @@ static inline void eval_seq(unsigned data, enum cont_type cont_type,
     if (!cdr(data)) {
         tramp_eval(car(data), env, next);
     } else {
+        // Extract first expr before allocation, protect all used after
+        unsigned first_expr = car(data);
+        gc_protect(&first_expr);
+        gc_protect(&env);
+        gc_protect(&next);
         unsigned k = make_cont(cont_type, cdr(data), env, next);
-        tramp_eval(car(data), env, k);
+        gc_unprotect(3);
+        tramp_eval(first_expr, env, k);
     }
 }
 
@@ -63,7 +75,11 @@ static inline unsigned make_syntax_transformer(unsigned transformer_form,
 {
     unsigned literals = cadr(transformer_form);
     unsigned rules = cddr(transformer_form);
-    return make_typed_cell(BT_SYNTAX, alloc_cons(literals, rules), closure_env);
+    gc_protect(&closure_env);
+    unsigned car_val = alloc_cons(literals, rules);
+    unsigned result = make_typed_cell(BT_SYNTAX, car_val, closure_env);
+    gc_unprotect(1);
+    return result;
 }
 
 // Bind syntax transformers from a list of bindings
@@ -71,18 +87,20 @@ static inline unsigned make_syntax_transformer(unsigned transformer_form,
 static inline bool bind_syntax_rules(unsigned bindings, unsigned def_env,
                                      unsigned closure_env, const char *context)
 {
-    FORLIST(b, bindings)
-    {
+    for (unsigned b = bindings; b; b = cdr(b)) {
+        gc_protect(&b);
         unsigned binding = car(b);
         unsigned name = car(binding);
         unsigned transformer_form = cadr(binding);
         if (!is_syntax_rules(transformer_form)) {
+            gc_unprotect(1);
             show_error("%s: expected syntax-rules", context);
             tramp_error();
             return false;
         }
         unsigned p = make_syntax_transformer(transformer_form, closure_env);
         defvar(name, p, def_env);
+        gc_unprotect(1);
     }
     return true;
 }

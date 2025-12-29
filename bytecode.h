@@ -1,0 +1,245 @@
+/**
+ * @file bytecode.h
+ * @brief Bytecode definitions for the compiled Scheme VM
+ *
+ * This file defines the bytecode instruction set and associated data structures
+ * for a stack-based virtual machine. The compiler translates S-expressions into
+ * bytecode, which the VM then executes.
+ *
+ * ## Design Overview
+ * - Stack-based execution model
+ * - Separate compilation phase produces code_object structures
+ * - Closures capture their defining environment
+ * - First-class continuations via stack copying
+ * - Tail calls optimized via dedicated TAILCALL instruction
+ *
+ * ## Memory Model
+ * Bytecode instructions use cell indices (unsigned) for all Scheme values,
+ * integrating with the existing GC infrastructure.
+ */
+
+#ifndef BYTECODE_H
+#define BYTECODE_H
+
+#include "types.h"
+
+// ============================================================================
+// Bytecode Opcodes
+// ============================================================================
+
+/**
+ * VM instruction opcodes.
+ *
+ * Instructions are variable-length: opcode byte followed by operands.
+ * Operands are unsigned integers (cell indices or counts).
+ */
+enum opcode {
+    // Stack manipulation
+    OP_CONST,      // Push constant: CONST idx -> push constants[idx]
+    OP_POP,        // Discard top of stack
+    OP_DUP,        // Duplicate top of stack
+
+    // Variables
+    OP_LOOKUP,     // Variable lookup: LOOKUP sym_id -> push lookup(sym_id, env)
+    OP_DEFINE,     // Define variable: DEFINE sym_id -> pop val, defvar(sym_id, val)
+    OP_SET,        // Set variable: SET sym_id -> pop val, setvar(sym_id, val)
+
+    // Closures and functions
+    OP_CLOSURE,    // Create closure: CLOSURE code_idx -> push closure(code[idx], env)
+    OP_CALL,       // Call function: CALL argc -> pop fn, pop argc args, apply
+    OP_TAILCALL,   // Tail call: TAILCALL argc -> like CALL but reuse frame
+    OP_RETURN,     // Return from function: RETURN -> pop val, restore frame
+
+    // Control flow
+    OP_JUMP,       // Unconditional jump: JUMP offset -> ip = offset
+    OP_JUMPIF,     // Jump if true: JUMPIF offset -> pop, if truthy: ip = offset
+    OP_JUMPIFNOT,  // Jump if false: JUMPIFNOT offset -> pop, if falsy: ip = offset
+
+    // Primitives (inline for common operations)
+    OP_PRIM,       // Call primitive: PRIM prim_id argc -> apply primitive
+
+    // Special operations
+    OP_PUSHCONT,   // Capture continuation: push reified continuation
+    OP_CALLCC,     // call/cc: CALLCC -> pop proc, call with captured continuation
+    OP_APPLY,      // apply primitive: APPLY -> pop proc, pop args-list, apply
+
+    // Environment
+    OP_PUSHENV,    // Push new empty frame onto environment
+    OP_POPENV,     // Pop frame from environment (for let scope exit)
+
+    // Multiple values
+    OP_VALUES,     // Wrap N values: VALUES n -> pop n vals, push multival
+    OP_CALLWITHVALUES, // call-with-values: pop consumer, pop producer, call
+
+    // Macros (compile-time only, but needed for dynamic define-syntax)
+    OP_DEFSYNTAX,  // Define syntax: DEFSYNTAX sym_id -> pop transformer
+
+    // Halt
+    OP_HALT,       // Stop execution: HALT -> vm returns top of stack
+
+    // Specialized opcodes for common operations (fast paths)
+    OP_CAR,        // Inline car: pop pair, push car
+    OP_CDR,        // Inline cdr: pop pair, push cdr
+    OP_CONS,       // Inline cons: pop cdr, pop car, push cons(car, cdr)
+    OP_NULLP,      // Inline null?: pop val, push (val == nil)
+    OP_PAIRP,      // Inline pair?: pop val, push (type == BT_CONS)
+    OP_ADD1,       // Increment: pop n, push n+1
+    OP_SUB1,       // Decrement: pop n, push n-1
+    OP_ZEROP,      // Zero check: pop n, push (n == 0)
+    OP_NOT,        // Boolean not: pop val, push (val == #f)
+    OP_EQ,         // Pointer equality: pop b, pop a, push (a eq? b)
+};
+
+// ============================================================================
+// Code Object
+// ============================================================================
+
+/**
+ * Compiled code object.
+ *
+ * Contains bytecode instructions and a constant pool. Code objects are
+ * immutable after compilation. Multiple closures can share the same
+ * code object (with different captured environments).
+ */
+typedef struct code_object {
+    unsigned *code;         // Bytecode instruction array
+    unsigned code_len;      // Number of instructions
+    unsigned code_cap;      // Allocated capacity
+
+    unsigned *constants;    // Constant pool (cell indices)
+    unsigned const_len;     // Number of constants
+    unsigned const_cap;     // Allocated capacity
+
+    struct code_object **children;  // Nested code objects (for lambdas)
+    unsigned children_len;
+    unsigned children_cap;
+
+    unsigned params;        // Parameter list (cell index to list of symbols)
+    unsigned arity;         // Number of required parameters
+    bool has_rest;          // True if has rest parameter
+    unsigned rest_idx;      // Index of rest parameter (if has_rest)
+
+    // Source info for debugging
+    const char *name;       // Function name (if known)
+    unsigned source_line;   // Source line number
+
+    // GC integration: linked list of all code objects
+    struct code_object *gc_next;
+    bool gc_marked;         // True if reachable during current GC
+} code_object;
+
+// Global registry of all code objects (for GC)
+extern code_object *code_object_registry;
+
+// ============================================================================
+// VM Closure
+// ============================================================================
+
+/**
+ * Runtime closure representation.
+ *
+ * A closure pairs a code object with a captured environment.
+ * Stored as a cons cell: car = BT_CLOSURE marker cell, cdr = env
+ * The marker cell's id holds the code_object pointer.
+ */
+#define BT_CLOSURE 100  // New cell type for VM closures
+
+// Accessor macros for closures - code_object* stored in separate cell's id
+#define GET_CLOSURE_CODE(c) ((code_object *)(intptr_t)CELL_ID(CELL_CAR(c)))
+#define GET_CLOSURE_ENV(c) (CELL_CDR(c))
+
+// ============================================================================
+// VM Call Frame
+// ============================================================================
+
+/**
+ * Call frame for the VM stack.
+ *
+ * Each function call pushes a frame. Frames track return state.
+ */
+typedef struct {
+    code_object *code;      // Code being executed
+    unsigned ip;            // Return address (instruction pointer)
+    unsigned bp;            // Base pointer (stack position before args)
+    unsigned env;           // Environment to restore
+} vm_frame;
+
+// ============================================================================
+// VM State
+// ============================================================================
+
+/**
+ * Virtual machine execution state.
+ */
+typedef struct {
+    // Value stack
+    unsigned *stack;        // Value stack (cell indices)
+    unsigned sp;            // Stack pointer (next free slot)
+    unsigned stack_cap;     // Stack capacity
+
+    // Call stack
+    vm_frame *frames;       // Call frame stack
+    unsigned fp;            // Frame pointer (current frame index)
+    unsigned frames_cap;    // Frames capacity
+
+    // Current execution state
+    code_object *code;      // Current code object
+    unsigned ip;            // Instruction pointer
+    unsigned env;           // Current environment
+
+    // Status
+    bool running;           // True while VM is executing
+    bool error;             // True if error occurred
+    const char *error_msg;  // Error message (if error)
+} vm_state;
+
+// ============================================================================
+// Compilation Context
+// ============================================================================
+
+/**
+ * Compiler state during code generation.
+ */
+typedef struct compile_ctx {
+    code_object *code;              // Code object being built
+    struct compile_ctx *parent;     // Parent context (for nested lambdas)
+    unsigned env;                   // Compile-time environment (for macros)
+    bool tail_position;             // True if compiling in tail position
+} compile_ctx;
+
+// ============================================================================
+// API Functions
+// ============================================================================
+
+// Code object management
+code_object *code_new(void);
+void code_free(code_object *code);
+void code_emit(code_object *code, unsigned instr);
+unsigned code_add_const(code_object *code, unsigned val);
+unsigned code_add_child(code_object *code, code_object *child);
+unsigned code_current_pos(code_object *code);
+void code_patch(code_object *code, unsigned pos, unsigned val);
+
+// Compiler
+code_object *compile_toplevel(unsigned expr, unsigned env);
+code_object *compile_expr(unsigned expr, compile_ctx *ctx);
+void compile_sequence(unsigned exprs, compile_ctx *ctx, bool tail);
+
+// VM
+void vm_init(vm_state *vm);
+void vm_free(vm_state *vm);
+unsigned vm_run(vm_state *vm, code_object *code, unsigned env);
+void vm_push(vm_state *vm, unsigned val);
+unsigned vm_pop(vm_state *vm);
+
+// GC integration
+unsigned gc_collect_code(code_object *code);
+void gc_update_vm_roots(vm_state *vm);
+void gc_update_all_code_objects(void);  // Update all code object constants during GC
+void code_register(code_object *code);  // Add code object to GC registry
+void gc_sweep_code_objects(void);       // Free unreachable code objects after GC
+
+// Disassembler
+void disassemble(code_object *code, const char *name);
+
+#endif // BYTECODE_H
