@@ -1,0 +1,613 @@
+/**
+ * @file reader.c
+ * @brief S-expression parser and tokenizer
+ *
+ * This file implements the Scheme reader, which parses text into the internal
+ * cell representation. It handles:
+ *
+ * ## Lexical Elements
+ * - Numbers: integers, decimals, rationals (1/3), bignums
+ * - Strings: with escape sequences (\n, \t, \\, \")
+ * - Characters: #\a, #\space, #\newline, #\tab
+ * - Symbols: case-insensitive, interned for fast comparison
+ * - Booleans: #t, #f
+ * - Vectors: #(1 2 3)
+ *
+ * ## Special Syntax
+ * - Quote: 'x -> (quote x)
+ * - Quasiquote: `x -> (quasiquote x)
+ * - Unquote: ,x -> (unquote x)
+ * - Unquote-splicing: ,@x -> (unquote-splicing x)
+ * - Datum labels: #n= (define) and #n# (reference) for cyclic structures
+ *
+ * ## Escape Commands (REPL only)
+ * - :q - Quit the interpreter
+ * - :g - Trigger garbage collection
+ *
+ * ## Error Handling
+ * Line and column tracking for meaningful error messages.
+ */
+
+#include "reader.h"
+#include "context.h"
+#include <ctype.h>
+#include <string.h>
+#include <strings.h>
+
+// Current input port for reading (NULL means use stdin)
+static FILE *reader_port = NULL;
+
+// Line number tracking for error messages
+static int reader_line = 1;
+static int reader_col = 0;
+
+// ============================================================================
+// Datum Labels (#n= and #n#)
+// ============================================================================
+
+#define MAX_DATUM_LABELS 256
+
+static struct {
+    int label;
+    unsigned value;
+    bool defined;
+} datum_labels[MAX_DATUM_LABELS];
+static int datum_label_count = 0;
+
+static void reset_datum_labels(void)
+{
+    datum_label_count = 0;
+}
+
+static int find_datum_label(int label)
+{
+    for (int i = 0; i < datum_label_count; i++) {
+        if (datum_labels[i].label == label)
+            return i;
+    }
+    return -1;
+}
+
+static int add_datum_label(int label)
+{
+    if (datum_label_count >= MAX_DATUM_LABELS) {
+        show_error("line %d: too many datum labels", reader_line);
+        return -1;
+    }
+    int idx = datum_label_count++;
+    datum_labels[idx].label = label;
+    datum_labels[idx].value = 0;
+    datum_labels[idx].defined = false;
+    return idx;
+}
+
+static int reader_getchar(void)
+{
+    FILE *fp = reader_port ? reader_port : stdin;
+    int c = fgetc(fp);
+    if (c == '\n') {
+        reader_line++;
+        reader_col = 0;
+    } else if (c != EOF) {
+        reader_col++;
+    }
+    return c;
+}
+
+static void reader_ungetc(int c)
+{
+    FILE *fp = reader_port ? reader_port : stdin;
+    if (c == '\n') {
+        reader_line--;
+    } else if (c != EOF) {
+        reader_col--;
+    }
+    ungetc(c, fp);
+}
+
+// Reset line tracking (call when switching input sources)
+void reader_reset_position(void)
+{
+    reader_line = 1;
+    reader_col = 0;
+}
+
+// Get current reader position for error messages
+int reader_get_line(void) { return reader_line; }
+int reader_get_col(void) { return reader_col; }
+
+// ============================================================================
+// String Buffer - eliminates repeated malloc/realloc pattern
+// ============================================================================
+
+typedef struct {
+    char *data;
+    size_t len;
+    size_t cap;
+} string_buffer;
+
+static void sb_init(string_buffer *sb)
+{
+    sb->data = malloc(INITIAL_STRING_CAP);
+    if (!sb->data) {
+        lisp_panic("failed to allocate string buffer");
+    }
+    sb->data[0] = '\0';
+    sb->len = 0;
+    sb->cap = INITIAL_STRING_CAP;
+}
+
+static void sb_append(string_buffer *sb, int ch)
+{
+    if (sb->len + 1 >= sb->cap) {
+        sb->cap *= 2;
+        sb->data = realloc(sb->data, sb->cap);
+        if (!sb->data) {
+            lisp_panic("failed to grow string buffer");
+        }
+    }
+    sb->data[sb->len++] = (char)ch;
+    sb->data[sb->len] = '\0';
+}
+
+static char *sb_finish(string_buffer *sb)
+{
+    return sb->data; // Caller takes ownership
+}
+
+static void sb_free(string_buffer *sb)
+{
+    free(sb->data);
+    sb->data = NULL;
+    sb->len = sb->cap = 0;
+}
+
+// ============================================================================
+// Token Delimiter Check
+// ============================================================================
+
+static inline bool is_delimiter(int c)
+{
+    return isspace(c) || c == '(' || c == ')' || c == '"' || c == ';' ||
+           c == EOF;
+}
+
+// ============================================================================
+// Character Name Lookup Table
+// ============================================================================
+
+static const struct {
+    const char *name;
+    int value;
+} char_names[] = {{"space", ' '}, {"newline", '\n'}, {"tab", '\t'}, {NULL, 0}};
+
+static int lookup_char_name(const char *name)
+{
+    for (int i = 0; char_names[i].name; i++) {
+        if (strcasecmp(name, char_names[i].name) == 0) {
+            return char_names[i].value;
+        }
+    }
+    return -1;
+}
+
+// ============================================================================
+// Token Reading
+// ============================================================================
+
+static unsigned read_character_literal(void)
+{
+    int c = reader_getchar();
+
+    // Try to read a named character
+    if (isalpha(c)) {
+        char buf[CHAR_NAME_BUF_SIZE];
+        buf[0] = c;
+        int i = 1;
+        int c2;
+        while (i < CHAR_NAME_BUF_SIZE - 1 && isalpha(c2 = reader_getchar())) {
+            buf[i++] = c2;
+        }
+        buf[i] = '\0';
+
+        if (i > 1) {
+            // Multi-character name - look it up
+            reader_ungetc(c2);
+            int char_val = lookup_char_name(buf);
+            if (char_val >= 0) {
+                return make_char(char_val);
+            }
+            // Unknown character name - just use first character
+        } else {
+            reader_ungetc(c2);
+        }
+    }
+
+    return make_char(c);
+}
+
+static unsigned read_string_literal(void)
+{
+    string_buffer sb;
+    sb_init(&sb);
+
+    for (;;) {
+        int c = reader_getchar();
+        if (c == EOF) {
+            show_error("line %d: unterminated string", reader_line);
+            sb_free(&sb);
+            return TOK_ERROR;
+        }
+        if (c == '"')
+            break;
+        if (c == '\\') {
+            c = reader_getchar();
+            switch (c) {
+            case 'n':
+                c = '\n';
+                break;
+            case 't':
+                c = '\t';
+                break;
+            case 'r':
+                c = '\r';
+                break;
+            case '\\':
+                c = '\\';
+                break;
+            case '"':
+                c = '"';
+                break;
+            default:
+                show_warning("unknown escape sequence: \\%c", c);
+            }
+        }
+        sb_append(&sb, c);
+    }
+
+    unsigned x = alloc();
+    CELL_TYPE(x) = BT_STRING;
+    CELL_ID(x) = (int64_t)(intptr_t)sb_finish(&sb);
+    return x;
+}
+
+// Read a number starting with decimal point (e.g., .5)
+static unsigned read_decimal_number(void)
+{
+    string_buffer sb;
+    sb_init(&sb);
+    sb_append(&sb, '.');
+
+    int c;
+    while (isdigit(c = reader_getchar()) || c == 'e' || c == 'E' || c == '+' ||
+           c == '-') {
+        sb_append(&sb, c);
+    }
+    reader_ungetc(c);
+
+    unsigned res = atom_from_string(sb.data);
+    sb_free(&sb);
+    return res;
+}
+
+unsigned read_token(void)
+{
+    int c;
+    for (;;) {
+        c = reader_getchar();
+        while (isspace(c))
+            c = reader_getchar();
+
+        // Escape commands (only for interactive mode/stdin)
+        if (c == ':' && reader_port == NULL) {
+            c = reader_getchar();
+            if (c == 'q') {
+                exit(0);
+            } else if (c == 'g') {
+                trigger_gc();
+                printf(";GC done\n");
+                fflush(stdout);
+                while ((c = reader_getchar()) != '\n' && c != EOF)
+                    ;
+                continue;  // Continue reading next expression
+            } else {
+                while ((c = reader_getchar()) != '\n' && c != EOF)
+                    ;
+                return TOK_ERROR;
+            }
+        }
+
+        // Comments
+        if (c == ';') {
+            while ((c = reader_getchar()) != '\n' && c != EOF)
+                ;
+            if (c == EOF) {
+                if (reader_port == NULL)
+                    exit(0);
+                return atom_from_string("eof-object");
+            }
+            continue;
+        }
+
+        if (c == EOF) {
+            if (reader_port == NULL)
+                exit(0);
+            return atom_from_string("eof-object");
+        }
+
+        switch (c) {
+        case '(':
+            return TOK_OPEN;
+        case ')':
+            return TOK_CLOSE;
+        case '.': {
+            // Check for ellipsis (...) or number starting with .
+            int c2 = reader_getchar();
+            if (c2 == '.') {
+                int c3 = reader_getchar();
+                if (c3 == '.') {
+                    return atom_from_string("...");
+                }
+                reader_ungetc(c3);
+            } else if (isdigit(c2)) {
+                reader_ungetc(c2);
+                return read_decimal_number();
+            }
+            reader_ungetc(c2);
+            return TOK_DOT;
+        }
+        case '\'':
+            return TOK_QUOTE;
+        case '`':
+            return TOK_QUASIQUOTE;
+        case ',': {
+            c = reader_getchar();
+            if (c == '@') {
+                return TOK_UNQUOTE_SPLICING;
+            }
+            reader_ungetc(c);
+            return TOK_UNQUOTE;
+        }
+        case '#': {
+            c = reader_getchar();
+            if (c == '(') {
+                return TOK_VECTOR_OPEN;
+            } else if (c == '\\') {
+                return read_character_literal();
+            } else if (c == 't' || c == 'T') {
+                return ctx.atom_true;
+            } else if (c == 'f' || c == 'F') {
+                return 0;
+            } else if (isdigit(c)) {
+                // Datum label: #n= or #n#
+                int label = c - '0';
+                while (isdigit(c = reader_getchar())) {
+                    label = label * 10 + (c - '0');
+                }
+                if (c == '=') {
+                    // Define label: #n=<datum>
+                    int idx = find_datum_label(label);
+                    if (idx >= 0 && datum_labels[idx].defined) {
+                        show_error("line %d: duplicate datum label #%d=",
+                                   reader_line, label);
+                        return TOK_ERROR;
+                    }
+                    // Pre-allocate a cell for forward references
+                    unsigned placeholder = alloc_cons(0, 0);
+                    if (idx < 0) {
+                        idx = add_datum_label(label);
+                        if (idx < 0)
+                            return TOK_ERROR;
+                    }
+                    datum_labels[idx].value = placeholder;
+                    datum_labels[idx].defined = true;
+                    // Read the datum
+                    unsigned datum = read_obj();
+                    if (datum == TOK_ERROR)
+                        return TOK_ERROR;
+                    // Copy datum content into placeholder
+                    if (IS_PAIR(datum)) {
+                        CELL_CAR(placeholder) = car(datum);
+                        CELL_CDR(placeholder) = cdr(datum);
+                    } else {
+                        // For non-pairs, copy the cell content
+                        ctx.cons_cells[placeholder] = ctx.cons_cells[datum];
+                    }
+                    return placeholder;
+                } else if (c == '#') {
+                    // Reference label: #n#
+                    int idx = find_datum_label(label);
+                    if (idx < 0) {
+                        show_error("line %d: undefined datum label #%d#",
+                                   reader_line, label);
+                        return TOK_ERROR;
+                    }
+                    return datum_labels[idx].value;
+                } else {
+                    show_error("line %d: expected = or # after #%d",
+                               reader_line, label);
+                    return TOK_ERROR;
+                }
+            }
+            show_error("line %d: unknown # syntax: #%c", reader_line, c);
+            return TOK_ERROR;
+        }
+        case '"':
+            return read_string_literal();
+        default: {
+            // Symbol or number
+            string_buffer sb;
+            sb_init(&sb);
+            bool is_number = isdigit(c) || c == '-' || c == '+';
+            sb_append(&sb, tolower(c));
+
+            for (;;) {
+                c = reader_getchar();
+                // Allow . in numbers (for decimals like 1.5)
+                if (c == '.' && is_number) {
+                    int c2 = reader_getchar();
+                    if (isdigit(c2) || c2 == 'e' || c2 == 'E') {
+                        // It's a decimal number
+                        sb_append(&sb, '.');
+                        sb_append(&sb, tolower(c2));
+                        continue;
+                    } else if (is_delimiter(c2)) {
+                        // End of number followed by dot (for dotted pairs)
+                        reader_ungetc(c2);
+                        reader_ungetc(c);
+                        break;
+                    }
+                    reader_ungetc(c2);
+                    sb_append(&sb, '.');
+                    continue;
+                }
+                if (is_delimiter(c))
+                    break;
+                // Allow . as part of symbols (but not as token starter which is
+                // handled above)
+                if (c == '.' && !is_number)
+                    break;
+                sb_append(&sb, tolower(c));
+            }
+            reader_ungetc(c);
+            unsigned res = atom_from_string(sb.data);
+            sb_free(&sb);
+            return res;
+        }
+        }
+    }
+}
+
+// ============================================================================
+// Object and List Reading
+// ============================================================================
+
+unsigned read_vector(void)
+{
+    unsigned head = 0, tail = 0;
+    unsigned count = 0;
+
+    for (;;) {
+        unsigned elem = read_obj();
+        if (elem == TOK_CLOSE)
+            break;
+        if (elem == TOK_ERROR)
+            return TOK_ERROR;
+        if (elem == TOK_DOT) {
+            show_error("line %d: dot not allowed in vector literal", reader_line);
+            return TOK_ERROR;
+        }
+
+        list_append(&head, &tail, elem);
+        count++;
+    }
+
+    unsigned vec = make_vector(count, 0);
+    unsigned *data = vector_data_ptr(vec);
+    unsigned i = 0;
+    FORLIST(l, head) {
+        data[i++] = car(l);
+    }
+    return vec;
+}
+
+unsigned read_obj(void)
+{
+    unsigned tok = read_token();
+    switch (tok) {
+    case TOK_OPEN:
+        return read_list();
+    case TOK_VECTOR_OPEN:
+        return read_vector();
+    case TOK_QUOTE:
+        tok = read_obj();
+        switch (tok) {
+        case TOK_CLOSE:
+            show_warning("ignoring quote before close parenthesis");
+            return tok;
+        case TOK_DOT:
+            show_warning("ignoring quote before dot");
+            return tok;
+        case TOK_ERROR:
+            return tok;
+        default:
+            return alloc_cons(ctx.atom_quote, alloc_cons(tok, 0));
+        }
+    case TOK_QUASIQUOTE:
+        tok = read_obj();
+        if (tok == TOK_CLOSE || tok == TOK_DOT || tok == TOK_ERROR) {
+            show_warning("ignoring quasiquote before special token");
+            return tok;
+        }
+        return alloc_cons(ctx.atom_quasiquote, alloc_cons(tok, 0));
+    case TOK_UNQUOTE:
+        tok = read_obj();
+        if (tok == TOK_CLOSE || tok == TOK_DOT || tok == TOK_ERROR) {
+            show_warning("ignoring unquote before special token");
+            return tok;
+        }
+        return alloc_cons(ctx.atom_unquote, alloc_cons(tok, 0));
+    case TOK_UNQUOTE_SPLICING:
+        tok = read_obj();
+        if (tok == TOK_CLOSE || tok == TOK_DOT || tok == TOK_ERROR) {
+            show_warning("ignoring unquote-splicing before special token");
+            return tok;
+        }
+        return alloc_cons(ctx.atom_unquote_splicing, alloc_cons(tok, 0));
+    default:
+        return tok;
+    }
+}
+
+unsigned read_list(void)
+{
+    unsigned sh = read_obj();
+    unsigned st;
+    switch (sh) {
+    case TOK_ERROR:
+        return TOK_ERROR;
+    case TOK_CLOSE:
+        return 0;
+    case TOK_DOT:
+        sh = read_obj();
+        switch (sh) {
+        case TOK_ERROR:
+            return TOK_ERROR;
+        case TOK_DOT:
+        case TOK_CLOSE:
+            show_error("line %d: a dot must be followed by an object", reader_line);
+            return TOK_ERROR;
+        }
+        st = read_list();
+        if (st == TOK_ERROR)
+            return TOK_ERROR;
+        if (st != 0) {
+            show_error("line %d: only one object may follow a dot", reader_line);
+            return TOK_ERROR;
+        }
+        return sh;
+    default:
+        st = read_list();
+        if (st == TOK_ERROR)
+            return TOK_ERROR;
+        return alloc_cons(sh, st);
+    }
+}
+
+void reader_reset_labels(void) { reset_datum_labels(); }
+
+unsigned read_obj_port(FILE *port)
+{
+    FILE *old_port = reader_port;
+    int old_line = reader_line;
+    int old_col = reader_col;
+    reader_port = port;
+    reader_line = 1;
+    reader_col = 0;
+    reset_datum_labels();
+    unsigned result = read_obj();
+    reader_port = old_port;
+    reader_line = old_line;
+    reader_col = old_col;
+    return result;
+}

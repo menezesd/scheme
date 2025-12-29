@@ -1,0 +1,19 @@
+# Object files
+*.o
+
+# Binaries
+lisp
+test_bignum
+test_reader
+test_context
+test_macros
+
+# IDE/editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Claude Code
+.claude/
