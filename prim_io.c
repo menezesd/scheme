@@ -63,6 +63,7 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned args)
         return arg;
     }
     case PNEWLINE: {
+        REQUIRE_ARGS(args, 0, 1, "newline");
         // newline takes optional port as first arg, not second
         if (args) {
             unsigned p = car(args);
@@ -89,12 +90,14 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned args)
         return 0;
     }
     case PREAD: {
+        REQUIRE_ARGS(args, 0, 1, "read");
         FILE *port;
         if (!extract_input_port(args, &port, "read"))
             return TOK_ERROR;
         return read_obj_port(port);
     }
     case PREADCHAR: {
+        REQUIRE_ARGS(args, 0, 1, "read-char");
         FILE *fport;
         string_port *sport;
         int ptype = extract_input_port_ex(args, &fport, &sport, "read-char");
@@ -111,6 +114,7 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned args)
         return make_char(c);
     }
     case PPEEKCHAR: {
+        REQUIRE_ARGS(args, 0, 1, "peek-char");
         FILE *fport;
         string_port *sport;
         int ptype = extract_input_port_ex(args, &fport, &sport, "peek-char");
@@ -153,6 +157,7 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned args)
                    : 0;
     }
     case PCHARREADY: {
+        REQUIRE_ARGS(args, 0, 1, "char-ready?");
         FILE *port;
         if (!extract_input_port(args, &port, "char-ready?"))
             return TOK_ERROR;

@@ -850,17 +850,29 @@ unsigned list_length(unsigned lst)
 
 bool check_args(unsigned args, unsigned min, unsigned max, const char *name)
 {
-    unsigned len = list_length(args);
+    // Early-exit optimization: only count as many args as needed to decide.
+    // For variadic (max=-1), stop after min. For fixed-arity, stop after max+1.
+    unsigned limit = (max == (unsigned)-1) ? min : max + 1;
+    unsigned len = 0;
+    unsigned a = args;
+
+    while (a && CELL_TYPE(a) == BT_CONS && len < limit) {
+        len++;
+        a = cdr(a);
+    }
+
     if (len < min) {
         show_error("%s: too few arguments (expected %u, got %u)", name, min,
                    len);
         return false;
     }
-    if (max != (unsigned)-1 && len > max) {
-        show_error("%s: too many arguments (expected %u, got %u)", name, max,
-                   len);
+
+    // If max is bounded and we counted more than max, or there are still more
+    if (max != (unsigned)-1 && (len > max || (a && CELL_TYPE(a) == BT_CONS))) {
+        show_error("%s: too many arguments (expected at most %u)", name, max);
         return false;
     }
+
     return true;
 }
 
@@ -944,7 +956,8 @@ unsigned collect(unsigned x)
         // cell. After collection completes, the old region is swept and any
         // BT_STRING cells there have their data freed. This is safe because:
         //   1. If the string was reachable: it was copied to new space and the
-        //      old cell is now BT_BROKENHEART (not BT_STRING), so sweep skips it
+        //      old cell is now BT_BROKENHEART (not BT_STRING), so sweep skips
+        //      it
         //   2. If the string was unreachable: it was never copied, so the old
         //      cell still has BT_STRING type and sweep correctly frees the data
         // Thus exactly one cell owns each string at any time.

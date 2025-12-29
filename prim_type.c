@@ -7,6 +7,7 @@
 
 unsigned apply_type_predicate(unsigned prim_id, unsigned args)
 {
+    REQUIRE_ARGS(args, 1, 1, "type predicate");
     unsigned arg = car(args);
     switch (prim_id) {
     case PSYMP:

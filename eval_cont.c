@@ -47,7 +47,8 @@ void handle_cont_set(unsigned val, unsigned data, unsigned env, unsigned next)
     tramp_apply(val, next);
 }
 
-void handle_cont_define(unsigned val, unsigned data, unsigned env, unsigned next)
+void handle_cont_define(unsigned val, unsigned data, unsigned env,
+                        unsigned next)
 {
     defvar(data, val, env);
     tramp_apply(data, next);
@@ -71,7 +72,8 @@ void handle_cont_or(unsigned val, unsigned data, unsigned env, unsigned next)
     eval_seq(data, CONT_OR, env, next);
 }
 
-void handle_cont_cond_test(unsigned val, unsigned data, unsigned env, unsigned next)
+void handle_cont_cond_test(unsigned val, unsigned data, unsigned env,
+                           unsigned next)
 {
     unsigned conseq = car(data);
     unsigned rest = cdr(data);
@@ -97,7 +99,8 @@ void handle_cont_cond_test(unsigned val, unsigned data, unsigned env, unsigned n
                 } else if (!cdr(conseq2)) {
                     tramp_eval(car(conseq2), env, next);
                 } else {
-                    unsigned k2 = make_cont(CONT_BEGIN, cdr(conseq2), env, next);
+                    unsigned k2 =
+                        make_cont(CONT_BEGIN, cdr(conseq2), env, next);
                     tramp_eval(car(conseq2), env, k2);
                 }
                 return;
@@ -109,7 +112,8 @@ void handle_cont_cond_test(unsigned val, unsigned data, unsigned env, unsigned n
     }
 }
 
-void handle_cont_let_vals(unsigned val, unsigned data, unsigned env, unsigned next)
+void handle_cont_let_vals(unsigned val, unsigned data, unsigned env,
+                          unsigned next)
 {
     unsigned vars = car(data);
     unsigned vals = cadr(data);
@@ -145,7 +149,8 @@ void handle_cont_let_vals(unsigned val, unsigned data, unsigned env, unsigned ne
     }
 }
 
-void handle_cont_let_body(unsigned val, unsigned data, unsigned env, unsigned next)
+void handle_cont_let_body(unsigned val, unsigned data, unsigned env,
+                          unsigned next)
 {
     (void)val;
     if (!cdr(data)) {
@@ -156,7 +161,8 @@ void handle_cont_let_body(unsigned val, unsigned data, unsigned env, unsigned ne
     }
 }
 
-void handle_cont_letstar_vals(unsigned val, unsigned data, unsigned env, unsigned next)
+void handle_cont_letstar_vals(unsigned val, unsigned data, unsigned env,
+                              unsigned next)
 {
     unsigned bindings = car(data);
     unsigned body = cdr(data);
@@ -179,7 +185,8 @@ void handle_cont_letstar_vals(unsigned val, unsigned data, unsigned env, unsigne
     }
 }
 
-void handle_cont_letrec_init(unsigned val, unsigned data, unsigned env, unsigned next)
+void handle_cont_letrec_init(unsigned val, unsigned data, unsigned env,
+                             unsigned next)
 {
     unsigned bindings = car(data);
     unsigned vals_and_body = cdr(data);
@@ -202,7 +209,8 @@ void handle_cont_letrec_init(unsigned val, unsigned data, unsigned env, unsigned
     }
 }
 
-void handle_cont_eval_fn(unsigned val, unsigned data, unsigned env, unsigned next)
+void handle_cont_eval_fn(unsigned val, unsigned data, unsigned env,
+                         unsigned next)
 {
     unsigned fn = val;
     unsigned arg_exprs = data;
@@ -218,9 +226,8 @@ void handle_cont_eval_fn(unsigned val, unsigned data, unsigned env, unsigned nex
             unsigned k2 = make_cont(CONT_MACRO_EXPAND, 0, env, next);
             tramp_eval(car(mbody), menv, k2);
         } else {
-            unsigned k2 =
-                make_cont(CONT_APPLY_FUNC, cdr(mbody), menv,
-                          make_cont(CONT_MACRO_EXPAND, 0, env, next));
+            unsigned k2 = make_cont(CONT_APPLY_FUNC, cdr(mbody), menv,
+                                    make_cont(CONT_MACRO_EXPAND, 0, env, next));
             tramp_eval(car(mbody), menv, k2);
         }
         return;
@@ -253,7 +260,8 @@ void handle_cont_eval_fn(unsigned val, unsigned data, unsigned env, unsigned nex
     tramp_eval(car(arg_exprs), env, k2);
 }
 
-void handle_cont_eval_args(unsigned val, unsigned data, unsigned env, unsigned next)
+void handle_cont_eval_args(unsigned val, unsigned data, unsigned env,
+                           unsigned next)
 {
     unsigned fn = car(data);
     unsigned evaled_and_rest = cdr(data);
@@ -281,7 +289,8 @@ void handle_cont_eval_args(unsigned val, unsigned data, unsigned env, unsigned n
     }
 }
 
-void handle_cont_apply_func(unsigned val, unsigned data, unsigned env, unsigned next)
+void handle_cont_apply_func(unsigned val, unsigned data, unsigned env,
+                            unsigned next)
 {
     (void)val;
     if (!cdr(data)) {
@@ -292,13 +301,15 @@ void handle_cont_apply_func(unsigned val, unsigned data, unsigned env, unsigned 
     }
 }
 
-void handle_cont_macro_expand(unsigned val, unsigned data, unsigned env, unsigned next)
+void handle_cont_macro_expand(unsigned val, unsigned data, unsigned env,
+                              unsigned next)
 {
     (void)data;
     tramp_eval(val, env, next);
 }
 
-void handle_cont_callwithvalues(unsigned val, unsigned data, unsigned env, unsigned next)
+void handle_cont_callwithvalues(unsigned val, unsigned data, unsigned env,
+                                unsigned next)
 {
     // data = consumer, val = producer's result
     unsigned consumer = data;

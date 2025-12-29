@@ -1,6 +1,7 @@
 /**
  * @file prim_numeric.c
- * @brief Numeric arithmetic operations (+, -, *, /, mod, quotient, remainder, abs)
+ * @brief Numeric arithmetic operations (+, -, *, /, mod, quotient, remainder,
+ * abs)
  */
 
 #include "prim_internal.h"

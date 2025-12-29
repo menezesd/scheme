@@ -21,8 +21,8 @@ bool handle_quote(unsigned id, unsigned env, unsigned cont)
 
 bool handle_lambda(unsigned id, unsigned env, unsigned cont)
 {
-    unsigned p = make_typed_cell(BT_FUNCTION, cadr(id),
-                                 alloc_cons(cddr(id), env));
+    unsigned p =
+        make_typed_cell(BT_FUNCTION, cadr(id), alloc_cons(cddr(id), env));
     tramp_apply(p, cont);
     return true;
 }
@@ -64,8 +64,8 @@ bool handle_define(unsigned id, unsigned env, unsigned cont)
     unsigned vid = cadr(id);
     if (IS_PAIR(vid)) {
         // Function definition shorthand
-        unsigned p = make_typed_cell(BT_FUNCTION, cdr(vid),
-                                     alloc_cons(cddr(id), env));
+        unsigned p =
+            make_typed_cell(BT_FUNCTION, cdr(vid), alloc_cons(cddr(id), env));
         defvar(car(vid), p, env);
         tramp_apply(car(vid), cont);
         return true;
@@ -279,7 +279,7 @@ bool handle_letrec_syntax(unsigned id, unsigned env, unsigned cont)
 // ============================================================================
 
 typedef struct {
-    int64_t *kw_ptr;  // Pointer to keyword ID in ctx
+    int64_t *kw_ptr; // Pointer to keyword ID in ctx
     special_form_handler handler;
 } special_form_entry;
 
@@ -289,15 +289,24 @@ typedef struct {
 bool dispatch_special_form(int64_t kw, unsigned id, unsigned env, unsigned cont)
 {
     // Check each special form
-    if (kw == ctx.kw_quote) return handle_quote(id, env, cont);
-    if (kw == ctx.kw_lambda) return handle_lambda(id, env, cont);
-    if (kw == ctx.kw_if) return handle_if(id, env, cont);
-    if (kw == ctx.kw_begin) return handle_begin(id, env, cont);
-    if (kw == ctx.kw_set) return handle_set(id, env, cont);
-    if (kw == ctx.kw_define) return handle_define(id, env, cont);
-    if (kw == ctx.kw_and) return handle_and(id, env, cont);
-    if (kw == ctx.kw_or) return handle_or(id, env, cont);
-    if (kw == ctx.kw_cond) return handle_cond(id, env, cont);
+    if (kw == ctx.kw_quote)
+        return handle_quote(id, env, cont);
+    if (kw == ctx.kw_lambda)
+        return handle_lambda(id, env, cont);
+    if (kw == ctx.kw_if)
+        return handle_if(id, env, cont);
+    if (kw == ctx.kw_begin)
+        return handle_begin(id, env, cont);
+    if (kw == ctx.kw_set)
+        return handle_set(id, env, cont);
+    if (kw == ctx.kw_define)
+        return handle_define(id, env, cont);
+    if (kw == ctx.kw_and)
+        return handle_and(id, env, cont);
+    if (kw == ctx.kw_or)
+        return handle_or(id, env, cont);
+    if (kw == ctx.kw_cond)
+        return handle_cond(id, env, cont);
 
     // Check for macro overrides on let/let*/letrec
     if (kw == ctx.kw_let || kw == ctx.kw_letstar || kw == ctx.kw_letrec) {
@@ -314,14 +323,22 @@ bool dispatch_special_form(int64_t kw, unsigned id, unsigned env, unsigned cont)
         }
     }
 
-    if (kw == ctx.kw_let) return handle_let(id, env, cont);
-    if (kw == ctx.kw_letstar) return handle_letstar(id, env, cont);
-    if (kw == ctx.kw_letrec) return handle_letrec(id, env, cont);
-    if (kw == ctx.kw_quasiquote) return handle_quasiquote(id, env, cont);
-    if (kw == ctx.kw_define_macro) return handle_define_macro(id, env, cont);
-    if (kw == ctx.kw_define_syntax) return handle_define_syntax(id, env, cont);
-    if (kw == ctx.kw_let_syntax) return handle_let_syntax(id, env, cont);
-    if (kw == ctx.kw_letrec_syntax) return handle_letrec_syntax(id, env, cont);
+    if (kw == ctx.kw_let)
+        return handle_let(id, env, cont);
+    if (kw == ctx.kw_letstar)
+        return handle_letstar(id, env, cont);
+    if (kw == ctx.kw_letrec)
+        return handle_letrec(id, env, cont);
+    if (kw == ctx.kw_quasiquote)
+        return handle_quasiquote(id, env, cont);
+    if (kw == ctx.kw_define_macro)
+        return handle_define_macro(id, env, cont);
+    if (kw == ctx.kw_define_syntax)
+        return handle_define_syntax(id, env, cont);
+    if (kw == ctx.kw_let_syntax)
+        return handle_let_syntax(id, env, cont);
+    if (kw == ctx.kw_letrec_syntax)
+        return handle_letrec_syntax(id, env, cont);
 
-    return false;  // Not a special form
+    return false; // Not a special form
 }

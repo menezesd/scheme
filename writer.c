@@ -34,13 +34,14 @@
 // Cycle Detection Hash Table
 // ============================================================================
 
-#define VISITED_TABLE_SIZE 8192 // Power of 2, supports ~6000 entries at 75% load
-#define VISITED_EMPTY 0         // 0 is never a valid cell (represents nil)
+#define VISITED_TABLE_SIZE                                                     \
+    8192                // Power of 2, supports ~6000 entries at 75% load
+#define VISITED_EMPTY 0 // 0 is never a valid cell (represents nil)
 
 typedef struct {
-    unsigned cell;  // Cell address (0 = empty slot)
-    int label;      // -1 = visited once, >= 0 = assigned label
-    bool printed;   // true if we've printed #n= prefix
+    unsigned cell; // Cell address (0 = empty slot)
+    int label;     // -1 = visited once, >= 0 = assigned label
+    bool printed;  // true if we've printed #n= prefix
 } visited_entry;
 
 static visited_entry visited_table[VISITED_TABLE_SIZE];

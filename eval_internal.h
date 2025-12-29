@@ -111,7 +111,8 @@ bool handle_letrec_syntax(unsigned id, unsigned env, unsigned cont);
 
 // Dispatch to special form handler by keyword ID
 // Returns true if handled, false if not a special form
-bool dispatch_special_form(int64_t kw, unsigned id, unsigned env, unsigned cont);
+bool dispatch_special_form(int64_t kw, unsigned id, unsigned env,
+                           unsigned cont);
 
 // ============================================================================
 // Continuation Handlers (defined in eval_cont.c)
@@ -123,21 +124,33 @@ typedef void (*cont_handler_t)(unsigned val, unsigned data, unsigned env,
 
 void handle_cont_halt(unsigned val, unsigned data, unsigned env, unsigned next);
 void handle_cont_if(unsigned val, unsigned data, unsigned env, unsigned next);
-void handle_cont_begin(unsigned val, unsigned data, unsigned env, unsigned next);
+void handle_cont_begin(unsigned val, unsigned data, unsigned env,
+                       unsigned next);
 void handle_cont_set(unsigned val, unsigned data, unsigned env, unsigned next);
-void handle_cont_define(unsigned val, unsigned data, unsigned env, unsigned next);
+void handle_cont_define(unsigned val, unsigned data, unsigned env,
+                        unsigned next);
 void handle_cont_and(unsigned val, unsigned data, unsigned env, unsigned next);
 void handle_cont_or(unsigned val, unsigned data, unsigned env, unsigned next);
-void handle_cont_cond_test(unsigned val, unsigned data, unsigned env, unsigned next);
-void handle_cont_let_vals(unsigned val, unsigned data, unsigned env, unsigned next);
-void handle_cont_let_body(unsigned val, unsigned data, unsigned env, unsigned next);
-void handle_cont_letstar_vals(unsigned val, unsigned data, unsigned env, unsigned next);
-void handle_cont_letrec_init(unsigned val, unsigned data, unsigned env, unsigned next);
-void handle_cont_eval_fn(unsigned val, unsigned data, unsigned env, unsigned next);
-void handle_cont_eval_args(unsigned val, unsigned data, unsigned env, unsigned next);
-void handle_cont_apply_func(unsigned val, unsigned data, unsigned env, unsigned next);
-void handle_cont_macro_expand(unsigned val, unsigned data, unsigned env, unsigned next);
-void handle_cont_callwithvalues(unsigned val, unsigned data, unsigned env, unsigned next);
+void handle_cont_cond_test(unsigned val, unsigned data, unsigned env,
+                           unsigned next);
+void handle_cont_let_vals(unsigned val, unsigned data, unsigned env,
+                          unsigned next);
+void handle_cont_let_body(unsigned val, unsigned data, unsigned env,
+                          unsigned next);
+void handle_cont_letstar_vals(unsigned val, unsigned data, unsigned env,
+                              unsigned next);
+void handle_cont_letrec_init(unsigned val, unsigned data, unsigned env,
+                             unsigned next);
+void handle_cont_eval_fn(unsigned val, unsigned data, unsigned env,
+                         unsigned next);
+void handle_cont_eval_args(unsigned val, unsigned data, unsigned env,
+                           unsigned next);
+void handle_cont_apply_func(unsigned val, unsigned data, unsigned env,
+                            unsigned next);
+void handle_cont_macro_expand(unsigned val, unsigned data, unsigned env,
+                              unsigned next);
+void handle_cont_callwithvalues(unsigned val, unsigned data, unsigned env,
+                                unsigned next);
 
 // Continuation handler dispatch table (indexed by cont_type)
 extern const cont_handler_t cont_handlers[CONT_COUNT];

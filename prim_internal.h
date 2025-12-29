@@ -156,7 +156,8 @@ static inline void get_rational_parts(unsigned x, int64_t *num, int64_t *denom)
 }
 
 // Helper to get rational components as cell references (supports bignums)
-static inline void get_rational_cells(unsigned x, unsigned *num, unsigned *denom)
+static inline void get_rational_cells(unsigned x, unsigned *num,
+                                      unsigned *denom)
 {
     enum lisp_type t = CELL_TYPE(x);
     if (t == BT_NUM || t == BT_BIGNUM) {

@@ -69,12 +69,14 @@ unsigned apply_port_primitive(unsigned prim_id, unsigned args)
         return IS_OUTPUT_PORT(car(args)) ? ctx.atom_true : 0;
     }
     case PCURRENTINPUT: {
+        REQUIRE_ARGS(args, 0, 0, "current-input-port");
         unsigned p = alloc();
         CELL_TYPE(p) = BT_INPORT;
         CELL_ID(p) = STORE_PTR(ctx.current_input);
         return p;
     }
     case PCURRENTOUTPUT: {
+        REQUIRE_ARGS(args, 0, 0, "current-output-port");
         unsigned p = alloc();
         CELL_TYPE(p) = BT_OUTPORT;
         CELL_ID(p) = STORE_PTR(ctx.current_output);

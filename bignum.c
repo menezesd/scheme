@@ -231,19 +231,10 @@ int bn_to_uint64(const bignum *a, uint64_t *out)
     return 0;
 }
 
-char *bn_to_string(const bignum *a, int base)
+// Simple digit-by-digit conversion for small numbers
+static char *bn_to_string_simple(const bignum *a, int base)
 {
-    if (!a || base < 2 || base > 36)
-        return NULL;
-
-    if (a->len == 0) {
-        char *s = malloc(2);
-        s[0] = '0';
-        s[1] = '\0';
-        return s;
-    }
-
-    // Estimate size: log_base(2^(len*32)) + sign + null
+    // Estimate size: log_base(2^(len*LIMB_BITS)) + sign + null
     size_t est_digits = (a->len * LIMB_BITS) / 3 + 3;
     char *buf = malloc(est_digits);
     if (!buf)
@@ -259,7 +250,7 @@ char *bn_to_string(const bignum *a, int base)
         bignum *rem = NULL;
         bignum *quot = bn_div(tmp, base_bn, &rem);
 
-        int digit = rem->len > 0 ? rem->limbs[0] : 0;
+        int digit = rem->len > 0 ? (int)rem->limbs[0] : 0;
         if (digit < 10) {
             buf[pos++] = '0' + digit;
         } else {
@@ -288,6 +279,97 @@ char *bn_to_string(const bignum *a, int base)
     }
 
     return buf;
+}
+
+// Divide-and-conquer conversion for base 10
+// Split number at 10^k, convert each half recursively, concatenate
+static char *bn_to_string_dc(const bignum *a, size_t num_digits)
+{
+    // Base case: use simple method for small numbers
+    if (a->len <= 16 || num_digits <= 150) {
+        return bn_to_string_simple(a, 10);
+    }
+
+    // Split at roughly half the digits
+    size_t split = num_digits / 2;
+
+    // Compute 10^split using binary exponentiation
+    bignum *ten = bn_from_int(10);
+    bignum *divisor = bn_pow(ten, split);
+    bn_free(ten);
+
+    // Divide: a = hi * 10^split + lo
+    bignum *lo = NULL;
+    bignum *hi = bn_div(a, divisor, &lo);
+    bn_free(divisor);
+
+    // Estimate digits in each half
+    size_t hi_digits = num_digits - split;
+    size_t lo_digits = split;
+
+    // Recursively convert each half
+    char *hi_str;
+    if (bn_is_zero(hi)) {
+        hi_str = malloc(1);
+        hi_str[0] = '\0';
+    } else {
+        hi_str = bn_to_string_dc(hi, hi_digits);
+    }
+    bn_free(hi);
+
+    char *lo_str = bn_to_string_dc(lo, lo_digits);
+    bn_free(lo);
+
+    // Concatenate with zero-padding for low part
+    size_t hi_len = strlen(hi_str);
+    size_t lo_len = strlen(lo_str);
+    size_t pad = (lo_len < split) ? split - lo_len : 0;
+
+    char *result = malloc(hi_len + pad + lo_len + 1);
+    memcpy(result, hi_str, hi_len);
+    memset(result + hi_len, '0', pad);
+    memcpy(result + hi_len + pad, lo_str, lo_len + 1);
+
+    free(hi_str);
+    free(lo_str);
+
+    return result;
+}
+
+char *bn_to_string(const bignum *a, int base)
+{
+    if (!a || base < 2 || base > 36)
+        return NULL;
+
+    if (a->len == 0) {
+        char *s = malloc(2);
+        s[0] = '0';
+        s[1] = '\0';
+        return s;
+    }
+
+    // For base 10 and large numbers, use divide-and-conquer
+    if (base == 10 && a->len > 16) {
+        // Estimate decimal digits: len * LIMB_BITS * log10(2) ≈ len * 9.63
+        size_t est_digits = (size_t)(a->len * LIMB_BITS * 0.30103) + 1;
+
+        bignum *abs_a = bn_abs(a);
+        char *digits = bn_to_string_dc(abs_a, est_digits);
+        bn_free(abs_a);
+
+        if (a->sign) {
+            size_t len = strlen(digits);
+            char *result = malloc(len + 2);
+            result[0] = '-';
+            memcpy(result + 1, digits, len + 1);
+            free(digits);
+            return result;
+        }
+        return digits;
+    }
+
+    // For other bases or small numbers, use simple method
+    return bn_to_string_simple(a, base);
 }
 
 // ============================================================================
@@ -657,23 +739,25 @@ bignum *bn_div(const bignum *a, const bignum *b, bignum **remainder)
     bignum *q = bn_alloc(m + 1);
     q->len = m + 1;
 
-    limb_t v_n1 = v->limbs[n - 1];  // Most significant limb of divisor
-    limb_t v_n2 = n >= 2 ? v->limbs[n - 2] : 0;  // Second most significant
+    limb_t v_n1 = v->limbs[n - 1]; // Most significant limb of divisor
+    limb_t v_n2 = n >= 2 ? v->limbs[n - 2] : 0; // Second most significant
 
     // D2-D7: Main loop - compute each quotient digit
     for (size_t j = m + 1; j > 0; j--) {
-        size_t jj = j - 1;  // 0-based index
+        size_t jj = j - 1; // 0-based index
 
         // D3: Calculate quotient estimate qhat
         // qhat = floor((u[j+n]*B + u[j+n-1]) / v[n-1])
-        dlimb_t u_hi = ((dlimb_t)u->limbs[jj + n] << LIMB_BITS) | u->limbs[jj + n - 1];
+        dlimb_t u_hi =
+            ((dlimb_t)u->limbs[jj + n] << LIMB_BITS) | u->limbs[jj + n - 1];
         dlimb_t qhat = u_hi / v_n1;
         dlimb_t rhat = u_hi % v_n1;
 
         // Refine qhat estimate (Knuth's correction)
         // While qhat >= B or qhat * v[n-2] > B * rhat + u[j+n-2]
         while (qhat > LIMB_MAX ||
-               (qhat * v_n2 > ((rhat << LIMB_BITS) | (jj + n >= 2 ? u->limbs[jj + n - 2] : 0)))) {
+               (qhat * v_n2 > ((rhat << LIMB_BITS) |
+                               (jj + n >= 2 ? u->limbs[jj + n - 2] : 0)))) {
             qhat--;
             rhat += v_n1;
             if (rhat > LIMB_MAX)

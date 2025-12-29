@@ -6,7 +6,8 @@
  * operations not extracted to separate modules. Most primitives are now in:
  *
  * - prim_numeric.c: Arithmetic (+, -, *, /, mod, quotient, remainder, abs)
- * - prim_compare.c: Comparison operations (=, <, >, <=, >=, char/string compare)
+ * - prim_compare.c: Comparison operations (=, <, >, <=, >=, char/string
+ * compare)
  * - prim_list.c: List operations (append, reverse)
  * - prim_string.c: String operations (string-append, substring)
  * - prim_type.c: Type predicates (number?, symbol?, etc.)
@@ -63,6 +64,7 @@ unsigned apply_primitive(unsigned prim_id, unsigned args)
         REQUIRE_ARGS(args, 1, 1, "not");
         return car(args) ? 0 : ctx.atom_true;
     case PEQ: {
+        REQUIRE_ARGS(args, 2, 2, "eq?");
         unsigned arg1 = car(args);
         unsigned arg2 = cadr(args);
         if (CELL_TYPE(arg1) != CELL_TYPE(arg2))
@@ -83,10 +85,13 @@ unsigned apply_primitive(unsigned prim_id, unsigned args)
 
     // List operations
     case PCONS:
+        REQUIRE_ARGS(args, 2, 2, "cons");
         return alloc_cons(car(args), cadr(args));
     case PCAR:
+        REQUIRE_ARGS(args, 1, 1, "car");
         return caar(args);
     case PCDR:
+        REQUIRE_ARGS(args, 1, 1, "cdr");
         return cdar(args);
     case PSETCAR: {
         REQUIRE_ARGS(args, 2, 2, "set-car!");
@@ -433,6 +438,7 @@ unsigned apply_primitive(unsigned prim_id, unsigned args)
         return TOK_ERROR;
     }
     case PGENSYM: {
+        REQUIRE_ARGS(args, 0, 0, "gensym");
         char buf[32];
         snprintf(buf, sizeof(buf), "g%u", gensym_counter++);
         return atom_from_string(buf);
@@ -496,6 +502,7 @@ unsigned apply_primitive(unsigned prim_id, unsigned args)
         return 0;
     }
     case PTRANSCRIPTOFF: {
+        REQUIRE_ARGS(args, 0, 0, "transcript-off");
         if (!ctx.transcript) {
             show_error("transcript-off: no transcript active");
             return TOK_ERROR;

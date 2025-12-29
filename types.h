@@ -100,9 +100,9 @@ enum cont_type {
                        // body)), env, next
     CONT_APPLY_FUNC,   // Apply user function; data = body, env, next
     CONT_MACRO_EXPAND, // Macro expansion done; data = 0, env, next
-    CONT_CALLWITHVALUES, // call-with-values producer done; data = consumer, env,
-                         // next
-    CONT_COUNT           // Number of continuation types (must be last)
+    CONT_CALLWITHVALUES, // call-with-values producer done; data = consumer,
+                         // env, next
+    CONT_COUNT // Number of continuation types (must be last)
 };
 
 enum token {
