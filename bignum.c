@@ -582,7 +582,20 @@ static limb_t bn_div_limb(bignum *a, limb_t d)
     return (limb_t)rem;
 }
 
-// Long division for multi-limb divisor
+// Count leading zeros in a limb
+static int clz_limb(limb_t x)
+{
+    if (x == 0)
+        return LIMB_BITS;
+#if LIMB_BITS == 32
+    return __builtin_clz(x);
+#else
+    return __builtin_clzll(x);
+#endif
+}
+
+// Long division using Knuth's Algorithm D
+// This is O(n*m) where n is dividend length and m is divisor length
 bignum *bn_div(const bignum *a, const bignum *b, bignum **remainder)
 {
     if (bn_is_zero(b)) {
@@ -623,53 +636,95 @@ bignum *bn_div(const bignum *a, const bignum *b, bignum **remainder)
         return quot;
     }
 
-    // Multi-limb division using Algorithm D (Knuth)
-    // Simplified version: binary long division
-    bignum *quotient = bn_new();
-    bn_ensure_cap(quotient, dividend->len - divisor->len + 1);
+    // Knuth's Algorithm D
+    size_t n = divisor->len;
+    size_t m = dividend->len - n;
 
-    // Binary search / shift-subtract method
-    while (bn_cmp_abs(dividend, divisor) >= 0) {
-        // Find how many bits to shift divisor to align with dividend
-        size_t shift = 0;
-        bignum *shifted = bn_copy(divisor);
+    // D1: Normalize - shift so divisor's top bit is set
+    int shift = clz_limb(divisor->limbs[n - 1]);
 
-        while (bn_cmp_abs(bn_lshift(shifted, 1), dividend) <= 0) {
-            bignum *tmp = bn_lshift(shifted, 1);
-            bn_free(shifted);
-            shifted = tmp;
-            shift++;
-        }
+    // Shift both dividend and divisor left by 'shift' bits
+    bignum *u = bn_lshift(dividend, shift);
+    bignum *v = bn_lshift(divisor, shift);
 
-        // Subtract and set quotient bit
-        bignum *tmp = bn_sub(dividend, shifted);
-        bn_free(dividend);
-        dividend = tmp;
-
-        // Add 2^shift to quotient
-        size_t limb_idx = shift / LIMB_BITS;
-        size_t bit_idx = shift % LIMB_BITS;
-        bn_ensure_cap(quotient, limb_idx + 1);
-        if (quotient->len <= limb_idx) {
-            quotient->len = limb_idx + 1;
-        }
-        quotient->limbs[limb_idx] |= (limb_t)1 << bit_idx;
-
-        bn_free(shifted);
+    // Ensure u has m+n+1 limbs (may need extra limb from shift)
+    bn_ensure_cap(u, m + n + 1);
+    while (u->len < m + n + 1) {
+        u->limbs[u->len++] = 0;
     }
 
-    bn_normalize(quotient);
-    quotient->sign = result_sign && !bn_is_zero(quotient);
+    // Allocate quotient
+    bignum *q = bn_alloc(m + 1);
+    q->len = m + 1;
+
+    limb_t v_n1 = v->limbs[n - 1];  // Most significant limb of divisor
+    limb_t v_n2 = n >= 2 ? v->limbs[n - 2] : 0;  // Second most significant
+
+    // D2-D7: Main loop - compute each quotient digit
+    for (size_t j = m + 1; j > 0; j--) {
+        size_t jj = j - 1;  // 0-based index
+
+        // D3: Calculate quotient estimate qhat
+        // qhat = floor((u[j+n]*B + u[j+n-1]) / v[n-1])
+        dlimb_t u_hi = ((dlimb_t)u->limbs[jj + n] << LIMB_BITS) | u->limbs[jj + n - 1];
+        dlimb_t qhat = u_hi / v_n1;
+        dlimb_t rhat = u_hi % v_n1;
+
+        // Refine qhat estimate (Knuth's correction)
+        // While qhat >= B or qhat * v[n-2] > B * rhat + u[j+n-2]
+        while (qhat > LIMB_MAX ||
+               (qhat * v_n2 > ((rhat << LIMB_BITS) | (jj + n >= 2 ? u->limbs[jj + n - 2] : 0)))) {
+            qhat--;
+            rhat += v_n1;
+            if (rhat > LIMB_MAX)
+                break;
+        }
+
+        // D4: Multiply and subtract: u[j..j+n] -= qhat * v[0..n-1]
+        int64_t borrow = 0;
+        for (size_t i = 0; i < n; i++) {
+            dlimb_t prod = qhat * v->limbs[i];
+            int64_t diff = (int64_t)u->limbs[jj + i] - (limb_t)prod - borrow;
+            u->limbs[jj + i] = (limb_t)diff;
+            borrow = (prod >> LIMB_BITS) - (diff >> LIMB_BITS);
+        }
+        int64_t diff = (int64_t)u->limbs[jj + n] - borrow;
+        u->limbs[jj + n] = (limb_t)diff;
+
+        // D5: Store quotient digit
+        q->limbs[jj] = (limb_t)qhat;
+
+        // D6: Add back if we subtracted too much
+        if (diff < 0) {
+            // qhat was 1 too large
+            q->limbs[jj]--;
+            dlimb_t carry = 0;
+            for (size_t i = 0; i < n; i++) {
+                dlimb_t sum = (dlimb_t)u->limbs[jj + i] + v->limbs[i] + carry;
+                u->limbs[jj + i] = (limb_t)sum;
+                carry = sum >> LIMB_BITS;
+            }
+            u->limbs[jj + n] += (limb_t)carry;
+        }
+    }
+
+    // D8: Unnormalize remainder
+    bn_normalize(q);
+    q->sign = result_sign && !bn_is_zero(q);
 
     if (remainder) {
-        *remainder = dividend;
-        (*remainder)->sign = a->sign && !bn_is_zero(dividend);
-    } else {
-        bn_free(dividend);
+        // Shift remainder right to undo normalization
+        bignum *rem = bn_rshift(u, shift);
+        rem->sign = a->sign && !bn_is_zero(rem);
+        *remainder = rem;
     }
 
+    bn_free(u);
+    bn_free(v);
+    bn_free(dividend);
     bn_free(divisor);
-    return quotient;
+
+    return q;
 }
 
 bignum *bn_mod(const bignum *a, const bignum *b)
