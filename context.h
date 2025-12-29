@@ -95,6 +95,15 @@ bool is_exact(unsigned x);
 // Normalize a rational (reduce to lowest terms, handle signs)
 unsigned normalize_rational(int64_t num, int64_t denom);
 
+// Normalize a rational from cell references (supports bignum numerator/denominator)
+unsigned normalize_rational_cells(unsigned num_cell, unsigned denom_cell);
+
+// Check if a numeric cell is negative
+bool is_negative_number(unsigned x);
+
+// Negate a numeric cell (returns new cell)
+unsigned negate_number(unsigned x);
+
 // Store a bignum (takes ownership of the bignum pointer)
 unsigned store_bignum(bignum *bn);
 
@@ -239,6 +248,19 @@ void trigger_gc(void);
 // then gc_unprotect when done. This ensures GC updates the variables in place.
 void gc_protect(unsigned *ptr);
 void gc_unprotect(int count);
+
+// Alternative: mark/release for safer scope-based protection.
+// gc_mark() returns current stack position, gc_release() restores it.
+// This avoids manual counting errors.
+int gc_mark(void);
+void gc_release(int mark);
+
+// Helper macro for scope-based GC protection:
+//   GC_PROTECTED { gc_protect(&a); gc_protect(&b); ... allocations ... }
+// Automatically releases all protected vars when scope exits.
+#define GC_PROTECTED \
+    for (int _gc_mark = gc_mark(), _gc_once = 1; _gc_once; \
+         gc_release(_gc_mark), _gc_once = 0)
 
 // ============================================================================
 // Initialization

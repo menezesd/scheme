@@ -14,6 +14,8 @@
  * 1. First pass: Traverse structure, mark cells visited multiple times
  * 2. Second pass: Print with labels for shared/cyclic references
  *
+ * Uses hash table for O(1) average lookup instead of O(n) linear search.
+ *
  * ## Numeric Formatting
  * - Integers: Decimal notation
  * - Bignums: Arbitrary precision decimal
@@ -29,32 +31,82 @@
 #include <stdlib.h>
 
 // ============================================================================
-// Cycle Detection for Datum Labels
+// Cycle Detection Hash Table
 // ============================================================================
 
-#define MAX_VISITED 4096
+#define VISITED_TABLE_SIZE 8192 // Power of 2, supports ~6000 entries at 75% load
+#define VISITED_EMPTY 0         // 0 is never a valid cell (represents nil)
 
-static struct {
-    unsigned cell;
-    int label;    // -1 = visited once, >= 0 = assigned label
-    bool printed; // true if we've printed the #n= prefix
-} visited[MAX_VISITED];
-static int visited_count = 0;
+typedef struct {
+    unsigned cell;  // Cell address (0 = empty slot)
+    int label;      // -1 = visited once, >= 0 = assigned label
+    bool printed;   // true if we've printed #n= prefix
+} visited_entry;
+
+static visited_entry visited_table[VISITED_TABLE_SIZE];
 static int next_label = 0;
+static int visited_count = 0;
+
+// Hash function - good distribution for cell addresses
+static inline unsigned hash_cell(unsigned cell)
+{
+    unsigned h = cell;
+    h ^= h >> 16;
+    h *= 0x85ebca6b;
+    h ^= h >> 13;
+    h *= 0xc2b2ae35;
+    h ^= h >> 16;
+    return h & (VISITED_TABLE_SIZE - 1);
+}
 
 static void reset_visited(void)
 {
-    visited_count = 0;
+    // Only clear slots that were used (optimization for sparse tables)
+    for (int i = 0; i < VISITED_TABLE_SIZE; i++) {
+        visited_table[i].cell = VISITED_EMPTY;
+    }
     next_label = 0;
+    visited_count = 0;
 }
 
-static int find_visited(unsigned cell)
+// Find entry in hash table, returns pointer or NULL if not found
+static visited_entry *find_visited(unsigned cell)
 {
-    for (int i = 0; i < visited_count; i++) {
-        if (visited[i].cell == cell)
-            return i;
+    unsigned idx = hash_cell(cell);
+    for (int i = 0; i < VISITED_TABLE_SIZE; i++) {
+        unsigned probe = (idx + i) & (VISITED_TABLE_SIZE - 1);
+        if (visited_table[probe].cell == VISITED_EMPTY)
+            return NULL; // Empty slot = not found
+        if (visited_table[probe].cell == cell)
+            return &visited_table[probe];
     }
-    return -1;
+    return NULL; // Table full (shouldn't happen)
+}
+
+// Insert new entry into hash table, returns pointer to entry
+static visited_entry *insert_visited(unsigned cell)
+{
+    // Warn if approaching capacity
+    if (visited_count >= VISITED_TABLE_SIZE * 3 / 4) {
+        static bool warned = false;
+        if (!warned) {
+            fprintf(stderr, "warning: cycle detection table near capacity\n");
+            warned = true;
+        }
+    }
+
+    unsigned idx = hash_cell(cell);
+    for (int i = 0; i < VISITED_TABLE_SIZE; i++) {
+        unsigned probe = (idx + i) & (VISITED_TABLE_SIZE - 1);
+        if (visited_table[probe].cell == VISITED_EMPTY) {
+            visited_table[probe].cell = cell;
+            visited_table[probe].label = -1;
+            visited_table[probe].printed = false;
+            visited_count++;
+            return &visited_table[probe];
+        }
+    }
+    return NULL; // Table full
 }
 
 // First pass: mark all cells that are visited more than once
@@ -68,22 +120,17 @@ static void mark_shared(unsigned s)
     if (type != BT_CONS && type != BT_VECTOR)
         return;
 
-    int idx = find_visited(s);
-    if (idx >= 0) {
+    visited_entry *entry = find_visited(s);
+    if (entry) {
         // Seen before - assign a label if not already assigned
-        if (visited[idx].label < 0) {
-            visited[idx].label = next_label++;
+        if (entry->label < 0) {
+            entry->label = next_label++;
         }
         return; // Don't recurse into already-visited cells
     }
 
-    // First visit - add to visited list
-    if (visited_count < MAX_VISITED) {
-        visited[visited_count].cell = s;
-        visited[visited_count].label = -1;
-        visited[visited_count].printed = false;
-        visited_count++;
-    }
+    // First visit - add to hash table
+    insert_visited(s);
 
     // Recurse into children
     if (type == BT_CONS) {
@@ -107,16 +154,16 @@ static void write_list_tail_fp(unsigned st, bool with_quotes, FILE *fp)
         return;
 
     // Check if the tail has a label (shared/circular)
-    int idx = find_visited(st);
-    if (idx >= 0 && visited[idx].label >= 0) {
-        if (visited[idx].printed) {
+    visited_entry *entry = find_visited(st);
+    if (entry && entry->label >= 0) {
+        if (entry->printed) {
             // Already printed - use reference
-            fprintf(fp, " . #%d#", visited[idx].label);
+            fprintf(fp, " . #%d#", entry->label);
             return;
         }
         // First print of this shared cell - print with label
-        fprintf(fp, " . #%d=", visited[idx].label);
-        visited[idx].printed = true;
+        fprintf(fp, " . #%d=", entry->label);
+        entry->printed = true;
         if (IS_PAIR(st)) {
             fprintf(fp, "(");
             write_obj_fp(car(st), with_quotes, fp);
@@ -150,16 +197,16 @@ static void write_obj_fp(unsigned s, bool with_quotes, FILE *fp)
     }
 
     // Check for shared/circular structure
-    int idx = find_visited(s);
-    if (idx >= 0 && visited[idx].label >= 0) {
-        if (visited[idx].printed) {
+    visited_entry *entry = find_visited(s);
+    if (entry && entry->label >= 0) {
+        if (entry->printed) {
             // Already printed - use reference
-            fprintf(fp, "#%d#", visited[idx].label);
+            fprintf(fp, "#%d#", entry->label);
             return;
         }
         // First print - mark as printed and add label prefix
-        visited[idx].printed = true;
-        fprintf(fp, "#%d=", visited[idx].label);
+        entry->printed = true;
+        fprintf(fp, "#%d=", entry->label);
     }
 
     switch (CELL_TYPE(s)) {
@@ -261,9 +308,6 @@ static void write_obj_fp(unsigned s, bool with_quotes, FILE *fp)
         break;
     case BT_FREE:
         fprintf(fp, "[NULL]");
-        break;
-    case BT_FORM:
-        fprintf(fp, "[syntax]");
         break;
     case BT_INPORT:
         fprintf(fp, "[input-port]");

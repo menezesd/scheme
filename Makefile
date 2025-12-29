@@ -1,12 +1,17 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -Wshadow -Wstrict-prototypes -Wmissing-prototypes \
-         -Wold-style-definition -std=c11 -O2
+         -Wold-style-definition -Wformat=2 -Wundef -Wdouble-promotion \
+         -std=c11 -O2
 LDFLAGS = -lm
 
 # Source files
-SRCS = main.c context.c reader.c writer.c env.c primitives.c macros.c eval.c bignum.c
+SRCS = main.c context.c reader.c writer.c env.c primitives.c macros.c eval.c bignum.c \
+       prim_numeric.c prim_compare.c prim_list.c prim_string.c prim_type.c \
+       prim_char.c prim_vector.c prim_math.c prim_io.c prim_port.c prim_numtower.c \
+       eval_forms.c eval_cont.c
 OBJS = $(SRCS:.c=.o)
-HEADERS = types.h context.h reader.h writer.h env.h primitives.h macros.h eval.h bignum.h
+HEADERS = types.h context.h reader.h writer.h env.h primitives.h macros.h eval.h bignum.h \
+          prim_internal.h eval_internal.h
 GENERATED = stdlib_data.h
 
 # Target executable
@@ -36,9 +41,22 @@ context.o: context.c context.h types.h
 reader.o: reader.c reader.h context.h types.h
 writer.o: writer.c writer.h context.h types.h
 env.o: env.c env.h context.h types.h
-primitives.o: primitives.c primitives.h context.h reader.h writer.h types.h
+primitives.o: primitives.c primitives.h prim_internal.h context.h reader.h writer.h types.h
+prim_numeric.o: prim_numeric.c prim_internal.h context.h types.h
+prim_compare.o: prim_compare.c prim_internal.h context.h types.h
+prim_list.o: prim_list.c prim_internal.h context.h types.h
+prim_string.o: prim_string.c prim_internal.h context.h types.h
+prim_type.o: prim_type.c prim_internal.h context.h types.h
+prim_char.o: prim_char.c prim_internal.h context.h types.h
+prim_vector.o: prim_vector.c prim_internal.h context.h types.h
+prim_math.o: prim_math.c prim_internal.h context.h types.h
+prim_io.o: prim_io.c prim_internal.h context.h reader.h writer.h types.h
+prim_port.o: prim_port.c prim_internal.h context.h types.h
+prim_numtower.o: prim_numtower.c prim_internal.h context.h types.h
 macros.o: macros.c macros.h context.h types.h
-eval.o: eval.c eval.h context.h env.h primitives.h macros.h reader.h types.h
+eval.o: eval.c eval.h eval_internal.h context.h env.h primitives.h macros.h reader.h types.h
+eval_forms.o: eval_forms.c eval_internal.h context.h env.h macros.h types.h
+eval_cont.o: eval_cont.c eval_internal.h context.h env.h types.h
 bignum.o: bignum.c bignum.h
 
 %.o: %.c
@@ -65,7 +83,10 @@ TEST_SRCS = test_bignum.c test_reader.c test_context.c test_macros.c
 TEST_BINS = $(TEST_SRCS:.c=)
 
 # Object files needed for interpreter tests (excludes main.o)
-INTERP_OBJS = context.o reader.o writer.o env.o primitives.o macros.o eval.o bignum.o
+INTERP_OBJS = context.o reader.o writer.o env.o primitives.o macros.o eval.o bignum.o \
+              prim_numeric.o prim_compare.o prim_list.o prim_string.o prim_type.o \
+              prim_char.o prim_vector.o prim_math.o prim_io.o prim_port.o prim_numtower.o \
+              eval_forms.o eval_cont.o
 
 test-c: $(TEST_BINS)
 	@for t in $(TEST_BINS); do ./$$t || exit 1; done

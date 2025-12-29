@@ -31,7 +31,12 @@ static void bn_ensure_cap(bignum *b, size_t cap)
     size_t new_cap = b->cap * 2;
     if (new_cap < cap)
         new_cap = cap;
-    b->limbs = realloc(b->limbs, new_cap * sizeof(limb_t));
+    limb_t *new_limbs = realloc(b->limbs, new_cap * sizeof(limb_t));
+    if (!new_limbs) {
+        fprintf(stderr, "bignum: out of memory\n");
+        abort();
+    }
+    b->limbs = new_limbs;
     memset(b->limbs + b->cap, 0, (new_cap - b->cap) * sizeof(limb_t));
     b->cap = new_cap;
 }
@@ -115,8 +120,9 @@ bignum *bn_from_string(const char *str, int base)
         str++;
     }
 
-    bignum *base_bn = bn_from_int(base);
-
+    // Use in-place operations to avoid allocations per digit
+    // Since base <= 36 fits in a single limb, we can use bn_mul_limb_ip
+    // and bn_add_limb_ip for efficient parsing
     while (*str) {
         int digit;
         if (isdigit(*str)) {
@@ -130,18 +136,13 @@ bignum *bn_from_string(const char *str, int base)
         if (digit >= base)
             break;
 
-        // result = result * base + digit
-        bignum *tmp = bn_mul(result, base_bn);
-        bn_free(result);
-        bignum *digit_bn = bn_from_int(digit);
-        result = bn_add(tmp, digit_bn);
-        bn_free(tmp);
-        bn_free(digit_bn);
+        // result = result * base + digit (all in-place, no allocations)
+        bn_mul_limb_ip(result, (limb_t)base);
+        bn_add_limb_ip(result, (limb_t)digit);
 
         str++;
     }
 
-    bn_free(base_bn);
     result->sign = sign;
     bn_normalize(result);
     return result;

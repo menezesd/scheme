@@ -381,6 +381,9 @@ static const struct {
     {"exact->inexact", PEXACT2INEXACT},
     {"inexact->exact", PINEXACT2EXACT},
     {"rationalize", PRATIONALIZE},
+    {"finite?", PFINITE},
+    {"infinite?", PINFINITE},
+    {"nan?", PNAN},
 
     // String constructor
     {"string", PSTRING},

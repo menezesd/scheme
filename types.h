@@ -54,7 +54,6 @@
  */
 enum lisp_type {
     BT_FREE,     // Unused cell (on free list)
-    BT_READY,    // Allocated but not yet typed
     BT_ATOM,     // Symbol: id = index into atom table
     BT_NUM,      // Exact integer: id = int64_t value
     BT_BIGNUM,   // Arbitrary precision integer: id = bignum* pointer
@@ -74,9 +73,7 @@ enum lisp_type {
     BT_STRINPORT,       // String input port: id = string_port* pointer
     BT_STROUTPORT,      // String output port: id = string_port* pointer
     BT_MULTIVAL,        // Multiple return values: car = list of values
-    BT_FORM,            // Special form (unused)
     BT_BUILTIN,         // Built-in primitive: id = primitive_id enum value
-    BT_DYNAMIC,         // Dynamic binding (unused)
     BT_BROKENHEART = -1 // GC forwarding pointer: car = new location
 };
 
@@ -94,7 +91,6 @@ enum cont_type {
     CONT_OR,        // Evaluated one; data = remaining, env, next
     CONT_COND_TEST, // Evaluated condition; data = (conseq . rest-clauses), env,
                     // next
-    CONT_COND_BODY, // Evaluated body expr; data = remaining-body, env, next
     CONT_LET_VALS,  // Evaluating let values; data = (vars . (vals . (bindings .
                     // body))), env, next
     CONT_LET_BODY,  // Evaluating let body; data = remaining-body, new-env, next
@@ -103,12 +99,10 @@ enum cont_type {
     CONT_LETREC_INIT,  // Initializing letrec; data = (bindings . (vals-ptr .
                        // body)), env, next
     CONT_APPLY_FUNC,   // Apply user function; data = body, env, next
-    CONT_QQ,           // Quasiquote; data = 0 (unused), env, next
-    CONT_QQ_LIST,      // QQ list elements; data = (result-head . (result-tail .
-                       // remaining)), env, next
     CONT_MACRO_EXPAND, // Macro expansion done; data = 0, env, next
-    CONT_CALLWITHVALUES // call-with-values producer done; data = consumer, env,
-                        // next
+    CONT_CALLWITHVALUES, // call-with-values producer done; data = consumer, env,
+                         // next
+    CONT_COUNT           // Number of continuation types (must be last)
 };
 
 enum token {
@@ -422,6 +416,9 @@ enum primitive_id {
     PEXACT2INEXACT,
     PINEXACT2EXACT,
     PRATIONALIZE,
+    PFINITE,
+    PINFINITE,
+    PNAN,
     // String constructor
     PSTRING,
     // Dynamic ports

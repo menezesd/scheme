@@ -124,6 +124,16 @@ void gc_unprotect(int count)
     }
 }
 
+int gc_mark(void) { return shadow_stack_top; }
+
+void gc_release(int mark)
+{
+    if (mark < 0 || mark > shadow_stack_top) {
+        lisp_panic("invalid gc_release mark");
+    }
+    shadow_stack_top = mark;
+}
+
 void trigger_gc(void)
 {
     if (alloc_gc_root && *alloc_gc_root) {
@@ -152,7 +162,10 @@ unsigned alloc(void)
 
 unsigned alloc_cons(unsigned car_val, unsigned cdr_val)
 {
+    gc_protect(&car_val);
+    gc_protect(&cdr_val);
     unsigned p = alloc();
+    gc_unprotect(2);
     CELL_TYPE(p) = BT_CONS;
     CELL_CAR(p) = car_val;
     CELL_CDR(p) = cdr_val;
@@ -294,13 +307,115 @@ unsigned store_rational(int64_t num, int64_t denom)
     return normalize_rational(num, denom);
 }
 
+bool is_negative_number(unsigned x)
+{
+    switch (CELL_TYPE(x)) {
+    case BT_NUM:
+        return CELL_ID(x) < 0;
+    case BT_BIGNUM:
+        return bn_sign(get_bignum(x)) < 0;
+    default:
+        return false;
+    }
+}
+
+unsigned negate_number(unsigned x)
+{
+    switch (CELL_TYPE(x)) {
+    case BT_NUM: {
+        int64_t val = CELL_ID(x);
+        // Handle INT64_MIN overflow
+        if (val == INT64_MIN) {
+            bignum *bn = bn_from_int(val);
+            bn_neg_ip(bn);
+            return store_integer(bn);
+        }
+        return store(-val);
+    }
+    case BT_BIGNUM: {
+        bignum *bn = bn_neg(get_bignum(x));
+        return store_integer(bn);
+    }
+    default:
+        return x;
+    }
+}
+
+unsigned normalize_rational_cells(unsigned num_cell, unsigned denom_cell)
+{
+    // Protect inputs from GC during allocations
+    gc_protect(&num_cell);
+    gc_protect(&denom_cell);
+
+    // Convert to bignums for GCD calculation
+    bignum *num = to_bignum(num_cell);
+    bignum *denom = to_bignum(denom_cell);
+
+    gc_unprotect(2);
+
+    if (!num || !denom) {
+        if (num)
+            bn_free(num);
+        if (denom)
+            bn_free(denom);
+        show_error("rational: invalid numeric operands");
+        return TOK_ERROR;
+    }
+
+    // Check for division by zero
+    if (bn_is_zero(denom)) {
+        bn_free(num);
+        bn_free(denom);
+        show_error("division by zero in rational");
+        return TOK_ERROR;
+    }
+
+    // Normalize sign - denominator always positive
+    if (bn_sign(denom) < 0) {
+        bn_neg_ip(num);
+        bn_neg_ip(denom);
+    }
+
+    // Compute GCD and reduce
+    bignum *g = bn_gcd(num, denom);
+    bignum *reduced_num = bn_div(num, g, NULL);
+    bignum *reduced_denom = bn_div(denom, g, NULL);
+    bn_free(num);
+    bn_free(denom);
+    bn_free(g);
+
+    // Check if denominator is 1 - return integer
+    int64_t denom_val;
+    if (bn_to_int64(reduced_denom, &denom_val) == 0 && denom_val == 1) {
+        bn_free(reduced_denom);
+        return store_integer(reduced_num);
+    }
+
+    // Store numerator and denominator as cells
+    unsigned num_stored = store_integer(reduced_num);
+    gc_protect(&num_stored);
+    unsigned denom_stored = store_integer(reduced_denom);
+    gc_protect(&denom_stored);
+
+    // Create rational cell
+    unsigned p = alloc();
+    gc_unprotect(2);
+    CELL_TYPE(p) = BT_RATIONAL;
+    CELL_CAR(p) = num_stored;
+    CELL_CDR(p) = denom_stored;
+    return p;
+}
+
 unsigned store_complex(unsigned real_part, unsigned imag_part)
 {
     // If imaginary part is zero, return just the real part
     if (CELL_TYPE(imag_part) == BT_NUM && CELL_ID(imag_part) == 0) {
         return real_part;
     }
+    gc_protect(&real_part);
+    gc_protect(&imag_part);
     unsigned p = alloc();
+    gc_unprotect(2);
     CELL_TYPE(p) = BT_COMPLEX;
     CELL_CAR(p) = real_part;
     CELL_CDR(p) = imag_part;
@@ -544,21 +659,34 @@ unsigned atom_from_string(const char *s)
                 }
             }
             if (sep) {
-                // Parse real part
-                char *real_str = strndup(s, sep - s);
-                unsigned real_part = atom_from_string(real_str);
-                free(real_str);
+                // Parse real part directly using strtod (avoids strndup)
+                double real_val = strtod(s, &endptr);
+                unsigned real_part =
+                    (endptr == sep) ? store_inexact(real_val) : store(0);
 
                 // Parse imaginary part (without the trailing i)
-                size_t imag_len = (s + n - 1) - sep;
-                char *imag_str = strndup(sep, imag_len);
-                unsigned imag_part = atom_from_string(imag_str);
-                free(imag_str);
+                double imag_val = strtod(sep, &endptr);
+                unsigned imag_part = store_inexact(imag_val);
 
                 return store_complex(real_part, imag_part);
             }
-            // Pure imaginary: 5i, 3.14i, etc.
+            // Pure imaginary: 5i, 3.14i, etc. - parse without trailing 'i'
+            double imag_val = strtod(s, &endptr);
+            // Check that we parsed up to the 'i'
+            if (endptr == s + n - 1) {
+                return store_complex(store(0), store_inexact(imag_val));
+            }
+            // Fallback for integers: try strtoll
+            int64_t imag_int = strtoll(s, &endptr, 10);
+            if (endptr == s + n - 1) {
+                return store_complex(store(0), store(imag_int));
+            }
+            // Last resort: use recursive parsing with temp string
             char *imag_str = strndup(s, n - 1);
+            if (!imag_str) {
+                show_error("out of memory");
+                return TOK_ERROR;
+            }
             unsigned imag_part = atom_from_string(imag_str);
             free(imag_str);
             return store_complex(store(0), imag_part);
@@ -613,21 +741,74 @@ unsigned atom_from_string(const char *s)
             }
         }
 
-        // Check for rational: num/denom
+        // Check for rational: num/denom (supports bignum numerator/denominator)
         const char *slash = strchr(s, '/');
         if (slash && slash != s && slash != s + n - 1) {
-            char *num_str = strndup(s, slash - s);
-            char *denom_str = strdup(slash + 1);
-            char *end1, *end2;
-            int64_t num = strtoll(num_str, &end1, 10);
-            int64_t denom = strtoll(denom_str, &end2, 10);
-            bool valid = (*end1 == '\0' && *end2 == '\0');
-            free(num_str);
-            free(denom_str);
-            if (valid) {
-                return store_rational(num, denom);
+            // Parse numerator
+            char *end1;
+            errno = 0;
+            int64_t num_val = strtoll(s, &end1, 10);
+            unsigned num_cell;
+            if (end1 == slash) {
+                // Parsed successfully up to slash
+                if (errno == ERANGE) {
+                    // Overflow - parse as bignum
+                    char *num_str = strndup(s, (size_t)(slash - s));
+                    if (!num_str)
+                        return TOK_ERROR;
+                    bignum *bn = bn_from_string(num_str, 10);
+                    free(num_str);
+                    if (!bn)
+                        return TOK_ERROR;
+                    num_cell = store_integer(bn);
+                } else {
+                    num_cell = store(num_val);
+                }
+            } else {
+                // Didn't parse to slash - might be bignum
+                char *num_str = strndup(s, (size_t)(slash - s));
+                if (!num_str)
+                    return TOK_ERROR;
+                bignum *bn = bn_from_string(num_str, 10);
+                free(num_str);
+                if (!bn)
+                    goto not_rational;
+                num_cell = store_integer(bn);
             }
+
+            // Parse denominator
+            gc_protect(&num_cell);
+            char *end2;
+            errno = 0;
+            int64_t denom_val = strtoll(slash + 1, &end2, 10);
+            unsigned denom_cell;
+            if (*end2 == '\0') {
+                // Parsed successfully to end
+                if (errno == ERANGE) {
+                    // Overflow - parse as bignum
+                    bignum *bn = bn_from_string(slash + 1, 10);
+                    if (!bn) {
+                        gc_unprotect(1);
+                        return TOK_ERROR;
+                    }
+                    denom_cell = store_integer(bn);
+                } else {
+                    denom_cell = store(denom_val);
+                }
+                gc_unprotect(1);
+                return normalize_rational_cells(num_cell, denom_cell);
+            } else {
+                // Didn't parse to end - might be bignum
+                bignum *bn = bn_from_string(slash + 1, 10);
+                if (bn) {
+                    denom_cell = store_integer(bn);
+                    gc_unprotect(1);
+                    return normalize_rational_cells(num_cell, denom_cell);
+                }
+            }
+            gc_unprotect(1);
         }
+    not_rational:
 
         // Try parsing as floating-point
         double dval = strtod(s, &endptr);
@@ -749,8 +930,15 @@ unsigned collect(unsigned x)
         return 0;
 
     case BT_STRING: {
-        // Just copy the pointer - string data is shared with new cell
-        // Unreachable strings are freed during sweep
+        // String GC Invariant: String data (malloc'd) is shared between old and
+        // new cells during collection. The pointer is simply copied to the new
+        // cell. After collection completes, the old region is swept and any
+        // BT_STRING cells there have their data freed. This is safe because:
+        //   1. If the string was reachable: it was copied to new space and the
+        //      old cell is now BT_BROKENHEART (not BT_STRING), so sweep skips it
+        //   2. If the string was unreachable: it was never copied, so the old
+        //      cell still has BT_STRING type and sweep correctly frees the data
+        // Thus exactly one cell owns each string at any time.
         unsigned xx = alloc();
         CELL_TYPE(xx) = BT_STRING;
         CELL_ID(xx) = CELL_ID(x);
@@ -760,41 +948,39 @@ unsigned collect(unsigned x)
     }
 
     case BT_BIGNUM: {
+        // Bignum GC follows the same invariant as strings: the pointer is
+        // shared, not copied. This is safe because bignums are immutable after
+        // storage - to_bignum() always returns a fresh copy for mutation.
         unsigned xx = alloc();
-        bignum *old_bn = get_bignum(x);
-        bignum *new_bn = bn_copy(old_bn);
         CELL_TYPE(xx) = BT_BIGNUM;
-        CELL_ID(xx) = (int64_t)(intptr_t)new_bn;
+        CELL_ID(xx) = CELL_ID(x);
         CELL_TYPE(x) = BT_BROKENHEART;
         CELL_CAR(x) = xx;
-        // Note: old_bn will be freed when we swap memory regions
         return xx;
     }
 
     case BT_VECTOR: {
+        // Vector GC: share the vector_data pointer and update element
+        // references in-place. Must set BROKENHEART before collecting elements
+        // to handle cyclic references (vector → cons → same vector).
         unsigned xx = alloc();
-        vector_data *old_vd = (vector_data *)(intptr_t)CELL_ID(x);
-        unsigned len = old_vd->len;
-        vector_data *new_vd =
-            malloc(sizeof(vector_data) + len * sizeof(unsigned));
-        if (!new_vd) {
-            lisp_panic("failed to allocate vector during GC");
-        }
-        new_vd->len = len;
-        for (unsigned i = 0; i < len; i++) {
-            new_vd->data[i] = collect(old_vd->data[i]);
-        }
         CELL_TYPE(xx) = BT_VECTOR;
-        CELL_ID(xx) = (int64_t)(intptr_t)new_vd;
+        CELL_ID(xx) = CELL_ID(x);
         CELL_TYPE(x) = BT_BROKENHEART;
         CELL_CAR(x) = xx;
+        // Now safe to collect elements - cycles will see BROKENHEART
+        vector_data *vd = (vector_data *)(intptr_t)CELL_ID(xx);
+        for (unsigned i = 0; i < vd->len; i++) {
+            vd->data[i] = collect(vd->data[i]);
+        }
         return xx;
     }
 
     case BT_STRINPORT:
     case BT_STROUTPORT: {
-        // Just copy the pointer - string port data is shared with new cell
-        // Unreachable string ports are freed during sweep
+        // String port GC follows the same invariant as strings above.
+        // The string_port struct and its data buffer are shared during
+        // collection; only unreachable ports in the old region are freed.
         unsigned xx = alloc();
         CELL_TYPE(xx) = CELL_TYPE(x);
         CELL_ID(xx) = CELL_ID(x);
@@ -869,8 +1055,13 @@ unsigned gc(unsigned root)
         *alloc_gc_root = collect(*alloc_gc_root);
     }
 
-    // Free heap-allocated data in old memory region (now at nmin after the
-    // swap)
+    // Sweep phase: Free heap-allocated data in old memory region (now at nmin
+    // after the swap). This is safe because:
+    //   - Reachable cells were copied and marked as BT_BROKENHEART
+    //   - Unreachable cells retain their original type (BT_STRING, etc.)
+    //   - We only free data from cells that still have their original type
+    //   - All pointer types (bignums, strings, vectors, string ports) share
+    //     their heap data with the new cell, so only unreachable data is freed
     unsigned old_start = ctx.nmin;
     unsigned old_end =
         (ctx.nmin < SEMISPACE_SIZE) ? SEMISPACE_SIZE : 2 * SEMISPACE_SIZE;

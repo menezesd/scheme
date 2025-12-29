@@ -31,6 +31,7 @@
 #include "reader.h"
 #include "context.h"
 #include <ctype.h>
+#include <limits.h>
 #include <string.h>
 #include <strings.h>
 
@@ -385,7 +386,18 @@ unsigned read_token(void)
                 // Datum label: #n= or #n#
                 int label = c - '0';
                 while (isdigit(c = reader_getchar())) {
-                    label = label * 10 + (c - '0');
+                    // Check for integer overflow before multiplication
+                    int digit = c - '0';
+                    if (label > (INT_MAX - digit) / 10) {
+                        show_error("datum label too large");
+                        return TOK_ERROR;
+                    }
+                    label = label * 10 + digit;
+                }
+                if (label >= MAX_DATUM_LABELS) {
+                    show_error("datum label too large (max %d)",
+                               MAX_DATUM_LABELS - 1);
+                    return TOK_ERROR;
                 }
                 if (c == '=') {
                     // Define label: #n=<datum>

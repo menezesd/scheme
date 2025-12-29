@@ -533,6 +533,100 @@
 (test "generator stress sum 1-50" 1275 gen-sum)
 
 ;;; ============================================================================
+;;; Edge Cases and New Predicates
+;;; ============================================================================
+
+(section "Numeric Predicates (R5RS)")
+
+; finite?, infinite?, nan? predicates
+(test "finite? integer" #t (finite? 42))
+(test "finite? float" #t (finite? 3.14159))
+(test "finite? rational" #t (finite? 22/7))
+(test "finite? bignum" #t (finite? 99999999999999999999))
+(test "finite? infinity" #f (finite? (exp 1000)))
+(test "infinite? integer" #f (infinite? 0))
+(test "infinite? overflow" #t (infinite? (exp 1000)))
+(test "nan? normal" #f (nan? 42))
+(test "nan? from log" #t (nan? (log -1)))
+
+; complex number predicates
+(test "finite? complex" #t (finite? (make-rectangular 3 4)))
+(test "infinite? complex" #t (infinite? (make-rectangular (exp 1000) 0)))
+(test "nan? complex" #t (nan? (make-rectangular (log -1) 0)))
+
+(section "String Edge Cases")
+
+; Empty strings
+(test "empty string length" 0 (string-length ""))
+(test "empty string->list" '() (string->list ""))
+(test "empty list->string" "" (list->string '()))
+(test "empty string append" "hello" (string-append "" "hello" ""))
+(test "empty substring" "" (substring "hello" 2 2))
+
+; Long strings
+(define long-str (make-string 1000 #\x))
+(test "long string length" 1000 (string-length long-str))
+(test "long string ref" #\x (string-ref long-str 999))
+
+(section "Vector Edge Cases")
+
+; Empty vectors
+(test "empty vector length" 0 (vector-length '#()))
+(test "empty vector->list" '() (vector->list '#()))
+(test "empty list->vector" '#() (list->vector '()))
+
+; Vector modification
+(define v (make-vector 3 0))
+(vector-set! v 0 'a)
+(vector-set! v 2 'c)
+(test "vector-set!" '#(a 0 c) v)
+
+(section "Complex Numbers")
+
+; Complex arithmetic
+(test "complex magnitude" 5.0 (magnitude (make-rectangular 3 4)))
+(test "complex real-part" 3 (real-part (make-rectangular 3 4)))
+(test "complex imag-part" 4 (imag-part (make-rectangular 3 4)))
+(test "real imag-part" 0 (imag-part 5))
+(test "real real-part" 5 (real-part 5))
+
+; Complex predicates
+(test "complex? true" #t (complex? (make-rectangular 1 2)))
+(test "complex? real" #t (complex? 5))  ; all reals are complex
+(test "rational? int" #t (rational? 5))
+(test "rational? frac" #t (rational? 3/4))
+
+(section "Rational Numbers")
+
+; numerator/denominator
+(test "numerator int" 5 (numerator 5))
+(test "denominator int" 1 (denominator 5))
+(test "numerator frac" 3 (numerator 3/4))
+(test "denominator frac" 4 (denominator 3/4))
+
+(section "Bignum Rationals")
+
+; Reading bignum rationals
+(define big-rat 99999999999999999999/7)
+(test "bignum rational read" 99999999999999999999/7 big-rat)
+(test "bignum reduces to int" 33333333333333333333 99999999999999999999/3)
+(test "bignum/bignum reduces" 9/8 99999999999999999999/88888888888888888888)
+(test "bignum rational numerator" 1 (numerator 1/99999999999999999999))
+(test "bignum rational denom" 99999999999999999999 (denominator 1/99999999999999999999))
+
+; Arithmetic with bignum rationals
+(test "bignum + rational" 199999999999999999999/2 (+ 99999999999999999999 1/2))
+(test "bignum * rational" 99999999999999999999/2 (* 99999999999999999999 1/2))
+
+(section "Exactness")
+
+; exact/inexact conversions
+(test "exact? int" #t (exact? 42))
+(test "inexact? float" #t (inexact? 3.14))
+(test "exact->inexact" 5.0 (exact->inexact 5))
+(test "inexact->exact" 5 (inexact->exact 5.0))
+
+;;; ============================================================================
 ;;; Summary
 ;;; ============================================================================
 
