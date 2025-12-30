@@ -3,8 +3,8 @@
  * @brief Type predicate operations (number?, symbol?, pair?, etc.)
  */
 
-#include "prim_internal.h"
 #include "bytecode.h"
+#include "prim_internal.h"
 
 unsigned apply_type_predicate(unsigned prim_id, unsigned args)
 {

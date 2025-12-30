@@ -60,7 +60,8 @@ bool panic_jmp_set = false;
 
 void init_heap(void)
 {
-    // Allocate cons cells heap (includes nursery space at end of first semispace)
+    // Allocate cons cells heap (includes nursery space at end of first
+    // semispace)
     size_t heap_size = 2 * SEMISPACE_SIZE * sizeof(cons_cell);
     ctx.cons_cells = malloc(heap_size);
     if (!ctx.cons_cells) {
@@ -146,7 +147,8 @@ void gc_protect(unsigned *ptr)
     if (shadow_stack_top >= shadow_stack_size) {
         // Expand the shadow stack
         int new_size = shadow_stack_size * 2;
-        unsigned **new_stack = realloc(shadow_stack, new_size * sizeof(unsigned *));
+        unsigned **new_stack =
+            realloc(shadow_stack, new_size * sizeof(unsigned *));
         if (!new_stack) {
             lisp_panic("failed to expand shadow stack");
         }
@@ -188,7 +190,8 @@ unsigned alloc(void)
     // Check if generational GC is disabled (no card table)
     if (!ctx.card_table) {
         // Simple semispace allocation without generational GC
-        unsigned limit = (ctx.hptr < SEMISPACE_SIZE) ? SEMISPACE_SIZE : 2 * SEMISPACE_SIZE;
+        unsigned limit =
+            (ctx.hptr < SEMISPACE_SIZE) ? SEMISPACE_SIZE : 2 * SEMISPACE_SIZE;
 
         // During GC, don't trigger nested GC
         if (in_gc_mode) {
@@ -202,7 +205,8 @@ unsigned alloc(void)
         if (ctx.hptr >= limit * 9 / 10 && alloc_gc_root && *alloc_gc_root) {
             *alloc_gc_root = gc(*alloc_gc_root);
             // Recalculate limit after GC (we may have switched semispaces)
-            limit = (ctx.hptr < SEMISPACE_SIZE) ? SEMISPACE_SIZE : 2 * SEMISPACE_SIZE;
+            limit = (ctx.hptr < SEMISPACE_SIZE) ? SEMISPACE_SIZE
+                                                : 2 * SEMISPACE_SIZE;
         }
 
         if (ctx.hptr >= limit) {
@@ -220,8 +224,8 @@ unsigned alloc(void)
     }
 
     // Generational GC: allocate from nursery
-    unsigned nursery_end = (ctx.mmin < SEMISPACE_SIZE)
-        ? SEMISPACE_SIZE : 2 * SEMISPACE_SIZE;
+    unsigned nursery_end =
+        (ctx.mmin < SEMISPACE_SIZE) ? SEMISPACE_SIZE : 2 * SEMISPACE_SIZE;
 
     // Check if nursery is full
     if (ctx.nursery_ptr >= nursery_end) {
@@ -235,13 +239,14 @@ unsigned alloc(void)
         // Check if old gen is getting full (> 80%) - trigger major GC
         unsigned old_gen_used = ctx.hptr - ctx.mmin;
         unsigned old_gen_size = ctx.nursery_start - ctx.mmin;
-        if (old_gen_used > old_gen_size * 8 / 10 && alloc_gc_root && *alloc_gc_root) {
+        if (old_gen_used > old_gen_size * 8 / 10 && alloc_gc_root &&
+            *alloc_gc_root) {
             *alloc_gc_root = gc(*alloc_gc_root);
         }
 
         // After GC, nursery should be reset
-        nursery_end = (ctx.mmin < SEMISPACE_SIZE)
-            ? SEMISPACE_SIZE : 2 * SEMISPACE_SIZE;
+        nursery_end =
+            (ctx.mmin < SEMISPACE_SIZE) ? SEMISPACE_SIZE : 2 * SEMISPACE_SIZE;
         if (ctx.nursery_ptr >= nursery_end) {
             lisp_panic("out of memory (nursery still full after GC)");
         }
@@ -1069,7 +1074,8 @@ unsigned collect(unsigned x)
     // After swap at start of gc(): nmin was old mmin, hptr started at nmin
     // So to-space is: [old nmin, ctx.hptr)
     // From-space is: the other semispace
-    unsigned to_space_start = (ctx.hptr < SEMISPACE_SIZE) ? HEAP_RESERVED : SEMISPACE_SIZE;
+    unsigned to_space_start =
+        (ctx.hptr < SEMISPACE_SIZE) ? HEAP_RESERVED : SEMISPACE_SIZE;
     unsigned to_space_end = ctx.hptr;
     if (x >= to_space_start && x < to_space_end) {
         // Cell is already in to-space, no collection needed
@@ -1158,7 +1164,8 @@ unsigned gc(unsigned root)
 {
     ctx.major_gc_count++;
 #ifdef DEBUG_GC
-    fprintf(stderr, "[GC #%d] start, hptr=%u, root=%u\n", ctx.major_gc_count, ctx.hptr, root);
+    fprintf(stderr, "[GC #%d] start, hptr=%u, root=%u\n", ctx.major_gc_count,
+            ctx.hptr, root);
 #endif
 
     // Enter GC mode - alloc() will use old gen instead of nursery
@@ -1242,10 +1249,13 @@ unsigned gc(unsigned root)
             CELL_CAR(scan) = collect(CELL_CAR(scan));
             CELL_CDR(scan) = collect(CELL_CDR(scan));
             // Debug: verify car was updated if it was in old space
-            unsigned new_min = (ctx.hptr < SEMISPACE_SIZE) ? 271 : SEMISPACE_SIZE;
-            if (old_car >= HEAP_RESERVED && old_car >= new_min + SEMISPACE_SIZE &&
+            unsigned new_min =
+                (ctx.hptr < SEMISPACE_SIZE) ? 271 : SEMISPACE_SIZE;
+            if (old_car >= HEAP_RESERVED &&
+                old_car >= new_min + SEMISPACE_SIZE &&
                 CELL_CAR(scan) == old_car) {
-                fprintf(stderr, "[GC_BUG] scan=%u: car=%u unchanged after collect!\n",
+                fprintf(stderr,
+                        "[GC_BUG] scan=%u: car=%u unchanged after collect!\n",
                         scan, old_car);
             }
         }
@@ -1322,7 +1332,8 @@ unsigned gc(unsigned root)
     in_gc_mode = false;
 
 #ifdef DEBUG_GC
-    fprintf(stderr, "[GC #%d] done, hptr=%u, root=%u\n", ctx.major_gc_count, ctx.hptr, root);
+    fprintf(stderr, "[GC #%d] done, hptr=%u, root=%u\n", ctx.major_gc_count,
+            ctx.hptr, root);
 #endif
     return root;
 }
@@ -1508,36 +1519,38 @@ unsigned minor_gc(unsigned root)
     // Scan dirty cards in old generation for nursery pointers
     // Skip if generational GC is disabled (no card table)
     if (ctx.card_table) {
-    // Use 'scan' as limit - cells from scan onward are being promoted during this GC
-    unsigned card_start = ctx.mmin / CARD_SIZE;
-    unsigned card_end = (scan + CARD_SIZE - 1) / CARD_SIZE; // Cards up to original hptr
-    for (unsigned card = card_start; card < card_end; card++) {
-        if (!ctx.card_table[card])
-            continue;
-        // Scan all cells in this card
-        unsigned cell_start = card * CARD_SIZE;
-        unsigned cell_end = cell_start + CARD_SIZE;
-        if (cell_start < ctx.mmin)
-            cell_start = ctx.mmin;
-        if (cell_end > scan)
-            cell_end = scan; // Only scan cells that existed before this GC
-        for (unsigned cell = cell_start; cell < cell_end; cell++) {
-            enum lisp_type t = CELL_TYPE(cell);
-            if (t == BT_CONS || t == BT_FUNCTION || t == BT_MACRO ||
-                t == BT_SYNTAX || t == BT_CONT || t == BT_RATIONAL ||
-                t == BT_COMPLEX) {
-                CELL_CAR(cell) = collect_to_old(CELL_CAR(cell));
-                CELL_CDR(cell) = collect_to_old(CELL_CDR(cell));
-            } else if (t == BT_VECTOR) {
-                vector_data *vd = (vector_data *)(intptr_t)CELL_ID(cell);
-                for (unsigned j = 0; j < vd->len; j++) {
-                    vd->data[j] = collect_to_old(vd->data[j]);
+        // Use 'scan' as limit - cells from scan onward are being promoted
+        // during this GC
+        unsigned card_start = ctx.mmin / CARD_SIZE;
+        unsigned card_end =
+            (scan + CARD_SIZE - 1) / CARD_SIZE; // Cards up to original hptr
+        for (unsigned card = card_start; card < card_end; card++) {
+            if (!ctx.card_table[card])
+                continue;
+            // Scan all cells in this card
+            unsigned cell_start = card * CARD_SIZE;
+            unsigned cell_end = cell_start + CARD_SIZE;
+            if (cell_start < ctx.mmin)
+                cell_start = ctx.mmin;
+            if (cell_end > scan)
+                cell_end = scan; // Only scan cells that existed before this GC
+            for (unsigned cell = cell_start; cell < cell_end; cell++) {
+                enum lisp_type t = CELL_TYPE(cell);
+                if (t == BT_CONS || t == BT_FUNCTION || t == BT_MACRO ||
+                    t == BT_SYNTAX || t == BT_CONT || t == BT_RATIONAL ||
+                    t == BT_COMPLEX) {
+                    CELL_CAR(cell) = collect_to_old(CELL_CAR(cell));
+                    CELL_CDR(cell) = collect_to_old(CELL_CDR(cell));
+                } else if (t == BT_VECTOR) {
+                    vector_data *vd = (vector_data *)(intptr_t)CELL_ID(cell);
+                    for (unsigned j = 0; j < vd->len; j++) {
+                        vd->data[j] = collect_to_old(vd->data[j]);
+                    }
                 }
             }
+            // Clear the card
+            ctx.card_table[card] = 0;
         }
-        // Clear the card
-        ctx.card_table[card] = 0;
-    }
     } // end if (ctx.card_table)
 
     // Scan newly promoted objects in old gen

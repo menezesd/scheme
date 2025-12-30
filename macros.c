@@ -458,14 +458,16 @@ unsigned syntax_expand(unsigned tmpl, unsigned bindings, unsigned mark)
                 list_append(&result, &result_tail, expanded);
                 gc_unprotect(3); // expanded, current_value, iter_bindings
             }
-            gc_unprotect(6); // ellipsis_pattern, rest_tmpl, elem_tmpl, ellipsis_values, result_tail, result
+            gc_unprotect(6); // ellipsis_pattern, rest_tmpl, elem_tmpl,
+                             // ellipsis_values, result_tail, result
 
             // Append expanded rest
             gc_protect(&result);
             gc_protect(&result_tail);
             unsigned rest_expanded = syntax_expand(rest_tmpl, bindings, mark);
             if (result) {
-                write_barrier(result_tail, rest_expanded); // result_tail may be in old gen
+                write_barrier(result_tail,
+                              rest_expanded); // result_tail may be in old gen
                 CELL_CDR(result_tail) = rest_expanded;
                 gc_unprotect(4); // result_tail, result, bindings, tmpl
                 return result;
@@ -549,8 +551,7 @@ unsigned syntax_expand(unsigned tmpl, unsigned bindings, unsigned mark)
             gc_protect(&elem_tmpl);
             gc_protect(&bindings);
 
-            for (; ellipsis_values; ellipsis_values = cdr(ellipsis_values))
-            {
+            for (; ellipsis_values; ellipsis_values = cdr(ellipsis_values)) {
                 unsigned current_value = car(ellipsis_values);
                 unsigned iter_bindings = bindings;
                 gc_protect(&iter_bindings);
@@ -561,8 +562,7 @@ unsigned syntax_expand(unsigned tmpl, unsigned bindings, unsigned mark)
                         syntax_match(ellipsis_pattern, current_value, 0, 0);
                     if (sub_bindings != TOK_ERROR) {
                         gc_protect(&sub_bindings);
-                        for (; sub_bindings; sub_bindings = cdr(sub_bindings))
-                        {
+                        for (; sub_bindings; sub_bindings = cdr(sub_bindings)) {
                             unsigned sb_car = car(sub_bindings);
                             gc_protect(&sb_car);
                             iter_bindings = alloc_cons(sb_car, iter_bindings);
@@ -582,7 +582,8 @@ unsigned syntax_expand(unsigned tmpl, unsigned bindings, unsigned mark)
                 result_data[idx++] =
                     syntax_expand(elem_tmpl, iter_bindings, mark);
             }
-            gc_unprotect(4); // bindings, elem_tmpl, ellipsis_pattern, ellipsis_values
+            gc_unprotect(
+                4); // bindings, elem_tmpl, ellipsis_pattern, ellipsis_values
 
             // Expand elements after ellipsis
             for (unsigned i = 0; i < post_count; i++) {
@@ -652,7 +653,8 @@ unsigned apply_syntax(unsigned transformer, unsigned input, unsigned use_env)
 
             gc_protect(&bindings);
             unsigned result = syntax_expand(tmpl, bindings, mark);
-            gc_unprotect(6); // bindings, tmpl, rules, literals, input, transformer
+            gc_unprotect(
+                6); // bindings, tmpl, rules, literals, input, transformer
             return result;
         }
     }

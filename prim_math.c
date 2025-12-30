@@ -14,10 +14,8 @@
 
 // xoshiro256** PRNG - fast, high-quality random number generator
 // Based on: https://prng.di.unimi.it/
-static uint64_t rng_state[4] = {
-    0x853c49e6748fea9bULL, 0xda3e39cb94b95bdbULL,
-    0x647c4677a2884327ULL, 0xc3f5015f73e1f6f4ULL
-};
+static uint64_t rng_state[4] = {0x853c49e6748fea9bULL, 0xda3e39cb94b95bdbULL,
+                                0x647c4677a2884327ULL, 0xc3f5015f73e1f6f4ULL};
 
 static inline uint64_t rotl(uint64_t x, int k)
 {
@@ -75,7 +73,8 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned args)
             return make_complex_inexact(real, imag);
         }
 
-        // Handle exact rationals: sqrt(a/b) = sqrt(a)/sqrt(b) if both perfect squares
+        // Handle exact rationals: sqrt(a/b) = sqrt(a)/sqrt(b) if both perfect
+        // squares
         if (t == BT_RATIONAL) {
             int64_t num, denom;
             get_rational_parts(arg, &num, &denom);
@@ -83,7 +82,8 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned args)
                 int64_t sqrt_num = (int64_t)sqrt((double)num);
                 int64_t sqrt_denom = (int64_t)sqrt((double)denom);
                 // Verify both are perfect squares
-                if (sqrt_num * sqrt_num == num && sqrt_denom * sqrt_denom == denom) {
+                if (sqrt_num * sqrt_num == num &&
+                    sqrt_denom * sqrt_denom == denom) {
                     return store_rational(sqrt_num, sqrt_denom);
                 }
             }
@@ -228,7 +228,8 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned args)
             get_complex_parts(arg, &a, &b);
             // tan(a+bi) = (sin(2a) + i*sinh(2b)) / (cos(2a) + cosh(2b))
             double denom = cos(2 * a) + cosh(2 * b);
-            return make_complex_inexact(sin(2 * a) / denom, sinh(2 * b) / denom);
+            return make_complex_inexact(sin(2 * a) / denom,
+                                        sinh(2 * b) / denom);
         }
         return store_inexact(tan(to_double(arg)));
     }

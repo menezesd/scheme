@@ -199,7 +199,7 @@ unsigned bind_params(unsigned params, unsigned args)
         unsigned val = args ? car(args) : 0;
 
         unsigned vc = 0;
-        gc_protect(&val);  // val may be in nursery
+        gc_protect(&val); // val may be in nursery
         gc_protect(&vc);
         vc = alloc_cons(var, 0);
         unsigned ac = alloc_cons(val, 0);

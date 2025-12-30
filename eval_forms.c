@@ -25,7 +25,7 @@ bool handle_lambda(unsigned id, unsigned env, unsigned cont)
     unsigned params = cadr(id);
     unsigned body = cddr(id);
     gc_protect(&params);
-    gc_protect(&body);  // Must protect - used in alloc_cons
+    gc_protect(&body); // Must protect - used in alloc_cons
     gc_protect(&env);
     gc_protect(&cont);
     unsigned body_env = alloc_cons(body, env);
@@ -81,7 +81,7 @@ bool handle_set(unsigned id, unsigned env, unsigned cont)
 {
     unsigned var = cadr(id);
     unsigned val_expr = caddr(id);
-    gc_protect(&var);  // Must protect - used in make_cont
+    gc_protect(&var); // Must protect - used in make_cont
     gc_protect(&val_expr);
     gc_protect(&env);
     gc_protect(&cont);
@@ -101,7 +101,7 @@ bool handle_define(unsigned id, unsigned env, unsigned cont)
         unsigned body = cddr(id);
         gc_protect(&name);
         gc_protect(&params);
-        gc_protect(&body);  // Must protect - used in alloc_cons
+        gc_protect(&body); // Must protect - used in alloc_cons
         gc_protect(&env);
         gc_protect(&cont);
         unsigned body_env = alloc_cons(body, env);
@@ -112,7 +112,7 @@ bool handle_define(unsigned id, unsigned env, unsigned cont)
         return true;
     }
     unsigned val_expr = caddr(id);
-    gc_protect(&vid);  // Must protect - used in make_cont
+    gc_protect(&vid); // Must protect - used in make_cont
     gc_protect(&val_expr);
     gc_protect(&env);
     gc_protect(&cont);
@@ -324,7 +324,8 @@ bool handle_letrec(unsigned id, unsigned env, unsigned cont)
     inner = alloc_cons(vals, body);
     unsigned data = alloc_cons(bindings, inner);
     unsigned k = make_cont(CONT_LETREC_INIT, data, new_env, cont);
-    gc_unprotect(11); // inner, bindings, body, env, cont, vars, vals, vars_tail, vals_tail, new_env, first_val_expr
+    gc_unprotect(11); // inner, bindings, body, env, cont, vars, vals,
+                      // vars_tail, vals_tail, new_env, first_val_expr
     tramp_eval(first_val_expr, new_env, k);
     return true;
 }
@@ -349,7 +350,7 @@ bool handle_define_macro(unsigned id, unsigned env, unsigned cont)
     // Protect all values used after allocations
     gc_protect(&name);
     gc_protect(&params);
-    gc_protect(&mbody);  // Must protect - used in alloc_cons
+    gc_protect(&mbody); // Must protect - used in alloc_cons
     gc_protect(&env);
     gc_protect(&cont);
     unsigned mbody_env = alloc_cons(mbody, env);
@@ -439,7 +440,8 @@ bool dispatch_special_form(int64_t kw, unsigned id, unsigned env, unsigned cont)
     if (kw == ctx.kw_let || kw == ctx.kw_letstar || kw == ctx.kw_letrec) {
         unsigned mac = lookup(kw, env);
         if (mac != TOK_ERROR && IS_SYNTAX(mac)) {
-            // Protect all values that might be in nursery before macro expansion
+            // Protect all values that might be in nursery before macro
+            // expansion
             gc_protect(&id);
             gc_protect(&env);
             gc_protect(&cont);

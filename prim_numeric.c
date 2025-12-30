@@ -168,7 +168,8 @@ slow_path:;
         }
 
         if (all_complex_exact) {
-            // Exact complex multiplication: (a+bi) * (c+di) = (ac-bd) + (ad+bc)i
+            // Exact complex multiplication: (a+bi) * (c+di) = (ac-bd) +
+            // (ad+bc)i
             unsigned real_prod = store(1), imag_prod = store(0);
             gc_protect(&real_prod);
             gc_protect(&imag_prod);
@@ -448,7 +449,8 @@ slow_path:;
         }
 
         if (all_complex_exact) {
-            // Exact complex division: (a+bi)/(c+di) = (ac+bd)/(c²+d²) + (bc-ad)/(c²+d²)i
+            // Exact complex division: (a+bi)/(c+di) = (ac+bd)/(c²+d²) +
+            // (bc-ad)/(c²+d²)i
             unsigned real_res, imag_res;
             get_complex_cells(car(args), &real_res, &imag_res);
             gc_protect(&real_res);

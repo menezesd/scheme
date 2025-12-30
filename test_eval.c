@@ -250,7 +250,8 @@ TEST(eval_lambda_call)
 TEST(eval_lambda_closure)
 {
     unsigned env = default_environment();
-    unsigned result = eval_string("(((lambda (x) (lambda (y) (+ x y))) 10) 5)", env);
+    unsigned result =
+        eval_string("(((lambda (x) (lambda (y) (+ x y))) 10) 5)", env);
     ASSERT(is_int(result, 15));
     PASS();
 }
@@ -258,7 +259,8 @@ TEST(eval_lambda_closure)
 TEST(eval_lambda_rest_param)
 {
     unsigned env = default_environment();
-    unsigned result = eval_string("((lambda (x . rest) (length rest)) 1 2 3 4)", env);
+    unsigned result =
+        eval_string("((lambda (x . rest) (length rest)) 1 2 3 4)", env);
     ASSERT(is_int(result, 3));
     PASS();
 }
@@ -309,8 +311,7 @@ TEST(eval_let_simple)
 TEST(eval_let_nested)
 {
     unsigned env = default_environment();
-    unsigned result =
-        eval_string("(let ((x 1)) (let ((y 2)) (+ x y)))", env);
+    unsigned result = eval_string("(let ((x 1)) (let ((y 2)) (+ x y)))", env);
     ASSERT(is_int(result, 3));
     PASS();
 }
@@ -450,7 +451,9 @@ TEST(gc_shadow_stack_letrec)
     unsigned env = default_environment();
     int initial = get_shadow_stack_top();
 
-    eval_string("(letrec ((f (lambda (n) (if (< n 1) 1 (* n (f (- n 1))))))) (f 5))", env);
+    eval_string(
+        "(letrec ((f (lambda (n) (if (< n 1) 1 (* n (f (- n 1))))))) (f 5))",
+        env);
 
     int final = get_shadow_stack_top();
     ASSERT_EQ(initial, final);
@@ -506,8 +509,7 @@ TEST(eval_apply_simple)
 TEST(eval_apply_lambda)
 {
     unsigned env = default_environment();
-    unsigned result =
-        eval_string("(apply (lambda (x y) (+ x y)) '(3 4))", env);
+    unsigned result = eval_string("(apply (lambda (x y) (+ x y)) '(3 4))", env);
     ASSERT(is_int(result, 7));
     PASS();
 }

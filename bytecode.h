@@ -35,82 +35,84 @@
  */
 enum opcode {
     // Stack manipulation
-    OP_CONST,      // Push constant: CONST idx -> push constants[idx]
-    OP_POP,        // Discard top of stack
-    OP_DUP,        // Duplicate top of stack
+    OP_CONST, // Push constant: CONST idx -> push constants[idx]
+    OP_POP,   // Discard top of stack
+    OP_DUP,   // Duplicate top of stack
 
     // Variables
-    OP_LOOKUP,     // Variable lookup: LOOKUP sym_id -> push lookup(sym_id, env)
-    OP_DEFINE,     // Define variable: DEFINE sym_id -> pop val, defvar(sym_id, val)
-    OP_SET,        // Set variable: SET sym_id -> pop val, setvar(sym_id, val)
+    OP_LOOKUP, // Variable lookup: LOOKUP sym_id -> push lookup(sym_id, env)
+    OP_DEFINE, // Define variable: DEFINE sym_id -> pop val, defvar(sym_id, val)
+    OP_SET,    // Set variable: SET sym_id -> pop val, setvar(sym_id, val)
 
     // Closures and functions
-    OP_CLOSURE,    // Create closure: CLOSURE code_idx -> push closure(code[idx], env)
-    OP_CALL,       // Call function: CALL argc -> pop fn, pop argc args, apply
-    OP_TAILCALL,   // Tail call: TAILCALL argc -> like CALL but reuse frame
-    OP_RETURN,     // Return from function: RETURN -> pop val, restore frame
+    OP_CLOSURE,  // Create closure: CLOSURE code_idx -> push closure(code[idx],
+                 // env)
+    OP_CALL,     // Call function: CALL argc -> pop fn, pop argc args, apply
+    OP_TAILCALL, // Tail call: TAILCALL argc -> like CALL but reuse frame
+    OP_RETURN,   // Return from function: RETURN -> pop val, restore frame
 
     // Control flow
-    OP_JUMP,       // Unconditional jump: JUMP offset -> ip = offset
-    OP_JUMPIF,     // Jump if true: JUMPIF offset -> pop, if truthy: ip = offset
-    OP_JUMPIFNOT,  // Jump if false: JUMPIFNOT offset -> pop, if falsy: ip = offset
+    OP_JUMP,      // Unconditional jump: JUMP offset -> ip = offset
+    OP_JUMPIF,    // Jump if true: JUMPIF offset -> pop, if truthy: ip = offset
+    OP_JUMPIFNOT, // Jump if false: JUMPIFNOT offset -> pop, if falsy: ip =
+                  // offset
 
     // Primitives (inline for common operations)
-    OP_PRIM,       // Call primitive: PRIM prim_id argc -> apply primitive
+    OP_PRIM, // Call primitive: PRIM prim_id argc -> apply primitive
 
     // Special operations
-    OP_PUSHCONT,   // Capture continuation: push reified continuation
-    OP_CALLCC,     // call/cc: CALLCC -> pop proc, call with captured continuation
-    OP_APPLY,      // apply primitive: APPLY -> pop proc, pop args-list, apply
+    OP_PUSHCONT, // Capture continuation: push reified continuation
+    OP_CALLCC,   // call/cc: CALLCC -> pop proc, call with captured continuation
+    OP_APPLY,    // apply primitive: APPLY -> pop proc, pop args-list, apply
 
     // Environment
-    OP_PUSHENV,    // Push new empty frame onto environment
-    OP_POPENV,     // Pop frame from environment (for let scope exit)
+    OP_PUSHENV, // Push new empty frame onto environment
+    OP_POPENV,  // Pop frame from environment (for let scope exit)
 
     // Multiple values
-    OP_VALUES,     // Wrap N values: VALUES n -> pop n vals, push multival
+    OP_VALUES,         // Wrap N values: VALUES n -> pop n vals, push multival
     OP_CALLWITHVALUES, // call-with-values: pop consumer, pop producer, call
 
     // Macros (compile-time only, but needed for dynamic define-syntax)
-    OP_DEFSYNTAX,  // Define syntax: DEFSYNTAX sym_id -> pop transformer
+    OP_DEFSYNTAX, // Define syntax: DEFSYNTAX sym_id -> pop transformer
 
     // Halt
-    OP_HALT,       // Stop execution: HALT -> vm returns top of stack
+    OP_HALT, // Stop execution: HALT -> vm returns top of stack
 
     // Specialized opcodes for common operations (fast paths)
-    OP_CAR,        // Inline car: pop pair, push car
-    OP_CDR,        // Inline cdr: pop pair, push cdr
-    OP_CONS,       // Inline cons: pop cdr, pop car, push cons(car, cdr)
-    OP_NULLP,      // Inline null?: pop val, push (val == nil)
-    OP_PAIRP,      // Inline pair?: pop val, push (type == BT_CONS)
-    OP_ADD1,       // Increment: pop n, push n+1
-    OP_SUB1,       // Decrement: pop n, push n-1
-    OP_ZEROP,      // Zero check: pop n, push (n == 0)
-    OP_NOT,        // Boolean not: pop val, push (val == #f)
-    OP_EQ,         // Pointer equality: pop b, pop a, push (a eq? b)
+    OP_CAR,   // Inline car: pop pair, push car
+    OP_CDR,   // Inline cdr: pop pair, push cdr
+    OP_CONS,  // Inline cons: pop cdr, pop car, push cons(car, cdr)
+    OP_NULLP, // Inline null?: pop val, push (val == nil)
+    OP_PAIRP, // Inline pair?: pop val, push (type == BT_CONS)
+    OP_ADD1,  // Increment: pop n, push n+1
+    OP_SUB1,  // Decrement: pop n, push n-1
+    OP_ZEROP, // Zero check: pop n, push (n == 0)
+    OP_NOT,   // Boolean not: pop val, push (val == #f)
+    OP_EQ,    // Pointer equality: pop b, pop a, push (a eq? b)
 
     // Specialized arithmetic opcodes (2 operands)
-    OP_ADD,        // Add: pop b, pop a, push a+b
-    OP_SUB,        // Subtract: pop b, pop a, push a-b
-    OP_MUL,        // Multiply: pop b, pop a, push a*b
-    OP_DIV,        // Divide: pop b, pop a, push a/b
-    OP_MOD,        // Modulo: pop b, pop a, push a%b
+    OP_ADD, // Add: pop b, pop a, push a+b
+    OP_SUB, // Subtract: pop b, pop a, push a-b
+    OP_MUL, // Multiply: pop b, pop a, push a*b
+    OP_DIV, // Divide: pop b, pop a, push a/b
+    OP_MOD, // Modulo: pop b, pop a, push a%b
 
     // Specialized comparison opcodes (2 operands)
-    OP_LT,         // Less than: pop b, pop a, push a<b
-    OP_GT,         // Greater than: pop b, pop a, push a>b
-    OP_LE,         // Less or equal: pop b, pop a, push a<=b
-    OP_GE,         // Greater or equal: pop b, pop a, push a>=b
-    OP_NUMEQ,      // Numeric equal: pop b, pop a, push a=b
+    OP_LT,    // Less than: pop b, pop a, push a<b
+    OP_GT,    // Greater than: pop b, pop a, push a>b
+    OP_LE,    // Less or equal: pop b, pop a, push a<=b
+    OP_GE,    // Greater or equal: pop b, pop a, push a>=b
+    OP_NUMEQ, // Numeric equal: pop b, pop a, push a=b
 
     // More list operations
-    OP_CADR,       // Inline cadr: pop pair, push cadr
-    OP_CDDR,       // Inline cddr: pop pair, push cddr
-    OP_SETCAR,     // Set car: pop val, pop pair, set-car!
-    OP_SETCDR,     // Set cdr: pop val, pop pair, set-cdr!
-    OP_LIST1,      // Make 1-element list: pop a, push (a)
-    OP_LIST2,      // Make 2-element list: pop b, pop a, push (a b)
-    OP_LIST3,      // Make 3-element list: pop c, pop b, pop a, push (a b c)
+    OP_CADR,   // Inline cadr: pop pair, push cadr
+    OP_CDDR,   // Inline cddr: pop pair, push cddr
+    OP_SETCAR, // Set car: pop val, pop pair, set-car!
+    OP_SETCDR, // Set cdr: pop val, pop pair, set-cdr!
+    OP_LIST1,  // Make 1-element list: pop a, push (a)
+    OP_LIST2,  // Make 2-element list: pop b, pop a, push (a b)
+    OP_LIST3,  // Make 3-element list: pop c, pop b, pop a, push (a b c)
 };
 
 // ============================================================================
@@ -125,30 +127,30 @@ enum opcode {
  * code object (with different captured environments).
  */
 typedef struct code_object {
-    unsigned *code;         // Bytecode instruction array
-    unsigned code_len;      // Number of instructions
-    unsigned code_cap;      // Allocated capacity
+    unsigned *code;    // Bytecode instruction array
+    unsigned code_len; // Number of instructions
+    unsigned code_cap; // Allocated capacity
 
-    unsigned *constants;    // Constant pool (cell indices)
-    unsigned const_len;     // Number of constants
-    unsigned const_cap;     // Allocated capacity
+    unsigned *constants; // Constant pool (cell indices)
+    unsigned const_len;  // Number of constants
+    unsigned const_cap;  // Allocated capacity
 
-    struct code_object **children;  // Nested code objects (for lambdas)
+    struct code_object **children; // Nested code objects (for lambdas)
     unsigned children_len;
     unsigned children_cap;
 
-    unsigned params;        // Parameter list (cell index to list of symbols)
-    unsigned arity;         // Number of required parameters
-    bool has_rest;          // True if has rest parameter
-    unsigned rest_idx;      // Index of rest parameter (if has_rest)
+    unsigned params;   // Parameter list (cell index to list of symbols)
+    unsigned arity;    // Number of required parameters
+    bool has_rest;     // True if has rest parameter
+    unsigned rest_idx; // Index of rest parameter (if has_rest)
 
     // Source info for debugging
-    const char *name;       // Function name (if known)
-    unsigned source_line;   // Source line number
+    const char *name;     // Function name (if known)
+    unsigned source_line; // Source line number
 
     // GC integration: linked list of all code objects
     struct code_object *gc_next;
-    bool gc_marked;         // True if reachable during current GC
+    bool gc_marked; // True if reachable during current GC
 } code_object;
 
 // Global registry of all code objects (for GC)
@@ -165,7 +167,7 @@ extern code_object *code_object_registry;
  * Stored as a cons cell: car = BT_CLOSURE marker cell, cdr = env
  * The marker cell's id holds the code_object pointer.
  */
-#define BT_CLOSURE 100  // New cell type for VM closures
+#define BT_CLOSURE 100 // New cell type for VM closures
 
 // Accessor macros for closures - code_object* stored in separate cell's id
 #define GET_CLOSURE_CODE(c) ((code_object *)(intptr_t)CELL_ID(CELL_CAR(c)))
@@ -181,10 +183,10 @@ extern code_object *code_object_registry;
  * Each function call pushes a frame. Frames track return state.
  */
 typedef struct {
-    code_object *code;      // Code being executed
-    unsigned ip;            // Return address (instruction pointer)
-    unsigned bp;            // Base pointer (stack position before args)
-    unsigned env;           // Environment to restore
+    code_object *code; // Code being executed
+    unsigned ip;       // Return address (instruction pointer)
+    unsigned bp;       // Base pointer (stack position before args)
+    unsigned env;      // Environment to restore
 } vm_frame;
 
 // ============================================================================
@@ -196,24 +198,24 @@ typedef struct {
  */
 typedef struct {
     // Value stack
-    unsigned *stack;        // Value stack (cell indices)
-    unsigned sp;            // Stack pointer (next free slot)
-    unsigned stack_cap;     // Stack capacity
+    unsigned *stack;    // Value stack (cell indices)
+    unsigned sp;        // Stack pointer (next free slot)
+    unsigned stack_cap; // Stack capacity
 
     // Call stack
-    vm_frame *frames;       // Call frame stack
-    unsigned fp;            // Frame pointer (current frame index)
-    unsigned frames_cap;    // Frames capacity
+    vm_frame *frames;    // Call frame stack
+    unsigned fp;         // Frame pointer (current frame index)
+    unsigned frames_cap; // Frames capacity
 
     // Current execution state
-    code_object *code;      // Current code object
-    unsigned ip;            // Instruction pointer
-    unsigned env;           // Current environment
+    code_object *code; // Current code object
+    unsigned ip;       // Instruction pointer
+    unsigned env;      // Current environment
 
     // Status
-    bool running;           // True while VM is executing
-    bool error;             // True if error occurred
-    const char *error_msg;  // Error message (if error)
+    bool running;          // True while VM is executing
+    bool error;            // True if error occurred
+    const char *error_msg; // Error message (if error)
 } vm_state;
 
 // ============================================================================
@@ -224,10 +226,10 @@ typedef struct {
  * Compiler state during code generation.
  */
 typedef struct compile_ctx {
-    code_object *code;              // Code object being built
-    struct compile_ctx *parent;     // Parent context (for nested lambdas)
-    unsigned env;                   // Compile-time environment (for macros)
-    bool tail_position;             // True if compiling in tail position
+    code_object *code;          // Code object being built
+    struct compile_ctx *parent; // Parent context (for nested lambdas)
+    unsigned env;               // Compile-time environment (for macros)
+    bool tail_position;         // True if compiling in tail position
 } compile_ctx;
 
 // ============================================================================
@@ -259,10 +261,11 @@ unsigned vm_pop(vm_state *vm);
 unsigned gc_collect_code(code_object *code);
 void gc_update_vm_roots(vm_state *vm);
 void gc_update_vm_roots_minor(vm_state *vm, unsigned (*collector)(unsigned));
-void gc_update_all_code_objects(void);  // Update all code object constants during GC
-void code_register(code_object *code);  // Add code object to GC registry
-void gc_sweep_code_objects(void);       // Free unreachable code objects after GC
-vm_state *get_active_vm(void);          // Get currently running VM (for GC)
+void gc_update_all_code_objects(
+    void); // Update all code object constants during GC
+void code_register(code_object *code); // Add code object to GC registry
+void gc_sweep_code_objects(void);      // Free unreachable code objects after GC
+vm_state *get_active_vm(void);         // Get currently running VM (for GC)
 
 // Disassembler
 void disassemble(code_object *code, const char *name);

@@ -102,7 +102,7 @@ enum cont_type {
     CONT_MACRO_EXPAND, // Macro expansion done; data = 0, env, next
     CONT_CALLWITHVALUES, // call-with-values producer done; data = consumer,
                          // env, next
-    CONT_COUNT // Number of continuation types (must be last)
+    CONT_COUNT           // Number of continuation types (must be last)
 };
 
 enum token {
@@ -194,12 +194,12 @@ typedef struct {
 // ============================================================================
 
 #define TABLE_SIZE 999983             // Size of atom table (prime for hashing)
-#define SEMISPACE_SIZE (16384 * 1024)        // Size of each GC semispace (16M cells)
+#define SEMISPACE_SIZE (16384 * 1024) // Size of each GC semispace (16M cells)
 #define INITIAL_STRING_CAP 32         // Initial capacity for string buffers
 
 // Generational GC settings (currently disabled due to bugs)
-#define NURSERY_SIZE (256 * 1024)     // Size of nursery (young generation)
-#define CARD_SIZE 512                 // Cells per card (2KB on 64-bit)
+#define NURSERY_SIZE (256 * 1024) // Size of nursery (young generation)
+#define CARD_SIZE 512             // Cells per card (2KB on 64-bit)
 
 // Reserved cell IDs for permanent atoms (never garbage collected)
 #define CELL_ATOM_TRUE 10
@@ -227,11 +227,12 @@ typedef struct {
     unsigned atom_quote;
     unsigned atom_true;
     // Generational GC state
-    unsigned nursery_start;  // Start of nursery region
-    unsigned nursery_ptr;    // Next free cell in nursery (bump pointer)
-    uint8_t *card_table;     // Card table for write barrier (1 byte per CARD_SIZE cells)
-    unsigned minor_gc_count;  // Statistics: number of minor GCs
-    unsigned major_gc_count;  // Statistics: number of major GCs
+    unsigned nursery_start; // Start of nursery region
+    unsigned nursery_ptr;   // Next free cell in nursery (bump pointer)
+    uint8_t *
+        card_table; // Card table for write barrier (1 byte per CARD_SIZE cells)
+    unsigned minor_gc_count; // Statistics: number of minor GCs
+    unsigned major_gc_count; // Statistics: number of major GCs
     // Cached keyword IDs
     int kw_quote;
     int kw_lambda;

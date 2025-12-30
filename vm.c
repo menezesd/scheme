@@ -680,8 +680,8 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
 
             unsigned literals = cadr(transformer_form);
             unsigned rules = cddr(transformer_form);
-            unsigned transformer =
-                make_typed_cell(BT_SYNTAX, alloc_cons(literals, rules), vm->env);
+            unsigned transformer = make_typed_cell(
+                BT_SYNTAX, alloc_cons(literals, rules), vm->env);
 
             // Define in current environment
             unsigned atom = alloc();

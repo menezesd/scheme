@@ -421,7 +421,9 @@ unsigned read_token(void)
                         return TOK_ERROR;
                     // Copy datum content into placeholder
                     if (IS_PAIR(datum)) {
-                        write_barrier(placeholder, car(datum)); // placeholder may be in old gen
+                        write_barrier(
+                            placeholder,
+                            car(datum)); // placeholder may be in old gen
                         write_barrier(placeholder, cdr(datum));
                         CELL_CAR(placeholder) = car(datum);
                         CELL_CDR(placeholder) = cdr(datum);

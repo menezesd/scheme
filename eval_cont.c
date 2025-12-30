@@ -86,7 +86,8 @@ void handle_cont_cond_test(unsigned val, unsigned data, unsigned env,
         } else if (!cdr(conseq)) {
             tramp_eval(car(conseq), env, next);
         } else {
-            // Extract first expr and rest before allocation, protect all used after
+            // Extract first expr and rest before allocation, protect all used
+            // after
             unsigned first_expr = car(conseq);
             unsigned rest_conseq = cdr(conseq);
             gc_protect(&first_expr);
@@ -110,7 +111,8 @@ void handle_cont_cond_test(unsigned val, unsigned data, unsigned env,
                 } else if (!cdr(conseq2)) {
                     tramp_eval(car(conseq2), env, next);
                 } else {
-                    // Extract first expr and rest before allocation, protect all used after
+                    // Extract first expr and rest before allocation, protect
+                    // all used after
                     unsigned first_expr2 = car(conseq2);
                     unsigned rest_conseq2 = cdr(conseq2);
                     gc_protect(&first_expr2);
@@ -171,7 +173,8 @@ void handle_cont_let_vals(unsigned val, unsigned data, unsigned env,
     } else {
         unsigned bind = car(rest_bindings);
 #ifdef DEBUG_GC
-        fprintf(stderr, "[LET_VALS else] bind=%u bind_type=%d\n", bind, CELL_TYPE(bind));
+        fprintf(stderr, "[LET_VALS else] bind=%u bind_type=%d\n", bind,
+                CELL_TYPE(bind));
 #endif
         unsigned new_vars = vars;
         unsigned new_vals = vals;
@@ -200,7 +203,8 @@ void handle_cont_let_vals(unsigned val, unsigned data, unsigned env,
 
         unsigned next_val_expr = cadr(bind);
 #ifdef DEBUG_GC
-        fprintf(stderr, "[LET_VALS else] next_val_expr=%u expr_type=%d\n", next_val_expr, CELL_TYPE(next_val_expr));
+        fprintf(stderr, "[LET_VALS else] next_val_expr=%u expr_type=%d\n",
+                next_val_expr, CELL_TYPE(next_val_expr));
 #endif
         gc_protect(&next_val_expr);
         unsigned inner = 0, middle = 0;
@@ -335,7 +339,8 @@ void handle_cont_eval_fn(unsigned val, unsigned data, unsigned env,
             gc_protect(&first_expr);
             gc_protect(&menv);
             unsigned k2 = make_cont(CONT_MACRO_EXPAND, 0, env, next);
-            gc_unprotect(11); // first_expr, menv, frame, next, env, macroenv, mbody + 4 params
+            gc_unprotect(11); // first_expr, menv, frame, next, env, macroenv,
+                              // mbody + 4 params
             tramp_eval(first_expr, menv, k2);
         } else {
             unsigned first_expr = car(mbody);
@@ -347,7 +352,8 @@ void handle_cont_eval_fn(unsigned val, unsigned data, unsigned env,
             gc_protect(&inner_k);
             inner_k = make_cont(CONT_MACRO_EXPAND, 0, env, next);
             unsigned k2 = make_cont(CONT_APPLY_FUNC, rest_mbody, menv, inner_k);
-            gc_unprotect(13); // inner_k, first_expr, rest_mbody, menv, frame, next, env, macroenv, mbody + 4 params
+            gc_unprotect(13); // inner_k, first_expr, rest_mbody, menv, frame,
+                              // next, env, macroenv, mbody + 4 params
             tramp_eval(first_expr, menv, k2);
         }
         return;
@@ -420,7 +426,8 @@ void handle_cont_eval_args(unsigned val, unsigned data, unsigned env,
             args = alloc_cons(car(l), args);
             gc_unprotect(1); // l
         }
-        gc_unprotect(8); // args, remaining, evaled_rev, fn, next, env, data, val
+        gc_unprotect(
+            8); // args, remaining, evaled_rev, fn, next, env, data, val
         apply_function(fn, args, env, next);
     } else {
         gc_protect(&new_evaled_rev);
@@ -432,7 +439,8 @@ void handle_cont_eval_args(unsigned val, unsigned data, unsigned env,
         inner = alloc_cons(new_evaled_rev, cdr(remaining));
         new_data = alloc_cons(fn, inner);
         unsigned k2 = make_cont(CONT_EVAL_ARGS, new_data, env, next);
-        gc_unprotect(11); // new_data, inner, first_arg, new_evaled_rev, remaining, evaled_rev, fn, next, env, data, val
+        gc_unprotect(11); // new_data, inner, first_arg, new_evaled_rev,
+                          // remaining, evaled_rev, fn, next, env, data, val
         tramp_eval(first_arg, env, k2);
     }
 }
@@ -444,7 +452,8 @@ void handle_cont_apply_func(unsigned val, unsigned data, unsigned env,
     if (!cdr(data)) {
         tramp_eval(car(data), env, next);
     } else {
-        // Extract first expr and rest before allocation, protect all used after alloc
+        // Extract first expr and rest before allocation, protect all used after
+        // alloc
         unsigned first_expr = car(data);
         unsigned rest = cdr(data);
         gc_protect(&first_expr);

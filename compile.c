@@ -94,8 +94,8 @@ unsigned code_add_child(code_object *code, code_object *child)
 {
     if (code->children_len >= code->children_cap) {
         code->children_cap *= 2;
-        code->children = realloc(code->children,
-                                 code->children_cap * sizeof(code_object *));
+        code->children =
+            realloc(code->children, code->children_cap * sizeof(code_object *));
     }
     code->children[code->children_len] = child;
     return code->children_len++;
@@ -113,8 +113,8 @@ void code_patch(code_object *code, unsigned pos, unsigned val)
 // ============================================================================
 
 typedef struct {
-    bool is_const;   // true if result is a compile-time constant
-    unsigned value;  // the constant value (only valid if is_const)
+    bool is_const;  // true if result is a compile-time constant
+    unsigned value; // the constant value (only valid if is_const)
 } compile_result;
 
 // Convenience constructors
@@ -250,10 +250,7 @@ static void cctx_free(compile_ctx *cctx)
 // Helper: Emit with operand
 // ============================================================================
 
-static void emit(compile_ctx *cctx, unsigned op)
-{
-    code_emit(cctx->code, op);
-}
+static void emit(compile_ctx *cctx, unsigned op) { code_emit(cctx->code, op); }
 
 static void emit2(compile_ctx *cctx, unsigned op, unsigned arg)
 {
@@ -733,8 +730,7 @@ static compile_result compile_or(unsigned expr, compile_ctx *cctx)
             if (result.value) {
                 // Constant true - short-circuit, rewind all bytecode
                 cctx->code->code_len = saved_pos;
-                emit2(cctx, OP_CONST,
-                      code_add_const(cctx->code, result.value));
+                emit2(cctx, OP_CONST, code_add_const(cctx->code, result.value));
                 return const_result(result.value);
             }
             // Constant false - can skip this expression if not last
@@ -848,8 +844,8 @@ static compile_result compile_define(unsigned expr, compile_ctx *cctx)
         unsigned body = cddr(expr);
 
         // Build lambda expression
-        unsigned lambda_expr = alloc_cons(atom_from_string("lambda"),
-                                          alloc_cons(params, body));
+        unsigned lambda_expr =
+            alloc_cons(atom_from_string("lambda"), alloc_cons(params, body));
 
         cctx->tail_position = false;
         compile_expr_internal(lambda_expr, cctx);
@@ -937,10 +933,7 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
                     }
                     // If folding failed (e.g., division by zero), re-compile
                     // normally
-                    FORLIST(a, args)
-                    {
-                        compile_expr_internal(car(a), cctx);
-                    }
+                    FORLIST(a, args) { compile_expr_internal(car(a), cctx); }
                 }
 
                 // Arguments already compiled, emit the operation
@@ -1076,10 +1069,7 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
             }
 
             // Compile arguments for general case
-            FORLIST(a, args)
-            {
-                compile_expr_internal(car(a), cctx);
-            }
+            FORLIST(a, args) { compile_expr_internal(car(a), cctx); }
 
             // Special handling for call/cc
             if (prim_id == PCALLCC) {

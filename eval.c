@@ -141,8 +141,11 @@ static void eval_step(void)
     case BT_ATOM: {
 #ifdef DEBUG_GC
         int64_t sym_id = CELL_ID(id);
-        fprintf(stderr, "[EVAL] ATOM id=%u sym_id=%lld env=%u (name=%s)\n", id, (long long)sym_id, env,
-                (sym_id >= 0 && sym_id < 1000000 && ctx.atom_table[sym_id]) ? ctx.atom_table[sym_id] : "?");
+        fprintf(stderr, "[EVAL] ATOM id=%u sym_id=%lld env=%u (name=%s)\n", id,
+                (long long)sym_id, env,
+                (sym_id >= 0 && sym_id < 1000000 && ctx.atom_table[sym_id])
+                    ? ctx.atom_table[sym_id]
+                    : "?");
 #endif
         unsigned val = lookup(CELL_ID(id), env);
         if (val == TOK_ERROR) {
@@ -165,13 +168,15 @@ static void eval_step(void)
         }
 
         // Not a special form - evaluate function position first
-        // Protect head, arg_exprs, env and cont - use pointer version for GC safety
+        // Protect head, arg_exprs, env and cont - use pointer version for GC
+        // safety
         unsigned arg_exprs = cdr(id);
         gc_protect(&head);
         gc_protect(&arg_exprs);
         gc_protect(&env);
         gc_protect(&cont);
-        unsigned k = make_cont_from_protected(CONT_EVAL_FN, &arg_exprs, &env, &cont);
+        unsigned k =
+            make_cont_from_protected(CONT_EVAL_FN, &arg_exprs, &env, &cont);
         gc_unprotect(4);
         tramp_eval(head, env, k);
         return;
@@ -422,7 +427,8 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
             gc_protect(&rest_body);
             gc_protect(&new_env);
             unsigned k = make_cont(CONT_APPLY_FUNC, rest_body, new_env, cont);
-            gc_unprotect(7); // first_expr, rest_body, new_env, frame, cont, def_env, body
+            gc_unprotect(7); // first_expr, rest_body, new_env, frame, cont,
+                             // def_env, body
             tramp_eval(first_expr, new_env, k);
         }
         return;
