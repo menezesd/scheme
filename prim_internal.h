@@ -88,7 +88,7 @@ static inline bool all_exact(unsigned args)
 // Numeric Tower Helpers
 // ============================================================================
 
-// Get real and imaginary parts of any number
+// Get real and imaginary parts of any number (as doubles)
 static inline void get_complex_parts(unsigned x, double *real, double *imag)
 {
     if (x == 0) {
@@ -103,6 +103,43 @@ static inline void get_complex_parts(unsigned x, double *real, double *imag)
         *real = to_double(x);
         *imag = 0.0;
     }
+}
+
+// Get real and imaginary parts as cells (preserves exactness)
+static inline void get_complex_cells(unsigned x, unsigned *real, unsigned *imag)
+{
+    if (x == 0) {
+        *real = store(0);
+        *imag = store(0);
+        return;
+    }
+    if (CELL_TYPE(x) == BT_COMPLEX) {
+        *real = CELL_CAR(x);
+        *imag = CELL_CDR(x);
+    } else {
+        *real = x;
+        *imag = store(0);
+    }
+}
+
+// Check if a complex number (or any number) is exact
+static inline bool is_complex_exact(unsigned x)
+{
+    if (CELL_TYPE(x) == BT_COMPLEX) {
+        return is_exact(CELL_CAR(x)) && is_exact(CELL_CDR(x));
+    }
+    return is_exact(x);
+}
+
+// Create complex result, simplifying to real if imaginary part is zero
+// Preserves exactness of components
+static inline unsigned make_complex_exact(unsigned real, unsigned imag)
+{
+    // Check if imaginary part is zero
+    double imag_d = to_double(imag);
+    if (imag_d == 0.0)
+        return real;
+    return store_complex(real, imag);
 }
 
 // Create result with appropriate exactness
@@ -220,7 +257,7 @@ static inline bool is_zero_cell(unsigned x)
 }
 
 // ============================================================================
-// Comparison Operations
+// Comparison Operations (type needed for binary functions below)
 // ============================================================================
 
 typedef enum { CMP_EQ, CMP_LT, CMP_GT, CMP_LE, CMP_GE } cmp_op;
@@ -232,6 +269,158 @@ typedef enum { CMP_EQ, CMP_LT, CMP_GT, CMP_LE, CMP_GE } cmp_op;
      : (op) == CMP_GT ? ((a) > (b))                                            \
      : (op) == CMP_LE ? ((a) <= (b))                                           \
                       : ((a) >= (b)))
+
+// ============================================================================
+// Direct Binary Arithmetic (for VM fast paths)
+// ============================================================================
+
+// Forward declarations for fallback paths
+unsigned prim_plus(unsigned args);
+unsigned prim_minus(unsigned args);
+unsigned prim_mult(unsigned args);
+unsigned prim_div(unsigned args);
+unsigned numeric_compare(unsigned args, cmp_op op);
+
+// Binary addition: a + b without list building
+// Returns TOK_ERROR on non-numeric operands
+static inline unsigned binary_add(unsigned a, unsigned b)
+{
+    // Fast path: both are small integers
+    if (IS_NUM(a) && IS_NUM(b)) {
+        int64_t va = CELL_ID(a);
+        int64_t vb = CELL_ID(b);
+        int64_t result;
+        if (!__builtin_add_overflow(va, vb, &result)) {
+            return store(result);
+        }
+        // Overflow - use bignum
+        bignum *ba = bn_from_int(va);
+        bignum *bb = bn_from_int(vb);
+        bn_add_ip(ba, bb);
+        bn_free(bb);
+        return store_integer(ba);
+    }
+    // Fall back to full numeric tower
+    gc_protect(&a);
+    gc_protect(&b);
+    unsigned args = alloc_cons(a, alloc_cons(b, 0));
+    gc_unprotect(2);
+    return prim_plus(args);
+}
+
+// Binary subtraction: a - b without list building
+static inline unsigned binary_sub(unsigned a, unsigned b)
+{
+    // Fast path: both are small integers
+    if (IS_NUM(a) && IS_NUM(b)) {
+        int64_t va = CELL_ID(a);
+        int64_t vb = CELL_ID(b);
+        int64_t result;
+        if (!__builtin_sub_overflow(va, vb, &result)) {
+            return store(result);
+        }
+        // Overflow - use bignum
+        bignum *ba = bn_from_int(va);
+        bignum *bb = bn_from_int(vb);
+        bn_sub_ip(ba, bb);
+        bn_free(bb);
+        return store_integer(ba);
+    }
+    // Fall back to full numeric tower
+    gc_protect(&a);
+    gc_protect(&b);
+    unsigned args = alloc_cons(a, alloc_cons(b, 0));
+    gc_unprotect(2);
+    return prim_minus(args);
+}
+
+// Binary multiplication: a * b without list building
+static inline unsigned binary_mul(unsigned a, unsigned b)
+{
+    // Fast path: both are small integers
+    if (IS_NUM(a) && IS_NUM(b)) {
+        int64_t va = CELL_ID(a);
+        int64_t vb = CELL_ID(b);
+        int64_t result;
+        if (!__builtin_mul_overflow(va, vb, &result)) {
+            return store(result);
+        }
+        // Overflow - use bignum
+        bignum *ba = bn_from_int(va);
+        bignum *bb = bn_from_int(vb);
+        bignum *br = bn_mul(ba, bb);
+        bn_free(ba);
+        bn_free(bb);
+        return store_integer(br);
+    }
+    // Fall back to full numeric tower
+    gc_protect(&a);
+    gc_protect(&b);
+    unsigned args = alloc_cons(a, alloc_cons(b, 0));
+    gc_unprotect(2);
+    return prim_mult(args);
+}
+
+// Binary division: a / b without list building
+static inline unsigned binary_div(unsigned a, unsigned b)
+{
+    // Fast path: both are small integers with exact division
+    if (IS_NUM(a) && IS_NUM(b)) {
+        int64_t va = CELL_ID(a);
+        int64_t vb = CELL_ID(b);
+        if (vb == 0) {
+            show_error("/: division by zero");
+            return TOK_ERROR;
+        }
+        if (va % vb == 0) {
+            // Exact division
+            return store(va / vb);
+        }
+        // Result is rational
+        return normalize_rational(va, vb);
+    }
+    // Fall back to full numeric tower
+    gc_protect(&a);
+    gc_protect(&b);
+    unsigned args = alloc_cons(a, alloc_cons(b, 0));
+    gc_unprotect(2);
+    return prim_div(args);
+}
+
+// Binary less-than comparison: a < b
+// Returns ctx.atom_true or 0
+static inline unsigned binary_lt(unsigned a, unsigned b)
+{
+    // Fast path: both are small integers
+    if (IS_NUM(a) && IS_NUM(b)) {
+        return CELL_ID(a) < CELL_ID(b) ? ctx.atom_true : 0;
+    }
+    // Fall back to full comparison
+    gc_protect(&a);
+    gc_protect(&b);
+    unsigned args = alloc_cons(a, alloc_cons(b, 0));
+    gc_unprotect(2);
+    return numeric_compare(args, CMP_LT);
+}
+
+// Binary numeric equality: a = b
+static inline unsigned binary_numeq(unsigned a, unsigned b)
+{
+    // Fast path: both are small integers
+    if (IS_NUM(a) && IS_NUM(b)) {
+        return CELL_ID(a) == CELL_ID(b) ? ctx.atom_true : 0;
+    }
+    // Fall back to full comparison
+    gc_protect(&a);
+    gc_protect(&b);
+    unsigned args = alloc_cons(a, alloc_cons(b, 0));
+    gc_unprotect(2);
+    return numeric_compare(args, CMP_EQ);
+}
+
+// ============================================================================
+// Comparison Helpers
+// ============================================================================
 
 // Compare two exact integers, returns -1, 0, or 1
 static inline int compare_exact_integers(unsigned a, unsigned b)

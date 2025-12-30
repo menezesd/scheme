@@ -29,6 +29,33 @@ slow_path:;
 
     switch (level) {
     case NUM_COMPLEX: {
+        // Check if all complex operands are exact
+        bool all_complex_exact = true;
+        FORLIST(a, args)
+        {
+            if (!is_complex_exact(car(a))) {
+                all_complex_exact = false;
+                break;
+            }
+        }
+
+        if (all_complex_exact) {
+            // Exact complex addition: (a+bi) + (c+di) = (a+c) + (b+d)i
+            unsigned real_sum = store(0), imag_sum = store(0);
+            gc_protect(&real_sum);
+            gc_protect(&imag_sum);
+            FORLIST(a, args)
+            {
+                unsigned r, i;
+                get_complex_cells(car(a), &r, &i);
+                real_sum = binary_add(real_sum, r);
+                imag_sum = binary_add(imag_sum, i);
+            }
+            gc_unprotect(2);
+            return make_complex_exact(real_sum, imag_sum);
+        }
+
+        // Fall back to inexact
         double real = 0.0, imag = 0.0;
         FORLIST(a, args)
         {
@@ -130,6 +157,46 @@ slow_path:;
 
     switch (level) {
     case NUM_COMPLEX: {
+        // Check if all complex operands are exact
+        bool all_complex_exact = true;
+        FORLIST(a, args)
+        {
+            if (!is_complex_exact(car(a))) {
+                all_complex_exact = false;
+                break;
+            }
+        }
+
+        if (all_complex_exact) {
+            // Exact complex multiplication: (a+bi) * (c+di) = (ac-bd) + (ad+bc)i
+            unsigned real_prod = store(1), imag_prod = store(0);
+            gc_protect(&real_prod);
+            gc_protect(&imag_prod);
+            FORLIST(a, args)
+            {
+                unsigned r, i;
+                get_complex_cells(car(a), &r, &i);
+                // nr = real*r - imag*i
+                // ni = real*i + imag*r
+                unsigned ac = binary_mul(real_prod, r);
+                gc_protect(&ac);
+                unsigned bd = binary_mul(imag_prod, i);
+                gc_protect(&bd);
+                unsigned ad = binary_mul(real_prod, i);
+                gc_protect(&ad);
+                unsigned bc = binary_mul(imag_prod, r);
+                gc_protect(&bc);
+                unsigned new_real = binary_sub(ac, bd);
+                unsigned new_imag = binary_add(ad, bc);
+                gc_unprotect(4);
+                real_prod = new_real;
+                imag_prod = new_imag;
+            }
+            gc_unprotect(2);
+            return make_complex_exact(real_prod, imag_prod);
+        }
+
+        // Fall back to inexact
         double real = 1.0, imag = 0.0;
         FORLIST(a, args)
         {
@@ -220,6 +287,42 @@ slow_path:;
 
     switch (level) {
     case NUM_COMPLEX: {
+        // Check if all complex operands are exact
+        bool all_complex_exact = true;
+        FORLIST(a, args)
+        {
+            if (!is_complex_exact(car(a))) {
+                all_complex_exact = false;
+                break;
+            }
+        }
+
+        if (all_complex_exact) {
+            // Exact complex subtraction: (a+bi) - (c+di) = (a-c) + (b-d)i
+            unsigned real_res, imag_res;
+            get_complex_cells(car(args), &real_res, &imag_res);
+            gc_protect(&real_res);
+            gc_protect(&imag_res);
+            unsigned rargs = cdr(args);
+            if (!rargs) {
+                // Unary negation
+                unsigned neg_real = negate_number(real_res);
+                gc_protect(&neg_real);
+                unsigned neg_imag = negate_number(imag_res);
+                gc_unprotect(3);
+                return make_complex_exact(neg_real, neg_imag);
+            }
+            for (; rargs; rargs = cdr(rargs)) {
+                unsigned r, i;
+                get_complex_cells(car(rargs), &r, &i);
+                real_res = binary_sub(real_res, r);
+                imag_res = binary_sub(imag_res, i);
+            }
+            gc_unprotect(2);
+            return make_complex_exact(real_res, imag_res);
+        }
+
+        // Fall back to inexact
         double real, imag;
         get_complex_parts(car(args), &real, &imag);
         unsigned rargs = cdr(args);
@@ -334,6 +437,82 @@ slow_path:;
 
     switch (level) {
     case NUM_COMPLEX: {
+        // Check if all complex operands are exact
+        bool all_complex_exact = true;
+        FORLIST(a, args)
+        {
+            if (!is_complex_exact(car(a))) {
+                all_complex_exact = false;
+                break;
+            }
+        }
+
+        if (all_complex_exact) {
+            // Exact complex division: (a+bi)/(c+di) = (ac+bd)/(c²+d²) + (bc-ad)/(c²+d²)i
+            unsigned real_res, imag_res;
+            get_complex_cells(car(args), &real_res, &imag_res);
+            gc_protect(&real_res);
+            gc_protect(&imag_res);
+            unsigned rargs = cdr(args);
+            if (!rargs) {
+                // Reciprocal: 1/(a+bi) = a/(a²+b²) - b/(a²+b²)i
+                unsigned a2 = binary_mul(real_res, real_res);
+                gc_protect(&a2);
+                unsigned b2 = binary_mul(imag_res, imag_res);
+                gc_protect(&b2);
+                unsigned denom = binary_add(a2, b2);
+                gc_unprotect(2);
+                gc_protect(&denom);
+                if (to_double(denom) == 0.0) {
+                    gc_unprotect(3);
+                    ERROR_RETURN("/: division by zero");
+                }
+                unsigned new_real = binary_div(real_res, denom);
+                gc_protect(&new_real);
+                unsigned neg_imag = negate_number(imag_res);
+                gc_protect(&neg_imag);
+                unsigned new_imag = binary_div(neg_imag, denom);
+                gc_unprotect(5);
+                return make_complex_exact(new_real, new_imag);
+            }
+            for (; rargs; rargs = cdr(rargs)) {
+                unsigned c, d;
+                get_complex_cells(car(rargs), &c, &d);
+                // (a+bi)/(c+di) = (ac+bd)/(c²+d²) + (bc-ad)/(c²+d²)i
+                unsigned ac = binary_mul(real_res, c);
+                gc_protect(&ac);
+                unsigned bd = binary_mul(imag_res, d);
+                gc_protect(&bd);
+                unsigned bc = binary_mul(imag_res, c);
+                gc_protect(&bc);
+                unsigned ad = binary_mul(real_res, d);
+                gc_protect(&ad);
+                unsigned c2 = binary_mul(c, c);
+                gc_protect(&c2);
+                unsigned d2 = binary_mul(d, d);
+                gc_protect(&d2);
+                unsigned denom = binary_add(c2, d2);
+                gc_unprotect(2);
+                gc_protect(&denom);
+                if (to_double(denom) == 0.0) {
+                    gc_unprotect(6);
+                    ERROR_RETURN("/: division by zero");
+                }
+                unsigned num_real = binary_add(ac, bd);
+                gc_unprotect(2);
+                gc_protect(&num_real);
+                unsigned num_imag = binary_sub(bc, ad);
+                gc_unprotect(2);
+                gc_protect(&num_imag);
+                real_res = binary_div(num_real, denom);
+                imag_res = binary_div(num_imag, denom);
+                gc_unprotect(3);
+            }
+            gc_unprotect(2);
+            return make_complex_exact(real_res, imag_res);
+        }
+
+        // Fall back to inexact
         double real, imag;
         get_complex_parts(car(args), &real, &imag);
         unsigned rargs = cdr(args);

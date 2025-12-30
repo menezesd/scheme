@@ -124,11 +124,19 @@ static unsigned find_ellipsis_binding(unsigned var, unsigned bindings)
 unsigned syntax_match(unsigned pattern, unsigned input, unsigned literals,
                       unsigned bindings)
 {
+    // Protect all parameters - this function is recursive and allocates
+    gc_protect(&pattern);
+    gc_protect(&input);
+    gc_protect(&literals);
+    gc_protect(&bindings);
+
     if (!pattern) {
+        gc_unprotect(4);
         return input ? TOK_ERROR : bindings;
     }
 
     if (is_underscore(pattern)) {
+        gc_unprotect(4);
         return bindings;
     }
 
@@ -138,20 +146,27 @@ unsigned syntax_match(unsigned pattern, unsigned input, unsigned literals,
 
         // Literal must match exactly
         if (is_literal(sym, literals)) {
+            gc_unprotect(4);
             if (IS_ATOM(input) && CELL_ID(input) == sym)
                 return bindings;
             return TOK_ERROR;
         }
 
         // Pattern variable - bind it
-        unsigned binding = alloc_cons(pattern, input);
-        return alloc_cons(binding, bindings);
+        unsigned binding = 0;
+        gc_protect(&binding);
+        binding = alloc_cons(pattern, input);
+        unsigned result = alloc_cons(binding, bindings);
+        gc_unprotect(5);
+        return result;
     }
 
     // Vector pattern - must match vector input element by element
     if (IS_VECTOR(pattern)) {
-        if (!IS_VECTOR(input))
+        if (!IS_VECTOR(input)) {
+            gc_unprotect(4);
             return TOK_ERROR;
+        }
 
         unsigned pat_len = vector_len(pattern);
         unsigned inp_len = vector_len(input);
@@ -170,8 +185,10 @@ unsigned syntax_match(unsigned pattern, unsigned input, unsigned literals,
         if (ellipsis_pos < pat_len) {
             // Pattern has ellipsis at position ellipsis_pos
             // Element before ellipsis is the repeated pattern
-            if (ellipsis_pos == 0)
+            if (ellipsis_pos == 0) {
+                gc_unprotect(4);
                 return TOK_ERROR; // No pattern before ellipsis
+            }
 
             unsigned elem_pattern = pat_data[ellipsis_pos - 1];
             unsigned pre_count =
@@ -179,15 +196,19 @@ unsigned syntax_match(unsigned pattern, unsigned input, unsigned literals,
             unsigned post_count =
                 pat_len - ellipsis_pos - 1; // Elements after ellipsis
 
-            if (inp_len < pre_count + post_count)
+            if (inp_len < pre_count + post_count) {
+                gc_unprotect(4);
                 return TOK_ERROR;
+            }
 
             // Match elements before the ellipsis pattern
             for (unsigned i = 0; i < pre_count; i++) {
                 bindings =
                     syntax_match(pat_data[i], inp_data[i], literals, bindings);
-                if (bindings == TOK_ERROR)
+                if (bindings == TOK_ERROR) {
+                    gc_unprotect(4);
                     return TOK_ERROR;
+                }
             }
 
             // Collect matches for the ellipsis pattern
@@ -197,14 +218,19 @@ unsigned syntax_match(unsigned pattern, unsigned input, unsigned literals,
                 unsigned inp_elem = inp_data[pre_count + i];
                 unsigned elem_bindings =
                     syntax_match(elem_pattern, inp_elem, literals, 0);
-                if (elem_bindings == TOK_ERROR)
+                if (elem_bindings == TOK_ERROR) {
+                    gc_unprotect(4);
                     return TOK_ERROR;
+                }
                 list_append(&matches, &matches_tail, inp_elem);
             }
 
             // Add ellipsis binding
-            unsigned ellipsis_binding = alloc_cons(elem_pattern, matches);
+            unsigned ellipsis_binding = 0;
+            gc_protect(&ellipsis_binding);
+            ellipsis_binding = alloc_cons(elem_pattern, matches);
             bindings = alloc_cons(ellipsis_binding, bindings);
+            gc_unprotect(1);
 
             // Match elements after ellipsis
             for (unsigned i = 0; i < post_count; i++) {
@@ -212,23 +238,31 @@ unsigned syntax_match(unsigned pattern, unsigned input, unsigned literals,
                 unsigned inp_idx = inp_len - post_count + i;
                 bindings = syntax_match(pat_data[pat_idx], inp_data[inp_idx],
                                         literals, bindings);
-                if (bindings == TOK_ERROR)
+                if (bindings == TOK_ERROR) {
+                    gc_unprotect(4);
                     return TOK_ERROR;
+                }
             }
 
+            gc_unprotect(4);
             return bindings;
         }
 
         // No ellipsis - lengths must match exactly
-        if (pat_len != inp_len)
+        if (pat_len != inp_len) {
+            gc_unprotect(4);
             return TOK_ERROR;
+        }
 
         for (unsigned i = 0; i < pat_len; i++) {
             bindings =
                 syntax_match(pat_data[i], inp_data[i], literals, bindings);
-            if (bindings == TOK_ERROR)
+            if (bindings == TOK_ERROR) {
+                gc_unprotect(4);
                 return TOK_ERROR;
+            }
         }
+        gc_unprotect(4);
         return bindings;
     }
 
@@ -247,9 +281,13 @@ unsigned syntax_match(unsigned pattern, unsigned input, unsigned literals,
                 unsigned tentative =
                     syntax_match(rest_pattern, rest_input, literals, bindings);
                 if (tentative != TOK_ERROR) {
-                    unsigned ellipsis_binding =
-                        alloc_cons(elem_pattern, matches);
-                    return alloc_cons(ellipsis_binding, tentative);
+                    unsigned ellipsis_binding = 0;
+                    gc_protect(&ellipsis_binding);
+                    ellipsis_binding = alloc_cons(elem_pattern, matches);
+                    gc_protect(&tentative);
+                    unsigned result = alloc_cons(ellipsis_binding, tentative);
+                    gc_unprotect(6);
+                    return result;
                 }
 
                 // Try to match one more element
@@ -267,26 +305,38 @@ unsigned syntax_match(unsigned pattern, unsigned input, unsigned literals,
             unsigned tentative =
                 syntax_match(rest_pattern, input, literals, bindings);
             if (tentative != TOK_ERROR) {
-                unsigned ellipsis_binding = alloc_cons(elem_pattern, matches);
-                return alloc_cons(ellipsis_binding, tentative);
+                unsigned ellipsis_binding = 0;
+                gc_protect(&ellipsis_binding);
+                ellipsis_binding = alloc_cons(elem_pattern, matches);
+                gc_protect(&tentative);
+                unsigned result = alloc_cons(ellipsis_binding, tentative);
+                gc_unprotect(6);
+                return result;
             }
+            gc_unprotect(4);
             return TOK_ERROR;
         }
 
         // Regular cons pattern
-        if (!IS_PAIR(input))
+        if (!IS_PAIR(input)) {
+            gc_unprotect(4);
             return TOK_ERROR;
+        }
 
         // Match car
         bindings = syntax_match(car(pattern), car(input), literals, bindings);
-        if (bindings == TOK_ERROR)
+        if (bindings == TOK_ERROR) {
+            gc_unprotect(4);
             return TOK_ERROR;
+        }
 
-        // Match cdr
+        // Match cdr - tail call, unprotect first
+        gc_unprotect(4);
         return syntax_match(cdr(pattern), cdr(input), literals, bindings);
     }
 
     // Other patterns (numbers, strings, etc.) must match exactly
+    gc_unprotect(4);
     if (CELL_TYPE(pattern) == CELL_TYPE(input) &&
         CELL_ID(pattern) == CELL_ID(input))
         return bindings;
@@ -302,12 +352,19 @@ unsigned syntax_expand(unsigned tmpl, unsigned bindings, unsigned mark)
 {
     (void)mark; // For now, we don't do full hygiene renaming
 
-    if (!tmpl)
+    // Protect parameters - this function is recursive and allocates
+    gc_protect(&tmpl);
+    gc_protect(&bindings);
+
+    if (!tmpl) {
+        gc_unprotect(2);
         return 0;
+    }
 
     // Atom - check if it's a pattern variable
     if (IS_ATOM(tmpl)) {
         unsigned lookup_result = syntax_lookup(tmpl, bindings);
+        gc_unprotect(2);
         if (lookup_result != TOK_ERROR)
             return lookup_result;
         return tmpl;
@@ -356,45 +413,76 @@ unsigned syntax_expand(unsigned tmpl, unsigned bindings, unsigned mark)
             }
 
             // Expand template for each ellipsis value
+            // Protect loop variables that survive across allocations
             unsigned result = 0, result_tail = 0;
+            gc_protect(&result);
+            gc_protect(&result_tail);
+            gc_protect(&ellipsis_values);
+            gc_protect(&elem_tmpl);
+            gc_protect(&rest_tmpl);
+            gc_protect(&ellipsis_pattern);
             for (; ellipsis_values; ellipsis_values = cdr(ellipsis_values)) {
                 unsigned current_value = car(ellipsis_values);
 
                 // Create iteration bindings
                 unsigned iter_bindings = bindings;
+                gc_protect(&iter_bindings);
+                gc_protect(&current_value);
                 if (ellipsis_pattern && IS_PAIR(ellipsis_pattern)) {
                     unsigned sub_bindings =
                         syntax_match(ellipsis_pattern, current_value, 0, 0);
                     if (sub_bindings != TOK_ERROR) {
-                        FORLIST(sb, sub_bindings)
-                        {
-                            iter_bindings = alloc_cons(car(sb), iter_bindings);
+                        // Protect sub_bindings across allocations
+                        unsigned sb = sub_bindings;
+                        gc_protect(&sb);
+                        while (sb) {
+                            unsigned sb_car = car(sb);
+                            gc_protect(&sb_car);
+                            iter_bindings = alloc_cons(sb_car, iter_bindings);
+                            gc_unprotect(1); // sb_car
+                            sb = cdr(sb);
                         }
+                        gc_unprotect(1); // sb
                     }
                 } else if (IS_ATOM(elem_tmpl)) {
-                    unsigned temp_binding =
-                        alloc_cons(elem_tmpl, current_value);
+                    unsigned temp_binding = 0;
+                    gc_protect(&temp_binding);
+                    temp_binding = alloc_cons(elem_tmpl, current_value);
                     iter_bindings = alloc_cons(temp_binding, bindings);
+                    gc_unprotect(1);
                 }
 
                 unsigned expanded =
                     syntax_expand(elem_tmpl, iter_bindings, mark);
+                gc_protect(&expanded);
                 list_append(&result, &result_tail, expanded);
+                gc_unprotect(3); // expanded, current_value, iter_bindings
             }
+            gc_unprotect(6); // ellipsis_pattern, rest_tmpl, elem_tmpl, ellipsis_values, result_tail, result
 
             // Append expanded rest
+            gc_protect(&result);
+            gc_protect(&result_tail);
             unsigned rest_expanded = syntax_expand(rest_tmpl, bindings, mark);
             if (result) {
+                write_barrier(result_tail, rest_expanded); // result_tail may be in old gen
                 CELL_CDR(result_tail) = rest_expanded;
+                gc_unprotect(4); // result_tail, result, bindings, tmpl
                 return result;
             }
+            gc_unprotect(4); // result_tail, result, bindings, tmpl
             return rest_expanded;
         }
 
         // Regular cons - expand both parts
-        unsigned new_car = syntax_expand(car(tmpl), bindings, mark);
+        unsigned new_car = 0;
+        gc_protect(&new_car);
+        new_car = syntax_expand(car(tmpl), bindings, mark);
         unsigned new_cdr = syntax_expand(cdr(tmpl), bindings, mark);
-        return alloc_cons(new_car, new_cdr);
+        gc_protect(&new_cdr);
+        unsigned result = alloc_cons(new_car, new_cdr);
+        gc_unprotect(4);
+        return result;
     }
 
     // Vector template - expand each element
@@ -454,30 +542,47 @@ unsigned syntax_expand(unsigned tmpl, unsigned bindings, unsigned mark)
             // Expand repeated element for each ellipsis value
             unsigned ellipsis_pattern =
                 ellipsis_binding ? car(ellipsis_binding) : 0;
-            FORLIST(ev, ellipsis_values)
+
+            // Protect loop variables across allocations
+            gc_protect(&ellipsis_values);
+            gc_protect(&ellipsis_pattern);
+            gc_protect(&elem_tmpl);
+            gc_protect(&bindings);
+
+            for (; ellipsis_values; ellipsis_values = cdr(ellipsis_values))
             {
-                unsigned current_value = car(ev);
+                unsigned current_value = car(ellipsis_values);
                 unsigned iter_bindings = bindings;
+                gc_protect(&iter_bindings);
 
                 if (ellipsis_pattern && (IS_PAIR(ellipsis_pattern) ||
                                          IS_VECTOR(ellipsis_pattern))) {
                     unsigned sub_bindings =
                         syntax_match(ellipsis_pattern, current_value, 0, 0);
                     if (sub_bindings != TOK_ERROR) {
-                        FORLIST(sb, sub_bindings)
+                        gc_protect(&sub_bindings);
+                        for (; sub_bindings; sub_bindings = cdr(sub_bindings))
                         {
-                            iter_bindings = alloc_cons(car(sb), iter_bindings);
+                            unsigned sb_car = car(sub_bindings);
+                            gc_protect(&sb_car);
+                            iter_bindings = alloc_cons(sb_car, iter_bindings);
+                            gc_unprotect(1);
                         }
+                        gc_unprotect(1); // sub_bindings
                     }
                 } else if (IS_ATOM(elem_tmpl)) {
-                    unsigned temp_binding =
-                        alloc_cons(elem_tmpl, current_value);
+                    unsigned temp_binding = 0;
+                    gc_protect(&temp_binding);
+                    temp_binding = alloc_cons(elem_tmpl, current_value);
                     iter_bindings = alloc_cons(temp_binding, bindings);
+                    gc_unprotect(1);
                 }
+                gc_unprotect(1); // iter_bindings
 
                 result_data[idx++] =
                     syntax_expand(elem_tmpl, iter_bindings, mark);
             }
+            gc_unprotect(4); // bindings, elem_tmpl, ellipsis_pattern, ellipsis_values
 
             // Expand elements after ellipsis
             for (unsigned i = 0; i < post_count; i++) {
@@ -485,6 +590,7 @@ unsigned syntax_expand(unsigned tmpl, unsigned bindings, unsigned mark)
                     syntax_expand(data[ellipsis_pos + 1 + i], bindings, mark);
             }
 
+            gc_unprotect(2);
             return result;
         }
 
@@ -494,10 +600,12 @@ unsigned syntax_expand(unsigned tmpl, unsigned bindings, unsigned mark)
         for (unsigned i = 0; i < len; i++) {
             result_data[i] = syntax_expand(data[i], bindings, mark);
         }
+        gc_unprotect(2);
         return result;
     }
 
     // Other values pass through unchanged
+    gc_unprotect(2);
     return tmpl;
 }
 
@@ -509,14 +617,24 @@ unsigned apply_syntax(unsigned transformer, unsigned input, unsigned use_env)
 {
     (void)use_env;
 
+    // Protect parameters that may be in nursery - GC can run during expansion
+    gc_protect(&transformer);
+    gc_protect(&input);
+
     unsigned literals = car(transformer);
+    gc_protect(&literals);
+
     unsigned rules = cdr(transformer);
+    gc_protect(&rules);
+
+    unsigned tmpl = 0;
+    gc_protect(&tmpl);
 
     // Try each rule
     for (; rules; rules = cdr(rules)) {
         unsigned rule = car(rules);
         unsigned pattern = car(rule);
-        unsigned tmpl = cadr(rule);
+        tmpl = cadr(rule);
 
         // Skip the keyword in pattern (first element is macro name)
         if (IS_PAIR(pattern))
@@ -526,14 +644,19 @@ unsigned apply_syntax(unsigned transformer, unsigned input, unsigned use_env)
         unsigned input_args = cdr(input);
 
         unsigned bindings = syntax_match(pattern, input_args, literals, 0);
+
         if (bindings != TOK_ERROR) {
             // Generate unique mark for hygiene
             static unsigned syntax_mark = 0;
             unsigned mark = ++syntax_mark;
 
-            return syntax_expand(tmpl, bindings, mark);
+            gc_protect(&bindings);
+            unsigned result = syntax_expand(tmpl, bindings, mark);
+            gc_unprotect(6); // bindings, tmpl, rules, literals, input, transformer
+            return result;
         }
     }
+    gc_unprotect(5); // tmpl, rules, literals, input, transformer
 
     show_error("syntax-rules: no matching pattern");
     return TOK_ERROR;

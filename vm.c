@@ -17,6 +17,7 @@
 #include "env.h"
 #include "eval.h"
 #include "macros.h"
+#include "prim_internal.h"
 #include "primitives.h"
 #include <stdlib.h>
 #include <string.h>
@@ -29,6 +30,13 @@
 #define INITIAL_FRAMES_SIZE 256
 #define MAX_STACK_SIZE (1024 * 1024)
 #define MAX_FRAMES_SIZE (64 * 1024)
+
+// Global VM state for GC integration
+// When the VM is running, this points to the active VM state
+// so that GC can update VM roots
+static vm_state *active_vm = NULL;
+
+vm_state *get_active_vm(void) { return active_vm; }
 
 // ============================================================================
 // VM Initialization
@@ -216,17 +224,11 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
     if (IS_BUILTIN(fn)) {
         int64_t prim_id = CELL_ID(fn);
 
-        // Build argument list (args are on stack, topmost is last arg)
+        // Build argument list in correct order by iterating stack in reverse
         unsigned args = 0;
-        for (unsigned i = 0; i < argc; i++) {
+        for (int i = (int)argc - 1; i >= 0; i--) {
             unsigned val = vm->stack[vm->sp - argc + i];
             args = alloc_cons(val, args);
-        }
-        // Reverse to get correct order
-        unsigned rev_args = 0;
-        while (args) {
-            rev_args = alloc_cons(car(args), rev_args);
-            args = cdr(args);
         }
 
         // Pop arguments
@@ -241,7 +243,7 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
                 vm->running = false;
                 return;
             }
-            unsigned proc = car(rev_args);
+            unsigned proc = car(args);
             unsigned cont = capture_continuation(vm);
             // Push continuation as argument and call proc
             vm_push(vm, cont);
@@ -257,8 +259,8 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
                 vm->running = false;
                 return;
             }
-            unsigned proc = car(rev_args);
-            unsigned apply_args = cadr(rev_args);
+            unsigned proc = car(args);
+            unsigned apply_args = cadr(args);
             // Count and push args
             unsigned apply_argc = list_length(apply_args);
             FORLIST(a, apply_args) { vm_push(vm, car(a)); }
@@ -267,7 +269,7 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
         }
 
         // Regular primitive
-        unsigned result = apply_primitive(prim_id, rev_args);
+        unsigned result = apply_primitive(prim_id, args);
         if (result == TOK_ERROR) {
             vm->error = true;
             vm->error_msg = "primitive error";
@@ -305,23 +307,17 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
             return;
         }
 
-        // Build argument list from stack (args are on stack, last arg on top)
+        // Build argument list in correct order by iterating stack in reverse
         unsigned args = 0;
-        for (unsigned i = 0; i < argc; i++) {
+        for (int i = (int)argc - 1; i >= 0; i--) {
             args = alloc_cons(vm->stack[vm->sp - argc + i], args);
-        }
-        // Reverse to get correct order
-        unsigned rev_args = 0;
-        while (args) {
-            rev_args = alloc_cons(car(args), rev_args);
-            args = cdr(args);
         }
 
         vm->sp -= argc;
 
         // Get params from constant pool and bind
         unsigned params = code->constants[code->params];
-        unsigned frame = bind_params(params, rev_args);
+        unsigned frame = bind_params(params, args);
         unsigned new_env = alloc_cons(frame, closure_env);
 
         if (tail && vm->fp > 0) {
@@ -348,22 +344,16 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
         unsigned body = car(body_env);
         unsigned def_env = cdr(body_env);
 
-        // Build argument list
+        // Build argument list in correct order by iterating in reverse
         unsigned args = 0;
-        for (unsigned i = 0; i < argc; i++) {
+        for (int i = (int)argc - 1; i >= 0; i--) {
             args = alloc_cons(vm->stack[vm->sp - argc + i], args);
-        }
-        // Reverse
-        unsigned rev_args = 0;
-        while (args) {
-            rev_args = alloc_cons(car(args), rev_args);
-            args = cdr(args);
         }
 
         vm->sp -= argc;
 
         // Bind parameters
-        unsigned frame = bind_params(params, rev_args);
+        unsigned frame = bind_params(params, args);
         unsigned new_env = alloc_cons(frame, def_env);
 
         // Evaluate body using interpreter
@@ -415,6 +405,10 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
     vm->fp = 0;
     vm->running = true;
     vm->error = false;
+
+    // Register VM with GC system
+    vm_state *saved_active_vm = active_vm;
+    active_vm = vm;
 
     while (vm->running) {
         if (!vm->code) {
@@ -559,22 +553,15 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             int64_t prim_id = vm->code->code[vm->ip++];
             unsigned argc = vm->code->code[vm->ip++];
 
-            // Build argument list
+            // Build argument list in correct order by iterating in reverse
             unsigned args = 0;
-            for (unsigned i = 0; i < argc; i++) {
-                unsigned val = vm->stack[vm->sp - argc + i];
-                args = alloc_cons(val, args);
-            }
-            // Reverse
-            unsigned rev_args = 0;
-            while (args) {
-                rev_args = alloc_cons(car(args), rev_args);
-                args = cdr(args);
+            for (int i = (int)argc - 1; i >= 0; i--) {
+                args = alloc_cons(vm->stack[vm->sp - argc + i], args);
             }
 
             vm->sp -= argc;
 
-            unsigned result = apply_primitive(prim_id, rev_args);
+            unsigned result = apply_primitive(prim_id, args);
             if (result == TOK_ERROR) {
                 vm->error = true;
                 vm->error_msg = "primitive error";
@@ -840,6 +827,242 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             break;
         }
 
+        // Specialized arithmetic opcodes (use direct binary operations)
+        case OP_ADD: {
+            unsigned b = vm_pop(vm);
+            unsigned a = vm_pop(vm);
+            unsigned result = binary_add(a, b);
+            if (result == TOK_ERROR) {
+                vm->error = true;
+                vm->error_msg = "+: invalid operands";
+                vm->running = false;
+                break;
+            }
+            vm_push(vm, result);
+            break;
+        }
+
+        case OP_SUB: {
+            unsigned b = vm_pop(vm);
+            unsigned a = vm_pop(vm);
+            unsigned result = binary_sub(a, b);
+            if (result == TOK_ERROR) {
+                vm->error = true;
+                vm->error_msg = "-: invalid operands";
+                vm->running = false;
+                break;
+            }
+            vm_push(vm, result);
+            break;
+        }
+
+        case OP_MUL: {
+            unsigned b = vm_pop(vm);
+            unsigned a = vm_pop(vm);
+            unsigned result = binary_mul(a, b);
+            if (result == TOK_ERROR) {
+                vm->error = true;
+                vm->error_msg = "*: invalid operands";
+                vm->running = false;
+                break;
+            }
+            vm_push(vm, result);
+            break;
+        }
+
+        case OP_DIV: {
+            unsigned b = vm_pop(vm);
+            unsigned a = vm_pop(vm);
+            unsigned result = binary_div(a, b);
+            if (result == TOK_ERROR) {
+                vm->error = true;
+                vm->error_msg = "/: invalid operands or division by zero";
+                vm->running = false;
+                break;
+            }
+            vm_push(vm, result);
+            break;
+        }
+
+        case OP_MOD: {
+            unsigned b = vm_pop(vm);
+            unsigned a = vm_pop(vm);
+            unsigned args = alloc_cons(a, alloc_cons(b, 0));
+            unsigned result = apply_primitive(PMOD, args);
+            if (result == TOK_ERROR) {
+                vm->error = true;
+                vm->error_msg = "modulo: invalid operands";
+                vm->running = false;
+                break;
+            }
+            vm_push(vm, result);
+            break;
+        }
+
+        // Specialized comparison opcodes (use direct binary operations)
+        case OP_LT: {
+            unsigned b = vm_pop(vm);
+            unsigned a = vm_pop(vm);
+            unsigned result = binary_lt(a, b);
+            if (result == TOK_ERROR) {
+                vm->error = true;
+                vm->error_msg = "<: invalid operands";
+                vm->running = false;
+                break;
+            }
+            vm_push(vm, result);
+            break;
+        }
+
+        case OP_GT: {
+            unsigned b = vm_pop(vm);
+            unsigned a = vm_pop(vm);
+            unsigned args = alloc_cons(a, alloc_cons(b, 0));
+            unsigned result = apply_primitive(PGT, args);
+            if (result == TOK_ERROR) {
+                vm->error = true;
+                vm->error_msg = ">: invalid operands";
+                vm->running = false;
+                break;
+            }
+            vm_push(vm, result);
+            break;
+        }
+
+        case OP_LE: {
+            unsigned b = vm_pop(vm);
+            unsigned a = vm_pop(vm);
+            unsigned args = alloc_cons(a, alloc_cons(b, 0));
+            unsigned result = apply_primitive(PLEQ, args);
+            if (result == TOK_ERROR) {
+                vm->error = true;
+                vm->error_msg = "<=: invalid operands";
+                vm->running = false;
+                break;
+            }
+            vm_push(vm, result);
+            break;
+        }
+
+        case OP_GE: {
+            unsigned b = vm_pop(vm);
+            unsigned a = vm_pop(vm);
+            unsigned args = alloc_cons(a, alloc_cons(b, 0));
+            unsigned result = apply_primitive(PGEQ, args);
+            if (result == TOK_ERROR) {
+                vm->error = true;
+                vm->error_msg = ">=: invalid operands";
+                vm->running = false;
+                break;
+            }
+            vm_push(vm, result);
+            break;
+        }
+
+        case OP_NUMEQ: {
+            unsigned b = vm_pop(vm);
+            unsigned a = vm_pop(vm);
+            unsigned result = binary_numeq(a, b);
+            if (result == TOK_ERROR) {
+                vm->error = true;
+                vm->error_msg = "=: invalid operands";
+                vm->running = false;
+                break;
+            }
+            vm_push(vm, result);
+            break;
+        }
+
+        // More list operations
+        case OP_CADR: {
+            unsigned pair = vm_pop(vm);
+            if (!IS_PAIR(pair)) {
+                vm->error = true;
+                vm->error_msg = "cadr: not a pair";
+                vm->running = false;
+                break;
+            }
+            unsigned inner = cdr(pair);
+            if (!IS_PAIR(inner)) {
+                vm->error = true;
+                vm->error_msg = "cadr: cdr not a pair";
+                vm->running = false;
+                break;
+            }
+            vm_push(vm, car(inner));
+            break;
+        }
+
+        case OP_CDDR: {
+            unsigned pair = vm_pop(vm);
+            if (!IS_PAIR(pair)) {
+                vm->error = true;
+                vm->error_msg = "cddr: not a pair";
+                vm->running = false;
+                break;
+            }
+            unsigned inner = cdr(pair);
+            if (!IS_PAIR(inner)) {
+                vm->error = true;
+                vm->error_msg = "cddr: cdr not a pair";
+                vm->running = false;
+                break;
+            }
+            vm_push(vm, cdr(inner));
+            break;
+        }
+
+        case OP_SETCAR: {
+            unsigned val = vm_pop(vm);
+            unsigned pair = vm_pop(vm);
+            if (!IS_PAIR(pair)) {
+                vm->error = true;
+                vm->error_msg = "set-car!: not a pair";
+                vm->running = false;
+                break;
+            }
+            write_barrier(pair, val); // Generational GC
+            CELL_CAR(pair) = val;
+            vm_push(vm, val);
+            break;
+        }
+
+        case OP_SETCDR: {
+            unsigned val = vm_pop(vm);
+            unsigned pair = vm_pop(vm);
+            if (!IS_PAIR(pair)) {
+                vm->error = true;
+                vm->error_msg = "set-cdr!: not a pair";
+                vm->running = false;
+                break;
+            }
+            write_barrier(pair, val); // Generational GC
+            CELL_CDR(pair) = val;
+            vm_push(vm, val);
+            break;
+        }
+
+        case OP_LIST1: {
+            unsigned a = vm_pop(vm);
+            vm_push(vm, alloc_cons(a, 0));
+            break;
+        }
+
+        case OP_LIST2: {
+            unsigned b = vm_pop(vm);
+            unsigned a = vm_pop(vm);
+            vm_push(vm, alloc_cons(a, alloc_cons(b, 0)));
+            break;
+        }
+
+        case OP_LIST3: {
+            unsigned c = vm_pop(vm);
+            unsigned b = vm_pop(vm);
+            unsigned a = vm_pop(vm);
+            vm_push(vm, alloc_cons(a, alloc_cons(b, alloc_cons(c, 0))));
+            break;
+        }
+
         default:
             vm->error = true;
             vm->error_msg = "unknown opcode";
@@ -847,6 +1070,9 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             break;
         }
     }
+
+    // Unregister VM from GC system
+    active_vm = saved_active_vm;
 
     if (vm->error) {
         show_error("VM error: %s", vm->error_msg);
@@ -862,6 +1088,9 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
 
 void gc_update_vm_roots(vm_state *vm)
 {
+    if (!vm)
+        return;
+
     // Update stack values
     for (unsigned i = 0; i < vm->sp; i++) {
         vm->stack[i] = collect(vm->stack[i]);
@@ -877,4 +1106,24 @@ void gc_update_vm_roots(vm_state *vm)
 
     // Update code object constants
     gc_collect_code(vm->code);
+}
+
+// Update VM roots for minor GC (uses collect_to_old instead of collect)
+void gc_update_vm_roots_minor(vm_state *vm, unsigned (*collector)(unsigned))
+{
+    if (!vm)
+        return;
+
+    // Update stack values
+    for (unsigned i = 0; i < vm->sp; i++) {
+        vm->stack[i] = collector(vm->stack[i]);
+    }
+
+    // Update frame environments
+    for (unsigned i = 0; i < vm->fp; i++) {
+        vm->frames[i].env = collector(vm->frames[i].env);
+    }
+
+    // Update current environment
+    vm->env = collector(vm->env);
 }

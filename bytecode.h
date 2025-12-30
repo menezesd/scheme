@@ -88,6 +88,29 @@ enum opcode {
     OP_ZEROP,      // Zero check: pop n, push (n == 0)
     OP_NOT,        // Boolean not: pop val, push (val == #f)
     OP_EQ,         // Pointer equality: pop b, pop a, push (a eq? b)
+
+    // Specialized arithmetic opcodes (2 operands)
+    OP_ADD,        // Add: pop b, pop a, push a+b
+    OP_SUB,        // Subtract: pop b, pop a, push a-b
+    OP_MUL,        // Multiply: pop b, pop a, push a*b
+    OP_DIV,        // Divide: pop b, pop a, push a/b
+    OP_MOD,        // Modulo: pop b, pop a, push a%b
+
+    // Specialized comparison opcodes (2 operands)
+    OP_LT,         // Less than: pop b, pop a, push a<b
+    OP_GT,         // Greater than: pop b, pop a, push a>b
+    OP_LE,         // Less or equal: pop b, pop a, push a<=b
+    OP_GE,         // Greater or equal: pop b, pop a, push a>=b
+    OP_NUMEQ,      // Numeric equal: pop b, pop a, push a=b
+
+    // More list operations
+    OP_CADR,       // Inline cadr: pop pair, push cadr
+    OP_CDDR,       // Inline cddr: pop pair, push cddr
+    OP_SETCAR,     // Set car: pop val, pop pair, set-car!
+    OP_SETCDR,     // Set cdr: pop val, pop pair, set-cdr!
+    OP_LIST1,      // Make 1-element list: pop a, push (a)
+    OP_LIST2,      // Make 2-element list: pop b, pop a, push (a b)
+    OP_LIST3,      // Make 3-element list: pop c, pop b, pop a, push (a b c)
 };
 
 // ============================================================================
@@ -235,9 +258,11 @@ unsigned vm_pop(vm_state *vm);
 // GC integration
 unsigned gc_collect_code(code_object *code);
 void gc_update_vm_roots(vm_state *vm);
+void gc_update_vm_roots_minor(vm_state *vm, unsigned (*collector)(unsigned));
 void gc_update_all_code_objects(void);  // Update all code object constants during GC
 void code_register(code_object *code);  // Add code object to GC registry
 void gc_sweep_code_objects(void);       // Free unreachable code objects after GC
+vm_state *get_active_vm(void);          // Get currently running VM (for GC)
 
 // Disassembler
 void disassemble(code_object *code, const char *name);

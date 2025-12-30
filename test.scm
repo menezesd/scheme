@@ -547,12 +547,13 @@
 (test "infinite? integer" #f (infinite? 0))
 (test "infinite? overflow" #t (infinite? (exp 1000)))
 (test "nan? normal" #f (nan? 42))
-(test "nan? from log" #t (nan? (log -1)))
+(test "log -1 is complex" #t (complex? (log -1)))
+(test "log -1 real-part" 0.0 (real-part (log -1)))
 
 ; complex number predicates
 (test "finite? complex" #t (finite? (make-rectangular 3 4)))
 (test "infinite? complex" #t (infinite? (make-rectangular (exp 1000) 0)))
-(test "nan? complex" #t (nan? (make-rectangular (log -1) 0)))
+(test "nan? complex" #f (nan? (make-rectangular 3 4)))
 
 (section "String Edge Cases")
 

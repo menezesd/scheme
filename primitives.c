@@ -99,6 +99,7 @@ unsigned apply_primitive(unsigned prim_id, unsigned args)
         if (!IS_PAIR(arg1))
             ERROR_RETURN("set-car!: not a pair");
         unsigned arg2 = cadr(args);
+        write_barrier(arg1, arg2); // Generational GC write barrier
         return CELL_CAR(arg1) = arg2;
     }
     case PSETCDR: {
@@ -107,6 +108,7 @@ unsigned apply_primitive(unsigned prim_id, unsigned args)
         if (!IS_PAIR(arg1))
             ERROR_RETURN("set-cdr!: not a pair");
         unsigned arg2 = cadr(args);
+        write_barrier(arg1, arg2); // Generational GC write barrier
         return CELL_CDR(arg1) = arg2;
     }
     case PLIST:
@@ -423,6 +425,9 @@ unsigned apply_primitive(unsigned prim_id, unsigned args)
     case PCEILING:
     case PTRUNCATE:
     case PROUND:
+    case PRANDOMINTEGER:
+    case PRANDOMREAL:
+    case PRANDOMSEED:
         return apply_math_primitive(prim_id, args);
 
     // Misc

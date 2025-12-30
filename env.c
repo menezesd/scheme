@@ -71,6 +71,7 @@ unsigned defvar(unsigned var, unsigned aval, unsigned env)
     for (; vars; vars = cdr(vars), vals = cdr(vals)) {
         if (CELL_TYPE(vars) == BT_ATOM) {
             if (CELL_ID(vars) == vid) {
+                write_barrier(vals, aval); // Generational GC
                 CELL_CAR(vals) = aval;
                 return var;
             } else {
@@ -79,6 +80,7 @@ unsigned defvar(unsigned var, unsigned aval, unsigned env)
         }
 
         if (CELL_ID(car(vars)) == vid) {
+            write_barrier(vals, aval); // Generational GC
             CELL_CAR(vals) = aval;
             return var;
         }
@@ -86,13 +88,21 @@ unsigned defvar(unsigned var, unsigned aval, unsigned env)
 
     vars = car(frame);
     vals = cdr(frame);
-    // Protect frame, aval, vals across allocations
+    // Protect all variables used across allocations
     gc_protect(&frame);
+    gc_protect(&var);
+    gc_protect(&vars);
     gc_protect(&aval);
     gc_protect(&vals);
-    CELL_CAR(frame) = alloc_cons(var, vars);
-    CELL_CDR(frame) = alloc_cons(aval, vals);
-    gc_unprotect(3);
+    unsigned new_vars = 0;
+    gc_protect(&new_vars);
+    new_vars = alloc_cons(var, vars);
+    unsigned new_vals = alloc_cons(aval, vals);
+    gc_unprotect(6);
+    write_barrier(frame, new_vars); // Generational GC
+    write_barrier(frame, new_vals);
+    CELL_CAR(frame) = new_vars;
+    CELL_CDR(frame) = new_vals;
     return var;
 }
 
@@ -107,6 +117,7 @@ unsigned setvar(int64_t var, unsigned aval, unsigned env)
             if (CELL_TYPE(vars) == BT_ATOM) {
                 if (CELL_ID(vars) == var) {
                     unsigned oid = car(vals);
+                    write_barrier(vals, aval); // Generational GC
                     CELL_CAR(vals) = aval;
                     return oid;
                 } else {
@@ -115,6 +126,7 @@ unsigned setvar(int64_t var, unsigned aval, unsigned env)
             }
             if (CELL_ID(car(vars)) == var) {
                 unsigned oid = car(vals);
+                write_barrier(vals, aval); // Generational GC
                 CELL_CAR(vals) = aval;
                 return oid;
             }
@@ -186,12 +198,18 @@ unsigned bind_params(unsigned params, unsigned args)
         unsigned var = car(params);
         unsigned val = args ? car(args) : 0;
 
-        unsigned vc = alloc_cons(var, 0);
+        unsigned vc = 0;
+        gc_protect(&val);  // val may be in nursery
+        gc_protect(&vc);
+        vc = alloc_cons(var, 0);
         unsigned ac = alloc_cons(val, 0);
+        gc_unprotect(2);
         if (!vars) {
             vars = vc;
             vals = ac;
         } else {
+            write_barrier(vars_tail, vc); // GC may have promoted vars_tail
+            write_barrier(vals_tail, ac);
             CELL_CDR(vars_tail) = vc;
             CELL_CDR(vals_tail) = ac;
         }
@@ -204,12 +222,17 @@ unsigned bind_params(unsigned params, unsigned args)
 
     // Handle rest parameter (dotted notation)
     if (params && CELL_TYPE(params) == BT_ATOM) {
-        unsigned vc = alloc_cons(params, 0);
+        unsigned vc = 0;
+        gc_protect(&vc);
+        vc = alloc_cons(params, 0);
         unsigned ac = alloc_cons(args, 0);
+        gc_unprotect(1);
         if (!vars) {
             vars = vc;
             vals = ac;
         } else {
+            write_barrier(vars_tail, vc); // GC may have promoted vars_tail
+            write_barrier(vals_tail, ac);
             CELL_CDR(vars_tail) = vc;
             CELL_CDR(vals_tail) = ac;
         }
@@ -387,6 +410,11 @@ static const struct {
     {"ceiling", PCEILING},
     {"truncate", PTRUNCATE},
     {"round", PROUND},
+
+    // Random numbers (SRFI-27)
+    {"random-integer", PRANDOMINTEGER},
+    {"random-real", PRANDOMREAL},
+    {"random-seed!", PRANDOMSEED},
 
     // Control
     {"apply", PAPPLY},

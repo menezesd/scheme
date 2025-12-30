@@ -40,13 +40,15 @@ static inline void eval_body(unsigned body, unsigned env, unsigned cont)
     } else if (!cdr(body)) {
         tramp_eval(car(body), env, cont);
     } else {
-        // Extract first expr before allocation, protect all used after
+        // Extract first expr and rest before allocation, protect all used after
         unsigned first_expr = car(body);
+        unsigned rest = cdr(body);
         gc_protect(&first_expr);
+        gc_protect(&rest);
         gc_protect(&env);
         gc_protect(&cont);
-        unsigned k = make_cont(CONT_LET_BODY, cdr(body), env, cont);
-        gc_unprotect(3);
+        unsigned k = make_cont(CONT_LET_BODY, rest, env, cont);
+        gc_unprotect(4);
         tramp_eval(first_expr, env, k);
     }
 }
@@ -58,13 +60,15 @@ static inline void eval_seq(unsigned data, enum cont_type cont_type,
     if (!cdr(data)) {
         tramp_eval(car(data), env, next);
     } else {
-        // Extract first expr before allocation, protect all used after
+        // Extract first expr and rest before allocation, protect all used after
         unsigned first_expr = car(data);
+        unsigned rest = cdr(data);
         gc_protect(&first_expr);
+        gc_protect(&rest);
         gc_protect(&env);
         gc_protect(&next);
-        unsigned k = make_cont(cont_type, cdr(data), env, next);
-        gc_unprotect(3);
+        unsigned k = make_cont(cont_type, rest, env, next);
+        gc_unprotect(4);
         tramp_eval(first_expr, env, k);
     }
 }

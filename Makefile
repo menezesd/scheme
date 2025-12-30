@@ -17,7 +17,7 @@ GENERATED = stdlib_data.h
 # Target executable
 TARGET = lisp
 
-.PHONY: all clean distclean debug test test-c
+.PHONY: all clean distclean debug test test-c test-prop test-all
 
 all: $(TARGET)
 
@@ -81,7 +81,7 @@ test: $(TARGET)
 	@./$(TARGET) < test.scm 2>&1 | grep -E '(^===|PASS|FAIL|^Tests:|passed|FAILED)'
 
 # C unit tests
-TEST_SRCS = test_bignum.c test_reader.c test_context.c test_macros.c
+TEST_SRCS = test_bignum.c test_reader.c test_context.c test_macros.c test_eval.c
 TEST_BINS = $(TEST_SRCS:.c=)
 
 # Object files needed for interpreter tests (excludes main.o)
@@ -105,8 +105,15 @@ test_context: test_context.c $(INTERP_OBJS)
 test_macros: test_macros.c $(INTERP_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
+test_eval: test_eval.c $(INTERP_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+# Run property tests
+test-prop: $(TARGET)
+	@./$(TARGET) property_tests.scm
+
 # Run all tests
-test-all: test test-c
+test-all: test test-c test-prop
 
 clean:
 	rm -f $(OBJS) $(TARGET) $(TEST_BINS)

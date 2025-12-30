@@ -65,7 +65,7 @@ unsigned qq_expand_cps(unsigned x, unsigned env)
         return TOK_ERROR;
     }
 
-    // Recursively process list; protect loop vars across allocations
+    // Recursively process list
     unsigned result = 0, tail = 0;
     gc_protect(&result);
     gc_protect(&tail);
@@ -114,6 +114,15 @@ static void eval_step(void)
         return;
     }
 
+#ifdef DEBUG_GC
+    if (id >= HEAP_RESERVED) {
+        enum lisp_type t = CELL_TYPE(id);
+        if (t == BT_FREE || t == BT_BROKENHEART) {
+            fprintf(stderr, "[EVAL] BAD CELL: id=%u type=%d\n", id, t);
+        }
+    }
+#endif
+
     switch (CELL_TYPE(id)) {
     case BT_NUM:
     case BT_STRING:
@@ -130,6 +139,11 @@ static void eval_step(void)
         return;
 
     case BT_ATOM: {
+#ifdef DEBUG_GC
+        int64_t sym_id = CELL_ID(id);
+        fprintf(stderr, "[EVAL] ATOM id=%u sym_id=%lld env=%u (name=%s)\n", id, (long long)sym_id, env,
+                (sym_id >= 0 && sym_id < 1000000 && ctx.atom_table[sym_id]) ? ctx.atom_table[sym_id] : "?");
+#endif
         unsigned val = lookup(CELL_ID(id), env);
         if (val == TOK_ERROR) {
             tramp_error();
@@ -151,12 +165,14 @@ static void eval_step(void)
         }
 
         // Not a special form - evaluate function position first
-        // Protect head, env and cont across make_cont (which may trigger GC)
+        // Protect head, arg_exprs, env and cont - use pointer version for GC safety
+        unsigned arg_exprs = cdr(id);
         gc_protect(&head);
+        gc_protect(&arg_exprs);
         gc_protect(&env);
         gc_protect(&cont);
-        unsigned k = make_cont(CONT_EVAL_FN, cdr(id), env, cont);
-        gc_unprotect(3);
+        unsigned k = make_cont_from_protected(CONT_EVAL_FN, &arg_exprs, &env, &cont);
+        gc_unprotect(4);
         tramp_eval(head, env, k);
         return;
     }
@@ -191,6 +207,11 @@ static void apply_cont_step(void)
     unsigned data = cont_data(k);
     unsigned env = cont_env(k);
     unsigned next = cont_next(k);
+
+#ifdef DEBUG_GC
+    fprintf(stderr, "[APPLY] cont=%u type=%d data=%u env=%u next=%u val=%u\n",
+            k, type, data, env, next, val);
+#endif
 
     // Dispatch via function pointer table
     if (type < CONT_COUNT && cont_handlers[type]) {
@@ -352,17 +373,22 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
                 tramp_eval(car(exprs), env, cont);
             } else {
                 unsigned first_expr = car(exprs);
+                unsigned rest = cdr(exprs);
                 gc_protect(&first_expr);
+                gc_protect(&rest);
                 gc_protect(&env);
                 gc_protect(&cont);
-                unsigned k = make_cont(CONT_BEGIN, cdr(exprs), env, cont);
-                gc_unprotect(3);
+                unsigned k = make_cont(CONT_BEGIN, rest, env, cont);
+                gc_unprotect(4);
                 tramp_eval(first_expr, env, k);
             }
             return;
         }
 
+        // Protect cont across apply_primitive (which can allocate/trigger GC)
+        gc_protect(&cont);
         unsigned result = apply_primitive(prim_id, args);
+        gc_unprotect(1);
         if (result == TOK_ERROR) {
             tramp_error();
             return;
@@ -381,18 +407,22 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
         gc_protect(&body);
         gc_protect(&def_env);
         gc_protect(&cont);
-        unsigned frame = bind_params(params, args);
+        unsigned frame = 0;
+        gc_protect(&frame);
+        frame = bind_params(params, args);
         unsigned new_env = alloc_cons(frame, def_env);
 
         if (!cdr(body)) {
-            gc_unprotect(3);
+            gc_unprotect(4);
             tramp_eval(car(body), new_env, cont);
         } else {
             unsigned first_expr = car(body);
+            unsigned rest_body = cdr(body);
             gc_protect(&first_expr);
+            gc_protect(&rest_body);
             gc_protect(&new_env);
-            unsigned k = make_cont(CONT_APPLY_FUNC, cdr(body), new_env, cont);
-            gc_unprotect(5); // first_expr, new_env, cont, def_env, body
+            unsigned k = make_cont(CONT_APPLY_FUNC, rest_body, new_env, cont);
+            gc_unprotect(7); // first_expr, rest_body, new_env, frame, cont, def_env, body
             tramp_eval(first_expr, new_env, k);
         }
         return;

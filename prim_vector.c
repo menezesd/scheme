@@ -40,8 +40,10 @@ unsigned apply_vector_primitive(unsigned prim_id, unsigned args)
             ERROR_RETURN("vector-set!: not a vector");
         int64_t idx = CELL_ID(cadr(args));
         CHECK_VECTOR_BOUNDS(idx, vec, "vector-set!");
-        vector_data_ptr(vec)[idx] = caddr(args);
-        return caddr(args);
+        unsigned val = caddr(args);
+        write_barrier(vec, val); // Generational GC write barrier
+        vector_data_ptr(vec)[idx] = val;
+        return val;
     }
     case PVECLEN: {
         REQUIRE_ARGS(args, 1, 1, "vector-length");
@@ -56,6 +58,7 @@ unsigned apply_vector_primitive(unsigned prim_id, unsigned args)
         if (!IS_VECTOR(vec))
             ERROR_RETURN("vector-fill!: not a vector");
         unsigned fill = cadr(args);
+        write_barrier(vec, fill); // Generational GC write barrier
         unsigned len = vector_len(vec);
         unsigned *data = vector_data_ptr(vec);
         for (unsigned i = 0; i < len; i++)

@@ -63,6 +63,7 @@ unsigned alloc_cons(unsigned car_val, unsigned cdr_val);
 // Forward declarations for GC protection (defined below)
 void gc_protect(unsigned *ptr);
 void gc_unprotect(int count);
+int get_shadow_stack_top(void);
 
 // Allocate a typed cell with given car and cdr
 static inline unsigned make_typed_cell(enum lisp_type type, unsigned car_val,
@@ -151,6 +152,11 @@ unsigned *vector_data_ptr(unsigned vec);
 unsigned make_cont(enum cont_type type, unsigned data, unsigned env,
                    unsigned next);
 
+// GC-safe version: takes pointers to caller's protected variables
+// Caller must have already gc_protect'd these variables
+unsigned make_cont_from_protected(enum cont_type type, unsigned *data_ptr,
+                                  unsigned *env_ptr, unsigned *next_ptr);
+
 // Continuation accessors
 static inline enum cont_type cont_type(unsigned k)
 {
@@ -236,8 +242,11 @@ bool deep_equal(unsigned a, unsigned b);
 // Collect a single cell
 unsigned collect(unsigned x);
 
-// Run garbage collection with given root
+// Run garbage collection with given root (major GC)
 unsigned gc(unsigned root);
+
+// Run minor GC (nursery only) - returns new root
+unsigned minor_gc(unsigned root);
 
 // Get current heap usage as percentage (0-100)
 int heap_usage_percent(void);
@@ -250,6 +259,22 @@ void set_alloc_gc_root(unsigned *root);
 
 // Trigger GC using the registered alloc root (for escape commands)
 void trigger_gc(void);
+
+// Write barrier: call when setting car/cdr/vector element of an old-gen cell
+// to a nursery value. This adds the cell to the remembered set.
+void write_barrier(unsigned target, unsigned value);
+
+// Check if a cell is in the nursery
+static inline bool is_in_nursery(unsigned x)
+{
+    return x >= ctx.nursery_start && x < ctx.nursery_start + NURSERY_SIZE;
+}
+
+// Check if a cell is in old generation (current semispace, before nursery)
+static inline bool is_in_old_gen(unsigned x)
+{
+    return x >= ctx.mmin && x < ctx.nursery_start;
+}
 
 // Shadow stack for protecting local C variables during nested allocations.
 // Use gc_protect before a sequence of allocations that depend on local vars,

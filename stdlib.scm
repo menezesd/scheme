@@ -206,16 +206,22 @@
 
 (define (map proc lst . lsts)
   (if (null? lsts)
-      ; Single list case
-      (if (null? lst)
-          '()
-          (cons (proc (car lst))
-                (map proc (cdr lst))))
-      ; Multiple lists case
-      (if (null? lst)
-          '()
-          (cons (apply proc (car lst) (map car lsts))
-                (apply map proc (cdr lst) (map cdr lsts))))))
+      ; Single list case - tail-recursive, builds in order via set-cdr!
+      (let ((head (cons '() '())))
+        (let loop ((lst lst) (tail head))
+          (if (null? lst)
+              (cdr head)
+              (let ((new-cell (cons (proc (car lst)) '())))
+                (set-cdr! tail new-cell)
+                (loop (cdr lst) new-cell)))))
+      ; Multiple lists case - tail-recursive, builds in order
+      (let ((head (cons '() '())))
+        (let loop ((lst lst) (lsts lsts) (tail head))
+          (if (or (null? lst) (any null? lsts))
+              (cdr head)
+              (let ((new-cell (cons (apply proc (car lst) (map car lsts)) '())))
+                (set-cdr! tail new-cell)
+                (loop (cdr lst) (map cdr lsts) new-cell)))))))
 
 (define (for-each proc lst . lsts)
   (if (null? lsts)
@@ -323,12 +329,16 @@
 ;;; List Processing Utilities (SRFI-1 style)
 ;;; ============================================================================
 
-; filter - return list of elements satisfying predicate
+; filter - return list of elements satisfying predicate (tail-recursive, in-order)
 (define (filter pred lst)
-  (cond ((null? lst) '())
-        ((pred (car lst))
-         (cons (car lst) (filter pred (cdr lst))))
-        (else (filter pred (cdr lst)))))
+  (let ((head (cons '() '()))) ; dummy head cell
+    (let loop ((lst lst) (tail head))
+      (cond ((null? lst) (cdr head))
+            ((pred (car lst))
+             (let ((new-cell (cons (car lst) '())))
+               (set-cdr! tail new-cell)
+               (loop (cdr lst) new-cell)))
+            (else (loop (cdr lst) tail))))))
 
 ; remove - return list of elements NOT satisfying predicate
 (define (remove pred lst)
