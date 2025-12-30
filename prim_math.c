@@ -45,6 +45,93 @@ typedef struct {
 static const math_func_entry math_funcs[] = {
     {PASIN, asin, "asin"}, {PACOS, acos, "acos"}, {0, NULL, NULL}};
 
+/**
+ * Compute integer nth root of a bignum using Newton's method.
+ * Returns the root if base is a perfect nth power, NULL otherwise.
+ * Caller must free the returned bignum.
+ */
+static bignum *bn_exact_nth_root(const bignum *base, int64_t n)
+{
+    if (n <= 0 || bn_is_zero(base))
+        return NULL;
+    if (n == 1)
+        return bn_copy(base);
+    if (base->sign)
+        return NULL; // No real nth root of negative for even n
+
+    // Initial guess using floating point
+    double d = 0;
+    for (size_t i = base->len; i > 0; i--) {
+        d = d * 4294967296.0 + base->limbs[i - 1];
+    }
+    double guess_d = pow(d, 1.0 / n);
+    bignum *guess = bn_from_int((int64_t)guess_d);
+    if (bn_is_zero(guess)) {
+        bn_free(guess);
+        guess = bn_from_int(1);
+    }
+
+    // Newton iteration: x_new = ((n-1)*x + base/x^(n-1)) / n
+    bignum *n_bn = bn_from_int(n);
+    bignum *n_minus_1 = bn_from_int(n - 1);
+
+    for (int iter = 0; iter < 100; iter++) {
+        // Compute guess^(n-1)
+        bignum *power = bn_from_int(1);
+        for (int64_t i = 0; i < n - 1; i++) {
+            bignum *temp = bn_mul(power, guess);
+            bn_free(power);
+            power = temp;
+        }
+
+        // Compute base / guess^(n-1)
+        bignum *quotient = bn_div(base, power, NULL);
+        bn_free(power);
+
+        // Compute (n-1) * guess
+        bignum *term1 = bn_mul(n_minus_1, guess);
+
+        // Sum: (n-1)*guess + base/guess^(n-1)
+        bignum *sum = bn_add(term1, quotient);
+        bn_free(term1);
+        bn_free(quotient);
+
+        // New guess: sum / n
+        bignum *new_guess = bn_div(sum, n_bn, NULL);
+        bn_free(sum);
+
+        // Check convergence
+        int cmp = bn_cmp(new_guess, guess);
+        if (cmp == 0) {
+            bn_free(new_guess);
+            break;
+        }
+
+        bn_free(guess);
+        guess = new_guess;
+    }
+
+    bn_free(n_bn);
+    bn_free(n_minus_1);
+
+    // Verify: guess^n == base
+    bignum *check = bn_from_int(1);
+    for (int64_t i = 0; i < n; i++) {
+        bignum *temp = bn_mul(check, guess);
+        bn_free(check);
+        check = temp;
+    }
+
+    if (bn_cmp(check, base) == 0) {
+        bn_free(check);
+        return guess; // Perfect nth power
+    }
+
+    bn_free(check);
+    bn_free(guess);
+    return NULL; // Not a perfect nth power
+}
+
 unsigned apply_math_primitive(unsigned prim_id, unsigned args)
 {
     // Check simple unary functions via table
@@ -113,6 +200,115 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned args)
         unsigned base_arg = car(args);
         unsigned exp_arg = cadr(args);
 
+        // Exact base with exact integer exponent -> exact result
+        // Covers integers, rationals, and complex with exact parts
+        if (is_exact(base_arg) && IS_EXACT_INT(exp_arg)) {
+            int64_t exp_val;
+            if (IS_NUM(exp_arg)) {
+                exp_val = CELL_ID(exp_arg);
+            } else {
+                // Bignum exponent - check if it fits in int64
+                bignum *exp_bn = get_bignum(exp_arg);
+                if (bn_to_int64(exp_bn, &exp_val) != 0) {
+                    // Exponent too large - fall through to inexact
+                    goto inexact_expt;
+                }
+            }
+
+            // Use repeated squaring with exact arithmetic
+            // result = base^|exp|, then invert if exp < 0
+            bool neg_exp = exp_val < 0;
+            uint64_t e = neg_exp ? (uint64_t)(-exp_val) : (uint64_t)exp_val;
+
+            unsigned result = store(1);
+            unsigned base = base_arg;
+            gc_protect(&result);
+            gc_protect(&base);
+
+            while (e > 0) {
+                if (e & 1) {
+                    // result = result * base (exact multiplication)
+                    unsigned mul_args = alloc_cons(result, alloc_cons(base, 0));
+                    gc_protect(&mul_args);
+                    result = prim_mult(mul_args);
+                    gc_unprotect(1);
+                    if (result == TOK_ERROR) {
+                        gc_unprotect(2);
+                        return TOK_ERROR;
+                    }
+                }
+                e >>= 1;
+                if (e > 0) {
+                    // base = base * base
+                    unsigned sq_args = alloc_cons(base, alloc_cons(base, 0));
+                    gc_protect(&sq_args);
+                    base = prim_mult(sq_args);
+                    gc_unprotect(1);
+                    if (base == TOK_ERROR) {
+                        gc_unprotect(2);
+                        return TOK_ERROR;
+                    }
+                }
+            }
+
+            gc_unprotect(2);
+
+            if (neg_exp) {
+                // Return 1 / result
+                unsigned one = store(1);
+                gc_protect(&one);
+                gc_protect(&result);
+                unsigned div_args = alloc_cons(one, alloc_cons(result, 0));
+                gc_unprotect(2);
+                return prim_div(div_args);
+            }
+            return result;
+        }
+
+        // Exact integer base with exact rational exponent p/q
+        // Try to compute exact (base^(1/q))^p if base is a perfect qth power
+        if (IS_EXACT_INT(base_arg) && CELL_TYPE(exp_arg) == BT_RATIONAL) {
+            int64_t numer, denom;
+            get_rational_parts(exp_arg, &numer, &denom);
+
+            // Only handle small roots (avoid expensive computation)
+            if (denom > 0 && denom <= 1000) {
+                bignum *base_bn = to_bignum(base_arg);
+                bignum *root = bn_exact_nth_root(base_bn, denom);
+                bn_free(base_bn);
+
+                if (root) {
+                    // base is a perfect qth power, root is the qth root
+                    // Now compute root^|numer|
+                    bool neg_exp = numer < 0;
+                    uint64_t p = neg_exp ? (uint64_t)(-numer) : (uint64_t)numer;
+
+                    bignum *power = bn_from_int(1);
+                    for (uint64_t i = 0; i < p; i++) {
+                        bignum *temp = bn_mul(power, root);
+                        bn_free(power);
+                        power = temp;
+                    }
+                    bn_free(root);
+
+                    unsigned result = store_integer(power);
+
+                    if (neg_exp) {
+                        // Return 1 / result
+                        gc_protect(&result);
+                        unsigned one = store(1);
+                        gc_protect(&one);
+                        unsigned div_args =
+                            alloc_cons(one, alloc_cons(result, 0));
+                        gc_unprotect(2);
+                        return prim_div(div_args);
+                    }
+                    return result;
+                }
+            }
+        }
+
+    inexact_expt:;
         bool base_complex = CELL_TYPE(base_arg) == BT_COMPLEX;
         bool exp_complex = CELL_TYPE(exp_arg) == BT_COMPLEX;
 
@@ -146,10 +342,6 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned args)
         }
 
         double result = pow(base_d, exp_d);
-        if (all_exact(args) && floor(result) == result && result >= INT64_MIN &&
-            result <= INT64_MAX) {
-            return store((int64_t)result);
-        }
         return store_inexact(result);
     }
     case PATAN: {

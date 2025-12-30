@@ -28,6 +28,7 @@
 #include "bignum.h"
 #include "context.h"
 #include <inttypes.h>
+#include <math.h>
 #include <stdlib.h>
 
 // ============================================================================
@@ -243,7 +244,15 @@ static void write_obj_fp(unsigned s, bool with_quotes, FILE *fp)
             int64_t i;
         } u;
         u.i = CELL_ID(s);
-        fprintf(fp, "%g", u.d);
+        // Use %g but ensure inexact integers show decimal point (R5RS)
+        // Check if value is a whole number
+        if (u.d == (double)(long long)u.d && isfinite(u.d) && u.d >= -1e15 &&
+            u.d <= 1e15) {
+            // It's an inexact integer - show with .0
+            fprintf(fp, "%.1f", u.d);
+        } else {
+            fprintf(fp, "%g", u.d);
+        }
         break;
     }
     case BT_RATIONAL:

@@ -5,6 +5,88 @@
 
 #include "prim_internal.h"
 
+/**
+ * Convert an inexact real number to an exact rational.
+ * Uses IEEE754 representation: value = mantissa * 2^exponent
+ */
+static unsigned prim_inexact_to_exact(unsigned x)
+{
+    double d = to_double(x);
+
+    // Handle special cases
+    if (isnan(d) || isinf(d)) {
+        show_error("inexact->exact: no exact representation for inf/nan");
+        return TOK_ERROR;
+    }
+
+    // Zero
+    if (d == 0.0)
+        return store(0);
+
+    // Handle negative
+    bool negative = d < 0;
+    if (negative)
+        d = -d;
+
+    // If it's a whole number that fits in int64, return as integer
+    if (d == floor(d) && d <= (double)INT64_MAX) {
+        int64_t n = (int64_t)d;
+        return store(negative ? -n : n);
+    }
+
+    // Extract IEEE754 components: d = mantissa * 2^exp where 1 <= mantissa < 2
+    int exp;
+    double mantissa = frexp(d, &exp);
+    // frexp returns: d = mantissa * 2^exp where 0.5 <= |mantissa| < 1
+    // Multiply by 2^53 to get the exact integer mantissa
+    int64_t int_mantissa = (int64_t)(mantissa * (1LL << 53));
+    exp -= 53;
+
+    // Now d = int_mantissa * 2^exp exactly
+    if (negative)
+        int_mantissa = -int_mantissa;
+
+    if (exp >= 0) {
+        // Result is int_mantissa * 2^exp (an integer)
+        // Use bignum for large shifts
+        bignum *bn =
+            bn_from_int(int_mantissa < 0 ? -int_mantissa : int_mantissa);
+        bignum *shifted = bn_lshift(bn, exp);
+        bn_free(bn);
+        if (int_mantissa < 0)
+            shifted->sign = 1;
+        return store_integer(shifted);
+    } else {
+        // Result is int_mantissa / 2^|exp| (a rational)
+        // Simplify by removing common factors of 2
+        int64_t num = int_mantissa;
+        int64_t denom_exp = -exp;
+
+        // Remove trailing zeros from numerator (common factors of 2)
+        while ((num & 1) == 0 && denom_exp > 0) {
+            num >>= 1;
+            denom_exp--;
+        }
+
+        if (denom_exp == 0) {
+            return store(num);
+        } else if (denom_exp <= 62) {
+            int64_t denom = 1LL << denom_exp;
+            return normalize_rational(num, denom);
+        } else {
+            // Large denominator - use bignums
+            unsigned numer = store(num);
+            gc_protect(&numer);
+            bignum *denom_bn = bn_from_int(1);
+            bignum *shifted = bn_lshift(denom_bn, (int)denom_exp);
+            bn_free(denom_bn);
+            unsigned denom = store_integer(shifted);
+            gc_unprotect(1);
+            return normalize_rational_cells(numer, denom);
+        }
+    }
+}
+
 unsigned apply_numtower_primitive(unsigned prim_id, unsigned args)
 {
     switch (prim_id) {
@@ -116,17 +198,21 @@ unsigned apply_numtower_primitive(unsigned prim_id, unsigned args)
     case PINEXACT2EXACT: {
         REQUIRE_ARGS(args, 1, 1, "inexact->exact");
         unsigned x = car(args);
+
+        // Already exact? Return as-is
+        if (is_exact(x))
+            return x;
+
         if (CELL_TYPE(x) == BT_COMPLEX) {
-            double real = to_double(CELL_CAR(x));
-            double imag = to_double(CELL_CDR(x));
-            unsigned real_part = store((int64_t)round(real));
-            gc_protect(&real_part);
-            unsigned imag_part = store((int64_t)round(imag));
+            // Convert both parts to exact
+            unsigned real_exact = prim_inexact_to_exact(CELL_CAR(x));
+            gc_protect(&real_exact);
+            unsigned imag_exact = prim_inexact_to_exact(CELL_CDR(x));
             gc_unprotect(1);
-            return store_complex(real_part, imag_part);
+            return store_complex(real_exact, imag_exact);
         }
-        double d = to_double(x);
-        return store((int64_t)round(d));
+
+        return prim_inexact_to_exact(x);
     }
     case PRATIONALIZE: {
         REQUIRE_ARGS(args, 2, 2, "rationalize");
