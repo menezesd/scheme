@@ -198,12 +198,18 @@ unsigned bind_params(unsigned params, unsigned args)
         unsigned var = car(params);
         unsigned val = args ? car(args) : 0;
 
+        // Validate var is an atom before using it
+        if (var && CELL_TYPE(var) != BT_ATOM) {
+            lisp_panic("bind_params: var is not BT_ATOM");
+        }
+
         unsigned vc = 0;
-        gc_protect(&val); // val may be in nursery
+        gc_protect(&var);
+        gc_protect(&val);
         gc_protect(&vc);
         vc = alloc_cons(var, 0);
         unsigned ac = alloc_cons(val, 0);
-        gc_unprotect(2);
+        gc_unprotect(3);
         if (!vars) {
             vars = vc;
             vals = ac;
@@ -320,6 +326,7 @@ static const struct {
     {"write-char", PWRITECHAR},
     {"eof-object?", PEOF},
     {"char-ready?", PCHARREADY},
+    {"read-line", PREADLINE},
     {"load", PLOAD},
 
     // Ports
@@ -416,6 +423,9 @@ static const struct {
     {"random-real", PRANDOMREAL},
     {"random-seed!", PRANDOMSEED},
 
+    // Process control
+    {"exit", PEXIT},
+
     // Control
     {"apply", PAPPLY},
     {"call/cc", PCALLCC},
@@ -425,6 +435,7 @@ static const struct {
     {"error", PERROR},
     {"gensym", PGENSYM},
     {"gc-flip", PGCFLIP},
+    {"gc-stats", PGCSTATS},
 
     // R3RS numeric tower
     {"complex?", PCOMPLEXP},
@@ -466,6 +477,12 @@ static const struct {
     {"get-output-string", PGETOUTPUTSTRING},
     {"open-input-string", POPENINPUTSTRING},
     {"string-port?", PSTRINGPORTP},
+
+    // Internal port setters
+    {"set-current-input-port!", PSETCURRENTINPUT},
+    {"set-current-output-port!", PSETCURRENTOUTPUT},
+    {"flush-output-port", PFLUSHOUTPUT},
+    {"current-second", PCURRENTSECOND},
 
     {NULL, 0}};
 

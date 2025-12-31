@@ -252,7 +252,8 @@ unsigned alloc(void)
         }
     }
 
-    return ctx.nursery_ptr++;
+    unsigned cell = ctx.nursery_ptr++;
+    return cell;
 }
 
 unsigned alloc_cons(unsigned car_val, unsigned cdr_val)
@@ -322,10 +323,6 @@ bignum *to_bignum(unsigned x)
         }
         return bn_copy(bn);
     }
-    // Debug: report unexpected type
-    fprintf(stderr,
-            "Warning: to_bignum called with non-integer cell %u type %d\n", x,
-            CELL_TYPE(x));
     return NULL;
 }
 
@@ -1003,7 +1000,15 @@ bool check_args(unsigned args, unsigned min, unsigned max, const char *name)
 
 void list_append(unsigned *head, unsigned *tail, unsigned elem)
 {
-    unsigned cell = alloc_cons(elem, 0);
+    // CRITICAL: Protect elem - alloc() can trigger GC which may move elem.
+    // If we pass elem by value to alloc_cons, GC could make that value stale.
+    // By protecting elem here, we ensure it's updated if GC moves it.
+    gc_protect(&elem);
+    unsigned cell = alloc();
+    CELL_TYPE(cell) = BT_CONS;
+    CELL_CAR(cell) = elem;  // elem is now up-to-date after any GC
+    CELL_CDR(cell) = 0;
+    gc_unprotect(1);
     if (!*head) {
         *head = *tail = cell;
     } else {
@@ -1150,6 +1155,29 @@ unsigned collect(unsigned x)
         return xx;
     }
 
+    case BT_VMCONT: {
+        // VM continuation contains cell references that must be updated.
+        // The vm_continuation struct has stack values, env, and frame envs.
+        unsigned xx = alloc();
+        CELL_TYPE(xx) = BT_VMCONT;
+        CELL_ID(xx) = CELL_ID(x);
+        CELL_TYPE(x) = BT_BROKENHEART;
+        CELL_CAR(x) = xx;
+        // Now update all cell references in the continuation
+        vm_continuation *cont = (vm_continuation *)(intptr_t)CELL_ID(xx);
+        // Update stack values
+        for (unsigned i = 0; i < cont->sp; i++) {
+            cont->stack[i] = collect(cont->stack[i]);
+        }
+        // Update environment
+        cont->env = collect(cont->env);
+        // Update frame environments
+        for (unsigned i = 0; i < cont->fp; i++) {
+            cont->frames[i].env = collect(cont->frames[i].env);
+        }
+        return xx;
+    }
+
     default: {
         unsigned xx = alloc();
         ctx.cons_cells[xx] = ctx.cons_cells[x];
@@ -1163,10 +1191,6 @@ unsigned collect(unsigned x)
 unsigned gc(unsigned root)
 {
     ctx.major_gc_count++;
-#ifdef DEBUG_GC
-    fprintf(stderr, "[GC #%d] start, hptr=%u, root=%u\n", ctx.major_gc_count,
-            ctx.hptr, root);
-#endif
 
     // Enter GC mode - alloc() will use old gen instead of nursery
     in_gc_mode = true;
@@ -1196,42 +1220,19 @@ unsigned gc(unsigned root)
         root = x;
     }
 
-    // Also collect trampoline state (global evaluator state)
-#ifdef DEBUG_GC
-    fprintf(stderr, "[GC] tramp before: expr=%u env=%u cont=%u value=%u\n",
-            tramp.expr, tramp.env, tramp.cont, tramp.value);
-#endif
+    // Collect trampoline state (global evaluator state)
     tramp.expr = collect(tramp.expr);
     tramp.env = collect(tramp.env);
     tramp.cont = collect(tramp.cont);
     tramp.value = collect(tramp.value);
-#ifdef DEBUG_GC
-    fprintf(stderr, "[GC] tramp after: expr=%u env=%u cont=%u value=%u\n",
-            tramp.expr, tramp.env, tramp.cont, tramp.value);
-#endif
 
     // Collect shadow stack entries - these are pointers to local C variables
     // that hold cell IDs. After GC, we update them to point to new locations.
-#ifdef DEBUG_GC
-    fprintf(stderr, "[GC] shadow_stack_top=%d\n", shadow_stack_top);
-    for (int i = 0; i < shadow_stack_top; i++) {
-        if (shadow_stack[i]) {
-            fprintf(stderr, "[GC] shadow[%d] before=%u\n", i, *shadow_stack[i]);
-        }
-    }
-#endif
     for (int i = 0; i < shadow_stack_top; i++) {
         if (shadow_stack[i] && *shadow_stack[i] >= HEAP_RESERVED) {
             *shadow_stack[i] = collect(*shadow_stack[i]);
         }
     }
-#ifdef DEBUG_GC
-    for (int i = 0; i < shadow_stack_top; i++) {
-        if (shadow_stack[i]) {
-            fprintf(stderr, "[GC] shadow[%d] after=%u\n", i, *shadow_stack[i]);
-        }
-    }
-#endif
 
     // Update VM roots if VM is active
     gc_update_vm_roots(get_active_vm());
@@ -1245,19 +1246,8 @@ unsigned gc(unsigned root)
         if (t == BT_CONS || t == BT_FUNCTION || t == BT_MACRO ||
             t == BT_SYNTAX || t == BT_CONT || t == BT_RATIONAL ||
             t == BT_COMPLEX) {
-            unsigned old_car = CELL_CAR(scan);
             CELL_CAR(scan) = collect(CELL_CAR(scan));
             CELL_CDR(scan) = collect(CELL_CDR(scan));
-            // Debug: verify car was updated if it was in old space
-            unsigned new_min =
-                (ctx.hptr < SEMISPACE_SIZE) ? 271 : SEMISPACE_SIZE;
-            if (old_car >= HEAP_RESERVED &&
-                old_car >= new_min + SEMISPACE_SIZE &&
-                CELL_CAR(scan) == old_car) {
-                fprintf(stderr,
-                        "[GC_BUG] scan=%u: car=%u unchanged after collect!\n",
-                        scan, old_car);
-            }
         }
         scan++;
     }
@@ -1331,10 +1321,6 @@ unsigned gc(unsigned root)
     // Exit GC mode
     in_gc_mode = false;
 
-#ifdef DEBUG_GC
-    fprintf(stderr, "[GC #%d] done, hptr=%u, root=%u\n", ctx.major_gc_count,
-            ctx.hptr, root);
-#endif
     return root;
 }
 
@@ -1387,8 +1373,9 @@ static unsigned collect_to_old(unsigned x)
     if (x < ctx.nursery_start)
         return x;
     // Not in nursery (past current allocation pointer)
-    if (x >= ctx.nursery_ptr)
+    if (x >= ctx.nursery_ptr) {
         return x;
+    }
 
     switch (CELL_TYPE(x)) {
     case BT_BROKENHEART:
@@ -1452,6 +1439,28 @@ static unsigned collect_to_old(unsigned x)
         return xx;
     }
 
+    case BT_VMCONT: {
+        // VM continuation contains cell references that must be updated.
+        unsigned xx = ctx.hptr++;
+        if (ctx.hptr >= ctx.nursery_start) {
+            lisp_panic("old generation full during minor GC");
+        }
+        CELL_TYPE(xx) = BT_VMCONT;
+        CELL_ID(xx) = CELL_ID(x);
+        CELL_TYPE(x) = BT_BROKENHEART;
+        CELL_CAR(x) = xx;
+        // Update all cell references in the continuation
+        vm_continuation *cont = (vm_continuation *)(intptr_t)CELL_ID(xx);
+        for (unsigned i = 0; i < cont->sp; i++) {
+            cont->stack[i] = collect_to_old(cont->stack[i]);
+        }
+        cont->env = collect_to_old(cont->env);
+        for (unsigned i = 0; i < cont->fp; i++) {
+            cont->frames[i].env = collect_to_old(cont->frames[i].env);
+        }
+        return xx;
+    }
+
     default: {
         unsigned xx = ctx.hptr++;
         if (ctx.hptr >= ctx.nursery_start) {
@@ -1468,15 +1477,9 @@ static unsigned collect_to_old(unsigned x)
 unsigned minor_gc(unsigned root)
 {
     ctx.minor_gc_count++;
-#ifdef DEBUG_GC
-    unsigned nursery_used = ctx.nursery_ptr - ctx.nursery_start;
-    fprintf(stderr, "[Minor GC #%d] nursery_used=%u old_gen_hptr=%u root=%u\n",
-            ctx.minor_gc_count, nursery_used, ctx.hptr, root);
-#endif
     unsigned scan = ctx.hptr; // Start of newly promoted objects
-    unsigned initial_hptr = ctx.hptr;
 
-    // Collect root (just call collect_to_old which handles the check)
+    // Collect root
     root = collect_to_old(root);
 
     // Collect trampoline state
@@ -1539,12 +1542,24 @@ unsigned minor_gc(unsigned root)
                 if (t == BT_CONS || t == BT_FUNCTION || t == BT_MACRO ||
                     t == BT_SYNTAX || t == BT_CONT || t == BT_RATIONAL ||
                     t == BT_COMPLEX) {
+                    // CPS continuations (BT_CONT) use CAR/CDR for structure
                     CELL_CAR(cell) = collect_to_old(CELL_CAR(cell));
                     CELL_CDR(cell) = collect_to_old(CELL_CDR(cell));
                 } else if (t == BT_VECTOR) {
                     vector_data *vd = (vector_data *)(intptr_t)CELL_ID(cell);
                     for (unsigned j = 0; j < vd->len; j++) {
                         vd->data[j] = collect_to_old(vd->data[j]);
+                    }
+                } else if (t == BT_VMCONT) {
+                    // VM continuation: update cell references inside struct
+                    vm_continuation *cont =
+                        (vm_continuation *)(intptr_t)CELL_ID(cell);
+                    for (unsigned j = 0; j < cont->sp; j++) {
+                        cont->stack[j] = collect_to_old(cont->stack[j]);
+                    }
+                    cont->env = collect_to_old(cont->env);
+                    for (unsigned j = 0; j < cont->fp; j++) {
+                        cont->frames[j].env = collect_to_old(cont->frames[j].env);
                     }
                 }
             }
@@ -1559,22 +1574,18 @@ unsigned minor_gc(unsigned root)
         if (t == BT_CONS || t == BT_FUNCTION || t == BT_MACRO ||
             t == BT_SYNTAX || t == BT_CONT || t == BT_RATIONAL ||
             t == BT_COMPLEX) {
+            // CPS continuations (BT_CONT) use CAR/CDR for structure
             CELL_CAR(scan) = collect_to_old(CELL_CAR(scan));
             CELL_CDR(scan) = collect_to_old(CELL_CDR(scan));
+        } else if (t == BT_VMCONT) {
+            // VM continuation's internal values were already collected when
+            // the cell was promoted - no need to scan again
         }
         scan++;
     }
 
     // Reset nursery - all survivors are now in old gen
-    // No sweep needed - nursery cells are simply abandoned
-    // (String/bignum data was moved to old gen cells, not freed)
     ctx.nursery_ptr = ctx.nursery_start;
-
-#ifdef DEBUG_GC
-    unsigned promoted = ctx.hptr - initial_hptr;
-    fprintf(stderr, "[Minor GC #%d] promoted=%u cells, new_hptr=%u\n",
-            ctx.minor_gc_count, promoted, ctx.hptr);
-#endif
 
     return root;
 }
@@ -1648,6 +1659,8 @@ void init_keywords(void)
     ctx.kw_ellipsis = intern("...");
     ctx.kw_underscore = intern("_");
     ctx.kw_else = intern("else");
+    ctx.kw_arrow = intern("=>");
     ctx.kw_let_syntax = intern("let-syntax");
     ctx.kw_letrec_syntax = intern("letrec-syntax");
+    ctx.kw_protected = intern("##protected##");
 }

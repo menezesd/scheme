@@ -38,6 +38,7 @@ enum opcode {
     OP_CONST, // Push constant: CONST idx -> push constants[idx]
     OP_POP,   // Discard top of stack
     OP_DUP,   // Duplicate top of stack
+    OP_SWAP,  // Swap top two stack elements
 
     // Variables
     OP_LOOKUP, // Variable lookup: LOOKUP sym_id -> push lookup(sym_id, env)
@@ -113,6 +114,12 @@ enum opcode {
     OP_LIST1,  // Make 1-element list: pop a, push (a)
     OP_LIST2,  // Make 2-element list: pop b, pop a, push (a b)
     OP_LIST3,  // Make 3-element list: pop c, pop b, pop a, push (a b c)
+
+    // Fused compare-and-jump opcodes (common loop patterns)
+    OP_JUMPIFNULL,    // Jump if top is null: pop, if null jump to offset
+    OP_JUMPIFNOTNULL, // Jump if top is not null: pop, if not null jump
+    OP_JUMPIFZERO,    // Jump if top is zero: pop, if zero jump
+    OP_JUMPIFNOTZERO, // Jump if top is not zero: pop, if not zero jump
 };
 
 // ============================================================================
@@ -168,6 +175,7 @@ extern code_object *code_object_registry;
  * The marker cell's id holds the code_object pointer.
  */
 #define BT_CLOSURE 100 // New cell type for VM closures
+#define BT_VMCONT 101  // VM continuation (distinct from CPS BT_CONT)
 
 // Accessor macros for closures - code_object* stored in separate cell's id
 #define GET_CLOSURE_CODE(c) ((code_object *)(intptr_t)CELL_ID(CELL_CAR(c)))
@@ -188,6 +196,25 @@ typedef struct {
     unsigned bp;       // Base pointer (stack position before args)
     unsigned env;      // Environment to restore
 } vm_frame;
+
+// ============================================================================
+// VM Continuation (for call/cc)
+// ============================================================================
+
+/**
+ * Captured continuation structure.
+ * Stored as a cell with type BT_VMCONT, id = pointer to this struct.
+ * The stack and frames arrays contain cell indices that must be updated by GC.
+ */
+typedef struct {
+    unsigned *stack;    // Saved value stack (cell indices)
+    unsigned sp;        // Stack pointer
+    vm_frame *frames;   // Saved call frames
+    unsigned fp;        // Frame pointer
+    code_object *code;  // Current code object
+    unsigned ip;        // Instruction pointer
+    unsigned env;       // Current environment (cell index)
+} vm_continuation;
 
 // ============================================================================
 // VM State
@@ -254,6 +281,7 @@ void compile_sequence(unsigned exprs, compile_ctx *ctx, bool tail);
 void vm_init(vm_state *vm);
 void vm_free(vm_state *vm);
 unsigned vm_run(vm_state *vm, code_object *code, unsigned env);
+unsigned vm_call_closure(unsigned closure, unsigned args); // CPS interop
 void vm_push(vm_state *vm, unsigned val);
 unsigned vm_pop(vm_state *vm);
 

@@ -1,3 +1,28 @@
+/**
+ * @file bignum.c
+ * @brief Arbitrary precision integer arithmetic
+ *
+ * Implements bignums for the Scheme numeric tower, supporting integers
+ * larger than int64_t range.
+ *
+ * ## Representation
+ * Bignums are stored as:
+ * - sign: 0 = positive/zero, 1 = negative
+ * - limbs[]: Array of 32-bit unsigned words (little-endian, least significant first)
+ * - len: Number of significant limbs
+ * - cap: Allocated capacity
+ *
+ * ## Operations
+ * All arithmetic operations produce new bignums; inputs are not modified.
+ * The caller is responsible for freeing results with bn_free().
+ *
+ * ## Conversion
+ * - bn_from_int: Convert int64_t to bignum
+ * - bn_from_str: Parse decimal string to bignum
+ * - bn_to_str: Convert bignum to decimal string
+ * - bn_to_int: Convert to int64_t if it fits
+ */
+
 #include "bignum.h"
 #include <ctype.h>
 #include <stdio.h>

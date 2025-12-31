@@ -12,8 +12,8 @@
 // Embedded standard library
 #include "stdlib_data.h"
 
-// Global flag for bytecode mode
-static bool use_bytecode = false;
+// Global flag for bytecode mode (default: true for performance)
+static bool use_bytecode = true;
 
 // ============================================================================
 // File Loading Utilities
@@ -26,6 +26,9 @@ static bool is_eof_object(unsigned expr)
            strcmp(ctx.atom_table[CELL_ID(expr)], "eof-object") == 0;
 }
 
+// Track evaluation depth to only sweep code objects at top level
+static int eval_depth = 0;
+
 // Evaluate expression (interpreter or bytecode depending on mode)
 static unsigned eval_expr(unsigned expr, unsigned env)
 {
@@ -37,13 +40,15 @@ static unsigned eval_expr(unsigned expr, unsigned env)
         }
         vm_state vm;
         vm_init(&vm);
+        eval_depth++;
         unsigned result = vm_run(&vm, code, env);
+        eval_depth--;
         vm_free(&vm);
-        // Note: We don't free the code object here because closures
-        // in the environment may still reference child code objects.
-        // In a production system, we'd use reference counting or
-        // a code object GC. For now, this is a small memory leak.
-        // code_free(code);
+        // Only sweep unreachable code objects at top level
+        // (nested eval via callback must not sweep parent's code)
+        if (eval_depth == 0) {
+            gc_sweep_code_objects();
+        }
         return result;
     } else {
         return eval_obj(expr, env);
@@ -52,6 +57,33 @@ static unsigned eval_expr(unsigned expr, unsigned env)
 
 // Load and evaluate expressions from a port
 // Returns true on success, false on error
+// Check if expression is a define-syntax form
+static bool is_define_syntax(unsigned expr)
+{
+    return IS_PAIR(expr) && IS_ATOM(car(expr)) &&
+           CELL_ID(car(expr)) == ctx.kw_define_syntax;
+}
+
+// Evaluate a batch of expressions as a begin form
+static unsigned eval_batch(unsigned exprs, unsigned env)
+{
+    if (!exprs)
+        return 0;
+    if (!cdr(exprs))
+        return eval_expr(car(exprs), env);
+
+    gc_protect(&exprs);
+    int begin_id = intern("begin");
+    unsigned begin_atom = alloc();
+    CELL_TYPE(begin_atom) = BT_ATOM;
+    CELL_ID(begin_atom) = begin_id;
+    gc_protect(&begin_atom);
+    unsigned begin_form = alloc_cons(begin_atom, exprs);
+    gc_unprotect(2);
+
+    return eval_expr(begin_form, env);
+}
+
 static bool load_from_port(FILE *f, unsigned *env, bool warn_on_error,
                            const char *filename)
 {
@@ -59,8 +91,12 @@ static bool load_from_port(FILE *f, unsigned *env, bool warn_on_error,
     reader_set_filename(filename);
     reader_reset_position();
 
+    // Read all expressions first
+    unsigned all_exprs = 0, all_tail = 0;
+    gc_protect(&all_exprs);
+    gc_protect(&all_tail);
+
     for (;;) {
-        // Skip whitespace
         int c;
         while ((c = fgetc(f)) != EOF && isspace(c))
             ;
@@ -68,26 +104,83 @@ static bool load_from_port(FILE *f, unsigned *env, bool warn_on_error,
             break;
         ungetc(c, f);
 
-        // Read expression
         unsigned expr = read_obj_port(f);
-        if (expr == TOK_ERROR)
-            break;
+        if (expr == TOK_ERROR) {
+            gc_unprotect(2);
+            reader_set_filename(old_filename);
+            return false;
+        }
         if (is_eof_object(expr))
             break;
 
-        // Evaluate
-        unsigned result = eval_expr(expr, *env);
-        if (result == TOK_ERROR) {
-            if (warn_on_error) {
-                fprintf(stderr, "Warning: error during load\n");
-            }
-            return false;
-        }
-
-        // GC when heap is 75% full
+        gc_protect(&expr);
+        list_append(&all_exprs, &all_tail, expr);
+        gc_unprotect(1);
         *env = maybe_gc(*env, 75);
     }
-    // Final GC
+
+    gc_unprotect(2);
+
+    if (!all_exprs) {
+        *env = gc(*env);
+        reader_set_filename(old_filename);
+        return true;
+    }
+
+    // Evaluate expressions, batching consecutive non-macro expressions
+    // for call/cc support, but evaluating define-syntax immediately
+    // so macros are available for subsequent expressions.
+    unsigned batch = 0, batch_tail = 0;
+    gc_protect(&batch);
+    gc_protect(&batch_tail);
+    gc_protect(&all_exprs);
+
+    for (unsigned exprs = all_exprs; exprs; exprs = cdr(exprs)) {
+        unsigned expr = car(exprs);
+
+        if (is_define_syntax(expr)) {
+            // Evaluate any pending batch first
+            if (batch) {
+                unsigned result = eval_batch(batch, *env);
+                if (result == TOK_ERROR) {
+                    gc_unprotect(3);
+                    reader_set_filename(old_filename);
+                    if (warn_on_error)
+                        fprintf(stderr, "Warning: error during load\n");
+                    return false;
+                }
+                batch = batch_tail = 0;
+            }
+            // Evaluate define-syntax immediately
+            unsigned result = eval_expr(expr, *env);
+            if (result == TOK_ERROR) {
+                gc_unprotect(3);
+                reader_set_filename(old_filename);
+                if (warn_on_error)
+                    fprintf(stderr, "Warning: error during load\n");
+                return false;
+            }
+        } else {
+            // Add to batch
+            gc_protect(&expr);
+            list_append(&batch, &batch_tail, expr);
+            gc_unprotect(1);
+        }
+    }
+
+    // Evaluate final batch
+    if (batch) {
+        unsigned result = eval_batch(batch, *env);
+        if (result == TOK_ERROR) {
+            gc_unprotect(3);
+            reader_set_filename(old_filename);
+            if (warn_on_error)
+                fprintf(stderr, "Warning: error during load\n");
+            return false;
+        }
+    }
+
+    gc_unprotect(3);
     *env = gc(*env);
     reader_set_filename(old_filename);
     return true;
@@ -118,6 +211,32 @@ static void load_stdlib(unsigned *env)
 }
 
 // ============================================================================
+// VM Callbacks for Special Primitives
+// ============================================================================
+
+// Callback for (load "filename") in bytecode mode
+static unsigned load_callback(const char *filename, unsigned *env_ptr)
+{
+    FILE *f = fopen(filename, "r");
+    if (!f) {
+        show_error("load: cannot open file: %s", filename);
+        return TOK_ERROR;
+    }
+    if (!load_from_port(f, env_ptr, true, filename)) {
+        fclose(f);
+        return TOK_ERROR;
+    }
+    fclose(f);
+    return 0; // Return nil on success (like the CPS evaluator)
+}
+
+// Callback for (eval expr env) in bytecode mode
+static unsigned eval_callback(unsigned expr, unsigned env)
+{
+    return eval_expr(expr, env);
+}
+
+// ============================================================================
 // Main Entry Point
 // ============================================================================
 
@@ -125,8 +244,8 @@ static void print_usage(const char *prog)
 {
     fprintf(stderr, "Usage: %s [options] [file.scm]\n", prog);
     fprintf(stderr, "Options:\n");
-    fprintf(stderr, "  --bytecode   Use bytecode compiler and VM\n");
-    fprintf(stderr, "  --help       Show this help message\n");
+    fprintf(stderr, "  --interpreter  Use CPS interpreter instead of bytecode VM\n");
+    fprintf(stderr, "  --help         Show this help message\n");
 }
 
 int main(int argc, char **argv)
@@ -134,8 +253,8 @@ int main(int argc, char **argv)
     // Parse command line options
     int file_arg = 0;
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--bytecode") == 0) {
-            use_bytecode = true;
+        if (strcmp(argv[i], "--interpreter") == 0) {
+            use_bytecode = false;
         } else if (strcmp(argv[i], "--help") == 0 ||
                    strcmp(argv[i], "-h") == 0) {
             print_usage(argv[0]);
@@ -152,6 +271,10 @@ int main(int argc, char **argv)
     // Initialize the heap first
     init_heap();
 
+    // Set up VM callbacks for special primitives
+    ctx.load_callback = load_callback;
+    ctx.eval_callback = eval_callback;
+
     // Initialize keywords and special atoms
     init_keywords();
 
@@ -161,14 +284,11 @@ int main(int argc, char **argv)
     // Set up automatic GC during allocation
     set_alloc_gc_root(&env);
 
-    // Load standard library (always use interpreter for stdlib)
-    bool saved_mode = use_bytecode;
-    use_bytecode = false;
+    // Load standard library
     load_stdlib(&env);
-    use_bytecode = saved_mode;
 
-    if (use_bytecode) {
-        fprintf(stderr, "; Bytecode mode enabled\n");
+    if (!use_bytecode) {
+        fprintf(stderr, "; CPS interpreter mode (use default for faster bytecode VM)\n");
     }
 
     // Execute file if provided
@@ -199,7 +319,6 @@ int main(int argc, char **argv)
         reader_reset_labels();
         reader_reset_position(); // Reset line/col for each REPL input
         unsigned expr = read_obj();
-        // Re-read env after read_obj() since :g escape can trigger GC
         unsigned x = eval_expr(expr, env);
         printf("\n;Value: ");
         write_obj(x);

@@ -74,15 +74,43 @@ static inline void eval_seq(unsigned data, enum cont_type cont_type,
 }
 
 // Create a syntax transformer from a syntax-rules form
+// Handles: (syntax-rules (<literal> ...) <rule> ...)
+//      or: (syntax-rules <ellipsis> (<literal> ...) <rule> ...)
 static inline unsigned make_syntax_transformer(unsigned transformer_form,
                                                unsigned closure_env)
 {
-    unsigned literals = cadr(transformer_form);
-    unsigned rules = cddr(transformer_form);
+    unsigned second = cadr(transformer_form);
+    int64_t ellipsis_id = 0; // 0 means no ellipsis (disabled/shadowed)
+    unsigned literals, rules;
+
+    // Check for custom ellipsis: (syntax-rules <ellipsis> (<literal> ...) ...)
+    if (IS_ATOM(second) && !IS_PAIR(second)) {
+        // Custom ellipsis specified - get its symbol ID
+        ellipsis_id = CELL_ID(second);
+        literals = caddr(transformer_form);
+        rules = cdddr(transformer_form);
+    } else {
+        // Standard form: (syntax-rules (<literal> ...) ...)
+        literals = second;
+        rules = cddr(transformer_form);
+        // Check if default ellipsis (...) is shadowed in closure_env
+        if (lookup_silent(ctx.kw_ellipsis, closure_env) == TOK_ERROR) {
+            // Not shadowed, use default ellipsis
+            ellipsis_id = ctx.kw_ellipsis;
+        }
+        // If shadowed, ellipsis_id stays 0 (no ellipsis)
+    }
+
     gc_protect(&closure_env);
-    unsigned car_val = alloc_cons(literals, rules);
+    gc_protect(&literals);
+    gc_protect(&rules);
+    // Store ellipsis_id as a number cell
+    unsigned ellipsis_cell = store(ellipsis_id);
+    // Store: (ellipsis_cell . (literals . rules))
+    unsigned lit_rules = alloc_cons(literals, rules);
+    unsigned car_val = alloc_cons(ellipsis_cell, lit_rules);
     unsigned result = make_typed_cell(BT_SYNTAX, car_val, closure_env);
-    gc_unprotect(1);
+    gc_unprotect(3);
     return result;
 }
 

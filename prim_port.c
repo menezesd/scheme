@@ -4,6 +4,7 @@
  */
 
 #include "prim_internal.h"
+#include "writer.h"
 
 unsigned apply_port_primitive(unsigned prim_id, unsigned args)
 {
@@ -70,6 +71,10 @@ unsigned apply_port_primitive(unsigned prim_id, unsigned args)
     }
     case PCURRENTINPUT: {
         REQUIRE_ARGS(args, 0, 0, "current-input-port");
+        // Return string port if active, otherwise wrap FILE*
+        if (ctx.current_input_cell != 0) {
+            return ctx.current_input_cell;
+        }
         unsigned p = alloc();
         CELL_TYPE(p) = BT_INPORT;
         CELL_ID(p) = STORE_PTR(ctx.current_input);
@@ -77,6 +82,10 @@ unsigned apply_port_primitive(unsigned prim_id, unsigned args)
     }
     case PCURRENTOUTPUT: {
         REQUIRE_ARGS(args, 0, 0, "current-output-port");
+        // Return string port if active, otherwise wrap FILE*
+        if (ctx.current_output_cell != 0) {
+            return ctx.current_output_cell;
+        }
         unsigned p = alloc();
         CELL_TYPE(p) = BT_OUTPORT;
         CELL_ID(p) = STORE_PTR(ctx.current_output);
@@ -137,6 +146,60 @@ unsigned apply_port_primitive(unsigned prim_id, unsigned args)
         REQUIRE_ARGS(args, 1, 1, "string-port?");
         unsigned a = car(args);
         return (IS_STRINPORT(a) || IS_STROUTPORT(a)) ? ctx.atom_true : 0;
+    }
+    // Internal port setters (used by with-input-from-file etc.)
+    case PSETCURRENTINPUT: {
+        REQUIRE_ARGS(args, 1, 1, "set-current-input-port!");
+        unsigned port = car(args);
+        if (IS_INPORT(port)) {
+            ctx.current_input = GET_PORT_PTR(port);
+            ctx.current_input_cell = 0; // Use FILE*
+        } else if (IS_STRINPORT(port)) {
+            ctx.current_input_cell = port; // Use string port cell
+        } else {
+            show_error("set-current-input-port!: not an input port, got %s",
+                       type_name(port));
+            return TOK_ERROR;
+        }
+        return port;
+    }
+    case PSETCURRENTOUTPUT: {
+        REQUIRE_ARGS(args, 1, 1, "set-current-output-port!");
+        unsigned port = car(args);
+        if (IS_OUTPORT(port)) {
+            ctx.current_output = GET_PORT_PTR(port);
+            ctx.current_output_cell = 0; // Use FILE*
+        } else if (IS_STROUTPORT(port)) {
+            ctx.current_output_cell = port; // Use string port cell
+        } else {
+            show_error("set-current-output-port!: not an output port, got %s",
+                       type_name(port));
+            return TOK_ERROR;
+        }
+        return port;
+    }
+    case PFLUSHOUTPUT: {
+        REQUIRE_ARGS(args, 0, 1, "flush-output-port");
+        if (!args) {
+            // Flush current output port
+            if (ctx.current_output_cell != 0) {
+                // String port - nothing to flush
+            } else {
+                fflush(ctx.current_output);
+            }
+        } else {
+            unsigned port = car(args);
+            if (IS_OUTPORT(port)) {
+                fflush(GET_PORT_PTR(port));
+            } else if (IS_STROUTPORT(port)) {
+                // String port - nothing to flush
+            } else {
+                show_error("flush-output-port: not an output port, got %s",
+                           type_name(port));
+                return TOK_ERROR;
+            }
+        }
+        return 0;
     }
     default:
         return TOK_ERROR;

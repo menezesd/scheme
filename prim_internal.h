@@ -570,8 +570,20 @@ static inline int extract_port(unsigned args, port_dir dir, bool use_second_arg,
 
     // Determine which arg contains the port
     unsigned port_arg = use_second_arg ? cdr(args) : args;
-    if (!port_arg)
-        return 0; // Use default port
+    if (!port_arg) {
+        // Check if current port is a string port
+        unsigned current_cell = (dir == PORT_INPUT) ? ctx.current_input_cell
+                                                    : ctx.current_output_cell;
+        if (current_cell != 0) {
+            *strport_out = GET_STRPORT_PTR(current_cell);
+            if (!*strport_out) {
+                show_error("%s: current port is closed", fn_name);
+                return -1;
+            }
+            return 1; // String port
+        }
+        return 0; // Use default file port
+    }
 
     unsigned p = car(port_arg);
 

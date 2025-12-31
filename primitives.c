@@ -21,6 +21,7 @@
 
 #include "primitives.h"
 #include "prim_internal.h"
+#include <time.h>
 
 // ============================================================================
 // Main Dispatch Function
@@ -74,6 +75,7 @@ unsigned apply_primitive(unsigned prim_id, unsigned args)
         case BT_FUNCTION:
         case BT_BUILTIN:
         case BT_ATOM:
+        case BT_CHAR:
             return CELL_ID(arg1) == CELL_ID(arg2) ? ctx.atom_true : 0;
         default:
             return arg1 == arg2 ? ctx.atom_true : 0;
@@ -168,6 +170,8 @@ unsigned apply_primitive(unsigned prim_id, unsigned args)
     case PWRITECHAR:
     case PEOF:
     case PCHARREADY:
+    case PREADLINE:
+    case PEXIT:
         return apply_io_primitive(prim_id, args);
 
     // Ports - delegated to prim_port.c
@@ -183,7 +187,18 @@ unsigned apply_primitive(unsigned prim_id, unsigned args)
     case PGETOUTPUTSTRING:
     case POPENINPUTSTRING:
     case PSTRINGPORTP:
+    case PSETCURRENTINPUT:
+    case PSETCURRENTOUTPUT:
+    case PFLUSHOUTPUT:
         return apply_port_primitive(prim_id, args);
+
+    // Time
+    case PCURRENTSECOND: {
+        REQUIRE_ARGS(args, 0, 0, "current-second");
+        time_t now = time(NULL);
+        // Return as inexact for sub-second precision compatibility
+        return store_inexact((double)now);
+    }
 
     // String operations
     case PSTRLEN: {
@@ -447,6 +462,26 @@ unsigned apply_primitive(unsigned prim_id, unsigned args)
         char buf[32];
         snprintf(buf, sizeof(buf), "g%u", gensym_counter++);
         return atom_from_string(buf);
+    }
+    case PGCSTATS: {
+        REQUIRE_ARGS(args, 0, 0, "gc-stats");
+        // Return ((minor . count) (major . count) (heap-used . bytes))
+        unsigned minor = store(ctx.minor_gc_count);
+        gc_protect(&minor);
+        unsigned major = store(ctx.major_gc_count);
+        gc_protect(&major);
+        unsigned heap_used = store(ctx.hptr - ctx.mmin);
+        gc_protect(&heap_used);
+        unsigned nursery_used = store(ctx.nursery_ptr - ctx.nursery_start);
+        gc_unprotect(3);
+        unsigned result = alloc_cons(
+            alloc_cons(atom_from_string("minor-gc"), minor),
+            alloc_cons(alloc_cons(atom_from_string("major-gc"), major),
+                       alloc_cons(alloc_cons(atom_from_string("old-gen"), heap_used),
+                                  alloc_cons(alloc_cons(atom_from_string("nursery"),
+                                                        nursery_used),
+                                             0))));
+        return result;
     }
     // PGCFLIP is handled specially in eval.c (needs environment as root)
 

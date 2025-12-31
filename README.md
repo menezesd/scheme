@@ -9,7 +9,8 @@ numeric tower support.
 - **Garbage Collection**: Semispace copying collector with Cheney's algorithm
 - **Tail Call Optimization**: Trampoline-based continuation-passing style (CPS)
 - **Numeric Tower**: Integers, bignums, rationals, floats, and complex numbers
-- **Hygienic Macros**: Full `syntax-rules` implementation with ellipsis patterns
+- **Hygienic Macros**: Full `syntax-rules` with referential transparency and hygiene
+- **SRFI Support**: SRFI-1 (list library), SRFI-9 (records), SRFI-26 (cut/cute)
 - **Standard Library**: Comprehensive stdlib with list utilities, higher-order
   functions, and more
 - **Ports**: File I/O and string ports with standard Scheme port operations
@@ -124,6 +125,8 @@ delay     define-syntax        syntax-rules
 
 ### Macros
 
+Full hygienic macro support with `syntax-rules`:
+
 ```scheme
 (define-syntax when
   (syntax-rules ()
@@ -134,6 +137,60 @@ delay     define-syntax        syntax-rules
   (syntax-rules ()
     ((unless test body ...)
      (if (not test) (begin body ...)))))
+```
+
+The macro system implements mark-based hygiene to handle complex cases like
+nested macros with shadowing:
+
+```scheme
+;; Nested macro hygiene - x in bar's template refers to outer x, not inner
+(let ((x 1))
+  (let-syntax
+      ((foo (syntax-rules ()
+              ((_ y) (let-syntax
+                           ((bar (syntax-rules ()
+                                 ((_) (let ((x 2)) y)))))
+                       (bar))))))
+    (foo x)))  ; => 1 (correctly returns outer x)
+
+;; Referential transparency - + refers to definition-time binding
+(let-syntax ((foo (syntax-rules ()
+                    ((_ expr) (+ expr 1)))))
+  (let ((+ *))
+    (foo 3)))  ; => 4 (uses + from definition, not shadowed *)
+```
+
+### Records (SRFI-9)
+
+```scheme
+(define-record-type point
+  (make-point x y)
+  point?
+  (x point-x point-set-x!)
+  (y point-y))
+
+(define p (make-point 3 4))
+(point-x p)        ; => 3
+(point-set-x! p 5)
+(point-x p)        ; => 5
+```
+
+### Partial Application (SRFI-26)
+
+```scheme
+;; cut - slots filled at call time
+(define add1 (cut + <> 1))
+(add1 5)  ; => 6
+
+(define list-1-x-3 (cut list 1 <> 3))
+(list-1-x-3 2)  ; => (1 2 3)
+
+;; cute - non-slot expressions evaluated at definition time
+(define counter 0)
+(define cute-fn (cute cons (begin (set! counter (+ counter 1)) counter) <>))
+counter     ; => 1 (evaluated once at definition)
+(cute-fn 'a)  ; => (1 . a)
+(cute-fn 'b)  ; => (1 . b) (still 1, not re-evaluated)
 ```
 
 ### Ports and I/O
@@ -175,7 +232,7 @@ delay     define-syntax        syntax-rules
 | `eval.c/h` | Trampoline evaluator, special forms |
 | `env.c/h` | Environment frames, variable binding |
 | `primitives.c/h` | Built-in procedures (~150 primitives) |
-| `macros.c/h` | Hygienic macro expander |
+| `macros.c/h` | Hygienic macro expander (mark-based hygiene) |
 | `bignum.c/h` | Arbitrary precision integer arithmetic |
 | `stdlib.scm` | Standard library (Scheme code) |
 

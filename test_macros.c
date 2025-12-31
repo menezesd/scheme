@@ -18,7 +18,7 @@ static unsigned atom(const char *s) { return atom_from_string(s); }
 TEST(match_empty_pattern)
 {
     // Empty pattern matches empty input
-    unsigned bindings = syntax_match(0, 0, 0, 0);
+    unsigned bindings = syntax_match(0, 0, 0, 0, ctx.kw_ellipsis);
     ASSERT(bindings != TOK_ERROR);
     ASSERT(bindings == 0); // No bindings
     PASS();
@@ -28,7 +28,7 @@ TEST(match_empty_pattern_fails_nonempty)
 {
     // Empty pattern doesn't match non-empty input
     unsigned input = store(42);
-    unsigned bindings = syntax_match(0, input, 0, 0);
+    unsigned bindings = syntax_match(0, input, 0, 0, ctx.kw_ellipsis);
     ASSERT(bindings == TOK_ERROR);
     PASS();
 }
@@ -38,7 +38,7 @@ TEST(match_atom_binds_value)
     // Atom pattern binds to input value
     unsigned pattern = atom("x");
     unsigned input = store(42);
-    unsigned bindings = syntax_match(pattern, input, 0, 0);
+    unsigned bindings = syntax_match(pattern, input, 0, 0, ctx.kw_ellipsis);
     ASSERT(bindings != TOK_ERROR);
     // Bindings should be ((x . 42))
     ASSERT(IS_PAIR(bindings));
@@ -54,7 +54,8 @@ TEST(match_literal_exact)
     unsigned pattern = atom("foo");
     unsigned input = atom("foo");
     unsigned literals = alloc_cons(atom("foo"), 0);
-    unsigned bindings = syntax_match(pattern, input, literals, 0);
+    unsigned bindings =
+        syntax_match(pattern, input, literals, 0, ctx.kw_ellipsis);
     ASSERT(bindings != TOK_ERROR);
     PASS();
 }
@@ -65,7 +66,8 @@ TEST(match_literal_fails)
     unsigned pattern = atom("foo");
     unsigned input = atom("bar");
     unsigned literals = alloc_cons(atom("foo"), 0);
-    unsigned bindings = syntax_match(pattern, input, literals, 0);
+    unsigned bindings =
+        syntax_match(pattern, input, literals, 0, ctx.kw_ellipsis);
     ASSERT(bindings == TOK_ERROR);
     PASS();
 }
@@ -75,7 +77,7 @@ TEST(match_underscore)
     // Underscore matches anything without binding
     unsigned pattern = atom("_");
     unsigned input = store(42);
-    unsigned bindings = syntax_match(pattern, input, 0, 0);
+    unsigned bindings = syntax_match(pattern, input, 0, 0, ctx.kw_ellipsis);
     ASSERT(bindings != TOK_ERROR);
     ASSERT(bindings == 0); // No bindings for underscore
     PASS();
@@ -90,7 +92,7 @@ TEST(match_simple_list)
     // Pattern (x y) matches input (1 2)
     unsigned pattern = alloc_cons(atom("x"), alloc_cons(atom("y"), 0));
     unsigned input = alloc_cons(store(1), alloc_cons(store(2), 0));
-    unsigned bindings = syntax_match(pattern, input, 0, 0);
+    unsigned bindings = syntax_match(pattern, input, 0, 0, ctx.kw_ellipsis);
     ASSERT(bindings != TOK_ERROR);
     // Should have bindings for x and y
     ASSERT(list_length(bindings) == 2);
@@ -102,7 +104,7 @@ TEST(match_nested_list)
     // Pattern ((x)) matches input ((42))
     unsigned pattern = alloc_cons(alloc_cons(atom("x"), 0), 0);
     unsigned input = alloc_cons(alloc_cons(store(42), 0), 0);
-    unsigned bindings = syntax_match(pattern, input, 0, 0);
+    unsigned bindings = syntax_match(pattern, input, 0, 0, ctx.kw_ellipsis);
     ASSERT(bindings != TOK_ERROR);
     PASS();
 }
@@ -112,7 +114,7 @@ TEST(match_dotted_pair)
     // Pattern (x . y) matches input (1 . 2)
     unsigned pattern = alloc_cons(atom("x"), atom("y"));
     unsigned input = alloc_cons(store(1), store(2));
-    unsigned bindings = syntax_match(pattern, input, 0, 0);
+    unsigned bindings = syntax_match(pattern, input, 0, 0, ctx.kw_ellipsis);
     ASSERT(bindings != TOK_ERROR);
     PASS();
 }
@@ -123,7 +125,7 @@ TEST(match_list_length_mismatch)
     unsigned pattern = alloc_cons(atom("x"), alloc_cons(atom("y"), 0));
     unsigned input =
         alloc_cons(store(1), alloc_cons(store(2), alloc_cons(store(3), 0)));
-    unsigned bindings = syntax_match(pattern, input, 0, 0);
+    unsigned bindings = syntax_match(pattern, input, 0, 0, ctx.kw_ellipsis);
     ASSERT(bindings == TOK_ERROR);
     PASS();
 }
@@ -137,7 +139,7 @@ TEST(match_ellipsis_zero)
     // Pattern (x ...) matches empty input ()
     unsigned pattern = alloc_cons(atom("x"), alloc_cons(atom("..."), 0));
     unsigned input = 0;
-    unsigned bindings = syntax_match(pattern, input, 0, 0);
+    unsigned bindings = syntax_match(pattern, input, 0, 0, ctx.kw_ellipsis);
     ASSERT(bindings != TOK_ERROR);
     PASS();
 }
@@ -148,7 +150,7 @@ TEST(match_ellipsis_multiple)
     unsigned pattern = alloc_cons(atom("x"), alloc_cons(atom("..."), 0));
     unsigned input =
         alloc_cons(store(1), alloc_cons(store(2), alloc_cons(store(3), 0)));
-    unsigned bindings = syntax_match(pattern, input, 0, 0);
+    unsigned bindings = syntax_match(pattern, input, 0, 0, ctx.kw_ellipsis);
     ASSERT(bindings != TOK_ERROR);
     PASS();
 }
@@ -160,7 +162,7 @@ TEST(match_ellipsis_with_tail)
         atom("x"), alloc_cons(atom("..."), alloc_cons(atom("y"), 0)));
     unsigned input =
         alloc_cons(store(1), alloc_cons(store(2), alloc_cons(store(3), 0)));
-    unsigned bindings = syntax_match(pattern, input, 0, 0);
+    unsigned bindings = syntax_match(pattern, input, 0, 0, ctx.kw_ellipsis);
     ASSERT(bindings != TOK_ERROR);
     PASS();
 }
@@ -182,7 +184,7 @@ TEST(match_vector_simple)
     inp_data[0] = store(1);
     inp_data[1] = store(2);
 
-    unsigned bindings = syntax_match(pattern, input, 0, 0);
+    unsigned bindings = syntax_match(pattern, input, 0, 0, ctx.kw_ellipsis);
     ASSERT(bindings != TOK_ERROR);
     PASS();
 }
@@ -199,7 +201,7 @@ TEST(match_vector_length_mismatch)
     unsigned *inp_data = vector_data_ptr(input);
     inp_data[0] = store(1);
 
-    unsigned bindings = syntax_match(pattern, input, 0, 0);
+    unsigned bindings = syntax_match(pattern, input, 0, 0, ctx.kw_ellipsis);
     ASSERT(bindings == TOK_ERROR);
     PASS();
 }
@@ -212,7 +214,7 @@ TEST(expand_atom_passthrough)
 {
     // Unbound atom passes through unchanged
     unsigned tmpl = atom("foo");
-    unsigned result = syntax_expand(tmpl, 0, 0);
+    unsigned result = syntax_expand(tmpl, 0, 0, ctx.kw_ellipsis);
     ASSERT(result == tmpl);
     PASS();
 }
@@ -224,7 +226,7 @@ TEST(expand_atom_substitute)
     unsigned val = store(42);
     unsigned binding = alloc_cons(tmpl, val);
     unsigned bindings = alloc_cons(binding, 0);
-    unsigned result = syntax_expand(tmpl, bindings, 0);
+    unsigned result = syntax_expand(tmpl, bindings, 0, ctx.kw_ellipsis);
     ASSERT_EQ(CELL_ID(result), 42);
     PASS();
 }
@@ -240,7 +242,7 @@ TEST(expand_list)
     unsigned by = alloc_cons(y, store(2));
     unsigned bindings = alloc_cons(bx, alloc_cons(by, 0));
 
-    unsigned result = syntax_expand(tmpl, bindings, 0);
+    unsigned result = syntax_expand(tmpl, bindings, 0, ctx.kw_ellipsis);
     ASSERT(IS_PAIR(result));
     ASSERT_EQ(CELL_ID(car(result)), 1);
     ASSERT_EQ(CELL_ID(cadr(result)), 2);
@@ -256,7 +258,7 @@ TEST(expand_nested_list)
     unsigned binding = alloc_cons(x, store(42));
     unsigned bindings = alloc_cons(binding, 0);
 
-    unsigned result = syntax_expand(tmpl, bindings, 0);
+    unsigned result = syntax_expand(tmpl, bindings, 0, ctx.kw_ellipsis);
     ASSERT(IS_PAIR(result));
     ASSERT(IS_PAIR(car(result)));
     ASSERT_EQ(CELL_ID(car(car(result))), 42);
@@ -273,7 +275,7 @@ TEST(expand_vector)
     unsigned binding = alloc_cons(x, store(42));
     unsigned bindings = alloc_cons(binding, 0);
 
-    unsigned result = syntax_expand(tmpl, bindings, 0);
+    unsigned result = syntax_expand(tmpl, bindings, 0, ctx.kw_ellipsis);
     ASSERT(IS_VECTOR(result));
     ASSERT_EQ(vector_len(result), 1);
     ASSERT_EQ(CELL_ID(vector_data_ptr(result)[0]), 42);

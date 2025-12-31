@@ -91,6 +91,7 @@ enum cont_type {
     CONT_OR,        // Evaluated one; data = remaining, env, next
     CONT_COND_TEST, // Evaluated condition; data = (conseq . rest-clauses), env,
                     // next
+    CONT_COND_ARROW, // Evaluated receiver expr; data = test-value, env, next
     CONT_LET_VALS,  // Evaluating let values; data = (vars . (vals . (bindings .
                     // body))), env, next
     CONT_LET_BODY,  // Evaluating let body; data = remaining-body, new-env, next
@@ -255,15 +256,26 @@ typedef struct {
     int kw_ellipsis;
     int kw_underscore;
     int kw_else;
+    int kw_arrow;  // => for cond receiver syntax
     int kw_let_syntax;
     int kw_letrec_syntax;
+    int kw_protected;  // Marker for protected identifiers in hygiene
     unsigned atom_quasiquote;
     unsigned atom_unquote;
     unsigned atom_unquote_splicing;
     // Current ports for dynamic I/O
     FILE *current_input;
     FILE *current_output;
+    unsigned current_input_cell;  // Cell index for current input port (0 = use FILE*)
+    unsigned current_output_cell; // Cell index for current output port (0 = use FILE*)
     FILE *transcript; // NULL if not recording
+    // Callbacks for VM special primitives (set by main.c)
+    unsigned (*load_callback)(const char *filename,
+                              unsigned *env); // Returns result or TOK_ERROR
+    unsigned (*eval_callback)(unsigned expr,
+                              unsigned env); // Returns result or TOK_ERROR
+    // Last error message for better error reporting
+    char last_error[256];
 } lisp_context;
 
 // ============================================================================
@@ -336,6 +348,7 @@ enum primitive_id {
     PERROR,
     PGENSYM,
     PGCFLIP,
+    PGCSTATS,
     PCALLCC,
     // R3RS additions
     PQUOTIENT,
@@ -390,6 +403,7 @@ enum primitive_id {
     PLASTPAIR,
     PSTRFILL,
     PCHARREADY,
+    PREADLINE,
     PSQRT,
     PEXPT,
     PSIN,
@@ -435,6 +449,8 @@ enum primitive_id {
     // Dynamic ports
     PSETCURRENTINPUT,
     PSETCURRENTOUTPUT,
+    PFLUSHOUTPUT,
+    PCURRENTSECOND,
     // Transcript
     PTRANSCRIPTON,
     PTRANSCRIPTOFF,
@@ -455,6 +471,8 @@ enum primitive_id {
     PRANDOMINTEGER,
     PRANDOMREAL,
     PRANDOMSEED,
+    // Process control
+    PEXIT,
     PRIM_COUNT // Total number of primitives
 };
 
@@ -483,12 +501,14 @@ int reader_get_col(void);
 const char *reader_get_filename(void);
 
 // Error with location info (file:line:col format)
+// Also stores message in ctx.last_error for programmatic access
 #define show_error(...)                                                        \
     do {                                                                       \
         fprintf(stderr, "%s:%d:%d: error: ", reader_get_filename(),            \
                 reader_get_line(), reader_get_col());                          \
         fprintf(stderr, __VA_ARGS__);                                          \
         fprintf(stderr, "\n");                                                 \
+        snprintf(ctx.last_error, sizeof(ctx.last_error), __VA_ARGS__);         \
     } while (0)
 
 #define show_warning(...)                                                      \

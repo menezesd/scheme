@@ -5,31 +5,27 @@
 ;;; Let forms as macros
 ;;; ============================================================================
 
-; letrec - recursive binding (must be defined first, uses only lambda)
-(define-syntax letrec
-  (syntax-rules ()
-    ((letrec ((var val) ...) body ...)
-     ((lambda (var ...)
-        (set! var val) ...
-        body ...)
-      #f ...))))
+; Note: letrec is built-in with proper call/cc semantics
+; (continuation restoration when reinvoking captured continuations)
 
-; let - parallel binding (named let uses letrec defined above)
+; let - parallel binding (named let uses built-in letrec)
 (define-syntax let
   (syntax-rules ()
     ((let ((var val) ...) body ...)
      ((lambda (var ...) body ...) val ...))
-    ; Named let
+    ; Named let - evaluate inits in outer env, then bind name
     ((let name ((var val) ...) body ...)
-     (letrec ((name (lambda (var ...) body ...)))
-       (name val ...)))))
+     ((lambda (var ...)
+        (letrec ((name (lambda (var ...) body ...)))
+          (name var ...)))
+      val ...))))
 
 ; let* - sequential binding (uses lambda directly)
 ; Need explicit patterns for different binding counts due to ellipsis limitations
 (define-syntax let*
   (syntax-rules ()
     ((let* () body ...)
-     (begin body ...))
+     (let () body ...))  ; Use let for proper scoping of internal defines
     ((let* ((var val) . more-bindings) body ...)
      ((lambda (var)
         (let* more-bindings body ...))
@@ -161,7 +157,7 @@
 (define (zero? n) (= n 0))
 (define (positive? n) (> n 0))
 (define (negative? n) (< n 0))
-(define (odd? n) (= (remainder n 2) 1))
+(define (odd? n) (not (= (remainder n 2) 0)))
 (define (even? n) (= (remainder n 2) 0))
 
 (define (max x . rest)
@@ -276,19 +272,23 @@
       result)))
 
 ; with-input-from-file temporarily redirects current-input-port
-; Note: This is a simplified implementation
 (define (with-input-from-file filename thunk)
-  (let ((port (open-input-file filename)))
+  (let* ((new-port (open-input-file filename))
+         (old-port (current-input-port)))
+    (set-current-input-port! new-port)
     (let ((result (thunk)))
-      (close-input-port port)
+      (set-current-input-port! old-port)
+      (close-input-port new-port)
       result)))
 
 ; with-output-to-file temporarily redirects current-output-port
-; Note: This is a simplified implementation
 (define (with-output-to-file filename thunk)
-  (let ((port (open-output-file filename)))
+  (let* ((new-port (open-output-file filename))
+         (old-port (current-output-port)))
+    (set-current-output-port! new-port)
     (let ((result (thunk)))
-      (close-output-port port)
+      (set-current-output-port! old-port)
+      (close-output-port new-port)
       result)))
 
 ;;; ============================================================================
@@ -886,4 +886,387 @@
 (define (alist-delete! key alist . maybe-eq)
   (let ((eq (if (null? maybe-eq) equal? (car maybe-eq))))
     (filter! (lambda (pair) (not (eq key (car pair)))) alist)))
+
+;;; ============================================================================
+;;; Dynamic-wind (R5RS)
+;;; ============================================================================
+
+; Wind stack: list of (before . after) pairs
+(define *wind-stack* '())
+
+; Helper: execute wind thunks when jumping between continuation points
+; Must update *wind-stack* as we go so thunks see correct state
+(define (do-wind from to)
+  (set! *wind-stack* from)
+  (cond ((eq? from to))  ; Same point - nothing to do
+        ((null? from)
+         ; Rewinding into 'to': recurse first, then run before thunks
+         (do-wind from (cdr to))
+         ((caar to)))
+        ((null? to)
+         ; Unwinding out of 'from': run after thunks, then recurse
+         ((cdar from))
+         (do-wind (cdr from) to))
+        (else
+         ; Both non-empty and different: unwind one, recurse, rewind one
+         ((cdar from))
+         (do-wind (cdr from) (cdr to))
+         ((caar to))))
+  (set! *wind-stack* to))
+
+; dynamic-wind: establish before/after thunks around body
+(define dynamic-wind
+  (lambda (before body after)
+    (before)
+    (set! *wind-stack* (cons (cons before after) *wind-stack*))
+    (let ((result (body)))
+      (set! *wind-stack* (cdr *wind-stack*))
+      (after)
+      result)))
+
+; Wrap call/cc to handle dynamic-wind
+(define call-with-current-continuation
+  (let ((primitive-call/cc call-with-current-continuation))
+    (lambda (proc)
+      (let ((winds *wind-stack*))
+        (primitive-call/cc
+         (lambda (cont)
+           (proc (lambda (val)
+                   (do-wind *wind-stack* winds)
+                   (cont val)))))))))
+
+(define call/cc call-with-current-continuation)
+
+;;; ============================================================================
+;;; SRFI-9: Defining Record Types
+;;; ============================================================================
+
+;; define-record-type creates a new record type with:
+;; - A constructor procedure
+;; - A predicate to test for instances
+;; - Accessor and mutator procedures for each field
+;;
+;; Syntax:
+;; (define-record-type <type-name>
+;;   (<constructor-name> <field-name> ...)
+;;   <predicate-name>
+;;   (<field-name> <accessor-name>)
+;;   (<field-name> <accessor-name> <mutator-name>)
+;;   ...)
+;;
+;; Implementation uses vectors: #(<type-tag> <field1> <field2> ...)
+
+(define-syntax define-record-type
+  (syntax-rules ()
+    ((define-record-type type-name
+       (constructor-name constructor-field ...)
+       predicate-name
+       field-spec ...)
+     (begin
+       ;; Generate a unique type tag (a gensym would be better, but symbol works)
+       (define type-tag 'type-name)
+
+       ;; Constructor: creates a vector with type tag and fields
+       (define (constructor-name constructor-field ...)
+         (vector type-tag constructor-field ...))
+
+       ;; Predicate: checks if value is a vector with matching type tag
+       (define (predicate-name obj)
+         (and (vector? obj)
+              (> (vector-length obj) 0)
+              (eq? (vector-ref obj 0) type-tag)))
+
+       ;; Generate field accessors and mutators
+       (define-record-fields type-name predicate-name 1 field-spec ...)))))
+
+;; Helper macro to define field accessors/mutators
+;; Index starts at 1 because position 0 is the type tag
+(define-syntax define-record-fields
+  (syntax-rules ()
+    ;; Base case: no more fields
+    ((define-record-fields type-name predicate-name index)
+     (begin))
+
+    ;; Field with accessor only
+    ((define-record-fields type-name predicate-name index
+       (field-name accessor-name)
+       rest ...)
+     (begin
+       (define (accessor-name obj)
+         (vector-ref obj index))
+       (define-record-fields type-name predicate-name (+ index 1) rest ...)))
+
+    ;; Field with accessor and mutator
+    ((define-record-fields type-name predicate-name index
+       (field-name accessor-name mutator-name)
+       rest ...)
+     (begin
+       (define (accessor-name obj)
+         (vector-ref obj index))
+       (define (mutator-name obj val)
+         (vector-set! obj index val))
+       (define-record-fields type-name predicate-name (+ index 1) rest ...)))))
+
+;;; ============================================================================
+;;; SRFI-26: Notation for Specializing Parameters (cut/cute)
+;;; ============================================================================
+
+;; cut creates a procedure by specializing some parameters of another procedure.
+;; <> is a slot marker for parameters to be filled in later.
+;; <...> is a rest-slot marker for remaining arguments.
+;;
+;; Examples:
+;; (cut cons (+ a 1) <>)      => (lambda (x) (cons (+ a 1) x))
+;; (cut list 1 <> 3 <> 5)     => (lambda (x y) (list 1 x 3 y 5))
+;; (cut list 1 <> 3 <...>)    => (lambda (x . rest) (apply list 1 x 3 rest))
+;; (cut list)                 => (lambda () (list))
+
+(define-syntax cut
+  (syntax-rules (<> <...>)
+    ;; Entry point: start collecting
+    ((cut slot-or-expr ...)
+     (cut-helper () () (slot-or-expr ...)))))
+
+(define-syntax cut-helper
+  (syntax-rules (<> <...>)
+    ;; Base case: no more slots/exprs, no rest-slot
+    ((cut-helper (param ...) (arg ...) ())
+     (lambda (param ...) (arg ...)))
+
+    ;; Rest-slot at the end
+    ((cut-helper (param ...) (arg ...) (<...>))
+     (lambda (param ... . rest-args) (apply arg ... rest-args)))
+
+    ;; Slot: add a parameter
+    ((cut-helper (param ...) (arg ...) (<> . rest))
+     (cut-helper (param ... x) (arg ... x) rest))
+
+    ;; Expression: evaluate and add to args
+    ((cut-helper (param ...) (arg ...) (expr . rest))
+     (cut-helper (param ...) (arg ... expr) rest))))
+
+;; cute is like cut but evaluates non-slot expressions at definition time
+;; (not at call time like cut does).
+;;
+;; Example:
+;; (cute cons (+ a 1) <>) evaluates (+ a 1) once when cute form is evaluated,
+;; while (cut cons (+ a 1) <>) evaluates it on each call.
+
+(define-syntax cute
+  (syntax-rules (<> <...>)
+    ;; Entry point: start collecting
+    ((cute slot-or-expr ...)
+     (cute-helper () () (slot-or-expr ...)))))
+
+(define-syntax cute-helper
+  (syntax-rules (<> <...>)
+    ;; Base case: no more slots/exprs, no rest-slot
+    ((cute-helper (param ...) (arg ...) ())
+     (lambda (param ...) (arg ...)))
+
+    ;; Rest-slot at the end
+    ((cute-helper (param ...) (arg ...) (<...>))
+     (lambda (param ... . rest-args) (apply arg ... rest-args)))
+
+    ;; Slot: add a parameter (no binding needed)
+    ((cute-helper (param ...) (arg ...) (<> . rest))
+     (cute-helper (param ... x) (arg ... x) rest))
+
+    ;; Expression: wrap in a let to evaluate once, using nested approach
+    ((cute-helper (param ...) (arg ...) (expr . rest))
+     (let ((tmp expr))
+       (cute-helper (param ...) (arg ... tmp) rest)))))
+
+;;; ============================================================================
+;;; Format (SRFI-28 basic format strings)
+;;; ============================================================================
+
+;; format - formatted output
+;; Supports: ~a (display), ~s (write), ~% (newline), ~~ (tilde)
+;; First argument can be:
+;;   #f - return string
+;;   #t - output to current-output-port, return unspecified
+;;   port - output to port, return unspecified
+(define (format dest fmt . args)
+  (define (format-to-string)
+    (let ((out (open-output-string)))
+      (format-to-port out)
+      (get-output-string out)))
+
+  (define (format-to-port port)
+    (let loop ((i 0) (args args))
+      (if (< i (string-length fmt))
+          (let ((c (string-ref fmt i)))
+            (if (char=? c #\~)
+                (if (< (+ i 1) (string-length fmt))
+                    (let ((directive (string-ref fmt (+ i 1))))
+                      (cond
+                        ((or (char=? directive #\a) (char=? directive #\A))
+                         (if (null? args)
+                             (error "format: not enough arguments for ~a")
+                             (begin
+                               (display (car args) port)
+                               (loop (+ i 2) (cdr args)))))
+                        ((or (char=? directive #\s) (char=? directive #\S))
+                         (if (null? args)
+                             (error "format: not enough arguments for ~s")
+                             (begin
+                               (write (car args) port)
+                               (loop (+ i 2) (cdr args)))))
+                        ((or (char=? directive #\d) (char=? directive #\D))
+                         (if (null? args)
+                             (error "format: not enough arguments for ~d")
+                             (begin
+                               (display (car args) port)
+                               (loop (+ i 2) (cdr args)))))
+                        ((char=? directive #\%)
+                         (newline port)
+                         (loop (+ i 2) args))
+                        ((char=? directive #\~)
+                         (write-char #\~ port)
+                         (loop (+ i 2) args))
+                        (else
+                         (error "format: unknown directive" directive))))
+                    (error "format: incomplete escape at end of string"))
+                (begin
+                  (write-char c port)
+                  (loop (+ i 1) args))))
+          #t)))
+
+  (cond
+    ((eq? dest #f) (format-to-string))
+    ((eq? dest #t) (format-to-port (current-output-port)))
+    ((output-port? dest) (format-to-port dest))
+    (else (error "format: invalid destination" dest))))
+
+;;; ============================================================================
+;;; String Utilities
+;;; ============================================================================
+
+;; string-upcase - convert string to uppercase
+(define (string-upcase s)
+  (list->string (map char-upcase (string->list s))))
+
+;; string-downcase - convert string to lowercase
+(define (string-downcase s)
+  (list->string (map char-downcase (string->list s))))
+
+;; string-prefix? - check if s starts with prefix
+(define (string-prefix? prefix s)
+  (let ((plen (string-length prefix))
+        (slen (string-length s)))
+    (and (>= slen plen)
+         (string=? prefix (substring s 0 plen)))))
+
+;; string-suffix? - check if s ends with suffix
+(define (string-suffix? suffix s)
+  (let ((xlen (string-length suffix))
+        (slen (string-length s)))
+    (and (>= slen xlen)
+         (string=? suffix (substring s (- slen xlen) slen)))))
+
+;; string-trim - remove leading/trailing whitespace
+(define (string-trim s)
+  (string-trim-right (string-trim-left s)))
+
+;; string-trim-left - remove leading whitespace
+(define (string-trim-left s)
+  (let ((len (string-length s)))
+    (let loop ((i 0))
+      (if (>= i len)
+          ""
+          (if (char-whitespace? (string-ref s i))
+              (loop (+ i 1))
+              (substring s i len))))))
+
+;; string-trim-right - remove trailing whitespace
+(define (string-trim-right s)
+  (let ((len (string-length s)))
+    (let loop ((i (- len 1)))
+      (if (< i 0)
+          ""
+          (if (char-whitespace? (string-ref s i))
+              (loop (- i 1))
+              (substring s 0 (+ i 1)))))))
+
+;; string-split - split string by delimiter (default: whitespace)
+(define (string-split s . args)
+  (let ((delim (if (null? args) #f (car args))))
+    (if delim
+        ;; Split by specific character
+        (let loop ((i 0) (start 0) (result '()))
+          (if (>= i (string-length s))
+              (reverse (if (> i start)
+                           (cons (substring s start i) result)
+                           result))
+              (if (char=? (string-ref s i) delim)
+                  (loop (+ i 1) (+ i 1)
+                        (if (> i start)
+                            (cons (substring s start i) result)
+                            result))
+                  (loop (+ i 1) start result))))
+        ;; Split by whitespace
+        (let loop ((i 0) (start #f) (result '()))
+          (if (>= i (string-length s))
+              (reverse (if start
+                           (cons (substring s start i) result)
+                           result))
+              (let ((c (string-ref s i)))
+                (if (char-whitespace? c)
+                    (loop (+ i 1) #f
+                          (if start
+                              (cons (substring s start i) result)
+                              result))
+                    (loop (+ i 1) (or start i) result))))))))
+
+;; string-join - join strings with separator (uses string port for O(n))
+(define (string-join strs . args)
+  (let ((sep (if (null? args) " " (car args))))
+    (if (null? strs)
+        ""
+        (let ((out (open-output-string)))
+          (display (car strs) out)
+          (for-each (lambda (s)
+                      (display sep out)
+                      (display s out))
+                    (cdr strs))
+          (get-output-string out)))))
+
+;;; ============================================================================
+;;; SRFI-8: receive (binding to multiple values)
+;;; ============================================================================
+
+;; (receive (var ...) producer body ...)
+;; Binds vars to values returned by producer, then evaluates body
+(define-syntax receive
+  (syntax-rules ()
+    ((receive formals expression body ...)
+     (call-with-values (lambda () expression)
+       (lambda formals body ...)))))
+
+;;; ============================================================================
+;;; SRFI-2: and-let* (guarded evaluation)
+;;; ============================================================================
+
+;; (and-let* ((var expr) ...) body ...)
+;; Sequential binding with short-circuit on #f
+(define-syntax and-let*
+  (syntax-rules ()
+    ;; No bindings, just body
+    ((and-let* () body ...)
+     (begin body ...))
+    ;; No bindings, no body -> #t
+    ((and-let* ())
+     #t)
+    ;; Binding without variable (just test)
+    ((and-let* ((expr) more ...) body ...)
+     (if expr
+         (and-let* (more ...) body ...)
+         #f))
+    ;; Binding with variable
+    ((and-let* ((var expr) more ...) body ...)
+     (let ((var expr))
+       (if var
+           (and-let* (more ...) body ...)
+           #f)))))
 

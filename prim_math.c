@@ -2,6 +2,29 @@
  * @file prim_math.c
  * @brief Math functions (sqrt, sin, cos, exp, log, floor, ceiling, etc.)
  *        and random number generation (SRFI-27 style)
+ *
+ * Implements transcendental and mathematical functions:
+ *
+ * ## Trigonometric
+ * sin, cos, tan, asin, acos, atan (including 2-argument atan)
+ *
+ * ## Exponential/Logarithmic
+ * exp, log, expt (power function)
+ *
+ * ## Rounding
+ * floor, ceiling, truncate, round
+ *
+ * ## Other
+ * sqrt, abs (delegated from prim_numeric)
+ *
+ * ## Random Numbers (SRFI-27 compatible)
+ * Uses xoshiro256** PRNG for high-quality randomness:
+ * - random-integer: Random integer in [0, n)
+ * - random-real: Random float in [0, 1)
+ * - random-seed!: Seed the generator
+ *
+ * Results are inexact except where input allows exact result
+ * (e.g., expt with integer arguments).
  */
 
 #define _USE_MATH_DEFINES
@@ -265,46 +288,77 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned args)
             return result;
         }
 
-        // Exact integer base with exact rational exponent p/q
+        // Exact integer or rational base with exact rational exponent p/q
         // Try to compute exact (base^(1/q))^p if base is a perfect qth power
-        if (IS_EXACT_INT(base_arg) && CELL_TYPE(exp_arg) == BT_RATIONAL) {
-            int64_t numer, denom;
-            get_rational_parts(exp_arg, &numer, &denom);
+        if ((IS_EXACT_INT(base_arg) || CELL_TYPE(base_arg) == BT_RATIONAL) &&
+            CELL_TYPE(exp_arg) == BT_RATIONAL) {
+            int64_t exp_numer, exp_denom;
+            get_rational_parts(exp_arg, &exp_numer, &exp_denom);
 
             // Only handle small roots (avoid expensive computation)
-            if (denom > 0 && denom <= 1000) {
-                bignum *base_bn = to_bignum(base_arg);
-                bignum *root = bn_exact_nth_root(base_bn, denom);
-                bn_free(base_bn);
+            if (exp_denom > 0 && exp_denom <= 1000) {
+                bignum *num_root = NULL;
+                bignum *den_root = NULL;
 
-                if (root) {
-                    // base is a perfect qth power, root is the qth root
-                    // Now compute root^|numer|
-                    bool neg_exp = numer < 0;
-                    uint64_t p = neg_exp ? (uint64_t)(-numer) : (uint64_t)numer;
+                if (IS_EXACT_INT(base_arg)) {
+                    // Integer base - denominator is implicitly 1
+                    bignum *base_bn = to_bignum(base_arg);
+                    num_root = bn_exact_nth_root(base_bn, exp_denom);
+                    bn_free(base_bn);
+                    if (num_root)
+                        den_root = bn_from_int(1);
+                } else {
+                    // Rational base - check both numerator and denominator
+                    unsigned base_num = CELL_CAR(base_arg);
+                    unsigned base_den = CELL_CDR(base_arg);
+                    bignum *num_bn = to_bignum(base_num);
+                    bignum *den_bn = to_bignum(base_den);
+                    num_root = bn_exact_nth_root(num_bn, exp_denom);
+                    if (num_root)
+                        den_root = bn_exact_nth_root(den_bn, exp_denom);
+                    bn_free(num_bn);
+                    bn_free(den_bn);
+                }
 
-                    bignum *power = bn_from_int(1);
+                if (num_root && den_root) {
+                    // Both are perfect qth powers
+                    // Now compute (num_root/den_root)^|exp_numer|
+                    bool neg_exp = exp_numer < 0;
+                    uint64_t p =
+                        neg_exp ? (uint64_t)(-exp_numer) : (uint64_t)exp_numer;
+
+                    bignum *num_power = bn_from_int(1);
+                    bignum *den_power = bn_from_int(1);
                     for (uint64_t i = 0; i < p; i++) {
-                        bignum *temp = bn_mul(power, root);
-                        bn_free(power);
-                        power = temp;
+                        bignum *temp = bn_mul(num_power, num_root);
+                        bn_free(num_power);
+                        num_power = temp;
+                        temp = bn_mul(den_power, den_root);
+                        bn_free(den_power);
+                        den_power = temp;
                     }
-                    bn_free(root);
+                    bn_free(num_root);
+                    bn_free(den_root);
 
-                    unsigned result = store_integer(power);
+                    unsigned result_num = store_integer(num_power);
+                    gc_protect(&result_num);
+                    unsigned result_den = store_integer(den_power);
+                    gc_unprotect(1);
 
                     if (neg_exp) {
-                        // Return 1 / result
-                        gc_protect(&result);
-                        unsigned one = store(1);
-                        gc_protect(&one);
-                        unsigned div_args =
-                            alloc_cons(one, alloc_cons(result, 0));
-                        gc_unprotect(2);
-                        return prim_div(div_args);
+                        // Swap numerator and denominator
+                        unsigned temp = result_num;
+                        result_num = result_den;
+                        result_den = temp;
                     }
-                    return result;
+
+                    return normalize_rational_cells(result_num, result_den);
                 }
+
+                if (num_root)
+                    bn_free(num_root);
+                if (den_root)
+                    bn_free(den_root);
             }
         }
 

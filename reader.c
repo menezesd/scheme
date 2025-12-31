@@ -20,10 +20,6 @@
  * - Unquote-splicing: ,@x -> (unquote-splicing x)
  * - Datum labels: #n= (define) and #n# (reference) for cyclic structures
  *
- * ## Escape Commands (REPL only)
- * - :q - Quit the interpreter
- * - :g - Trigger garbage collection
- *
  * ## Error Handling
  * Line and column tracking for meaningful error messages.
  */
@@ -302,25 +298,6 @@ unsigned read_token(void)
         while (isspace(c))
             c = reader_getchar();
 
-        // Escape commands (only for interactive mode/stdin)
-        if (c == ':' && reader_port == NULL) {
-            c = reader_getchar();
-            if (c == 'q') {
-                exit(0);
-            } else if (c == 'g') {
-                trigger_gc();
-                printf(";GC done\n");
-                fflush(stdout);
-                while ((c = reader_getchar()) != '\n' && c != EOF)
-                    ;
-                continue; // Continue reading next expression
-            } else {
-                while ((c = reader_getchar()) != '\n' && c != EOF)
-                    ;
-                return TOK_ERROR;
-            }
-        }
-
         // Comments
         if (c == ';') {
             while ((c = reader_getchar()) != '\n' && c != EOF)
@@ -479,10 +456,8 @@ unsigned read_token(void)
                 }
                 if (is_delimiter(c))
                     break;
-                // Allow . as part of symbols (but not as token starter which is
-                // handled above)
-                if (c == '.' && !is_number)
-                    break;
+                // R5RS: . + - @ are valid subsequent characters in identifiers
+                // The . as dotted-pair marker is handled in the switch above
                 sb_append(&sb, tolower(c));
             }
             reader_ungetc(c);

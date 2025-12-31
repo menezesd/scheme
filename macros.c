@@ -6,7 +6,8 @@
  *
  * ## Syntax-Rules Structure
  * A syntax-rules object is stored as:
- *   (literals . ((pattern1 . template1) (pattern2 . template2) ...))
+ *   ((ellipsis . (literals . rules)) . closure_env)
+ * where rules is: ((pattern1 . template1) (pattern2 . template2) ...)
  *
  * ## Pattern Matching
  * Patterns can contain:
@@ -23,13 +24,69 @@
  * - Ellipsis: Replicate preceding template for each match
  * - Nested ellipsis: For nested pattern ellipsis
  *
- * ## Hygiene
- * Pattern variables are alpha-renamed using gensym to prevent capture.
- * Literals are compared by identity, not by name.
+ * ## Hygiene Implementation
+ * The macro system uses a combination of techniques for hygiene:
+ *
+ * 1. **Gensym renaming**: Bindings introduced by the template (in let, lambda,
+ *    etc.) are alpha-renamed to fresh gensyms. This prevents template-introduced
+ *    bindings from capturing references in the macro use site.
+ *
+ * 2. **Protection markers**: When a pattern variable is substituted with an
+ *    identifier, that identifier is wrapped as (##protected## . id). This marks
+ *    it as "coming from input" so that nested macro expansions don't rename it.
+ *    The protection marker is preserved through:
+ *    - hygienize_template: Skips protected wrappers
+ *    - rename_in_template: Skips protected wrappers
+ *    - unwrap_protected: Removes markers after expansion (but not inside
+ *      syntax-rules, which will be processed separately)
+ *
+ * This handles the challenging case of nested macros where a substituted
+ * identifier has the same name as a template-introduced binding:
+ *
+ *   (let ((x 1))
+ *     (let-syntax ((foo (syntax-rules ()
+ *                         ((_ y) (let-syntax ((bar (syntax-rules ()
+ *                                                    ((_) (let ((x 2)) y)))))
+ *                                  (bar))))))
+ *       (foo x)))  ; => 1
+ *
+ * When foo expands, y is substituted with (##protected## . x). When bar's
+ * template is hygienized, the let-introduced x is renamed to a gensym, but
+ * the protected x is preserved. Result: (let ((g0 2)) x) => 1.
+ *
+ * 3. **Referential transparency**: Free identifiers in templates (not pattern
+ *    variables, not special forms) are looked up in the macro's definition
+ *    environment. If found, they are renamed to gensyms and the gensym is
+ *    bound to the definition-time value in the use-site environment. This
+ *    ensures that macros "close over" their definition environment:
+ *
+ *   (let-syntax ((foo (syntax-rules ()
+ *                       ((_ expr) (+ expr 1)))))
+ *     (let ((+ *))
+ *       (foo 3)))  ; => 4, not 3
+ *
+ *    The + in foo's template refers to the + at definition time (addition),
+ *    not the shadowed + at use time (multiplication).
+ *
+ *    Note: Assignment targets (set!, define) are NOT renamed to preserve
+ *    the ability to mutate bindings from the use-site environment.
  */
 
 #include "macros.h"
 #include "context.h"
+#include "env.h"
+#include <string.h>
+
+// External gensym counter
+extern unsigned gensym_counter;
+
+// Generate a fresh gensym atom
+static unsigned do_gensym(void)
+{
+    char buf[32];
+    snprintf(buf, sizeof(buf), "g%u", gensym_counter++);
+    return atom_from_string(buf);
+}
 
 // ============================================================================
 // Helper Functions
@@ -45,8 +102,13 @@ static bool is_literal(int64_t sym, unsigned literals)
     return false;
 }
 
-// Check if symbol is ellipsis
-static bool is_ellipsis(unsigned x) { return IS_KEYWORD(x, ctx.kw_ellipsis); }
+// Check if symbol is the ellipsis (0 means no ellipsis/disabled)
+static bool is_ellipsis(unsigned x, int64_t ellipsis_id)
+{
+    if (!ellipsis_id)
+        return false; // Ellipsis disabled (shadowed)
+    return IS_ATOM(x) && CELL_ID(x) == ellipsis_id;
+}
 
 // Check if symbol is underscore (wildcard)
 static bool is_underscore(unsigned x)
@@ -83,8 +145,9 @@ static unsigned syntax_lookup(unsigned var, unsigned bindings)
     for (; bindings; bindings = cdr(bindings)) {
         unsigned binding = car(bindings);
         unsigned pvar = car(binding);
-        if (IS_ATOM(pvar) && IS_ATOM(var) && CELL_ID(pvar) == CELL_ID(var))
+        if (IS_ATOM(pvar) && IS_ATOM(var) && CELL_ID(pvar) == CELL_ID(var)) {
             return cdr(binding);
+        }
     }
     return TOK_ERROR;
 }
@@ -118,11 +181,716 @@ static unsigned find_ellipsis_binding(unsigned var, unsigned bindings)
 }
 
 // ============================================================================
+// Hygienic Renaming
+// ============================================================================
+
+// Unwrap protected identifiers: (##protected## . x) → x
+// Called after expansion to remove protection markers
+static unsigned unwrap_protected(unsigned expr)
+{
+    if (!expr)
+        return 0;
+
+    gc_protect(&expr);
+
+    // Check for protected wrapper
+    if (IS_PAIR(expr)) {
+        unsigned head = car(expr);
+        if (IS_ATOM(head) && CELL_ID(head) == ctx.kw_protected) {
+            // Unwrap: (##protected## . x) → x
+            gc_unprotect(1);
+            return cdr(expr);
+        }
+
+        // Don't unwrap inside syntax-rules - those templates will be
+        // processed later by their own apply_syntax
+        if (IS_ATOM(head) && CELL_ID(head) == ctx.kw_syntax_rules) {
+            gc_unprotect(1);
+            return expr;
+        }
+
+        // Recursively unwrap car and cdr
+        unsigned new_car = unwrap_protected(car(expr));
+        gc_protect(&new_car);
+        unsigned new_cdr = unwrap_protected(cdr(expr));
+        gc_protect(&new_cdr);
+        unsigned result;
+        if (new_car == car(expr) && new_cdr == cdr(expr))
+            result = expr;
+        else {
+            result = alloc_cons(new_car, new_cdr);
+        }
+        gc_unprotect(3);
+        return result;
+    }
+
+    if (IS_VECTOR(expr)) {
+        unsigned len = vector_len(expr);
+        bool changed = false;
+
+        for (unsigned i = 0; i < len && !changed; i++) {
+            // Refresh data pointer - GC may have moved expr
+            unsigned *data = vector_data_ptr(expr);
+            unsigned orig = data[i];
+            unsigned unwrapped = unwrap_protected(orig);
+            if (unwrapped != orig)
+                changed = true;
+        }
+
+        if (!changed) {
+            gc_unprotect(1);
+            return expr;
+        }
+
+        unsigned new_vec = make_vector(len, 0);
+        gc_protect(&new_vec);
+        for (unsigned i = 0; i < len; i++) {
+            // Refresh data pointers - GC may have moved vectors
+            unsigned *data = vector_data_ptr(expr);
+            unsigned *new_data = vector_data_ptr(new_vec);
+            new_data[i] = unwrap_protected(data[i]);
+        }
+        gc_unprotect(2);
+        return new_vec;
+    }
+
+    gc_unprotect(1);
+    return expr;
+}
+
+// Check if a symbol ID is a pattern variable (bound in bindings list)
+static bool is_pattern_var(int64_t sym_id, unsigned bindings)
+{
+    for (; bindings; bindings = cdr(bindings)) {
+        unsigned binding = car(bindings);
+        unsigned pvar = car(binding);
+        if (IS_ATOM(pvar) && CELL_ID(pvar) == sym_id)
+            return true;
+        // Also check pattern pairs (nested pattern variables)
+        if (IS_PAIR(pvar)) {
+            unsigned p = pvar;
+            for (; p; p = IS_PAIR(p) ? cdr(p) : 0) {
+                unsigned elem = IS_PAIR(p) ? car(p) : p;
+                if (IS_ATOM(elem) && CELL_ID(elem) == sym_id)
+                    return true;
+                if (!IS_PAIR(p))
+                    break;
+            }
+        }
+    }
+    return false;
+}
+
+// Check if an identifier is a special form keyword
+static bool is_special_form(int64_t id)
+{
+    return id == ctx.kw_lambda || id == ctx.kw_if || id == ctx.kw_define ||
+           id == ctx.kw_set || id == ctx.kw_quote || id == ctx.kw_begin ||
+           id == ctx.kw_cond || id == ctx.kw_and || id == ctx.kw_or ||
+           id == ctx.kw_let_syntax || id == ctx.kw_letrec_syntax ||
+           id == ctx.kw_define_syntax || id == ctx.kw_syntax_rules ||
+           id == ctx.kw_quasiquote || id == ctx.kw_unquote ||
+           id == ctx.kw_unquote_splicing || id == ctx.kw_else ||
+           id == ctx.kw_ellipsis || id == ctx.kw_underscore ||
+           id == ctx.kw_let || id == ctx.kw_letrec;
+}
+
+// Check if identifier is in a list (used for free_ids collection)
+static bool id_in_list(int64_t id, unsigned list)
+{
+    for (; list; list = cdr(list)) {
+        if (IS_ATOM(car(list)) && CELL_ID(car(list)) == id)
+            return true;
+    }
+    return false;
+}
+
+// Collect free identifiers from a template
+// Returns a list of unique atoms that are free (not pattern vars, not special forms)
+static unsigned collect_free_ids(unsigned tmpl, unsigned bindings,
+                                 unsigned collected, int64_t ellipsis_id)
+{
+    if (!tmpl)
+        return collected;
+
+    gc_protect(&tmpl);
+    gc_protect(&bindings);
+    gc_protect(&collected);
+
+    if (IS_ATOM(tmpl)) {
+        int64_t id = CELL_ID(tmpl);
+        // Skip if special form, pattern variable, ellipsis, or already collected
+        if (!is_special_form(id) && !is_pattern_var(id, bindings) &&
+            id != ellipsis_id && !id_in_list(id, collected)) {
+            // Add to collected list
+            unsigned new_collected = alloc_cons(tmpl, collected);
+            gc_unprotect(3);
+            return new_collected;
+        }
+        gc_unprotect(3);
+        return collected;
+    }
+
+    if (IS_PAIR(tmpl)) {
+        unsigned head = car(tmpl);
+        // Skip protected wrappers and syntax-rules (they'll be processed later)
+        if (IS_ATOM(head)) {
+            int64_t head_id = CELL_ID(head);
+            if (head_id == ctx.kw_protected || head_id == ctx.kw_syntax_rules) {
+                gc_unprotect(3);
+                return collected;
+            }
+            // For quote, skip the quoted data
+            if (head_id == ctx.kw_quote) {
+                gc_unprotect(3);
+                return collected;
+            }
+            // For set! and define, skip the target variable but collect from expr
+            // (set! var expr) - skip var, collect from expr
+            // (define var expr) - skip var, collect from expr
+            if (head_id == ctx.kw_set || head_id == ctx.kw_define) {
+                // Collect only from the expression part (cddr), not the variable (cadr)
+                unsigned expr = cddr(tmpl);
+                if (expr) {
+                    unsigned result =
+                        collect_free_ids(car(expr), bindings, collected, ellipsis_id);
+                    gc_unprotect(3);
+                    return result;
+                }
+                gc_unprotect(3);
+                return collected;
+            }
+        }
+        // Recursively collect from car and cdr
+        collected = collect_free_ids(car(tmpl), bindings, collected, ellipsis_id);
+        gc_protect(&collected);
+        unsigned result =
+            collect_free_ids(cdr(tmpl), bindings, collected, ellipsis_id);
+        gc_unprotect(4);
+        return result;
+    }
+
+    if (IS_VECTOR(tmpl)) {
+        unsigned len = vector_len(tmpl);
+        for (unsigned i = 0; i < len; i++) {
+            // Refresh data pointer - GC may have moved tmpl
+            unsigned *data = vector_data_ptr(tmpl);
+            collected =
+                collect_free_ids(data[i], bindings, collected, ellipsis_id);
+        }
+        gc_unprotect(3);
+        return collected;
+    }
+
+    gc_unprotect(3);
+    return collected;
+}
+
+// Rename free identifiers in template according to rename_map
+// rename_map is ((old_atom . new_gensym) ...)
+static unsigned rename_free_ids(unsigned tmpl, unsigned rename_map)
+{
+    if (!tmpl || !rename_map)
+        return tmpl;
+
+    gc_protect(&tmpl);
+    gc_protect(&rename_map);
+
+    if (IS_ATOM(tmpl)) {
+        int64_t id = CELL_ID(tmpl);
+        // Look up in rename_map
+        for (unsigned m = rename_map; m; m = cdr(m)) {
+            unsigned entry = car(m);
+            if (IS_ATOM(car(entry)) && CELL_ID(car(entry)) == id) {
+                gc_unprotect(2);
+                return cdr(entry); // Return the gensym
+            }
+        }
+        gc_unprotect(2);
+        return tmpl;
+    }
+
+    if (IS_PAIR(tmpl)) {
+        unsigned head = car(tmpl);
+        // Skip protected wrappers and syntax-rules
+        if (IS_ATOM(head)) {
+            int64_t head_id = CELL_ID(head);
+            if (head_id == ctx.kw_protected || head_id == ctx.kw_syntax_rules) {
+                gc_unprotect(2);
+                return tmpl;
+            }
+            if (head_id == ctx.kw_quote) {
+                gc_unprotect(2);
+                return tmpl;
+            }
+            // For set! and define, don't rename the target variable
+            // (set! var expr) -> (set! var renamed-expr)
+            // (define var expr) -> (define var renamed-expr)
+            if (head_id == ctx.kw_set || head_id == ctx.kw_define) {
+                unsigned var = cadr(tmpl);
+                unsigned expr = cddr(tmpl);
+                if (expr) {
+                    unsigned new_expr = rename_free_ids(car(expr), rename_map);
+                    gc_protect(&new_expr);
+                    unsigned result = alloc_cons(
+                        head, alloc_cons(var, alloc_cons(new_expr, 0)));
+                    gc_unprotect(3);
+                    return result;
+                }
+                gc_unprotect(2);
+                return tmpl;
+            }
+        }
+        unsigned new_car = rename_free_ids(car(tmpl), rename_map);
+        gc_protect(&new_car);
+        unsigned new_cdr = rename_free_ids(cdr(tmpl), rename_map);
+        gc_protect(&new_cdr);
+        unsigned result;
+        if (new_car == car(tmpl) && new_cdr == cdr(tmpl))
+            result = tmpl;
+        else
+            result = alloc_cons(new_car, new_cdr);
+        gc_unprotect(4);
+        return result;
+    }
+
+    if (IS_VECTOR(tmpl)) {
+        unsigned len = vector_len(tmpl);
+        bool changed = false;
+        for (unsigned i = 0; i < len && !changed; i++) {
+            // Refresh data pointer - GC may have moved tmpl
+            unsigned *data = vector_data_ptr(tmpl);
+            unsigned orig = data[i];
+            unsigned renamed = rename_free_ids(orig, rename_map);
+            if (renamed != orig)
+                changed = true;
+        }
+        if (!changed) {
+            gc_unprotect(2);
+            return tmpl;
+        }
+        unsigned new_vec = make_vector(len, 0);
+        gc_protect(&new_vec);
+        for (unsigned i = 0; i < len; i++) {
+            // Refresh data pointers - GC may have moved vectors
+            unsigned *data = vector_data_ptr(tmpl);
+            unsigned *new_data = vector_data_ptr(new_vec);
+            new_data[i] = rename_free_ids(data[i], rename_map);
+        }
+        gc_unprotect(3);
+        return new_vec;
+    }
+
+    gc_unprotect(2);
+    return tmpl;
+}
+
+// Rename all occurrences of old_id to new_sym in template
+// Returns a new template with substitutions made
+static unsigned rename_in_template(unsigned tmpl, int64_t old_id,
+                                   unsigned new_sym)
+{
+    if (!tmpl)
+        return 0;
+
+    gc_protect(&tmpl);
+    gc_protect(&new_sym);
+
+    if (IS_ATOM(tmpl)) {
+        gc_unprotect(2);
+        if (CELL_ID(tmpl) == old_id)
+            return new_sym;
+        return tmpl;
+    }
+
+    if (IS_PAIR(tmpl)) {
+        // Skip protected wrappers - they should not be renamed
+        unsigned head = car(tmpl);
+        if (IS_ATOM(head) && CELL_ID(head) == ctx.kw_protected) {
+            gc_unprotect(2);
+            return tmpl;
+        }
+        unsigned new_car = rename_in_template(car(tmpl), old_id, new_sym);
+        gc_protect(&new_car);
+        unsigned new_cdr = rename_in_template(cdr(tmpl), old_id, new_sym);
+        gc_protect(&new_cdr);
+        // Now 4 protected: tmpl, new_sym, new_car, new_cdr
+        unsigned result;
+        if (new_car == car(tmpl) && new_cdr == cdr(tmpl))
+            result = tmpl;
+        else
+            result = alloc_cons(new_car, new_cdr);
+        gc_unprotect(4);
+        return result;
+    }
+
+    if (IS_VECTOR(tmpl)) {
+        unsigned len = vector_len(tmpl);
+        bool changed = false;
+
+        // First pass: check if any element changes
+        for (unsigned i = 0; i < len && !changed; i++) {
+            // Refresh data pointer - GC may have moved tmpl
+            unsigned *data = vector_data_ptr(tmpl);
+            unsigned orig = data[i];
+            unsigned renamed = rename_in_template(orig, old_id, new_sym);
+            if (renamed != orig)
+                changed = true;
+        }
+
+        if (!changed) {
+            gc_unprotect(2);
+            return tmpl;
+        }
+
+        // Create new vector with renamed elements
+        unsigned new_vec = make_vector(len, 0);
+        gc_protect(&new_vec);
+        for (unsigned i = 0; i < len; i++) {
+            // Refresh data pointers - GC may have moved vectors
+            unsigned *data = vector_data_ptr(tmpl);
+            unsigned *new_data = vector_data_ptr(new_vec);
+            new_data[i] = rename_in_template(data[i], old_id, new_sym);
+        }
+        gc_unprotect(3);
+        return new_vec;
+    }
+
+    gc_unprotect(2);
+    return tmpl;
+}
+
+// Forward declaration
+static unsigned hygienize_template(unsigned tmpl, unsigned bindings);
+
+// Hygienize a let-style binding form: (let ((var val) ...) body ...)
+// Renames introduced bindings (not pattern variables) to gensyms
+static unsigned hygienize_let(unsigned tmpl, unsigned bindings, bool is_letrec)
+{
+    // tmpl = (let ((var val) ...) body ...)
+    unsigned keyword = car(tmpl);
+    unsigned binding_list = cadr(tmpl);
+    unsigned body = cddr(tmpl);
+
+    gc_protect(&tmpl);
+    gc_protect(&bindings);
+    gc_protect(&keyword);
+    gc_protect(&binding_list);
+    gc_protect(&body);
+
+    // For letrec, we need to rename in all vals too (they can reference each other)
+    // Collect all introduced bindings first
+    unsigned renames = 0; // list of (old_id . new_sym)
+    gc_protect(&renames);
+
+    // First pass: identify introduced bindings and create gensyms
+    // Skip ellipsis (...) which appears in macro templates
+    for (unsigned bl = binding_list; bl; bl = cdr(bl)) {
+        unsigned binding = car(bl);
+        // Skip ellipsis in binding list
+        if (IS_ATOM(binding) && CELL_ID(binding) == ctx.kw_ellipsis)
+            continue;
+        unsigned var = car(binding);
+        if (IS_ATOM(var)) {
+            int64_t var_id = CELL_ID(var);
+            // Skip ellipsis
+            if (var_id == ctx.kw_ellipsis)
+                continue;
+            if (!is_pattern_var(var_id, bindings)) {
+                // This is an introduced binding - generate gensym
+                unsigned new_sym = do_gensym();
+                gc_protect(&new_sym);
+                unsigned rename_pair = alloc_cons(var, new_sym);
+                renames = alloc_cons(rename_pair, renames);
+                gc_unprotect(1);
+            }
+        }
+    }
+
+    if (!renames) {
+        // No introduced bindings - just hygienize nested templates
+        unsigned new_bindings = 0, new_bindings_tail = 0;
+        gc_protect(&new_bindings);
+        gc_protect(&new_bindings_tail);
+
+        for (unsigned bl = binding_list; bl; bl = cdr(bl)) {
+            unsigned binding = car(bl);
+            unsigned var = car(binding);
+            unsigned val = cadr(binding);
+            unsigned new_val = hygienize_template(val, bindings);
+            gc_protect(&new_val);
+            unsigned new_binding = alloc_cons(var, alloc_cons(new_val, 0));
+            list_append(&new_bindings, &new_bindings_tail, new_binding);
+            gc_unprotect(1);
+        }
+
+        unsigned new_body = hygienize_template(body, bindings);
+        gc_protect(&new_body);
+        unsigned result = alloc_cons(keyword, alloc_cons(new_bindings, new_body));
+        gc_unprotect(9);
+        return result;
+    }
+
+    // Apply renames to binding list and body
+    unsigned new_binding_list = binding_list;
+    unsigned new_body = body;
+    gc_protect(&new_binding_list);
+    gc_protect(&new_body);
+
+    for (unsigned r = renames; r; r = cdr(r)) {
+        unsigned rename = car(r);
+        unsigned old_sym = car(rename);
+        unsigned new_sym = cdr(rename);
+        int64_t old_id = CELL_ID(old_sym);
+
+        if (is_letrec) {
+            // For letrec, rename in all binding vals
+            new_binding_list =
+                rename_in_template(new_binding_list, old_id, new_sym);
+        } else {
+            // For let/let*, only rename var in binding, body sees the rename
+            unsigned renamed_bindings = 0, renamed_tail = 0;
+            gc_protect(&renamed_bindings);
+            gc_protect(&renamed_tail);
+            for (unsigned bl = new_binding_list; bl; bl = cdr(bl)) {
+                unsigned binding = car(bl);
+                unsigned var = car(binding);
+                unsigned val = cadr(binding);
+                unsigned new_var = var;
+                if (IS_ATOM(var) && CELL_ID(var) == old_id)
+                    new_var = new_sym;
+                unsigned new_bind = alloc_cons(new_var, alloc_cons(val, 0));
+                list_append(&renamed_bindings, &renamed_tail, new_bind);
+            }
+            gc_unprotect(2);
+            new_binding_list = renamed_bindings;
+        }
+        new_body = rename_in_template(new_body, old_id, new_sym);
+    }
+
+    // Now hygienize nested templates in the binding values
+    unsigned final_bindings = 0, final_tail = 0;
+    gc_protect(&final_bindings);
+    gc_protect(&final_tail);
+
+    for (unsigned bl = new_binding_list; bl; bl = cdr(bl)) {
+        unsigned binding = car(bl);
+        unsigned var = car(binding);
+        unsigned val = cadr(binding);
+        unsigned new_val = hygienize_template(val, bindings);
+        gc_protect(&new_val);
+        unsigned new_binding = alloc_cons(var, alloc_cons(new_val, 0));
+        list_append(&final_bindings, &final_tail, new_binding);
+        gc_unprotect(1);
+    }
+
+    unsigned final_body = hygienize_template(new_body, bindings);
+    gc_protect(&final_body);
+    unsigned result =
+        alloc_cons(keyword, alloc_cons(final_bindings, final_body));
+    gc_unprotect(11); // 5 initial + renames + new_binding_list + new_body + final_bindings + final_tail + final_body
+    return result;
+}
+
+// Hygienize a lambda form: (lambda (params...) body ...)
+static unsigned hygienize_lambda(unsigned tmpl, unsigned bindings)
+{
+    unsigned keyword = car(tmpl);
+    unsigned params = cadr(tmpl);
+    unsigned body = cddr(tmpl);
+
+    gc_protect(&tmpl);
+    gc_protect(&bindings);
+    gc_protect(&keyword);
+    gc_protect(&params);
+    gc_protect(&body);
+
+    // Collect renames for introduced parameters
+    unsigned renames = 0;
+    gc_protect(&renames);
+
+    // Handle both proper list and dotted list params
+    // Skip ellipsis (...) which appears in macro templates
+    for (unsigned p = params; p; p = IS_PAIR(p) ? cdr(p) : 0) {
+        unsigned param = IS_PAIR(p) ? car(p) : p;
+        if (IS_ATOM(param)) {
+            int64_t param_id = CELL_ID(param);
+            // Skip ellipsis - it's a macro template construct, not a real param
+            if (param_id == ctx.kw_ellipsis)
+                continue;
+            if (!is_pattern_var(param_id, bindings)) {
+                unsigned new_sym = do_gensym();
+                gc_protect(&new_sym);
+                unsigned rename_pair = alloc_cons(param, new_sym);
+                renames = alloc_cons(rename_pair, renames);
+                gc_unprotect(1);
+            }
+        }
+        if (!IS_PAIR(p))
+            break;
+    }
+
+    if (!renames) {
+        // No introduced params - just hygienize body
+        unsigned new_body = hygienize_template(body, bindings);
+        gc_protect(&new_body);
+        unsigned result = alloc_cons(keyword, alloc_cons(params, new_body));
+        gc_unprotect(7);
+        return result;
+    }
+
+    // Apply renames to params and body
+    unsigned new_params = params;
+    unsigned new_body = body;
+    gc_protect(&new_params);
+    gc_protect(&new_body);
+
+    for (unsigned r = renames; r; r = cdr(r)) {
+        unsigned rename = car(r);
+        int64_t old_id = CELL_ID(car(rename));
+        unsigned new_sym = cdr(rename);
+        new_params = rename_in_template(new_params, old_id, new_sym);
+        new_body = rename_in_template(new_body, old_id, new_sym);
+    }
+
+    // Hygienize body
+    unsigned final_body = hygienize_template(new_body, bindings);
+    gc_protect(&final_body);
+    unsigned result = alloc_cons(keyword, alloc_cons(new_params, final_body));
+    gc_unprotect(9); // 5 initial + renames + new_params + new_body + final_body
+    return result;
+}
+
+// Main hygienize function - walk template and rename introduced bindings
+static unsigned hygienize_template(unsigned tmpl, unsigned bindings)
+{
+    if (!tmpl)
+        return 0;
+
+    gc_protect(&tmpl);
+    gc_protect(&bindings);
+
+    // Atoms don't need hygienization (they're handled by syntax_expand)
+    if (IS_ATOM(tmpl)) {
+        gc_unprotect(2);
+        return tmpl;
+    }
+
+    if (IS_PAIR(tmpl)) {
+        unsigned head = car(tmpl);
+
+        // Check for protected wrapper: (##protected## . identifier)
+        // These come from pattern variable substitution and should not be renamed
+        if (IS_ATOM(head) && CELL_ID(head) == ctx.kw_protected) {
+            gc_unprotect(2);
+            return tmpl; // Return protected wrapper unchanged
+        }
+
+        // Check for binding forms
+        if (IS_ATOM(head)) {
+            int64_t head_id = CELL_ID(head);
+
+            // let, let*, letrec
+            if (head_id == ctx.kw_let || head_id == ctx.kw_letstar) {
+                // Check it's not named let: (let name ((var val) ...) body)
+                unsigned second = cadr(tmpl);
+                if (IS_PAIR(second) && IS_PAIR(car(second))) {
+                    gc_unprotect(2);
+                    return hygienize_let(tmpl, bindings, false);
+                }
+            }
+            if (head_id == ctx.kw_letrec) {
+                gc_unprotect(2);
+                return hygienize_let(tmpl, bindings, true);
+            }
+
+            // lambda
+            if (head_id == ctx.kw_lambda) {
+                gc_unprotect(2);
+                return hygienize_lambda(tmpl, bindings);
+            }
+
+            // Skip syntax-rules - they have their own patterns/templates
+            // that will be hygienized when expanded
+            if (head_id == ctx.kw_syntax_rules) {
+                gc_unprotect(2);
+                return tmpl;
+            }
+
+            // For let-syntax/letrec-syntax, hygienize the body but not the
+            // syntax-rules bindings
+            if (head_id == ctx.kw_let_syntax ||
+                head_id == ctx.kw_letrec_syntax) {
+                // (let-syntax ((name transformer) ...) body ...)
+                unsigned syn_bindings = cadr(tmpl);
+                unsigned syn_body = cddr(tmpl);
+                gc_protect(&syn_bindings);
+                gc_protect(&syn_body);
+                // Only hygienize the body, not the transformer bindings
+                unsigned new_body = hygienize_template(syn_body, bindings);
+                gc_protect(&new_body);
+                unsigned result =
+                    alloc_cons(head, alloc_cons(syn_bindings, new_body));
+                gc_unprotect(5); // new_body, syn_body, syn_bindings, tmpl, bindings
+                return result;
+            }
+        }
+
+        // Regular list - hygienize each element
+        unsigned new_car = hygienize_template(car(tmpl), bindings);
+        gc_protect(&new_car);
+        unsigned new_cdr = hygienize_template(cdr(tmpl), bindings);
+        gc_protect(&new_cdr);
+        // Now 4 protected: tmpl, bindings, new_car, new_cdr
+        unsigned result;
+        if (new_car == car(tmpl) && new_cdr == cdr(tmpl))
+            result = tmpl;
+        else
+            result = alloc_cons(new_car, new_cdr);
+        gc_unprotect(4);
+        return result;
+    }
+
+    if (IS_VECTOR(tmpl)) {
+        unsigned len = vector_len(tmpl);
+        bool changed = false;
+
+        for (unsigned i = 0; i < len && !changed; i++) {
+            // Refresh data pointer - GC may have moved tmpl
+            unsigned *data = vector_data_ptr(tmpl);
+            unsigned orig = data[i];
+            unsigned h = hygienize_template(orig, bindings);
+            if (h != orig)
+                changed = true;
+        }
+
+        if (!changed) {
+            gc_unprotect(2);
+            return tmpl;
+        }
+
+        unsigned new_vec = make_vector(len, 0);
+        gc_protect(&new_vec);
+        for (unsigned i = 0; i < len; i++) {
+            // Refresh data pointers - GC may have moved vectors
+            unsigned *data = vector_data_ptr(tmpl);
+            unsigned *new_data = vector_data_ptr(new_vec);
+            new_data[i] = hygienize_template(data[i], bindings);
+        }
+        gc_unprotect(3);
+        return new_vec;
+    }
+
+    gc_unprotect(2);
+    return tmpl;
+}
+
+// ============================================================================
 // Pattern Matching
 // ============================================================================
 
 unsigned syntax_match(unsigned pattern, unsigned input, unsigned literals,
-                      unsigned bindings)
+                      unsigned bindings, int64_t ellipsis_id)
 {
     // Protect all parameters - this function is recursive and allocates
     gc_protect(&pattern);
@@ -176,7 +944,7 @@ unsigned syntax_match(unsigned pattern, unsigned input, unsigned literals,
         // Check for ellipsis in vector pattern
         unsigned ellipsis_pos = pat_len;
         for (unsigned i = 0; i < pat_len; i++) {
-            if (is_ellipsis(pat_data[i])) {
+            if (is_ellipsis(pat_data[i], ellipsis_id)) {
                 ellipsis_pos = i;
                 break;
             }
@@ -203,8 +971,11 @@ unsigned syntax_match(unsigned pattern, unsigned input, unsigned literals,
 
             // Match elements before the ellipsis pattern
             for (unsigned i = 0; i < pre_count; i++) {
-                bindings =
-                    syntax_match(pat_data[i], inp_data[i], literals, bindings);
+                // Refresh pointers - GC may have moved vectors
+                pat_data = vector_data_ptr(pattern);
+                inp_data = vector_data_ptr(input);
+                bindings = syntax_match(pat_data[i], inp_data[i], literals,
+                                        bindings, ellipsis_id);
                 if (bindings == TOK_ERROR) {
                     gc_unprotect(4);
                     return TOK_ERROR;
@@ -213,19 +984,26 @@ unsigned syntax_match(unsigned pattern, unsigned input, unsigned literals,
 
             // Collect matches for the ellipsis pattern
             unsigned matches = 0, matches_tail = 0;
+            gc_protect(&matches);
+            gc_protect(&matches_tail);
             unsigned repeat_count = inp_len - pre_count - post_count;
             for (unsigned i = 0; i < repeat_count; i++) {
+                // Refresh pointer - GC may have moved input vector
+                inp_data = vector_data_ptr(input);
                 unsigned inp_elem = inp_data[pre_count + i];
-                unsigned elem_bindings =
-                    syntax_match(elem_pattern, inp_elem, literals, 0);
+                unsigned elem_bindings = syntax_match(elem_pattern, inp_elem,
+                                                      literals, 0, ellipsis_id);
                 if (elem_bindings == TOK_ERROR) {
-                    gc_unprotect(4);
+                    gc_unprotect(6);
                     return TOK_ERROR;
                 }
                 list_append(&matches, &matches_tail, inp_elem);
             }
 
             // Add ellipsis binding
+            // Refresh elem_pattern - GC may have moved pattern vector
+            pat_data = vector_data_ptr(pattern);
+            elem_pattern = pat_data[ellipsis_pos - 1];
             unsigned ellipsis_binding = 0;
             gc_protect(&ellipsis_binding);
             ellipsis_binding = alloc_cons(elem_pattern, matches);
@@ -234,17 +1012,20 @@ unsigned syntax_match(unsigned pattern, unsigned input, unsigned literals,
 
             // Match elements after ellipsis
             for (unsigned i = 0; i < post_count; i++) {
+                // Refresh pointers - GC may have moved vectors
+                pat_data = vector_data_ptr(pattern);
+                inp_data = vector_data_ptr(input);
                 unsigned pat_idx = ellipsis_pos + 1 + i;
                 unsigned inp_idx = inp_len - post_count + i;
                 bindings = syntax_match(pat_data[pat_idx], inp_data[inp_idx],
-                                        literals, bindings);
+                                        literals, bindings, ellipsis_id);
                 if (bindings == TOK_ERROR) {
-                    gc_unprotect(4);
+                    gc_unprotect(6);
                     return TOK_ERROR;
                 }
             }
 
-            gc_unprotect(4);
+            gc_unprotect(6);
             return bindings;
         }
 
@@ -255,8 +1036,11 @@ unsigned syntax_match(unsigned pattern, unsigned input, unsigned literals,
         }
 
         for (unsigned i = 0; i < pat_len; i++) {
-            bindings =
-                syntax_match(pat_data[i], inp_data[i], literals, bindings);
+            // Refresh pointers - GC may have moved vectors
+            pat_data = vector_data_ptr(pattern);
+            inp_data = vector_data_ptr(input);
+            bindings = syntax_match(pat_data[i], inp_data[i], literals,
+                                    bindings, ellipsis_id);
             if (bindings == TOK_ERROR) {
                 gc_unprotect(4);
                 return TOK_ERROR;
@@ -269,32 +1053,39 @@ unsigned syntax_match(unsigned pattern, unsigned input, unsigned literals,
     // List pattern
     if (IS_PAIR(pattern)) {
         // Check for ellipsis in pattern: (pat ... rest)
-        if (cdr(pattern) && is_ellipsis(cadr(pattern))) {
-            unsigned elem_pattern = car(pattern);
-            unsigned rest_pattern = cddr(pattern);
-
+        if (cdr(pattern) && is_ellipsis(cadr(pattern), ellipsis_id)) {
             // Collect matches for elem_pattern (zero or more)
             unsigned matches = 0, matches_tail = 0;
+            gc_protect(&matches);
+            gc_protect(&matches_tail);
             while (IS_PAIR(input)) {
+                // Refresh pattern references - GC may have moved pattern
+                unsigned rest_pattern = cddr(pattern);
                 // Try to match remaining input against rest pattern
                 unsigned rest_input = input;
-                unsigned tentative =
-                    syntax_match(rest_pattern, rest_input, literals, bindings);
+                unsigned tentative = syntax_match(
+                    rest_pattern, rest_input, literals, bindings, ellipsis_id);
                 if (tentative != TOK_ERROR) {
+                    // Refresh elem_pattern - GC may have moved pattern
+                    unsigned elem_pattern = car(pattern);
                     unsigned ellipsis_binding = 0;
                     gc_protect(&ellipsis_binding);
+                    gc_protect(&tentative);  // MUST protect before alloc - GC could happen!
                     ellipsis_binding = alloc_cons(elem_pattern, matches);
-                    gc_protect(&tentative);
                     unsigned result = alloc_cons(ellipsis_binding, tentative);
-                    gc_unprotect(6);
+                    gc_unprotect(8);
                     return result;
                 }
 
+                // Refresh elem_pattern - GC may have moved pattern
+                unsigned elem_pattern = car(pattern);
                 // Try to match one more element
-                unsigned elem_bindings =
-                    syntax_match(elem_pattern, car(input), literals, 0);
-                if (elem_bindings == TOK_ERROR)
+                unsigned car_input = car(input);
+                unsigned elem_bindings = syntax_match(elem_pattern, car_input,
+                                                      literals, 0, ellipsis_id);
+                if (elem_bindings == TOK_ERROR) {
                     break;
+                }
 
                 // Add this match to the list
                 list_append(&matches, &matches_tail, car(input));
@@ -302,18 +1093,22 @@ unsigned syntax_match(unsigned pattern, unsigned input, unsigned literals,
             }
 
             // Try matching empty ellipsis
-            unsigned tentative =
-                syntax_match(rest_pattern, input, literals, bindings);
+            // Refresh pattern references - GC may have moved pattern
+            unsigned rest_pattern = cddr(pattern);
+            unsigned tentative = syntax_match(rest_pattern, input, literals,
+                                              bindings, ellipsis_id);
             if (tentative != TOK_ERROR) {
+                // Refresh elem_pattern - GC may have moved pattern
+                unsigned elem_pattern = car(pattern);
                 unsigned ellipsis_binding = 0;
                 gc_protect(&ellipsis_binding);
+                gc_protect(&tentative);  // MUST protect before alloc - GC could happen!
                 ellipsis_binding = alloc_cons(elem_pattern, matches);
-                gc_protect(&tentative);
                 unsigned result = alloc_cons(ellipsis_binding, tentative);
-                gc_unprotect(6);
+                gc_unprotect(8);
                 return result;
             }
-            gc_unprotect(4);
+            gc_unprotect(6);
             return TOK_ERROR;
         }
 
@@ -324,7 +1119,8 @@ unsigned syntax_match(unsigned pattern, unsigned input, unsigned literals,
         }
 
         // Match car
-        bindings = syntax_match(car(pattern), car(input), literals, bindings);
+        bindings = syntax_match(car(pattern), car(input), literals, bindings,
+                                ellipsis_id);
         if (bindings == TOK_ERROR) {
             gc_unprotect(4);
             return TOK_ERROR;
@@ -332,7 +1128,8 @@ unsigned syntax_match(unsigned pattern, unsigned input, unsigned literals,
 
         // Match cdr - tail call, unprotect first
         gc_unprotect(4);
-        return syntax_match(cdr(pattern), cdr(input), literals, bindings);
+        return syntax_match(cdr(pattern), cdr(input), literals, bindings,
+                            ellipsis_id);
     }
 
     // Other patterns (numbers, strings, etc.) must match exactly
@@ -348,7 +1145,8 @@ unsigned syntax_match(unsigned pattern, unsigned input, unsigned literals,
 // Template Expansion
 // ============================================================================
 
-unsigned syntax_expand(unsigned tmpl, unsigned bindings, unsigned mark)
+unsigned syntax_expand(unsigned tmpl, unsigned bindings, unsigned mark,
+                       int64_t ellipsis_id)
 {
     (void)mark; // For now, we don't do full hygiene renaming
 
@@ -364,16 +1162,31 @@ unsigned syntax_expand(unsigned tmpl, unsigned bindings, unsigned mark)
     // Atom - check if it's a pattern variable
     if (IS_ATOM(tmpl)) {
         unsigned lookup_result = syntax_lookup(tmpl, bindings);
-        gc_unprotect(2);
-        if (lookup_result != TOK_ERROR)
+        if (lookup_result != TOK_ERROR) {
+            // Protect lookup_result BEFORE any allocations - this is critical!
+            gc_protect(&lookup_result);
+            // If substituting with an identifier, wrap it to protect from
+            // future renaming by nested macros (mark-based hygiene)
+            if (IS_ATOM(lookup_result)) {
+                unsigned protected_marker = alloc();
+                CELL_TYPE(protected_marker) = BT_ATOM;
+                CELL_ID(protected_marker) = ctx.kw_protected;
+                gc_protect(&protected_marker);
+                unsigned wrapped = alloc_cons(protected_marker, lookup_result);
+                gc_unprotect(4); // protected_marker, lookup_result, bindings, tmpl
+                return wrapped;
+            }
+            gc_unprotect(3); // lookup_result, bindings, tmpl
             return lookup_result;
+        }
+        gc_unprotect(2);
         return tmpl;
     }
 
     // List template
     if (IS_PAIR(tmpl)) {
         // Check for ellipsis: (tmpl ... rest)
-        if (cdr(tmpl) && is_ellipsis(cadr(tmpl))) {
+        if (cdr(tmpl) && is_ellipsis(cadr(tmpl), ellipsis_id)) {
             unsigned elem_tmpl = car(tmpl);
             unsigned rest_tmpl = cddr(tmpl);
 
@@ -429,8 +1242,9 @@ unsigned syntax_expand(unsigned tmpl, unsigned bindings, unsigned mark)
                 gc_protect(&iter_bindings);
                 gc_protect(&current_value);
                 if (ellipsis_pattern && IS_PAIR(ellipsis_pattern)) {
-                    unsigned sub_bindings =
-                        syntax_match(ellipsis_pattern, current_value, 0, 0);
+                    // Re-match to extract nested bindings
+                    unsigned sub_bindings = syntax_match(
+                        ellipsis_pattern, current_value, 0, 0, ellipsis_id);
                     if (sub_bindings != TOK_ERROR) {
                         // Protect sub_bindings across allocations
                         unsigned sb = sub_bindings;
@@ -453,7 +1267,7 @@ unsigned syntax_expand(unsigned tmpl, unsigned bindings, unsigned mark)
                 }
 
                 unsigned expanded =
-                    syntax_expand(elem_tmpl, iter_bindings, mark);
+                    syntax_expand(elem_tmpl, iter_bindings, mark, ellipsis_id);
                 gc_protect(&expanded);
                 list_append(&result, &result_tail, expanded);
                 gc_unprotect(3); // expanded, current_value, iter_bindings
@@ -464,7 +1278,8 @@ unsigned syntax_expand(unsigned tmpl, unsigned bindings, unsigned mark)
             // Append expanded rest
             gc_protect(&result);
             gc_protect(&result_tail);
-            unsigned rest_expanded = syntax_expand(rest_tmpl, bindings, mark);
+            unsigned rest_expanded =
+                syntax_expand(rest_tmpl, bindings, mark, ellipsis_id);
             if (result) {
                 write_barrier(result_tail,
                               rest_expanded); // result_tail may be in old gen
@@ -479,8 +1294,9 @@ unsigned syntax_expand(unsigned tmpl, unsigned bindings, unsigned mark)
         // Regular cons - expand both parts
         unsigned new_car = 0;
         gc_protect(&new_car);
-        new_car = syntax_expand(car(tmpl), bindings, mark);
-        unsigned new_cdr = syntax_expand(cdr(tmpl), bindings, mark);
+        new_car = syntax_expand(car(tmpl), bindings, mark, ellipsis_id);
+        unsigned new_cdr =
+            syntax_expand(cdr(tmpl), bindings, mark, ellipsis_id);
         gc_protect(&new_cdr);
         unsigned result = alloc_cons(new_car, new_cdr);
         gc_unprotect(4);
@@ -495,7 +1311,7 @@ unsigned syntax_expand(unsigned tmpl, unsigned bindings, unsigned mark)
         // Check for ellipsis in vector template
         unsigned ellipsis_pos = len;
         for (unsigned i = 0; i < len; i++) {
-            if (is_ellipsis(data[i])) {
+            if (is_ellipsis(data[i], ellipsis_id)) {
                 ellipsis_pos = i;
                 break;
             }
@@ -533,15 +1349,22 @@ unsigned syntax_expand(unsigned tmpl, unsigned bindings, unsigned mark)
             FORLIST(ev, ellipsis_values) { expanded_count++; }
 
             unsigned result = make_vector(expanded_count, 0);
-            unsigned *result_data = vector_data_ptr(result);
+            gc_protect(&result);  // Protect result from GC
             unsigned idx = 0;
 
             // Expand elements before ellipsis
             for (unsigned i = 0; i < pre_count; i++) {
-                result_data[idx++] = syntax_expand(data[i], bindings, mark);
+                // Refresh pointers - GC may have moved vectors
+                unsigned *result_data = vector_data_ptr(result);
+                data = vector_data_ptr(tmpl);
+                result_data[idx++] =
+                    syntax_expand(data[i], bindings, mark, ellipsis_id);
             }
 
             // Expand repeated element for each ellipsis value
+            // Refresh data pointer before accessing elem_tmpl
+            data = vector_data_ptr(tmpl);
+            elem_tmpl = data[ellipsis_pos - 1];
             unsigned ellipsis_pattern =
                 ellipsis_binding ? car(ellipsis_binding) : 0;
 
@@ -558,8 +1381,9 @@ unsigned syntax_expand(unsigned tmpl, unsigned bindings, unsigned mark)
 
                 if (ellipsis_pattern && (IS_PAIR(ellipsis_pattern) ||
                                          IS_VECTOR(ellipsis_pattern))) {
-                    unsigned sub_bindings =
-                        syntax_match(ellipsis_pattern, current_value, 0, 0);
+                    // Re-match to extract nested bindings
+                    unsigned sub_bindings = syntax_match(
+                        ellipsis_pattern, current_value, 0, 0, ellipsis_id);
                     if (sub_bindings != TOK_ERROR) {
                         gc_protect(&sub_bindings);
                         for (; sub_bindings; sub_bindings = cdr(sub_bindings)) {
@@ -579,29 +1403,38 @@ unsigned syntax_expand(unsigned tmpl, unsigned bindings, unsigned mark)
                 }
                 gc_unprotect(1); // iter_bindings
 
+                // Refresh result_data pointer - GC may have moved result
+                unsigned *result_data = vector_data_ptr(result);
                 result_data[idx++] =
-                    syntax_expand(elem_tmpl, iter_bindings, mark);
+                    syntax_expand(elem_tmpl, iter_bindings, mark, ellipsis_id);
             }
             gc_unprotect(
                 4); // bindings, elem_tmpl, ellipsis_pattern, ellipsis_values
 
             // Expand elements after ellipsis
             for (unsigned i = 0; i < post_count; i++) {
-                result_data[idx++] =
-                    syntax_expand(data[ellipsis_pos + 1 + i], bindings, mark);
+                // Refresh pointers - GC may have moved vectors
+                unsigned *result_data = vector_data_ptr(result);
+                data = vector_data_ptr(tmpl);
+                result_data[idx++] = syntax_expand(data[ellipsis_pos + 1 + i],
+                                                   bindings, mark, ellipsis_id);
             }
 
-            gc_unprotect(2);
+            gc_unprotect(3);  // result, tmpl, bindings
             return result;
         }
 
         // No ellipsis - expand each element
         unsigned result = make_vector(len, 0);
-        unsigned *result_data = vector_data_ptr(result);
+        gc_protect(&result);  // Protect result from GC
         for (unsigned i = 0; i < len; i++) {
-            result_data[i] = syntax_expand(data[i], bindings, mark);
+            // Refresh pointers - GC may have moved vectors
+            unsigned *result_data = vector_data_ptr(result);
+            data = vector_data_ptr(tmpl);
+            result_data[i] =
+                syntax_expand(data[i], bindings, mark, ellipsis_id);
         }
-        gc_unprotect(2);
+        gc_unprotect(3);  // result, tmpl, bindings
         return result;
     }
 
@@ -616,16 +1449,22 @@ unsigned syntax_expand(unsigned tmpl, unsigned bindings, unsigned mark)
 
 unsigned apply_syntax(unsigned transformer, unsigned input, unsigned use_env)
 {
-    (void)use_env;
-
     // Protect parameters that may be in nursery - GC can run during expansion
     gc_protect(&transformer);
     gc_protect(&input);
+    gc_protect(&use_env);
 
-    unsigned literals = car(transformer);
+    // Extract transformer structure:
+    // CAR = (ellipsis_cell . (literals . rules)), CDR = closure_env
+    unsigned syn_data = car(transformer);
+    unsigned closure_env = cdr(transformer);
+    unsigned ellipsis_cell = car(syn_data);
+    int64_t ellipsis_id = CELL_ID(ellipsis_cell);
+    unsigned literals = cadr(syn_data);
     gc_protect(&literals);
+    gc_protect(&closure_env);
 
-    unsigned rules = cdr(transformer);
+    unsigned rules = cddr(syn_data);
     gc_protect(&rules);
 
     unsigned tmpl = 0;
@@ -644,7 +1483,8 @@ unsigned apply_syntax(unsigned transformer, unsigned input, unsigned use_env)
         // Skip the keyword in input
         unsigned input_args = cdr(input);
 
-        unsigned bindings = syntax_match(pattern, input_args, literals, 0);
+        unsigned bindings =
+            syntax_match(pattern, input_args, literals, 0, ellipsis_id);
 
         if (bindings != TOK_ERROR) {
             // Generate unique mark for hygiene
@@ -652,13 +1492,58 @@ unsigned apply_syntax(unsigned transformer, unsigned input, unsigned use_env)
             unsigned mark = ++syntax_mark;
 
             gc_protect(&bindings);
-            unsigned result = syntax_expand(tmpl, bindings, mark);
+
+            // Referential transparency: find free identifiers in template
+            // and bind them to their definition-time values
+            unsigned free_ids =
+                collect_free_ids(tmpl, bindings, 0, ellipsis_id);
+            gc_protect(&free_ids);
+
+            unsigned rename_map = 0;
+            gc_protect(&rename_map);
+
+            // For each free identifier, check if it's bound in closure_env
+            for (unsigned f = free_ids; f; f = cdr(f)) {
+                unsigned free_atom = car(f);
+                int64_t free_id = CELL_ID(free_atom);
+
+                // Look up in closure environment (macro definition site)
+                unsigned closure_val = lookup_silent(free_id, closure_env);
+                if (closure_val != TOK_ERROR) {
+                    // Found in closure env - create gensym and bind in use_env
+                    unsigned gensym = do_gensym();
+                    gc_protect(&gensym);
+                    gc_protect(&closure_val);
+
+                    // Define gensym in use_env with the closure value
+                    defvar(gensym, closure_val, use_env);
+
+                    // Add to rename map: (free_atom . gensym)
+                    unsigned entry = alloc_cons(free_atom, gensym);
+                    rename_map = alloc_cons(entry, rename_map);
+
+                    gc_unprotect(2); // gensym, closure_val
+                }
+            }
+
+            // Apply free variable renames to template
+            unsigned renamed_tmpl = rename_free_ids(tmpl, rename_map);
+            gc_protect(&renamed_tmpl);
+
+            // Hygienize template: rename introduced bindings to gensyms
+            unsigned hygienic_tmpl = hygienize_template(renamed_tmpl, bindings);
+            gc_protect(&hygienic_tmpl);
+            unsigned result =
+                syntax_expand(hygienic_tmpl, bindings, mark, ellipsis_id);
+            gc_protect(&result);
+            result = unwrap_protected(result);
             gc_unprotect(
-                6); // bindings, tmpl, rules, literals, input, transformer
+                13); // result, hygienic_tmpl, renamed_tmpl, rename_map, free_ids,
+                     // bindings, tmpl, rules, closure_env, literals, use_env, input, transformer
             return result;
         }
     }
-    gc_unprotect(5); // tmpl, rules, literals, input, transformer
+    gc_unprotect(7); // tmpl, rules, closure_env, literals, use_env, input, transformer
 
     show_error("syntax-rules: no matching pattern");
     return TOK_ERROR;

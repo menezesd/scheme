@@ -1,7 +1,7 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -Wshadow -Wstrict-prototypes -Wmissing-prototypes \
-         -Wold-style-definition -Wformat=2 -Wundef -Wdouble-promotion \
-         -std=c11 -O2
+CFLAGS ?= -Wall -Wextra -Wshadow -Wstrict-prototypes -Wmissing-prototypes \
+          -Wold-style-definition -Wformat=2 -Wundef -Wdouble-promotion \
+          -std=c11 -O2
 LDFLAGS = -lm
 
 # Source files
@@ -64,7 +64,7 @@ vm.o: vm.c bytecode.h context.h env.h primitives.h macros.h types.h
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-debug: CFLAGS = -Wall -Wextra -Wshadow -Wstrict-prototypes -std=c11 -g -O0 -DDEBUG \
+debug: CFLAGS = -Wall -Wextra -Wshadow -Wstrict-prototypes -std=c11 -g -O0 -DDEBUG -DDEBUG_GC \
                -fsanitize=address,undefined -fno-omit-frame-pointer
 debug: LDFLAGS += -fsanitize=address,undefined
 debug: clean $(TARGET)

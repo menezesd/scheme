@@ -36,6 +36,8 @@
 
 #include "eval.h"
 #include "eval_internal.h"
+#include "bytecode.h"
+#include "writer.h"
 
 // ============================================================================
 // Forward Declarations
@@ -48,21 +50,67 @@ static void apply_cont_step(void);
 // Quasiquote Expansion
 // ============================================================================
 
-unsigned qq_expand_cps(unsigned x, unsigned env)
+// Helper to check if a keyword is shadowed in the environment
+static bool is_keyword_shadowed(int64_t kw, unsigned env)
+{
+    return lookup_silent(kw, env) != TOK_ERROR;
+}
+
+// Helper for nested quasiquote expansion with depth tracking
+static unsigned qq_expand_depth(unsigned x, unsigned env, int depth)
 {
     if (!IS_PAIR(x)) {
         return x;
     }
 
-    // Check for (unquote expr)
-    if (IS_KEYWORD(car(x), ctx.kw_unquote)) {
-        return eval_cps(cadr(x), env);
+    unsigned head = car(x);
+
+    // Check for (unquote expr) - only if unquote is not shadowed
+    if (IS_KEYWORD(head, ctx.kw_unquote) &&
+        !is_keyword_shadowed(ctx.kw_unquote, env)) {
+        if (depth == 1) {
+            // Evaluate the unquote
+            return eval_cps(cadr(x), env);
+        } else {
+            // Keep the unquote but expand inside at lower depth
+            unsigned inner = qq_expand_depth(cadr(x), env, depth - 1);
+            if (inner == TOK_ERROR)
+                return TOK_ERROR;
+            gc_protect(&inner);
+            unsigned result = alloc_cons(head, alloc_cons(inner, 0));
+            gc_unprotect(1);
+            return result;
+        }
     }
 
-    // Check for (unquote-splicing expr) - error at top level
-    if (IS_KEYWORD(car(x), ctx.kw_unquote_splicing)) {
-        show_error("unquote-splicing not inside list");
-        return TOK_ERROR;
+    // Check for (unquote-splicing expr) - only if not shadowed
+    if (IS_KEYWORD(head, ctx.kw_unquote_splicing) &&
+        !is_keyword_shadowed(ctx.kw_unquote_splicing, env)) {
+        if (depth == 1) {
+            show_error("unquote-splicing not inside list");
+            return TOK_ERROR;
+        } else {
+            // Keep but expand inside at lower depth
+            unsigned inner = qq_expand_depth(cadr(x), env, depth - 1);
+            if (inner == TOK_ERROR)
+                return TOK_ERROR;
+            gc_protect(&inner);
+            unsigned result = alloc_cons(head, alloc_cons(inner, 0));
+            gc_unprotect(1);
+            return result;
+        }
+    }
+
+    // Check for nested (quasiquote expr) - only if not shadowed
+    if (IS_KEYWORD(head, ctx.kw_quasiquote) &&
+        !is_keyword_shadowed(ctx.kw_quasiquote, env)) {
+        unsigned inner = qq_expand_depth(cadr(x), env, depth + 1);
+        if (inner == TOK_ERROR)
+            return TOK_ERROR;
+        gc_protect(&inner);
+        unsigned result = alloc_cons(head, alloc_cons(inner, 0));
+        gc_unprotect(1);
+        return result;
     }
 
     // Recursively process list
@@ -73,20 +121,36 @@ unsigned qq_expand_cps(unsigned x, unsigned env)
         gc_protect(&l);
         unsigned elem = car(l);
 
-        // Check if element is (unquote-splicing expr)
-        if (IS_PAIR(elem) && IS_KEYWORD(car(elem), ctx.kw_unquote_splicing)) {
-            unsigned spliced = eval_cps(cadr(elem), env);
-            if (spliced == TOK_ERROR) {
-                gc_unprotect(3);
-                return spliced;
+        // Check if element is (unquote-splicing expr) - only if not shadowed
+        if (IS_PAIR(elem) && IS_KEYWORD(car(elem), ctx.kw_unquote_splicing) &&
+            !is_keyword_shadowed(ctx.kw_unquote_splicing, env)) {
+            if (depth == 1) {
+                // Evaluate and splice
+                unsigned spliced = eval_cps(cadr(elem), env);
+                if (spliced == TOK_ERROR) {
+                    gc_unprotect(3);
+                    return spliced;
+                }
+                gc_protect(&spliced);
+                for (; IS_PAIR(spliced); spliced = cdr(spliced)) {
+                    list_append(&result, &tail, car(spliced));
+                }
+                gc_unprotect(1);
+            } else {
+                // Keep but expand inside
+                unsigned inner = qq_expand_depth(cadr(elem), env, depth - 1);
+                if (inner == TOK_ERROR) {
+                    gc_unprotect(3);
+                    return inner;
+                }
+                gc_protect(&inner);
+                unsigned kept =
+                    alloc_cons(ctx.kw_unquote_splicing, alloc_cons(inner, 0));
+                gc_unprotect(1);
+                list_append(&result, &tail, kept);
             }
-            gc_protect(&spliced);
-            for (; IS_PAIR(spliced); spliced = cdr(spliced)) {
-                list_append(&result, &tail, car(spliced));
-            }
-            gc_unprotect(1); // spliced
         } else {
-            unsigned expanded = qq_expand_cps(elem, env);
+            unsigned expanded = qq_expand_depth(elem, env, depth);
             if (expanded == TOK_ERROR) {
                 gc_unprotect(3);
                 return expanded;
@@ -97,6 +161,11 @@ unsigned qq_expand_cps(unsigned x, unsigned env)
     }
     gc_unprotect(2); // tail, result
     return result;
+}
+
+unsigned qq_expand_cps(unsigned x, unsigned env)
+{
+    return qq_expand_depth(x, env, 1);
 }
 
 // ============================================================================
@@ -114,15 +183,6 @@ static void eval_step(void)
         return;
     }
 
-#ifdef DEBUG_GC
-    if (id >= HEAP_RESERVED) {
-        enum lisp_type t = CELL_TYPE(id);
-        if (t == BT_FREE || t == BT_BROKENHEART) {
-            fprintf(stderr, "[EVAL] BAD CELL: id=%u type=%d\n", id, t);
-        }
-    }
-#endif
-
     switch (CELL_TYPE(id)) {
     case BT_NUM:
     case BT_STRING:
@@ -139,14 +199,6 @@ static void eval_step(void)
         return;
 
     case BT_ATOM: {
-#ifdef DEBUG_GC
-        int64_t sym_id = CELL_ID(id);
-        fprintf(stderr, "[EVAL] ATOM id=%u sym_id=%lld env=%u (name=%s)\n", id,
-                (long long)sym_id, env,
-                (sym_id >= 0 && sym_id < 1000000 && ctx.atom_table[sym_id])
-                    ? ctx.atom_table[sym_id]
-                    : "?");
-#endif
         unsigned val = lookup(CELL_ID(id), env);
         if (val == TOK_ERROR) {
             tramp_error();
@@ -213,11 +265,6 @@ static void apply_cont_step(void)
     unsigned env = cont_env(k);
     unsigned next = cont_next(k);
 
-#ifdef DEBUG_GC
-    fprintf(stderr, "[APPLY] cont=%u type=%d data=%u env=%u next=%u val=%u\n",
-            k, type, data, env, next, val);
-#endif
-
     // Dispatch via function pointer table
     if (type < CONT_COUNT && cont_handlers[type]) {
         cont_handlers[type](val, data, env, next);
@@ -254,14 +301,40 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
         }
 
         // Special handling for apply
+        // (apply proc arg1 arg2 ... arglist) - prepend args to arglist
         if (prim_id == PAPPLY) {
-            if (!args || !cdr(args) || cddr(args)) {
-                show_error("apply expects exactly two arguments");
+            if (!args || !cdr(args)) {
+                show_error("apply expects at least two arguments");
                 tramp_error();
                 return;
             }
             unsigned proc = car(args);
-            unsigned proc_args = cadr(args);
+            args = cdr(args);
+
+            // Find the last argument (must be a list) and collect preceding
+            // args
+            unsigned proc_args = 0;
+            gc_protect(&proc);
+            gc_protect(&proc_args);
+            gc_protect(&args);
+
+            // Build list of all args except last, then append last
+            unsigned prefix = 0;
+            gc_protect(&prefix);
+            while (cdr(args)) {
+                prefix = alloc_cons(car(args), prefix);
+                args = cdr(args);
+            }
+            // args is now the last element, car(args) is the final list
+            proc_args = car(args);
+
+            // Prepend the reversed prefix to proc_args
+            while (prefix) {
+                proc_args = alloc_cons(car(prefix), proc_args);
+                prefix = cdr(prefix);
+            }
+            gc_unprotect(4);
+
             apply_function(proc, proc_args, env, cont);
             return;
         }
@@ -408,7 +481,9 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
         unsigned body = car(body_env);
         unsigned def_env = cdr(body_env);
 
-        // Protect body, def_env and cont across allocations
+        // Protect all values across allocations (including params and args for bind_params)
+        gc_protect(&params);
+        gc_protect(&args);
         gc_protect(&body);
         gc_protect(&def_env);
         gc_protect(&cont);
@@ -418,7 +493,7 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
         unsigned new_env = alloc_cons(frame, def_env);
 
         if (!cdr(body)) {
-            gc_unprotect(4);
+            gc_unprotect(6); // params, args, body, def_env, cont, frame
             tramp_eval(car(body), new_env, cont);
         } else {
             unsigned first_expr = car(body);
@@ -427,8 +502,8 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
             gc_protect(&rest_body);
             gc_protect(&new_env);
             unsigned k = make_cont(CONT_APPLY_FUNC, rest_body, new_env, cont);
-            gc_unprotect(7); // first_expr, rest_body, new_env, frame, cont,
-                             // def_env, body
+            gc_unprotect(9); // first_expr, rest_body, new_env, frame, cont,
+                             // def_env, body, args, params
             tramp_eval(first_expr, new_env, k);
         }
         return;
@@ -444,7 +519,18 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
         return;
     }
 
-    show_error("not a function");
+    // Handle bytecode VM closures (for CPS/bytecode interop)
+    if (IS_PAIR(fn) && CELL_TYPE(car(fn)) == BT_CLOSURE) {
+        unsigned result = vm_call_closure(fn, args);
+        if (result == TOK_ERROR) {
+            tramp_error();
+            return;
+        }
+        tramp_apply(result, cont);
+        return;
+    }
+
+    show_error("not a procedure, got %s", type_name(fn));
     tramp_error();
 }
 
@@ -454,7 +540,12 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
 
 unsigned eval_cps(unsigned expr, unsigned env)
 {
-    tramp_eval(expr, env, make_halt_cont());
+    // Protect expr and env across make_halt_cont() which can trigger GC
+    gc_protect(&expr);
+    gc_protect(&env);
+    unsigned halt_k = make_halt_cont();
+    gc_unprotect(2);
+    tramp_eval(expr, env, halt_k);
 
     while (tramp.mode != TRAMP_DONE && tramp.mode != TRAMP_ERROR) {
         if (tramp.mode == TRAMP_EVAL) {

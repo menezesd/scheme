@@ -17,12 +17,14 @@ static inline unsigned make_frame(unsigned vars, unsigned vals)
 // Extend environment with a new frame
 static inline unsigned extend_env(unsigned vars, unsigned vals, unsigned env)
 {
+    gc_protect(&vars);
+    gc_protect(&vals);
     gc_protect(&env);
     unsigned frame = 0;
     gc_protect(&frame);
     frame = make_frame(vars, vals);
     unsigned result = alloc_cons(frame, env);
-    gc_unprotect(2);
+    gc_unprotect(4);
     return result;
 }
 

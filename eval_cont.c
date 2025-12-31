@@ -2,10 +2,20 @@
  * @file eval_cont.c
  * @brief Continuation handlers for the evaluator
  *
- * Each handler processes a specific continuation type and either:
- * - Evaluates the next expression (sets tramp_eval)
- * - Applies a value to the next continuation (sets tramp_apply)
- * - Signals completion or error
+ * This file implements handlers for each continuation type. When an expression
+ * finishes evaluating, its value is passed to the current continuation via
+ * apply_cont_step(), which dispatches to the appropriate handler here.
+ *
+ * ## Handler Parameters
+ * All handlers receive:
+ * - val: The value being passed to this continuation
+ * - data: Operation-specific data saved when continuation was created
+ * - env: Environment saved when continuation was created
+ * - next: The outer continuation to pass results to
+ *
+ * ## GC Safety
+ * Handlers must protect local variables across allocations. The val, data,
+ * env, and next parameters are already on the shadow stack.
  */
 
 #include "eval_internal.h"
@@ -14,6 +24,9 @@
 // Continuation Handlers
 // ============================================================================
 
+/**
+ * CONT_HALT: Top-level continuation signaling evaluation is complete.
+ */
 void handle_cont_halt(unsigned val, unsigned data, unsigned env, unsigned next)
 {
     (void)data;
@@ -22,6 +35,10 @@ void handle_cont_halt(unsigned val, unsigned data, unsigned env, unsigned next)
     tramp_done(val);
 }
 
+/**
+ * CONT_IF: Choose branch based on test result.
+ * data = (then-expr . else-expr)
+ */
 void handle_cont_if(unsigned val, unsigned data, unsigned env, unsigned next)
 {
     if (val) {
@@ -31,12 +48,20 @@ void handle_cont_if(unsigned val, unsigned data, unsigned env, unsigned next)
     }
 }
 
+/**
+ * CONT_BEGIN: Evaluate remaining expressions in sequence.
+ * data = remaining expressions list
+ */
 void handle_cont_begin(unsigned val, unsigned data, unsigned env, unsigned next)
 {
     (void)val;
     eval_seq(data, CONT_BEGIN, env, next);
 }
 
+/**
+ * CONT_SET: Store value in existing binding.
+ * data = variable atom
+ */
 void handle_cont_set(unsigned val, unsigned data, unsigned env, unsigned next)
 {
     unsigned result = setvar(CELL_ID(data), val, env);
@@ -47,16 +72,23 @@ void handle_cont_set(unsigned val, unsigned data, unsigned env, unsigned next)
     tramp_apply(val, next);
 }
 
+/**
+ * CONT_DEFINE: Create new binding in current frame.
+ * data = variable atom
+ */
 void handle_cont_define(unsigned val, unsigned data, unsigned env,
                         unsigned next)
 {
-    // Protect next across defvar (which can allocate)
     gc_protect(&next);
     defvar(data, val, env);
     gc_unprotect(1);
     tramp_apply(data, next);
 }
 
+/**
+ * CONT_AND: Short-circuit and - stop on #f, continue otherwise.
+ * data = remaining expressions
+ */
 void handle_cont_and(unsigned val, unsigned data, unsigned env, unsigned next)
 {
     if (!val) {
@@ -66,6 +98,10 @@ void handle_cont_and(unsigned val, unsigned data, unsigned env, unsigned next)
     eval_seq(data, CONT_AND, env, next);
 }
 
+/**
+ * CONT_OR: Short-circuit or - stop on truthy, continue otherwise.
+ * data = remaining expressions
+ */
 void handle_cont_or(unsigned val, unsigned data, unsigned env, unsigned next)
 {
     if (val) {
@@ -75,6 +111,12 @@ void handle_cont_or(unsigned val, unsigned data, unsigned env, unsigned next)
     eval_seq(data, CONT_OR, env, next);
 }
 
+/**
+ * CONT_COND_TEST: Process cond clause based on test result.
+ * data = (consequent-exprs . remaining-clauses)
+ * If val is truthy, evaluate consequent. Otherwise try next clause.
+ * Supports => receiver syntax: (test => receiver) calls receiver with test value.
+ */
 void handle_cont_cond_test(unsigned val, unsigned data, unsigned env,
                            unsigned next)
 {
@@ -82,12 +124,23 @@ void handle_cont_cond_test(unsigned val, unsigned data, unsigned env,
     unsigned rest = cdr(data);
     if (val) {
         if (!conseq) {
+            // No consequent: return test value
             tramp_apply(val, next);
+        } else if (IS_KEYWORD(car(conseq), ctx.kw_arrow) &&
+                   lookup_silent(ctx.kw_arrow, env) == TOK_ERROR) {
+            // (test => receiver) syntax - evaluate receiver, then call with val
+            // Only if => is not lexically bound (R5RS hygiene)
+            unsigned receiver_expr = cadr(conseq);
+            gc_protect(&val);
+            gc_protect(&receiver_expr);
+            gc_protect(&env);
+            gc_protect(&next);
+            unsigned k2 = make_cont(CONT_COND_ARROW, val, env, next);
+            gc_unprotect(4);
+            tramp_eval(receiver_expr, env, k2);
         } else if (!cdr(conseq)) {
             tramp_eval(car(conseq), env, next);
         } else {
-            // Extract first expr and rest before allocation, protect all used
-            // after
             unsigned first_expr = car(conseq);
             unsigned rest_conseq = cdr(conseq);
             gc_protect(&first_expr);
@@ -142,22 +195,39 @@ void handle_cont_cond_test(unsigned val, unsigned data, unsigned env,
     }
 }
 
+/**
+ * CONT_COND_ARROW: Apply receiver procedure to test value.
+ * data = test value that was truthy
+ * val = evaluated receiver procedure
+ * Calls (receiver test-value) and returns the result.
+ */
+static void handle_cont_cond_arrow(unsigned val, unsigned data, unsigned env,
+                                   unsigned next)
+{
+    // val is the receiver procedure, data is the test value
+    // We need to call (val data)
+    gc_protect(&val);
+    gc_protect(&data);
+    gc_protect(&env);
+    gc_protect(&next);
+    unsigned args = alloc_cons(data, 0);  // Build argument list (test-value)
+    gc_unprotect(4);
+    apply_function(val, args, env, next);
+}
+
+/**
+ * CONT_LET_VALS: Accumulate let binding values.
+ * data = (vars . (vals . (remaining-bindings . body)))
+ * Stores val in vals list, then evaluates next binding or body.
+ */
 void handle_cont_let_vals(unsigned val, unsigned data, unsigned env,
                           unsigned next)
 {
-#ifdef DEBUG_GC
-    fprintf(stderr, "[LET_VALS] data=%u data_type=%d\n", data, CELL_TYPE(data));
-    fflush(stderr);
-#endif
     unsigned vars = car(data);
     unsigned vals = cadr(data);
     unsigned rest_and_body = cddr(data);
     unsigned rest_bindings = car(rest_and_body);
     unsigned body = cdr(rest_and_body);
-#ifdef DEBUG_GC
-    fprintf(stderr, "[LET_VALS] vars=%u vals=%u rest_bindings=%u body=%u\n",
-            vars, vals, rest_bindings, body);
-#endif
 
     unsigned v = list_last(vals);
     write_barrier(v, val); // v may be in old gen
@@ -172,10 +242,6 @@ void handle_cont_let_vals(unsigned val, unsigned data, unsigned env,
         eval_body(body, new_env, next);
     } else {
         unsigned bind = car(rest_bindings);
-#ifdef DEBUG_GC
-        fprintf(stderr, "[LET_VALS else] bind=%u bind_type=%d\n", bind,
-                CELL_TYPE(bind));
-#endif
         unsigned new_vars = vars;
         unsigned new_vals = vals;
 
@@ -202,10 +268,6 @@ void handle_cont_let_vals(unsigned val, unsigned data, unsigned env,
         CELL_CDR(v) = new_valc;
 
         unsigned next_val_expr = cadr(bind);
-#ifdef DEBUG_GC
-        fprintf(stderr, "[LET_VALS else] next_val_expr=%u expr_type=%d\n",
-                next_val_expr, CELL_TYPE(next_val_expr));
-#endif
         gc_protect(&next_val_expr);
         unsigned inner = 0, middle = 0;
         gc_protect(&inner);
@@ -278,32 +340,61 @@ void handle_cont_letstar_vals(unsigned val, unsigned data, unsigned env,
 void handle_cont_letrec_init(unsigned val, unsigned data, unsigned env,
                              unsigned next)
 {
+    // Data structure: (bindings . (vals_ptr . (all_vals . (saved . body))))
+    // saved = list of saved car values for cells from all_vals to vals_ptr
     unsigned bindings = car(data);
-    unsigned vals_and_body = cdr(data);
-    unsigned vals_ptr = car(vals_and_body);
-    unsigned body = cdr(vals_and_body);
+    unsigned inner = cdr(data);
+    unsigned vals_ptr = car(inner);
+    unsigned inner2 = cdr(inner);
+    unsigned all_vals = car(inner2);
+    unsigned inner3 = cdr(inner2);
+    unsigned saved = car(inner3);
+    unsigned body = cdr(inner3);
 
-    write_barrier(vals_ptr, val); // vals_ptr may be in old gen
+    // Restore all values from the saved state (for reinvoked continuations)
+    // This resets any modifications made by set! after initialization
+    unsigned v = all_vals;
+    unsigned s = saved;
+    for (; v && v != vals_ptr && s; v = cdr(v), s = cdr(s)) {
+        write_barrier(v, car(s));
+        CELL_CAR(v) = car(s);
+    }
+
+    // Store the new value
+    write_barrier(vals_ptr, val);
     CELL_CAR(vals_ptr) = val;
 
     unsigned rest = cdr(bindings);
     if (!rest) {
         eval_body(body, env, next);
     } else {
-        // Extract next value expr and protect across all allocations (inc next)
+        // Extract next value expr and protect across all allocations
         unsigned next_val_expr = cadr(car(rest));
         gc_protect(&next_val_expr);
         gc_protect(&rest);
         gc_protect(&body);
-        gc_protect(&vals_ptr);
+        gc_protect(&all_vals);
+        gc_protect(&saved);
         gc_protect(&env);
         gc_protect(&next);
-        unsigned inner = 0;
-        gc_protect(&inner);
-        inner = alloc_cons(cdr(vals_ptr), body);
-        unsigned new_data = alloc_cons(rest, inner);
+        gc_protect(&vals_ptr);
+
+        // Build new saved list: prepend current value to saved
+        unsigned new_saved = 0;
+        gc_protect(&new_saved);
+        new_saved = alloc_cons(val, saved);
+
+        // Build new data: (rest . (next_vals_ptr . (all_vals . (new_saved . body))))
+        unsigned inner1 = 0, inner2_new = 0, inner3_new = 0;
+        gc_protect(&inner1);
+        gc_protect(&inner2_new);
+        gc_protect(&inner3_new);
+        inner1 = alloc_cons(new_saved, body);
+        inner2_new = alloc_cons(all_vals, inner1);
+        inner3_new = alloc_cons(cdr(vals_ptr), inner2_new);
+        unsigned new_data = alloc_cons(rest, inner3_new);
         unsigned k2 = make_cont(CONT_LETREC_INIT, new_data, env, next);
-        gc_unprotect(7);
+        gc_unprotect(12);
         tramp_eval(next_val_expr, env, k2);
     }
 }
@@ -325,7 +416,9 @@ void handle_cont_eval_fn(unsigned val, unsigned data, unsigned env,
         unsigned params = car(fn);
         unsigned mbody = cadr(fn);
         unsigned macroenv = cddr(fn);
-        // Protect mbody, macroenv, env and next across allocations
+        // Protect all values across allocations (including params and arg_exprs for bind_params)
+        gc_protect(&params);
+        gc_protect(&arg_exprs);
         gc_protect(&mbody);
         gc_protect(&macroenv);
         gc_protect(&env);
@@ -339,8 +432,8 @@ void handle_cont_eval_fn(unsigned val, unsigned data, unsigned env,
             gc_protect(&first_expr);
             gc_protect(&menv);
             unsigned k2 = make_cont(CONT_MACRO_EXPAND, 0, env, next);
-            gc_unprotect(11); // first_expr, menv, frame, next, env, macroenv,
-                              // mbody + 4 params
+            gc_unprotect(13); // first_expr, menv, frame, next, env, macroenv,
+                              // mbody, arg_exprs, params + 4 initial
             tramp_eval(first_expr, menv, k2);
         } else {
             unsigned first_expr = car(mbody);
@@ -352,8 +445,8 @@ void handle_cont_eval_fn(unsigned val, unsigned data, unsigned env,
             gc_protect(&inner_k);
             inner_k = make_cont(CONT_MACRO_EXPAND, 0, env, next);
             unsigned k2 = make_cont(CONT_APPLY_FUNC, rest_mbody, menv, inner_k);
-            gc_unprotect(13); // inner_k, first_expr, rest_mbody, menv, frame,
-                              // next, env, macroenv, mbody + 4 params
+            gc_unprotect(15); // inner_k, first_expr, rest_mbody, menv, frame,
+                              // next, env, macroenv, mbody, arg_exprs, params + 4 initial
             tramp_eval(first_expr, menv, k2);
         }
         return;
@@ -361,12 +454,11 @@ void handle_cont_eval_fn(unsigned val, unsigned data, unsigned env,
 
     // Handle syntax transformers
     if (IS_SYNTAX(fn)) {
-        unsigned transformer = car(fn);
-        gc_protect(&transformer);
+        gc_protect(&fn);
         gc_protect(&arg_exprs);
         unsigned input = alloc_cons(0, arg_exprs);
-        unsigned expanded = apply_syntax(transformer, input, env);
-        gc_unprotect(6); // transformer, arg_exprs + 4 params
+        unsigned expanded = apply_syntax(fn, input, env);
+        gc_unprotect(6); // fn, arg_exprs + 4 params
         if (expanded == TOK_ERROR) {
             tramp_error();
             return;
@@ -508,6 +600,7 @@ const cont_handler_t cont_handlers[CONT_COUNT] = {
     [CONT_AND] = handle_cont_and,
     [CONT_OR] = handle_cont_or,
     [CONT_COND_TEST] = handle_cont_cond_test,
+    [CONT_COND_ARROW] = handle_cont_cond_arrow,
     [CONT_LET_VALS] = handle_cont_let_vals,
     [CONT_LET_BODY] = handle_cont_let_body,
     [CONT_LETSTAR_VALS] = handle_cont_letstar_vals,

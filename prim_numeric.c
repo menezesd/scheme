@@ -1,7 +1,21 @@
 /**
  * @file prim_numeric.c
- * @brief Numeric arithmetic operations (+, -, *, /, mod, quotient, remainder,
- * abs)
+ * @brief Numeric arithmetic operations (+, -, *, /, mod, quotient, remainder, abs)
+ *
+ * Implements the full numeric tower for arithmetic:
+ * - Fast path: Pure int64_t arithmetic with overflow detection
+ * - Bignum: Arbitrary precision for integer overflow
+ * - Rational: Exact fractions when division doesn't produce integers
+ * - Inexact: IEEE 754 doubles for transcendental operations
+ * - Complex: Real + imaginary parts (can be any of the above)
+ *
+ * ## Exactness Propagation
+ * Results are exact if all operands are exact, except for operations that
+ * inherently produce inexact results (sqrt of non-perfect-square, etc.).
+ *
+ * ## Overflow Handling
+ * Uses __builtin_*_overflow intrinsics for fast overflow detection,
+ * promoting to bignum when int64_t overflows.
  */
 
 #include "prim_internal.h"

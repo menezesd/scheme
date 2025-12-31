@@ -15,4 +15,7 @@ void write_obj_port(unsigned s, FILE *port);
 // Write object without outer quotes to specified port
 void display_obj_port(unsigned s, FILE *port);
 
+// Get type name for error messages
+const char *type_name(unsigned cell);
+
 #endif // WRITER_H

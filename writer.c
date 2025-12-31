@@ -32,6 +32,62 @@
 #include <stdlib.h>
 
 // ============================================================================
+// Type Names for Error Messages
+// ============================================================================
+
+const char *type_name(unsigned cell)
+{
+    if (cell == 0)
+        return "nil";
+    switch (CELL_TYPE(cell)) {
+    case BT_FREE:
+        return "free-cell";
+    case BT_ATOM:
+        return "symbol";
+    case BT_NUM:
+        return "integer";
+    case BT_BIGNUM:
+        return "bignum";
+    case BT_INEXACT:
+        return "float";
+    case BT_RATIONAL:
+        return "rational";
+    case BT_COMPLEX:
+        return "complex";
+    case BT_STRING:
+        return "string";
+    case BT_CHAR:
+        return "character";
+    case BT_VECTOR:
+        return "vector";
+    case BT_CONS:
+        return "pair";
+    case BT_FUNCTION:
+        return "procedure";
+    case BT_MACRO:
+        return "macro";
+    case BT_SYNTAX:
+        return "syntax-transformer";
+    case BT_CONT:
+        return "continuation";
+    case BT_INPORT:
+        return "input-port";
+    case BT_OUTPORT:
+        return "output-port";
+    case BT_STRINPORT:
+        return "string-input-port";
+    case BT_STROUTPORT:
+        return "string-output-port";
+    case BT_MULTIVAL:
+        return "multiple-values";
+    case BT_BUILTIN:
+        return "primitive";
+    default:
+        return "unknown";
+    }
+}
+
+// ============================================================================
 // Cycle Detection Hash Table
 // ============================================================================
 

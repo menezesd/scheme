@@ -15,6 +15,7 @@
 #include "context.h"
 #include "env.h"
 #include "eval.h"
+#include "eval_internal.h"
 #include "macros.h"
 #include "primitives.h"
 #include "writer.h"
@@ -170,14 +171,12 @@ static bool is_foldable_primitive(int64_t prim_id)
     case PGT:
     case PLEQ:
     case PGEQ:
-    // List operations
+    // List operations (read-only ones)
     case PCAR:
     case PCDR:
-    case PCONS:
-    case PLIST:
     case PLENGTH:
-    case PREVERSE:
-    case PAPPEND:
+    // Note: PCONS, PLIST, PREVERSE, PAPPEND are NOT foldable because
+    // they create mutable cons cells that must not be shared
     // Type predicates
     case PCONSP:
     case PNULLP:
@@ -251,6 +250,7 @@ static void cctx_free(compile_ctx *cctx)
 // ============================================================================
 
 static void emit(compile_ctx *cctx, unsigned op) { code_emit(cctx->code, op); }
+
 
 static void emit2(compile_ctx *cctx, unsigned op, unsigned arg)
 {
@@ -328,12 +328,27 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
                 return compile_lambda(expr, cctx);
             if (kw == ctx.kw_begin)
                 return compile_begin(cdr(expr), cctx);
-            if (kw == ctx.kw_let)
-                return compile_let(expr, cctx);
-            if (kw == ctx.kw_letstar)
-                return compile_letstar(expr, cctx);
-            if (kw == ctx.kw_letrec)
+            // For let/let*/letrec, check for macro override first
+            // (e.g., stdlib defines let macro for named let)
+            if (kw == ctx.kw_let || kw == ctx.kw_letstar ||
+                kw == ctx.kw_letrec) {
+                unsigned mac = lookup_silent(kw, cctx->env);
+                if (mac != TOK_ERROR && IS_SYNTAX(mac)) {
+                    unsigned expanded = apply_syntax(mac, expr, cctx->env);
+                    if (expanded == TOK_ERROR) {
+                        show_error("let macro expansion failed");
+                        emit(cctx, OP_HALT);
+                        return dynamic_result();
+                    }
+                    return compile_expr_internal(expanded, cctx);
+                }
+                // No macro override, use built-in compilation
+                if (kw == ctx.kw_let)
+                    return compile_let(expr, cctx);
+                if (kw == ctx.kw_letstar)
+                    return compile_letstar(expr, cctx);
                 return compile_letrec(expr, cctx);
+            }
             if (kw == ctx.kw_and)
                 return compile_and(expr, cctx);
             if (kw == ctx.kw_or)
@@ -357,13 +372,95 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
                 return dynamic_result();
             }
 
+            if (kw == ctx.kw_let_syntax || kw == ctx.kw_letrec_syntax) {
+                // (let-syntax ((name transformer) ...) body ...)
+                // (letrec-syntax ((name transformer) ...) body ...)
+                unsigned bindings = cadr(expr);
+                unsigned body = cddr(expr);
+
+                // If no bindings, just compile body in current env
+                if (!bindings) {
+                    return compile_begin(body, cctx);
+                }
+
+                // Create a new compile-time environment
+                gc_protect(&bindings);
+                gc_protect(&body);
+
+                unsigned new_env = cctx->env;
+                gc_protect(&new_env);
+                unsigned frame_vars = 0, frame_vals = 0;
+                gc_protect(&frame_vars);
+                gc_protect(&frame_vals);
+
+                // For let-syntax, closure env is outer env
+                // For letrec-syntax, closure env is new env (set after frame
+                // created)
+                unsigned closure_env = cctx->env;
+
+                // First pass: create frame with placeholder values for
+                // letrec-syntax
+                if (kw == ctx.kw_letrec_syntax) {
+                    unsigned frame = alloc_cons(0, 0);
+                    new_env = alloc_cons(frame, cctx->env);
+                    closure_env = new_env;
+                }
+
+                // Bind each syntax transformer
+                for (unsigned b = bindings; b; b = cdr(b)) {
+                    unsigned binding = car(b);
+                    unsigned name = car(binding);
+                    unsigned transformer_form = cadr(binding);
+
+                    // Check it's a syntax-rules form
+                    if (!IS_PAIR(transformer_form) ||
+                        !IS_KEYWORD(car(transformer_form), ctx.kw_syntax_rules)) {
+                        show_error("%s: expected syntax-rules",
+                                   kw == ctx.kw_let_syntax ? "let-syntax"
+                                                          : "letrec-syntax");
+                        gc_unprotect(5);
+                        emit(cctx, OP_HALT);
+                        return dynamic_result();
+                    }
+
+                    // Create syntax transformer
+                    unsigned transformer =
+                        make_syntax_transformer(transformer_form, closure_env);
+
+                    // Add to frame
+                    gc_protect(&name);
+                    gc_protect(&transformer);
+                    unsigned vc = alloc_cons(name, frame_vars);
+                    unsigned ac = alloc_cons(transformer, frame_vals);
+                    gc_unprotect(2);
+                    frame_vars = vc;
+                    frame_vals = ac;
+                }
+
+                // Create frame if let-syntax (letrec-syntax already has frame)
+                if (kw == ctx.kw_let_syntax) {
+                    unsigned frame = alloc_cons(frame_vars, frame_vals);
+                    new_env = alloc_cons(frame, cctx->env);
+                } else {
+                    // Update letrec-syntax frame
+                    unsigned frame = car(new_env);
+                    CELL_CAR(frame) = frame_vars;
+                    CELL_CDR(frame) = frame_vals;
+                }
+
+                gc_unprotect(5);
+
+                // Compile body with new environment
+                compile_ctx new_cctx = *cctx;
+                new_cctx.env = new_env;
+                return compile_begin(body, &new_cctx);
+            }
+
             // Check for macro application (silent - don't warn if not found)
             unsigned mac = lookup_silent(kw, cctx->env);
             if (mac != TOK_ERROR) {
                 if (IS_SYNTAX(mac)) {
-                    unsigned transformer = car(mac);
-                    unsigned expanded =
-                        apply_syntax(transformer, expr, cctx->env);
+                    unsigned expanded = apply_syntax(mac, expr, cctx->env);
                     if (expanded == TOK_ERROR) {
                         show_error("macro expansion failed");
                         emit(cctx, OP_HALT);
@@ -472,8 +569,49 @@ static compile_result compile_lambda(unsigned expr, compile_ctx *cctx)
     unsigned params = cadr(expr);
     unsigned body = cddr(expr);
 
-    // Create new compilation context for lambda body
-    compile_ctx *lambda_cctx = cctx_new(cctx, cctx->env);
+    // Create compile-time environment that shadows lambda parameters
+    // This prevents the compiler from inlining builtins that are shadowed
+    // by lambda parameters (e.g., (lambda (exit) (exit 'x)) should not
+    // call the exit primitive)
+    unsigned lambda_env = cctx->env;
+    gc_protect(&lambda_env);
+    gc_protect(&params);
+    gc_protect(&body);
+
+    // Build a dummy frame with parameters as vars, all bound to 0
+    unsigned vars = 0, vals = 0;
+    gc_protect(&vars);
+    gc_protect(&vals);
+    unsigned vars_tail = 0, vals_tail = 0;
+    gc_protect(&vars_tail);
+    gc_protect(&vals_tail);
+
+    for (unsigned p = params; p; p = IS_PAIR(p) ? cdr(p) : 0) {
+        unsigned var = IS_PAIR(p) ? car(p) : p;
+        unsigned vc = alloc_cons(var, 0);
+        unsigned ac = alloc_cons(0, 0); // dummy value
+        if (!vars) {
+            vars = vc;
+            vals = ac;
+        } else {
+            CELL_CDR(vars_tail) = vc;
+            CELL_CDR(vals_tail) = ac;
+        }
+        vars_tail = vc;
+        vals_tail = ac;
+        if (!IS_PAIR(p))
+            break; // rest param
+    }
+
+    if (vars) {
+        unsigned frame = alloc_cons(vars, vals);
+        lambda_env = alloc_cons(frame, lambda_env);
+    }
+
+    gc_unprotect(7);
+
+    // Create new compilation context for lambda body with shadowed params
+    compile_ctx *lambda_cctx = cctx_new(cctx, lambda_env);
     lambda_cctx->tail_position = true;
 
     // Count parameters
@@ -774,12 +912,12 @@ static compile_result compile_cond(unsigned expr, compile_ctx *cctx)
     bool tail = cctx->tail_position;
     unsigned end_jumps[256];
     unsigned end_count = 0;
+    bool found_else = false;
 
     while (clauses) {
         unsigned clause = car(clauses);
         unsigned test = car(clause);
         unsigned conseq = cdr(clause);
-        bool is_last = !cdr(clauses);
 
         // Check for else clause
         if (IS_KEYWORD(test, ctx.kw_else)) {
@@ -790,6 +928,7 @@ static compile_result compile_cond(unsigned expr, compile_ctx *cctx)
                 emit2(cctx, OP_CONST,
                       code_add_const(cctx->code, ctx.atom_true));
             }
+            found_else = true;
             break;
         }
 
@@ -797,34 +936,54 @@ static compile_result compile_cond(unsigned expr, compile_ctx *cctx)
         cctx->tail_position = false;
         compile_expr_internal(test, cctx);
 
+        // Check if we need the test value (=> syntax or no consequent)
+        bool is_arrow = conseq && IS_KEYWORD(car(conseq), ctx.kw_arrow) &&
+                        lookup_silent(ctx.kw_arrow, cctx->env) == TOK_ERROR;
+        bool need_test_value = is_arrow || !conseq;
+
+        if (need_test_value) {
+            // Duplicate test result for => receiver or (test) form
+            emit(cctx, OP_DUP);
+        }
+
         unsigned next_clause = emit_jump(cctx, OP_JUMPIFNOT);
 
         // Compile consequence
         cctx->tail_position = tail;
-        if (conseq) {
+        if (is_arrow) {
+            // (test => receiver) syntax
+            // Stack has: test-value (from DUP)
+            unsigned receiver_expr = cadr(conseq);
+            compile_expr_internal(receiver_expr, cctx);
+            // Stack has: test-value receiver
+            // CALL pops fn first, then args - already in correct order
+            emit2(cctx, OP_CALL, 1);
+        } else if (conseq) {
+            // Normal consequent - compile expressions
             compile_begin(conseq, cctx);
-        } else {
-            // (cond (test) ...) => test value if true
-            emit2(cctx, OP_CONST, code_add_const(cctx->code, ctx.atom_true));
         }
+        // else: no conseq, test value already on stack from DUP
 
-        if (!is_last) {
-            end_jumps[end_count++] = emit_jump(cctx, OP_JUMP);
-        }
+        // Always jump to end after true branch
+        end_jumps[end_count++] = emit_jump(cctx, OP_JUMP);
 
+        // Patch false branch entry point
         patch_jump(cctx, next_clause);
+
+        // Pop test value on false branch if we DUP'd
+        if (need_test_value) {
+            emit(cctx, OP_POP);
+        }
+
         clauses = cdr(clauses);
     }
 
-    // If no else and no clause matched, result is unspecified
-    if (clauses && !cdr(clauses)) {
-        // Already handled else
-    } else if (!clauses) {
-        // No else clause - emit unspecified for fall-through
+    // If no else clause was found, emit unspecified for fall-through
+    if (!found_else) {
         emit2(cctx, OP_CONST, code_add_const(cctx->code, 0));
     }
 
-    // Patch end jumps
+    // Patch all end jumps
     for (unsigned i = 0; i < end_count; i++) {
         patch_jump(cctx, end_jumps[i]);
     }
@@ -967,6 +1126,81 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
                         emit(cctx, OP_EQ);
                         return dynamic_result();
                     }
+
+                    // Check for unary arithmetic patterns: (+ x 1), (- x 1),
+                    // (= x 0)
+                    bool arg0_const = arg_results[0].is_const;
+                    bool arg1_const = arg_results[1].is_const;
+                    int64_t val0 =
+                        arg0_const && CELL_TYPE(arg_results[0].value) == BT_NUM
+                            ? CELL_ID(arg_results[0].value)
+                            : -999;
+                    int64_t val1 =
+                        arg1_const && CELL_TYPE(arg_results[1].value) == BT_NUM
+                            ? CELL_ID(arg_results[1].value)
+                            : -999;
+
+                    // (+ x 1) or (+ 1 x) -> ADD1
+                    // (+ x -1) or (+ -1 x) -> SUB1
+                    if (prim_id == PPLUS) {
+                        if (arg1_const && val1 == 1) {
+                            cctx->code->code_len = saved_pos;
+                            compile_expr_internal(car(args), cctx);
+                            emit(cctx, OP_ADD1);
+                            return dynamic_result();
+                        }
+                        if (arg0_const && val0 == 1) {
+                            cctx->code->code_len = saved_pos;
+                            compile_expr_internal(cadr(args), cctx);
+                            emit(cctx, OP_ADD1);
+                            return dynamic_result();
+                        }
+                        if (arg1_const && val1 == -1) {
+                            cctx->code->code_len = saved_pos;
+                            compile_expr_internal(car(args), cctx);
+                            emit(cctx, OP_SUB1);
+                            return dynamic_result();
+                        }
+                        if (arg0_const && val0 == -1) {
+                            cctx->code->code_len = saved_pos;
+                            compile_expr_internal(cadr(args), cctx);
+                            emit(cctx, OP_SUB1);
+                            return dynamic_result();
+                        }
+                    }
+
+                    // (- x 1) -> SUB1
+                    // (- x -1) -> ADD1
+                    if (prim_id == PMINUS) {
+                        if (arg1_const && val1 == 1) {
+                            cctx->code->code_len = saved_pos;
+                            compile_expr_internal(car(args), cctx);
+                            emit(cctx, OP_SUB1);
+                            return dynamic_result();
+                        }
+                        if (arg1_const && val1 == -1) {
+                            cctx->code->code_len = saved_pos;
+                            compile_expr_internal(car(args), cctx);
+                            emit(cctx, OP_ADD1);
+                            return dynamic_result();
+                        }
+                    }
+
+                    // (= x 0) or (= 0 x) -> ZEROP
+                    if (prim_id == PEQUAL) {
+                        if (arg1_const && val1 == 0) {
+                            cctx->code->code_len = saved_pos;
+                            compile_expr_internal(car(args), cctx);
+                            emit(cctx, OP_ZEROP);
+                            return dynamic_result();
+                        }
+                        if (arg0_const && val0 == 0) {
+                            cctx->code->code_len = saved_pos;
+                            compile_expr_internal(cadr(args), cctx);
+                            emit(cctx, OP_ZEROP);
+                            return dynamic_result();
+                        }
+                    }
                 }
 
                 emit3(cctx, OP_PRIM, prim_id, argc);
@@ -1077,9 +1311,9 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
                 return dynamic_result();
             }
 
-            // Special handling for apply
+            // Special handling for apply - use OP_PRIM to handle variable args
             if (prim_id == PAPPLY) {
-                emit(cctx, OP_APPLY);
+                emit3(cctx, OP_PRIM, prim_id, argc);
                 return dynamic_result();
             }
 
@@ -1113,20 +1347,161 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
     return dynamic_result();
 }
 
-// Quasiquote expansion (at compile time)
+// Check if quasiquote contains unquote or unquote-splicing
+static bool qq_has_unquote(unsigned x, int depth)
+{
+    if (!IS_PAIR(x))
+        return false;
+
+    unsigned head = car(x);
+
+    // Found unquote at depth 1
+    if (IS_KEYWORD(head, ctx.kw_unquote) && depth == 1)
+        return true;
+    if (IS_KEYWORD(head, ctx.kw_unquote_splicing) && depth == 1)
+        return true;
+
+    // Nested quasiquote increases depth
+    if (IS_KEYWORD(head, ctx.kw_quasiquote))
+        return qq_has_unquote(cadr(x), depth + 1);
+
+    // Unquote decreases depth
+    if (IS_KEYWORD(head, ctx.kw_unquote) ||
+        IS_KEYWORD(head, ctx.kw_unquote_splicing))
+        return qq_has_unquote(cadr(x), depth - 1);
+
+    // Check all elements of list
+    for (unsigned l = x; IS_PAIR(l); l = cdr(l)) {
+        if (qq_has_unquote(car(l), depth))
+            return true;
+    }
+    return false;
+}
+
+// Compile quasiquote recursively - generates runtime code
+static void compile_qq_rec(unsigned x, compile_ctx *cctx, int depth)
+{
+    if (!IS_PAIR(x)) {
+        // Non-pair: just quote it
+        emit2(cctx, OP_CONST, code_add_const(cctx->code, x));
+        return;
+    }
+
+    unsigned head = car(x);
+
+    // (unquote expr) at depth 1: compile the expression
+    if (IS_KEYWORD(head, ctx.kw_unquote) && depth == 1) {
+        compile_expr_internal(cadr(x), cctx);
+        return;
+    }
+
+    // (unquote expr) at depth > 1: decrement depth and wrap result
+    if (IS_KEYWORD(head, ctx.kw_unquote) && depth > 1) {
+        compile_qq_rec(cadr(x), cctx, depth - 1);
+        emit2(cctx, OP_CONST, code_add_const(cctx->code, ctx.atom_unquote));
+        emit(cctx, OP_SWAP);
+        emit(cctx, OP_LIST1);
+        emit(cctx, OP_CONS);
+        return;
+    }
+
+    // (unquote-splicing expr) at depth > 1: decrement depth and wrap result
+    if (IS_KEYWORD(head, ctx.kw_unquote_splicing) && depth > 1) {
+        compile_qq_rec(cadr(x), cctx, depth - 1);
+        emit2(cctx, OP_CONST,
+              code_add_const(cctx->code, ctx.atom_unquote_splicing));
+        emit(cctx, OP_SWAP);
+        emit(cctx, OP_LIST1);
+        emit(cctx, OP_CONS);
+        return;
+    }
+
+    // Nested quasiquote: keep structure but recurse with depth+1
+    if (IS_KEYWORD(head, ctx.kw_quasiquote)) {
+        compile_qq_rec(cadr(x), cctx, depth + 1);
+        emit2(cctx, OP_CONST, code_add_const(cctx->code, ctx.atom_quasiquote));
+        emit(cctx, OP_SWAP);
+        emit(cctx, OP_LIST1);
+        emit(cctx, OP_CONS);
+        return;
+    }
+
+    // Handle list by compiling each element and building with cons
+    // Need to handle unquote-splicing specially
+    bool has_splice = false;
+    for (unsigned l = x; IS_PAIR(l); l = cdr(l)) {
+        unsigned elem = car(l);
+        if (IS_PAIR(elem) && IS_KEYWORD(car(elem), ctx.kw_unquote_splicing) &&
+            depth == 1) {
+            has_splice = true;
+            break;
+        }
+    }
+
+    if (has_splice) {
+        // Use append-based building for splicing
+        // Start with empty list
+        emit2(cctx, OP_CONST, code_add_const(cctx->code, 0));
+
+        for (unsigned l = x; IS_PAIR(l); l = cdr(l)) {
+            unsigned elem = car(l);
+            if (IS_PAIR(elem) &&
+                IS_KEYWORD(car(elem), ctx.kw_unquote_splicing) && depth == 1) {
+                // ,@expr: compile expr and append
+                compile_expr_internal(cadr(elem), cctx);
+                emit3(cctx, OP_PRIM, PAPPEND, 2);
+            } else {
+                // Regular element: compile, wrap in list, append
+                compile_qq_rec(elem, cctx, depth);
+                emit(cctx, OP_LIST1);
+                emit3(cctx, OP_PRIM, PAPPEND, 2);
+            }
+        }
+    } else {
+        // No splicing: build with cons from the end
+        // First compile all elements, then cons them together
+        unsigned len = 0;
+        for (unsigned l = x; IS_PAIR(l); l = cdr(l)) {
+            compile_qq_rec(car(l), cctx, depth);
+            len++;
+        }
+        // Handle improper list tail
+        unsigned tail = x;
+        while (IS_PAIR(tail))
+            tail = cdr(tail);
+        if (tail) {
+            compile_qq_rec(tail, cctx, depth);
+        } else {
+            emit2(cctx, OP_CONST, code_add_const(cctx->code, 0));
+        }
+        // Now cons them together from right to left
+        for (unsigned i = 0; i < len; i++) {
+            emit(cctx, OP_CONS);
+        }
+    }
+}
+
+// Quasiquote expansion
 static compile_result compile_quasiquote(unsigned expr, compile_ctx *cctx)
 {
     unsigned tmpl = cadr(expr);
 
-    // Simple implementation: expand at compile time
-    unsigned expanded = qq_expand_cps(tmpl, cctx->env);
-    if (expanded == TOK_ERROR) {
-        show_error("quasiquote expansion failed");
-        emit(cctx, OP_HALT);
-        return dynamic_result();
+    // Check if quasiquote has any unquotes that need runtime evaluation
+    if (!qq_has_unquote(tmpl, 1)) {
+        // No unquotes - can expand at compile time
+        unsigned expanded = qq_expand_cps(tmpl, cctx->env);
+        if (expanded == TOK_ERROR) {
+            show_error("quasiquote expansion failed");
+            emit(cctx, OP_HALT);
+            return dynamic_result();
+        }
+        emit2(cctx, OP_CONST, code_add_const(cctx->code, expanded));
+        return const_result(expanded);
     }
-    emit2(cctx, OP_CONST, code_add_const(cctx->code, expanded));
-    return const_result(expanded);
+
+    // Has unquotes - generate runtime code
+    compile_qq_rec(tmpl, cctx, 1);
+    return dynamic_result();
 }
 
 // ============================================================================
@@ -1153,10 +1528,8 @@ code_object *compile_toplevel(unsigned expr, unsigned env)
     compile_expr_internal(expr, cctx);
     emit(cctx, OP_HALT);
 
-    // Apply peephole optimization
-    peephole_optimize(cctx->code);
-
     code_object *result = cctx->code;
+    peephole_optimize(result);
     cctx_free(cctx);
     return result;
 }
@@ -1179,6 +1552,10 @@ static unsigned opcode_size(unsigned op)
     case OP_JUMP:
     case OP_JUMPIF:
     case OP_JUMPIFNOT:
+    case OP_JUMPIFNULL:
+    case OP_JUMPIFNOTNULL:
+    case OP_JUMPIFZERO:
+    case OP_JUMPIFNOTZERO:
     case OP_VALUES:
     case OP_DEFSYNTAX:
         return 2; // opcode + 1 operand
@@ -1189,7 +1566,7 @@ static unsigned opcode_size(unsigned op)
     }
 }
 
-// Peephole optimization pass - optimize bytecode patterns in place
+// Peephole optimization with proper jump target fixup
 static void peephole_optimize(code_object *code)
 {
     if (!code || code->code_len < 2)
@@ -1197,72 +1574,190 @@ static void peephole_optimize(code_object *code)
 
     unsigned *c = code->code;
     unsigned len = code->code_len;
-    unsigned write = 0; // Write position for compacted code
 
-    for (unsigned read = 0; read < len;) {
-        unsigned op = c[read];
+    // First pass: identify which bytes to remove and build offset map
+    // offset_map[old] = new offset after compaction
+    unsigned *offset_map = malloc(len * sizeof(unsigned));
+    if (!offset_map)
+        return;
+
+    bool *remove = calloc(len, sizeof(bool));
+    if (!remove) {
+        free(offset_map);
+        return;
+    }
+
+    // Mark patterns to remove
+    for (unsigned i = 0; i < len;) {
+        unsigned op = c[i];
         unsigned size = opcode_size(op);
 
         // Pattern: CONST x, POP -> nothing (dead code)
-        if (op == OP_CONST && read + 2 < len && c[read + 2] == OP_POP) {
-            read += 3; // Skip CONST idx POP
+        if (op == OP_CONST && i + 2 < len && c[i + 2] == OP_POP) {
+            remove[i] = remove[i + 1] = remove[i + 2] = true;
+            i += 3;
+            continue;
+        }
+
+        // Pattern: LOOKUP x, POP -> nothing (dead code)
+        if (op == OP_LOOKUP && i + 2 < len && c[i + 2] == OP_POP) {
+            remove[i] = remove[i + 1] = remove[i + 2] = true;
+            i += 3;
             continue;
         }
 
         // Pattern: DUP, POP -> nothing
-        if (op == OP_DUP && read + 1 < len && c[read + 1] == OP_POP) {
-            read += 2; // Skip DUP POP
+        if (op == OP_DUP && i + 1 < len && c[i + 1] == OP_POP) {
+            remove[i] = remove[i + 1] = true;
+            i += 2;
             continue;
         }
 
-        // Pattern: JUMP to next instruction -> nothing
-        if (op == OP_JUMP && read + 2 <= len) {
-            unsigned target = c[read + 1];
-            if (target == write + 2) {
-                // Jump target is the next instruction, skip this jump
-                read += 2;
-                continue;
-            }
+        // Pattern: SWAP, SWAP -> nothing (identity)
+        if (op == OP_SWAP && i + 1 < len && c[i + 1] == OP_SWAP) {
+            remove[i] = remove[i + 1] = true;
+            i += 2;
+            continue;
         }
 
         // Pattern: NOT, NOT -> nothing (double negation)
-        if (op == OP_NOT && read + 1 < len && c[read + 1] == OP_NOT) {
-            read += 2; // Skip both NOTs
+        if (op == OP_NOT && i + 1 < len && c[i + 1] == OP_NOT) {
+            remove[i] = remove[i + 1] = true;
+            i += 2;
             continue;
         }
 
-        // Pattern: NOT, JUMPIFNOT -> JUMPIF (and vice versa)
-        if (op == OP_NOT && read + 2 < len && c[read + 1] == OP_JUMPIFNOT) {
-            c[write++] = OP_JUMPIF;
-            c[write++] = c[read + 2];
-            read += 3;
-            continue;
-        }
-        if (op == OP_NOT && read + 2 < len && c[read + 1] == OP_JUMPIF) {
-            c[write++] = OP_JUMPIFNOT;
-            c[write++] = c[read + 2];
-            read += 3;
+        // Pattern: NOT, JUMPIFNOT -> JUMPIF (remove NOT, change jump type)
+        if (op == OP_NOT && i + 1 < len && c[i + 1] == OP_JUMPIFNOT) {
+            remove[i] = true;
+            c[i + 1] = OP_JUMPIF;
+            i += 1;  // Continue from JUMPIF
             continue;
         }
 
-        // Pattern: CAR, CAR -> invalid, but CAR, CDR is common (cadr pattern)
-        // We could emit CADR, but it's already handled by stdlib
-
-        // Copy instruction as-is
-        for (unsigned i = 0; i < size && read + i < len; i++) {
-            c[write++] = c[read + i];
+        // Pattern: NOT, JUMPIF -> JUMPIFNOT (remove NOT, change jump type)
+        if (op == OP_NOT && i + 1 < len && c[i + 1] == OP_JUMPIF) {
+            remove[i] = true;
+            c[i + 1] = OP_JUMPIFNOT;
+            i += 1;
+            continue;
         }
-        read += size;
+
+        // Pattern: JUMP to immediately next instruction -> nothing
+        if (op == OP_JUMP && i + 2 < len && c[i + 1] == i + 2) {
+            remove[i] = remove[i + 1] = true;
+            i += 2;
+            continue;
+        }
+
+        // Pattern: NULLP, JUMPIFNOT target -> JUMPIFNOTNULL target
+        if (op == OP_NULLP && i + 1 < len && c[i + 1] == OP_JUMPIFNOT) {
+            remove[i] = true;       // Remove NULLP
+            c[i + 1] = OP_JUMPIFNOTNULL;  // Replace with fused opcode
+            i += 1;
+            continue;
+        }
+
+        // Pattern: NULLP, JUMPIF target -> JUMPIFNULL target
+        if (op == OP_NULLP && i + 1 < len && c[i + 1] == OP_JUMPIF) {
+            remove[i] = true;
+            c[i + 1] = OP_JUMPIFNULL;
+            i += 1;
+            continue;
+        }
+
+        // Pattern: ZEROP, JUMPIFNOT target -> JUMPIFNOTZERO target
+        if (op == OP_ZEROP && i + 1 < len && c[i + 1] == OP_JUMPIFNOT) {
+            remove[i] = true;
+            c[i + 1] = OP_JUMPIFNOTZERO;
+            i += 1;
+            continue;
+        }
+
+        // Pattern: ZEROP, JUMPIF target -> JUMPIFZERO target
+        if (op == OP_ZEROP && i + 1 < len && c[i + 1] == OP_JUMPIF) {
+            remove[i] = true;
+            c[i + 1] = OP_JUMPIFZERO;
+            i += 1;
+            continue;
+        }
+
+        // Pattern: ADD1, SUB1 -> nothing (identity)
+        if (op == OP_ADD1 && i + 1 < len && c[i + 1] == OP_SUB1) {
+            remove[i] = remove[i + 1] = true;
+            i += 2;
+            continue;
+        }
+
+        // Pattern: SUB1, ADD1 -> nothing (identity)
+        if (op == OP_SUB1 && i + 1 < len && c[i + 1] == OP_ADD1) {
+            remove[i] = remove[i + 1] = true;
+            i += 2;
+            continue;
+        }
+
+        // Pattern: CAR, CDR can be fused (if we add CADR) - already have OP_CADR
+        // Pattern: CDR, CDR can be fused (if we add CDDR) - already have OP_CDDR
+
+        // Pattern: PAIRP, NOT -> use directly in conditional
+        if (op == OP_PAIRP && i + 1 < len && c[i + 1] == OP_NOT &&
+            i + 2 < len && c[i + 2] == OP_JUMPIFNOT) {
+            // PAIRP, NOT, JUMPIFNOT -> PAIRP, JUMPIF
+            remove[i + 1] = true;
+            c[i + 2] = OP_JUMPIF;
+            i += 2;
+            continue;
+        }
+
+        i += size;
     }
 
-    // Update code length if we removed any instructions
-    if (write < len) {
-        code->code_len = write;
-
-        // Need to fix up jump targets if we removed code
-        // For now, do a simple approach: re-run to fix jumps
-        // This is quadratic but bytecode is small
+    // Build offset map
+    unsigned new_offset = 0;
+    for (unsigned i = 0; i < len; i++) {
+        offset_map[i] = new_offset;
+        if (!remove[i])
+            new_offset++;
     }
+    // Map for end-of-code (jump targets can point here)
+    unsigned final_len = new_offset;
+
+    // Second pass: compact code and fix jump targets
+    unsigned write = 0;
+    for (unsigned read = 0; read < len;) {
+        unsigned op = c[read];
+        unsigned size = opcode_size(op);
+
+        if (remove[read]) {
+            read += size;
+            continue;
+        }
+
+        // Copy opcode
+        c[write++] = op;
+
+        // Handle operands, fixing jump targets
+        if (op == OP_JUMP || op == OP_JUMPIF || op == OP_JUMPIFNOT ||
+            op == OP_JUMPIFNULL || op == OP_JUMPIFNOTNULL ||
+            op == OP_JUMPIFZERO || op == OP_JUMPIFNOTZERO) {
+            unsigned old_target = c[read + 1];
+            unsigned new_target =
+                (old_target < len) ? offset_map[old_target] : final_len;
+            c[write++] = new_target;
+            read += 2;
+        } else {
+            // Copy remaining operands as-is
+            for (unsigned j = 1; j < size; j++) {
+                c[write++] = c[read + j];
+            }
+            read += size;
+        }
+    }
+
+    code->code_len = write;
+
+    free(offset_map);
+    free(remove);
 
     // Recursively optimize children
     for (unsigned i = 0; i < code->children_len; i++) {
@@ -1325,14 +1820,21 @@ void gc_sweep_code_objects(void)
         code->gc_marked = false;
     }
 
-    // Walk the new heap and mark code objects referenced by closures
-    unsigned start = ctx.mmin;
-    unsigned end = ctx.hptr;
-    for (unsigned i = start; i < end; i++) {
+    // Walk the heap and mark code objects referenced by closures
+    // Scan old generation: [mmin, hptr)
+    for (unsigned i = ctx.mmin; i < ctx.hptr; i++) {
         if (CELL_TYPE(i) == BT_CLOSURE) {
-            // Closure car points to marker cell containing code_object*
-            code_object *code = GET_CLOSURE_CODE(i);
+            code_object *code = (code_object *)(intptr_t)CELL_ID(i);
             mark_code_object(code);
+        }
+    }
+    // Scan nursery if generational GC is enabled: [nursery_start, nursery_ptr)
+    if (ctx.card_table) {
+        for (unsigned i = ctx.nursery_start; i < ctx.nursery_ptr; i++) {
+            if (CELL_TYPE(i) == BT_CLOSURE) {
+                code_object *code = (code_object *)(intptr_t)CELL_ID(i);
+                mark_code_object(code);
+            }
         }
     }
 
@@ -1362,6 +1864,7 @@ static const char *opcode_names[] = {
     [OP_CONST] = "CONST",
     [OP_POP] = "POP",
     [OP_DUP] = "DUP",
+    [OP_SWAP] = "SWAP",
     [OP_LOOKUP] = "LOOKUP",
     [OP_DEFINE] = "DEFINE",
     [OP_SET] = "SET",
@@ -1409,6 +1912,10 @@ static const char *opcode_names[] = {
     [OP_LIST1] = "LIST1",
     [OP_LIST2] = "LIST2",
     [OP_LIST3] = "LIST3",
+    [OP_JUMPIFNULL] = "JUMPIFNULL",
+    [OP_JUMPIFNOTNULL] = "JUMPIFNOTNULL",
+    [OP_JUMPIFZERO] = "JUMPIFZERO",
+    [OP_JUMPIFNOTZERO] = "JUMPIFNOTZERO",
 };
 
 void disassemble(code_object *code, const char *name)

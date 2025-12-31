@@ -19,6 +19,7 @@
 #include "macros.h"
 #include "prim_internal.h"
 #include "primitives.h"
+#include "writer.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -61,6 +62,71 @@ void vm_free(vm_state *vm)
     free(vm->stack);
     free(vm->frames);
     memset(vm, 0, sizeof(vm_state));
+}
+
+// ============================================================================
+// Closure Call Helper (for CPS evaluator interop)
+// ============================================================================
+
+/**
+ * Call a bytecode closure from the CPS evaluator.
+ * This creates a temporary VM to execute the closure body.
+ *
+ * @param closure The bytecode closure (cons cell with BT_CLOSURE marker)
+ * @param args    Argument list
+ * @return Result value, or TOK_ERROR on error
+ */
+unsigned vm_call_closure(unsigned closure, unsigned args)
+{
+    code_object *code = GET_CLOSURE_CODE(closure);
+    unsigned closure_env = GET_CLOSURE_ENV(closure);
+
+    if (!code || !code->code) {
+        show_error("invalid bytecode closure");
+        return TOK_ERROR;
+    }
+
+    // Check arity
+    unsigned argc = 0;
+    for (unsigned a = args; a; a = cdr(a))
+        argc++;
+
+    if (!code->has_rest && argc != code->arity) {
+        show_error("wrong number of arguments to closure");
+        return TOK_ERROR;
+    }
+    if (code->has_rest && argc < code->arity) {
+        show_error("too few arguments to closure");
+        return TOK_ERROR;
+    }
+
+    // Bind parameters to arguments
+    unsigned params = code->constants[code->params];
+    gc_protect(&closure_env);
+    gc_protect(&args);
+    gc_protect(&params);
+    unsigned frame = bind_params(params, args);
+    gc_unprotect(2);  // args, params no longer needed
+    gc_protect(&frame);
+    unsigned new_env = alloc_cons(frame, closure_env);
+    gc_unprotect(2);  // frame, closure_env
+
+    // Create a temporary VM and run the code
+    vm_state vm;
+    vm_init(&vm);
+    unsigned result = vm_run(&vm, code, new_env);
+    bool had_error = vm.error;
+    const char *error_msg = vm.error_msg;
+    vm_free(&vm);
+
+    if (had_error) {
+        if (error_msg) {
+            show_error("VM error: %s", error_msg);
+        }
+        return TOK_ERROR;
+    }
+
+    return result;
 }
 
 // ============================================================================
@@ -146,19 +212,7 @@ static void pop_frame(vm_state *vm)
 // Continuation Support
 // ============================================================================
 
-/**
- * Captured continuation structure.
- * Stored as a cell with type BT_CONT, id = pointer to this struct.
- */
-typedef struct {
-    unsigned *stack;
-    unsigned sp;
-    vm_frame *frames;
-    unsigned fp;
-    code_object *code;
-    unsigned ip;
-    unsigned env;
-} vm_continuation;
+// vm_continuation is now defined in bytecode.h for GC access
 
 static unsigned capture_continuation(vm_state *vm)
 {
@@ -181,7 +235,7 @@ static unsigned capture_continuation(vm_state *vm)
 
     // Wrap in a cell
     unsigned cell = alloc();
-    CELL_TYPE(cell) = BT_CONT;
+    CELL_TYPE(cell) = BT_VMCONT;
     CELL_ID(cell) = (int64_t)(intptr_t)cont;
 
     return cell;
@@ -252,15 +306,31 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
         }
 
         if (prim_id == PAPPLY) {
-            // apply: (apply proc args-list)
-            if (argc != 2) {
+            // apply: (apply proc arg1 ... args-list)
+            if (argc < 2) {
                 vm->error = true;
-                vm->error_msg = "apply: expected 2 arguments";
+                vm->error_msg = "apply: expected at least 2 arguments";
                 vm->running = false;
                 return;
             }
             unsigned proc = car(args);
-            unsigned apply_args = cadr(args);
+            args = cdr(args);
+
+            // Collect all args except last, then append last list
+            unsigned apply_args = 0;
+            unsigned prefix = 0;
+            while (cdr(args)) {
+                prefix = alloc_cons(car(args), prefix);
+                args = cdr(args);
+            }
+            apply_args = car(args); // Last arg is the list
+
+            // Prepend reversed prefix
+            while (prefix) {
+                apply_args = alloc_cons(car(prefix), apply_args);
+                prefix = cdr(prefix);
+            }
+
             // Count and push args
             unsigned apply_argc = list_length(apply_args);
             FORLIST(a, apply_args) { vm_push(vm, car(a)); }
@@ -272,7 +342,7 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
         unsigned result = apply_primitive(prim_id, args);
         if (result == TOK_ERROR) {
             vm->error = true;
-            vm->error_msg = "primitive error";
+            vm->error_msg = ctx.last_error[0] ? ctx.last_error : "primitive error";
             vm->running = false;
             return;
         }
@@ -307,6 +377,9 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
             return;
         }
 
+        // Protect closure_env from GC during argument building
+        gc_protect(&closure_env);
+
         // Build argument list in correct order by iterating stack in reverse
         unsigned args = 0;
         for (int i = (int)argc - 1; i >= 0; i--) {
@@ -316,9 +389,14 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
         vm->sp -= argc;
 
         // Get params from constant pool and bind
+        gc_protect(&args);
         unsigned params = code->constants[code->params];
+        gc_protect(&params);
         unsigned frame = bind_params(params, args);
+        gc_unprotect(2);  // params, args
+        gc_protect(&frame);
         unsigned new_env = alloc_cons(frame, closure_env);
+        gc_unprotect(2);  // frame, closure_env
 
         if (tail && vm->fp > 0) {
             // Tail call: reuse current frame
@@ -344,6 +422,11 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
         unsigned body = car(body_env);
         unsigned def_env = cdr(body_env);
 
+        // Protect these values from GC during argument building
+        gc_protect(&params);
+        gc_protect(&body);
+        gc_protect(&def_env);
+
         // Build argument list in correct order by iterating in reverse
         unsigned args = 0;
         for (int i = (int)argc - 1; i >= 0; i--) {
@@ -353,8 +436,12 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
         vm->sp -= argc;
 
         // Bind parameters
+        gc_protect(&args);
         unsigned frame = bind_params(params, args);
+        gc_unprotect(1);  // args
+        gc_protect(&frame);
         unsigned new_env = alloc_cons(frame, def_env);
+        gc_unprotect(4);  // frame, def_env, body, params
 
         // Evaluate body using interpreter
         // For now, fall back to eval_cps
@@ -373,8 +460,8 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
         return;
     }
 
-    if (IS_CONT(fn)) {
-        // Continuation invocation
+    if (CELL_TYPE(fn) == BT_VMCONT) {
+        // VM continuation invocation
         if (argc != 1) {
             vm->error = true;
             vm->error_msg = "continuation: expected 1 argument";
@@ -387,8 +474,9 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
         return;
     }
 
+    show_error("not a procedure, got %s", type_name(fn));
     vm->error = true;
-    vm->error_msg = "not a procedure";
+    vm->error_msg = ctx.last_error[0] ? ctx.last_error : "not a procedure";
     vm->running = false;
 }
 
@@ -444,6 +532,14 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             vm_push(vm, vm_peek(vm, 0));
             break;
 
+        case OP_SWAP: {
+            unsigned a = vm_pop(vm);
+            unsigned b = vm_pop(vm);
+            vm_push(vm, a);
+            vm_push(vm, b);
+            break;
+        }
+
         case OP_LOOKUP: {
             int64_t sym_id = vm->code->code[vm->ip++];
             unsigned val = lookup(sym_id, vm->env);
@@ -492,7 +588,10 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             CELL_ID(code_cell) = (int64_t)(intptr_t)child;
 
             // Create closure cell: car = code_cell, cdr = env
+            // Protect code_cell from GC during alloc_cons
+            gc_protect(&code_cell);
             unsigned closure = alloc_cons(code_cell, vm->env);
+            gc_unprotect(1);
 
             vm_push(vm, closure);
             break;
@@ -554,17 +653,209 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             unsigned argc = vm->code->code[vm->ip++];
 
             // Build argument list in correct order by iterating in reverse
+            // Protect args from GC during list building
             unsigned args = 0;
+            gc_protect(&args);
             for (int i = (int)argc - 1; i >= 0; i--) {
                 args = alloc_cons(vm->stack[vm->sp - argc + i], args);
             }
+            gc_unprotect(1);
 
             vm->sp -= argc;
+
+            // Handle special primitives that need full apply treatment
+            if (prim_id == PAPPLY) {
+                // apply: (apply proc arg1 ... args-list)
+                if (argc < 2) {
+                    vm->error = true;
+                    vm->error_msg = "apply: expected at least 2 arguments";
+                    vm->running = false;
+                    break;
+                }
+                unsigned proc = car(args);
+                args = cdr(args);
+
+                // Protect values across allocations
+                gc_protect(&proc);
+                gc_protect(&args);
+
+                // Collect all args except last, then append last list
+                unsigned apply_args = 0;
+                unsigned prefix = 0;
+                gc_protect(&apply_args);
+                gc_protect(&prefix);
+
+                while (cdr(args)) {
+                    prefix = alloc_cons(car(args), prefix);
+                    args = cdr(args);
+                }
+                apply_args = car(args); // Last arg is the list
+
+                // Prepend reversed prefix
+                while (prefix) {
+                    apply_args = alloc_cons(car(prefix), apply_args);
+                    prefix = cdr(prefix);
+                }
+
+                gc_unprotect(4);
+
+                // Count and push args
+                unsigned apply_argc = list_length(apply_args);
+                FORLIST(a, apply_args) { vm_push(vm, car(a)); }
+                vm_apply(vm, proc, apply_argc, false);
+                break;
+            }
+
+            // Special handling for load - uses callback to main.c
+            if (prim_id == PLOAD) {
+                if (argc != 1) {
+                    vm->error = true;
+                    vm->error_msg = "load: expected 1 argument";
+                    vm->running = false;
+                    break;
+                }
+                unsigned filename_cell = car(args);
+                if (CELL_TYPE(filename_cell) != BT_STRING) {
+                    vm->error = true;
+                    vm->error_msg = "load: expected string argument";
+                    vm->running = false;
+                    break;
+                }
+                if (!ctx.load_callback) {
+                    vm->error = true;
+                    vm->error_msg = "load: callback not set";
+                    vm->running = false;
+                    break;
+                }
+                const char *filename = GET_STRING_PTR(filename_cell);
+                unsigned result = ctx.load_callback(filename, &vm->env);
+                if (result == TOK_ERROR) {
+                    vm->error = true;
+                    vm->error_msg = "load failed";
+                    vm->running = false;
+                    break;
+                }
+                vm_push(vm, result);
+                break;
+            }
+
+            // Special handling for call-with-values
+            if (prim_id == PCALLWITHVALUES) {
+                if (argc != 2) {
+                    vm->error = true;
+                    vm->error_msg = "call-with-values: expected 2 arguments";
+                    vm->running = false;
+                    break;
+                }
+                unsigned producer = car(args);
+                unsigned consumer = cadr(args);
+                unsigned result;
+
+                gc_protect(&consumer);
+                gc_protect(&producer);
+
+                // Call producer with 0 args - handle different closure types
+                if (IS_PAIR(producer) && CELL_TYPE(car(producer)) == BT_CLOSURE) {
+                    // Bytecode closure - use vm_call_closure
+                    result = vm_call_closure(producer, 0);
+                } else if (IS_FUNCTION(producer)) {
+                    // CPS closure - use CPS evaluator via callback
+                    // Build: (producer)
+                    unsigned call_expr = alloc_cons(producer, 0);
+                    if (ctx.eval_callback) {
+                        result = ctx.eval_callback(call_expr, vm->env);
+                    } else {
+                        gc_unprotect(2);
+                        vm->error = true;
+                        vm->error_msg =
+                            "call-with-values: cannot call CPS producer";
+                        vm->running = false;
+                        break;
+                    }
+                } else if (CELL_TYPE(producer) == BT_BUILTIN) {
+                    // Builtin - call directly with no args
+                    result = apply_primitive(CELL_ID(producer), 0);
+                } else {
+                    gc_unprotect(2);
+                    vm->error = true;
+                    vm->error_msg =
+                        "call-with-values: producer is not a procedure";
+                    vm->running = false;
+                    break;
+                }
+
+                gc_unprotect(2);
+
+                if (result == TOK_ERROR) {
+                    vm->error = true;
+                    vm->error_msg = "call-with-values: producer failed";
+                    vm->running = false;
+                    break;
+                }
+
+                // If result is multival, unpack values as args to consumer
+                if (IS_MULTIVAL(result)) {
+                    unsigned vals = car(result);
+                    unsigned consumer_argc = 0;
+                    FORLIST(v, vals)
+                    {
+                        vm_push(vm, car(v));
+                        consumer_argc++;
+                    }
+                    vm_apply(vm, consumer, consumer_argc, false);
+                } else {
+                    // Single value - pass as single argument
+                    vm_push(vm, result);
+                    vm_apply(vm, consumer, 1, false);
+                }
+                break;
+            }
+
+            // Special handling for interaction-environment
+            if (prim_id == PINTERACTIONENV) {
+                if (argc != 0) {
+                    vm->error = true;
+                    vm->error_msg = "interaction-environment: expected 0 arguments";
+                    vm->running = false;
+                    break;
+                }
+                vm_push(vm, vm->env);  // Return current environment
+                break;
+            }
+
+            // Special handling for eval - uses callback to main.c
+            if (prim_id == PEVAL) {
+                if (argc < 1 || argc > 2) {
+                    vm->error = true;
+                    vm->error_msg = "eval: expected 1 or 2 arguments";
+                    vm->running = false;
+                    break;
+                }
+                unsigned expr = car(args);
+                unsigned eval_env =
+                    (argc == 2) ? cadr(args) : vm->env; // Use current env if not
+                                                        // specified
+                if (!ctx.eval_callback) {
+                    vm->error = true;
+                    vm->error_msg = "eval: callback not set";
+                    vm->running = false;
+                    break;
+                }
+                unsigned result = ctx.eval_callback(expr, eval_env);
+                if (result == TOK_ERROR) {
+                    vm->error = true;
+                    vm->error_msg = "eval failed";
+                    vm->running = false;
+                    break;
+                }
+                vm_push(vm, result);
+                break;
+            }
 
             unsigned result = apply_primitive(prim_id, args);
             if (result == TOK_ERROR) {
                 vm->error = true;
-                vm->error_msg = "primitive error";
+                vm->error_msg = ctx.last_error[0] ? ctx.last_error : "primitive error";
                 vm->running = false;
                 break;
             }
@@ -581,7 +872,9 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
         case OP_CALLCC: {
             // Stack: [proc]
             unsigned proc = vm_pop(vm);
+            gc_protect(&proc);  // Protect across capture_continuation which allocs
             unsigned cont = capture_continuation(vm);
+            gc_unprotect(1);
             vm_push(vm, cont);
             vm_apply(vm, proc, 1, false);
             break;
@@ -607,7 +900,9 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
         case OP_PUSHENV: {
             // Push new empty frame onto environment
             unsigned frame = alloc_cons(0, 0);
+            gc_protect(&frame);
             vm->env = alloc_cons(frame, vm->env);
+            gc_unprotect(1);
             break;
         }
 
@@ -678,10 +973,18 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 break;
             }
 
+            // New transformer structure: (ellipsis_cell . (literals . rules))
+            // Use default ellipsis for VM path
+            unsigned ellipsis_cell = store(ctx.kw_ellipsis);
             unsigned literals = cadr(transformer_form);
             unsigned rules = cddr(transformer_form);
-            unsigned transformer = make_typed_cell(
-                BT_SYNTAX, alloc_cons(literals, rules), vm->env);
+            gc_protect(&ellipsis_cell);
+            gc_protect(&literals);
+            gc_protect(&rules);
+            unsigned lit_rules = alloc_cons(literals, rules);
+            unsigned car_val = alloc_cons(ellipsis_cell, lit_rules);
+            unsigned transformer = make_typed_cell(BT_SYNTAX, car_val, vm->env);
+            gc_unprotect(3);
 
             // Define in current environment
             unsigned atom = alloc();
@@ -823,7 +1126,24 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
         case OP_EQ: {
             unsigned b = vm_pop(vm);
             unsigned a = vm_pop(vm);
-            vm_push(vm, a == b ? ctx.atom_true : 0);
+            // eq? must compare CELL_ID for atoms/numbers, cell index for others
+            bool eq = false;
+            if (a == b) {
+                eq = true;
+            } else if (CELL_TYPE(a) == CELL_TYPE(b)) {
+                switch (CELL_TYPE(a)) {
+                case BT_ATOM:
+                case BT_NUM:
+                case BT_CHAR:
+                case BT_FUNCTION:
+                case BT_BUILTIN:
+                    eq = (CELL_ID(a) == CELL_ID(b));
+                    break;
+                default:
+                    break;
+                }
+            }
+            vm_push(vm, eq ? ctx.atom_true : 0);
             break;
         }
 
@@ -1060,6 +1380,49 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             unsigned b = vm_pop(vm);
             unsigned a = vm_pop(vm);
             vm_push(vm, alloc_cons(a, alloc_cons(b, alloc_cons(c, 0))));
+            break;
+        }
+
+        // Fused compare-and-jump opcodes
+        case OP_JUMPIFNULL: {
+            unsigned target = vm->code->code[vm->ip++];
+            unsigned val = vm_pop(vm);
+            if (val == 0) {
+                vm->ip = target;
+            }
+            break;
+        }
+
+        case OP_JUMPIFNOTNULL: {
+            unsigned target = vm->code->code[vm->ip++];
+            unsigned val = vm_pop(vm);
+            if (val != 0) {
+                vm->ip = target;
+            }
+            break;
+        }
+
+        case OP_JUMPIFZERO: {
+            unsigned target = vm->code->code[vm->ip++];
+            unsigned n = vm_pop(vm);
+            bool is_zero = (n == 0) ||
+                           (CELL_TYPE(n) == BT_NUM && CELL_ID(n) == 0) ||
+                           (CELL_TYPE(n) == BT_BIGNUM && bn_is_zero(get_bignum(n)));
+            if (is_zero) {
+                vm->ip = target;
+            }
+            break;
+        }
+
+        case OP_JUMPIFNOTZERO: {
+            unsigned target = vm->code->code[vm->ip++];
+            unsigned n = vm_pop(vm);
+            bool is_zero = (n == 0) ||
+                           (CELL_TYPE(n) == BT_NUM && CELL_ID(n) == 0) ||
+                           (CELL_TYPE(n) == BT_BIGNUM && bn_is_zero(get_bignum(n)));
+            if (!is_zero) {
+                vm->ip = target;
+            }
             break;
         }
 
