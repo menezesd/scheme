@@ -54,13 +54,6 @@ make clean    # Remove build artifacts
 ./lisp script.scm
 ```
 
-### Escape Commands
-
-In the REPL, special escape commands are available:
-
-- `:q` - Quit the interpreter
-- `:g` - Trigger garbage collection
-
 ## Language Features
 
 ### Special Forms
