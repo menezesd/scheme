@@ -234,7 +234,7 @@ counter     ; => 1 (evaluated once at definition)
 The interpreter uses a semispace copying garbage collector:
 
 - **Heap**: Two semispaces of 16M cells each (configurable via `SEMISPACE_SIZE`)
-- **Cells**: 24-byte tagged unions containing type, car/cdr or numeric value
+- **Cells**: 12-byte tagged unions containing type, car/cdr or numeric value
 - **Reserved Space**: Cells 0-14 are permanent atoms (nil, #t, quote, etc.)
 - **Allocation**: Bump pointer within current semispace
 - **Collection**: Cheney's algorithm copies live objects to other semispace
