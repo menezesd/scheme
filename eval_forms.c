@@ -135,7 +135,8 @@ bool handle_set(unsigned id, unsigned env, unsigned cont)
 }
 
 /**
- * Handle define: (define variable expression) or (define (name params...) body...)
+ * Handle define: (define variable expression) or (define (name params...)
+ * body...)
  *
  * Two forms:
  * 1. (define var expr) - Evaluates expr, binds to var in current frame
@@ -422,13 +423,15 @@ bool handle_letrec(unsigned id, unsigned env, unsigned cont)
     gc_protect(&inner1);
     gc_protect(&inner2);
     gc_protect(&inner3);
-    inner1 = alloc_cons(0, body);         // (saved . body) - saved starts empty
-    inner2 = alloc_cons(vals, inner1);    // (all_vals . (saved . body))
-    inner3 = alloc_cons(vals, inner2);    // (vals_ptr . (all_vals . (saved . body)))
+    inner1 = alloc_cons(0, body);      // (saved . body) - saved starts empty
+    inner2 = alloc_cons(vals, inner1); // (all_vals . (saved . body))
+    inner3 =
+        alloc_cons(vals, inner2); // (vals_ptr . (all_vals . (saved . body)))
     unsigned data = alloc_cons(bindings, inner3);
     unsigned k = make_cont(CONT_LETREC_INIT, data, new_env, cont);
-    gc_unprotect(13); // inner1, inner2, inner3, bindings, body, env, cont, vars, vals,
-                      // vars_tail, vals_tail, new_env, first_val_expr
+    gc_unprotect(
+        13); // inner1, inner2, inner3, bindings, body, env, cont, vars, vals,
+             // vars_tail, vals_tail, new_env, first_val_expr
     tramp_eval(first_val_expr, new_env, k);
     return true;
 }
@@ -535,7 +538,8 @@ static bool is_keyword_shadowed(int64_t kw, unsigned env)
     // If not found, not shadowed
     if (val == TOK_ERROR)
         return false;
-    // If found but it's a syntax transformer, it's a macro override, not shadowing
+    // If found but it's a syntax transformer, it's a macro override, not
+    // shadowing
     if (IS_SYNTAX(val))
         return false;
     // Otherwise, it's shadowed by a regular binding

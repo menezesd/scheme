@@ -1,6 +1,7 @@
 /**
  * @file prim_numeric.c
- * @brief Numeric arithmetic operations (+, -, *, /, mod, quotient, remainder, abs)
+ * @brief Numeric arithmetic operations (+, -, *, /, mod, quotient, remainder,
+ * abs)
  *
  * Implements the full numeric tower for arithmetic:
  * - Fast path: Pure int64_t arithmetic with overflow detection

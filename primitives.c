@@ -76,14 +76,16 @@ unsigned apply_primitive(unsigned prim_id, unsigned args)
         case BT_BUILTIN:
         case BT_ATOM:
         case BT_CHAR:
-            return CELL_ID(arg1) == CELL_ID(arg2) ? ctx.atom_true : ctx.atom_false;
+            return CELL_ID(arg1) == CELL_ID(arg2) ? ctx.atom_true
+                                                  : ctx.atom_false;
         default:
             return arg1 == arg2 ? ctx.atom_true : ctx.atom_false;
         }
     }
     case PEQUALP:
         REQUIRE_ARGS(args, 2, 2, "equal?");
-        return deep_equal(car(args), cadr(args)) ? ctx.atom_true : ctx.atom_false;
+        return deep_equal(car(args), cadr(args)) ? ctx.atom_true
+                                                 : ctx.atom_false;
 
     // List operations
     case PCONS:
@@ -476,11 +478,12 @@ unsigned apply_primitive(unsigned prim_id, unsigned args)
         gc_unprotect(3);
         unsigned result = alloc_cons(
             alloc_cons(atom_from_string("minor-gc"), minor),
-            alloc_cons(alloc_cons(atom_from_string("major-gc"), major),
-                       alloc_cons(alloc_cons(atom_from_string("old-gen"), heap_used),
-                                  alloc_cons(alloc_cons(atom_from_string("nursery"),
-                                                        nursery_used),
-                                             0))));
+            alloc_cons(
+                alloc_cons(atom_from_string("major-gc"), major),
+                alloc_cons(alloc_cons(atom_from_string("old-gen"), heap_used),
+                           alloc_cons(alloc_cons(atom_from_string("nursery"),
+                                                 nursery_used),
+                                      0))));
         return result;
     }
     // PGCFLIP is handled specially in eval.c (needs environment as root)

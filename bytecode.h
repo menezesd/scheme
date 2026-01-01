@@ -207,13 +207,13 @@ typedef struct {
  * The stack and frames arrays contain cell indices that must be updated by GC.
  */
 typedef struct {
-    unsigned *stack;    // Saved value stack (cell indices)
-    unsigned sp;        // Stack pointer
-    vm_frame *frames;   // Saved call frames
-    unsigned fp;        // Frame pointer
-    code_object *code;  // Current code object
-    unsigned ip;        // Instruction pointer
-    unsigned env;       // Current environment (cell index)
+    unsigned *stack;   // Saved value stack (cell indices)
+    unsigned sp;       // Stack pointer
+    vm_frame *frames;  // Saved call frames
+    unsigned fp;       // Frame pointer
+    code_object *code; // Current code object
+    unsigned ip;       // Instruction pointer
+    unsigned env;      // Current environment (cell index)
 } vm_continuation;
 
 // ============================================================================

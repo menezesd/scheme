@@ -115,7 +115,8 @@ void handle_cont_or(unsigned val, unsigned data, unsigned env, unsigned next)
  * CONT_COND_TEST: Process cond clause based on test result.
  * data = (consequent-exprs . remaining-clauses)
  * If val is truthy, evaluate consequent. Otherwise try next clause.
- * Supports => receiver syntax: (test => receiver) calls receiver with test value.
+ * Supports => receiver syntax: (test => receiver) calls receiver with test
+ * value.
  */
 void handle_cont_cond_test(unsigned val, unsigned data, unsigned env,
                            unsigned next)
@@ -210,7 +211,7 @@ static void handle_cont_cond_arrow(unsigned val, unsigned data, unsigned env,
     gc_protect(&data);
     gc_protect(&env);
     gc_protect(&next);
-    unsigned args = alloc_cons(data, 0);  // Build argument list (test-value)
+    unsigned args = alloc_cons(data, 0); // Build argument list (test-value)
     gc_unprotect(4);
     apply_function(val, args, env, next);
 }
@@ -384,7 +385,8 @@ void handle_cont_letrec_init(unsigned val, unsigned data, unsigned env,
         gc_protect(&new_saved);
         new_saved = alloc_cons(val, saved);
 
-        // Build new data: (rest . (next_vals_ptr . (all_vals . (new_saved . body))))
+        // Build new data: (rest . (next_vals_ptr . (all_vals . (new_saved .
+        // body))))
         unsigned inner1 = 0, inner2_new = 0, inner3_new = 0;
         gc_protect(&inner1);
         gc_protect(&inner2_new);
@@ -416,7 +418,8 @@ void handle_cont_eval_fn(unsigned val, unsigned data, unsigned env,
         unsigned params = car(fn);
         unsigned mbody = cadr(fn);
         unsigned macroenv = cddr(fn);
-        // Protect all values across allocations (including params and arg_exprs for bind_params)
+        // Protect all values across allocations (including params and arg_exprs
+        // for bind_params)
         gc_protect(&params);
         gc_protect(&arg_exprs);
         gc_protect(&mbody);
@@ -446,7 +449,8 @@ void handle_cont_eval_fn(unsigned val, unsigned data, unsigned env,
             inner_k = make_cont(CONT_MACRO_EXPAND, 0, env, next);
             unsigned k2 = make_cont(CONT_APPLY_FUNC, rest_mbody, menv, inner_k);
             gc_unprotect(15); // inner_k, first_expr, rest_mbody, menv, frame,
-                              // next, env, macroenv, mbody, arg_exprs, params + 4 initial
+                              // next, env, macroenv, mbody, arg_exprs, params +
+                              // 4 initial
             tramp_eval(first_expr, menv, k2);
         }
         return;

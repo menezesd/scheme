@@ -19,11 +19,16 @@
 #include "macros.h"
 #include "primitives.h"
 #include "writer.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 // Forward declaration from eval.c
 unsigned qq_expand_cps(unsigned x, unsigned env);
+
+// Forward declaration for helper
+static void emit_gensym_definitions(compile_ctx *cctx, unsigned old_gensym,
+                                    unsigned new_gensym);
 
 // ============================================================================
 // Code Object Management
@@ -236,11 +241,15 @@ static compile_ctx *cctx_new(compile_ctx *parent, unsigned env)
     cctx->parent = parent;
     cctx->env = env;
     cctx->tail_position = false;
+    // Protect env so it's updated if GC runs during compilation
+    gc_protect(&cctx->env);
     return cctx;
 }
 
 static void cctx_free(compile_ctx *cctx)
 {
+    // Unprotect env that was protected in cctx_new
+    gc_unprotect(1);
     // Note: code is transferred out, not freed here
     free(cctx);
 }
@@ -250,7 +259,6 @@ static void cctx_free(compile_ctx *cctx)
 // ============================================================================
 
 static void emit(compile_ctx *cctx, unsigned op) { code_emit(cctx->code, op); }
-
 
 static void emit2(compile_ctx *cctx, unsigned op, unsigned arg)
 {
@@ -277,6 +285,27 @@ static unsigned emit_jump(compile_ctx *cctx, unsigned op)
 static void patch_jump(compile_ctx *cctx, unsigned pos)
 {
     code_patch(cctx->code, pos, code_current_pos(cctx->code));
+}
+
+// Emit bytecode to define gensyms created during macro expansion
+// This ensures gensyms from referential transparency are available at runtime
+static void emit_gensym_definitions(compile_ctx *cctx, unsigned old_gensym,
+                                    unsigned new_gensym)
+{
+    for (unsigned g = old_gensym; g < new_gensym; g++) {
+        char name[20];
+        snprintf(name, sizeof(name), "g%u", g);
+        unsigned atom = atom_from_string(name);
+        int64_t gensym_id = CELL_ID(atom);
+
+        // Look up the gensym value in the compile-time environment
+        unsigned val = lookup_silent(gensym_id, cctx->env);
+        if (val != TOK_ERROR) {
+            // Emit code to define this gensym at runtime
+            emit2(cctx, OP_CONST, code_add_const(cctx->code, val));
+            emit2(cctx, OP_DEFINE, gensym_id);
+        }
+    }
 }
 
 // ============================================================================
@@ -334,12 +363,14 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
                 kw == ctx.kw_letrec) {
                 unsigned mac = lookup_silent(kw, cctx->env);
                 if (mac != TOK_ERROR && IS_SYNTAX(mac)) {
+                    unsigned old_gensym = gensym_counter;
                     unsigned expanded = apply_syntax(mac, expr, cctx->env);
                     if (expanded == TOK_ERROR) {
                         show_error("let macro expansion failed");
                         emit(cctx, OP_HALT);
                         return dynamic_result();
                     }
+                    emit_gensym_definitions(cctx, old_gensym, gensym_counter);
                     return compile_expr_internal(expanded, cctx);
                 }
                 // No macro override, use built-in compilation
@@ -414,10 +445,11 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
 
                     // Check it's a syntax-rules form
                     if (!IS_PAIR(transformer_form) ||
-                        !IS_KEYWORD(car(transformer_form), ctx.kw_syntax_rules)) {
+                        !IS_KEYWORD(car(transformer_form),
+                                    ctx.kw_syntax_rules)) {
                         show_error("%s: expected syntax-rules",
                                    kw == ctx.kw_let_syntax ? "let-syntax"
-                                                          : "letrec-syntax");
+                                                           : "letrec-syntax");
                         gc_unprotect(5);
                         emit(cctx, OP_HALT);
                         return dynamic_result();
@@ -460,12 +492,14 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
             unsigned mac = lookup_silent(kw, cctx->env);
             if (mac != TOK_ERROR) {
                 if (IS_SYNTAX(mac)) {
+                    unsigned old_gensym = gensym_counter;
                     unsigned expanded = apply_syntax(mac, expr, cctx->env);
                     if (expanded == TOK_ERROR) {
                         show_error("macro expansion failed");
                         emit(cctx, OP_HALT);
                         return dynamic_result();
                     }
+                    emit_gensym_definitions(cctx, old_gensym, gensym_counter);
                     return compile_expr_internal(expanded, cctx);
                 }
                 if (IS_MACRO(mac)) {
@@ -808,7 +842,8 @@ static compile_result compile_and(unsigned expr, compile_ctx *cctx)
             if (IS_FALSE(result.value)) {
                 // Constant false - short-circuit, rewind all bytecode
                 cctx->code->code_len = saved_pos;
-                emit2(cctx, OP_CONST, code_add_const(cctx->code, ctx.atom_false));
+                emit2(cctx, OP_CONST,
+                      code_add_const(cctx->code, ctx.atom_false));
                 return const_result(ctx.atom_false);
             }
             // Constant truthy - can skip this expression if not last
@@ -1575,15 +1610,35 @@ static void peephole_optimize(code_object *code)
     unsigned *c = code->code;
     unsigned len = code->code_len;
 
+    // Collect all jump targets - needed to avoid unsafe fusions
+    bool *is_jump_target = calloc(len + 1, sizeof(bool));
+    if (!is_jump_target)
+        return;
+    for (unsigned i = 0; i < len;) {
+        unsigned op = c[i];
+        unsigned size = opcode_size(op);
+        if (op == OP_JUMP || op == OP_JUMPIF || op == OP_JUMPIFNOT ||
+            op == OP_JUMPIFNULL || op == OP_JUMPIFNOTNULL ||
+            op == OP_JUMPIFZERO || op == OP_JUMPIFNOTZERO) {
+            unsigned target = c[i + 1];
+            if (target <= len)
+                is_jump_target[target] = true;
+        }
+        i += size;
+    }
+
     // First pass: identify which bytes to remove and build offset map
     // offset_map[old] = new offset after compaction
     unsigned *offset_map = malloc(len * sizeof(unsigned));
-    if (!offset_map)
+    if (!offset_map) {
+        free(is_jump_target);
         return;
+    }
 
     bool *remove = calloc(len, sizeof(bool));
     if (!remove) {
         free(offset_map);
+        free(is_jump_target);
         return;
     }
 
@@ -1631,7 +1686,7 @@ static void peephole_optimize(code_object *code)
         if (op == OP_NOT && i + 1 < len && c[i + 1] == OP_JUMPIFNOT) {
             remove[i] = true;
             c[i + 1] = OP_JUMPIF;
-            i += 1;  // Continue from JUMPIF
+            i += 1; // Continue from JUMPIF
             continue;
         }
 
@@ -1651,15 +1706,19 @@ static void peephole_optimize(code_object *code)
         }
 
         // Pattern: NULLP, JUMPIFNOT target -> JUMPIFNOTNULL target
-        if (op == OP_NULLP && i + 1 < len && c[i + 1] == OP_JUMPIFNOT) {
-            remove[i] = true;       // Remove NULLP
-            c[i + 1] = OP_JUMPIFNOTNULL;  // Replace with fused opcode
+        // Only safe if no other code jumps to the JUMPIFNOT instruction
+        if (op == OP_NULLP && i + 1 < len && c[i + 1] == OP_JUMPIFNOT &&
+            !is_jump_target[i + 1]) {
+            remove[i] = true;            // Remove NULLP
+            c[i + 1] = OP_JUMPIFNOTNULL; // Replace with fused opcode
             i += 1;
             continue;
         }
 
         // Pattern: NULLP, JUMPIF target -> JUMPIFNULL target
-        if (op == OP_NULLP && i + 1 < len && c[i + 1] == OP_JUMPIF) {
+        // Only safe if no other code jumps to the JUMPIF instruction
+        if (op == OP_NULLP && i + 1 < len && c[i + 1] == OP_JUMPIF &&
+            !is_jump_target[i + 1]) {
             remove[i] = true;
             c[i + 1] = OP_JUMPIFNULL;
             i += 1;
@@ -1667,7 +1726,9 @@ static void peephole_optimize(code_object *code)
         }
 
         // Pattern: ZEROP, JUMPIFNOT target -> JUMPIFNOTZERO target
-        if (op == OP_ZEROP && i + 1 < len && c[i + 1] == OP_JUMPIFNOT) {
+        // Only safe if no other code jumps to the JUMPIFNOT instruction
+        if (op == OP_ZEROP && i + 1 < len && c[i + 1] == OP_JUMPIFNOT &&
+            !is_jump_target[i + 1]) {
             remove[i] = true;
             c[i + 1] = OP_JUMPIFNOTZERO;
             i += 1;
@@ -1675,7 +1736,9 @@ static void peephole_optimize(code_object *code)
         }
 
         // Pattern: ZEROP, JUMPIF target -> JUMPIFZERO target
-        if (op == OP_ZEROP && i + 1 < len && c[i + 1] == OP_JUMPIF) {
+        // Only safe if no other code jumps to the JUMPIF instruction
+        if (op == OP_ZEROP && i + 1 < len && c[i + 1] == OP_JUMPIF &&
+            !is_jump_target[i + 1]) {
             remove[i] = true;
             c[i + 1] = OP_JUMPIFZERO;
             i += 1;
@@ -1696,8 +1759,9 @@ static void peephole_optimize(code_object *code)
             continue;
         }
 
-        // Pattern: CAR, CDR can be fused (if we add CADR) - already have OP_CADR
-        // Pattern: CDR, CDR can be fused (if we add CDDR) - already have OP_CDDR
+        // Pattern: CAR, CDR can be fused (if we add CADR) - already have
+        // OP_CADR Pattern: CDR, CDR can be fused (if we add CDDR) - already
+        // have OP_CDDR
 
         // Pattern: PAIRP, NOT -> use directly in conditional
         if (op == OP_PAIRP && i + 1 < len && c[i + 1] == OP_NOT &&
@@ -1758,6 +1822,7 @@ static void peephole_optimize(code_object *code)
 
     free(offset_map);
     free(remove);
+    free(is_jump_target);
 
     // Recursively optimize children
     for (unsigned i = 0; i < code->children_len; i++) {
@@ -1973,6 +2038,10 @@ void disassemble(code_object *code, const char *name)
         case OP_JUMP:
         case OP_JUMPIF:
         case OP_JUMPIFNOT:
+        case OP_JUMPIFNULL:
+        case OP_JUMPIFNOTNULL:
+        case OP_JUMPIFZERO:
+        case OP_JUMPIFNOTZERO:
             printf(" -> %u", code->code[ip++]);
             break;
         case OP_PRIM:

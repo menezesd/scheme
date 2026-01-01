@@ -33,7 +33,8 @@ unsigned apply_type_predicate(unsigned prim_id, unsigned args)
     case PEXACTP:
         return is_exact(arg) ? ctx.atom_true : ctx.atom_false;
     case PINEXACTP:
-        return (is_numeric(arg) && !is_exact(arg)) ? ctx.atom_true : ctx.atom_false;
+        return (is_numeric(arg) && !is_exact(arg)) ? ctx.atom_true
+                                                   : ctx.atom_false;
     case PCOMPLEXP:
         return is_numeric(arg) ? ctx.atom_true : ctx.atom_false;
     case PRATIONALP:
@@ -58,7 +59,8 @@ unsigned apply_type_predicate(unsigned prim_id, unsigned args)
     case PVECTORP:
         return IS_VECTOR(arg) ? ctx.atom_true : ctx.atom_false;
     case PBOOLP:
-        return (IS_FALSE(arg) || arg == ctx.atom_true) ? ctx.atom_true : ctx.atom_false;
+        return (IS_FALSE(arg) || arg == ctx.atom_true) ? ctx.atom_true
+                                                       : ctx.atom_false;
     case PLISTP: {
         unsigned x = arg;
         while (IS_PAIR(x))

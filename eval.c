@@ -35,8 +35,8 @@
  */
 
 #include "eval.h"
-#include "eval_internal.h"
 #include "bytecode.h"
+#include "eval_internal.h"
 #include "writer.h"
 
 // ============================================================================
@@ -481,7 +481,8 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
         unsigned body = car(body_env);
         unsigned def_env = cdr(body_env);
 
-        // Protect all values across allocations (including params and args for bind_params)
+        // Protect all values across allocations (including params and args for
+        // bind_params)
         gc_protect(&params);
         gc_protect(&args);
         gc_protect(&body);

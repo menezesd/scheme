@@ -8,7 +8,8 @@
  * ## Representation
  * Bignums are stored as:
  * - sign: 0 = positive/zero, 1 = negative
- * - limbs[]: Array of 32-bit unsigned words (little-endian, least significant first)
+ * - limbs[]: Array of 32-bit unsigned words (little-endian, least significant
+ * first)
  * - len: Number of significant limbs
  * - cap: Allocated capacity
  *

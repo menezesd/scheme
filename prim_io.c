@@ -126,7 +126,8 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned args)
             // Use current output port (may be string port)
             if (ctx.current_output_cell != 0) {
                 string_port *sport = GET_STRPORT_PTR(ctx.current_output_cell);
-                if (sport) strport_putc(sport, '\n');
+                if (sport)
+                    strport_putc(sport, '\n');
             } else {
                 fprintf(ctx.current_output, "\n");
                 // Transcript
@@ -245,8 +246,9 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned args)
         }
 
         struct pollfd pfd = {.fd = fd, .events = POLLIN, .revents = 0};
-        int ret = poll(&pfd, 1, 0);  // Non-blocking check
-        return (ret > 0 && (pfd.revents & POLLIN)) ? ctx.atom_true : ctx.atom_false;
+        int ret = poll(&pfd, 1, 0); // Non-blocking check
+        return (ret > 0 && (pfd.revents & POLLIN)) ? ctx.atom_true
+                                                   : ctx.atom_false;
     }
     case PREADLINE: {
         REQUIRE_ARGS(args, 0, 1, "read-line");
@@ -296,7 +298,7 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned args)
         buf[len] = '\0';
         unsigned result = alloc();
         CELL_TYPE(result) = BT_STRING;
-        CELL_ID(result) = (int64_t)(intptr_t)buf;  // Transfer ownership
+        CELL_ID(result) = (int64_t)(intptr_t)buf; // Transfer ownership
         return result;
     }
     case PEXIT: {

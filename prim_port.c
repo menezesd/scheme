@@ -145,7 +145,8 @@ unsigned apply_port_primitive(unsigned prim_id, unsigned args)
     case PSTRINGPORTP: {
         REQUIRE_ARGS(args, 1, 1, "string-port?");
         unsigned a = car(args);
-        return (IS_STRINPORT(a) || IS_STROUTPORT(a)) ? ctx.atom_true : ctx.atom_false;
+        return (IS_STRINPORT(a) || IS_STROUTPORT(a)) ? ctx.atom_true
+                                                     : ctx.atom_false;
     }
     // Internal port setters (used by with-input-from-file etc.)
     case PSETCURRENTINPUT: {

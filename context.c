@@ -1006,7 +1006,7 @@ void list_append(unsigned *head, unsigned *tail, unsigned elem)
     gc_protect(&elem);
     unsigned cell = alloc();
     CELL_TYPE(cell) = BT_CONS;
-    CELL_CAR(cell) = elem;  // elem is now up-to-date after any GC
+    CELL_CAR(cell) = elem; // elem is now up-to-date after any GC
     CELL_CDR(cell) = 0;
     gc_unprotect(1);
     if (!*head) {
@@ -1559,7 +1559,8 @@ unsigned minor_gc(unsigned root)
                     }
                     cont->env = collect_to_old(cont->env);
                     for (unsigned j = 0; j < cont->fp; j++) {
-                        cont->frames[j].env = collect_to_old(cont->frames[j].env);
+                        cont->frames[j].env =
+                            collect_to_old(cont->frames[j].env);
                     }
                 }
             }

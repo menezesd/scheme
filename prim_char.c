@@ -26,7 +26,8 @@ unsigned apply_char_primitive(unsigned prim_id, unsigned args)
     for (const char_pred_entry *e = char_predicates; e->predicate; e++) {
         if (e->id == prim_id) {
             REQUIRE_ARGS(args, 1, 1, e->name);
-            return e->predicate((int)CELL_ID(car(args))) ? ctx.atom_true : ctx.atom_false;
+            return e->predicate((int)CELL_ID(car(args))) ? ctx.atom_true
+                                                         : ctx.atom_false;
         }
     }
 

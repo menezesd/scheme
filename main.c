@@ -149,7 +149,8 @@ static bool load_from_port(FILE *f, unsigned *env, bool warn_on_error,
             if (batch) {
                 unsigned result = eval_batch(batch, *env);
                 if (result == TOK_ERROR) {
-                    gc_unprotect(5);  // expr, exprs, all_exprs, batch_tail, batch
+                    gc_unprotect(
+                        5); // expr, exprs, all_exprs, batch_tail, batch
                     reader_set_filename(old_filename);
                     if (warn_on_error)
                         fprintf(stderr, "Warning: error during load\n");
@@ -159,16 +160,16 @@ static bool load_from_port(FILE *f, unsigned *env, bool warn_on_error,
             }
             // Evaluate define-syntax immediately
             unsigned result = eval_expr(expr, *env);
-            gc_unprotect(1);  // expr
+            gc_unprotect(1); // expr
             if (result == TOK_ERROR) {
-                gc_unprotect(4);  // exprs, all_exprs, batch_tail, batch
+                gc_unprotect(4); // exprs, all_exprs, batch_tail, batch
                 reader_set_filename(old_filename);
                 if (warn_on_error)
                     fprintf(stderr, "Warning: error during load\n");
                 return false;
             }
         } else {
-            gc_unprotect(1);  // expr (will be re-protected by list_append)
+            gc_unprotect(1); // expr (will be re-protected by list_append)
             // Add to batch
             gc_protect(&expr);
             list_append(&batch, &batch_tail, expr);
@@ -180,7 +181,7 @@ static bool load_from_port(FILE *f, unsigned *env, bool warn_on_error,
     if (batch) {
         unsigned result = eval_batch(batch, *env);
         if (result == TOK_ERROR) {
-            gc_unprotect(4);  // exprs, all_exprs, batch_tail, batch
+            gc_unprotect(4); // exprs, all_exprs, batch_tail, batch
             reader_set_filename(old_filename);
             if (warn_on_error)
                 fprintf(stderr, "Warning: error during load\n");
@@ -188,7 +189,7 @@ static bool load_from_port(FILE *f, unsigned *env, bool warn_on_error,
         }
     }
 
-    gc_unprotect(4);  // exprs, all_exprs, batch_tail, batch
+    gc_unprotect(4); // exprs, all_exprs, batch_tail, batch
     *env = gc(*env);
     reader_set_filename(old_filename);
     return true;
@@ -252,7 +253,8 @@ static void print_usage(const char *prog)
 {
     fprintf(stderr, "Usage: %s [options] [file.scm]\n", prog);
     fprintf(stderr, "Options:\n");
-    fprintf(stderr, "  --interpreter  Use CPS interpreter instead of bytecode VM\n");
+    fprintf(stderr,
+            "  --interpreter  Use CPS interpreter instead of bytecode VM\n");
     fprintf(stderr, "  --help         Show this help message\n");
 }
 
@@ -296,7 +298,9 @@ int main(int argc, char **argv)
     load_stdlib(&env);
 
     if (!use_bytecode) {
-        fprintf(stderr, "; CPS interpreter mode (use default for faster bytecode VM)\n");
+        fprintf(
+            stderr,
+            "; CPS interpreter mode (use default for faster bytecode VM)\n");
     }
 
     // Execute file if provided

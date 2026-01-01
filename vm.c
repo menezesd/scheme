@@ -106,10 +106,10 @@ unsigned vm_call_closure(unsigned closure, unsigned args)
     gc_protect(&args);
     gc_protect(&params);
     unsigned frame = bind_params(params, args);
-    gc_unprotect(2);  // args, params no longer needed
+    gc_unprotect(2); // args, params no longer needed
     gc_protect(&frame);
     unsigned new_env = alloc_cons(frame, closure_env);
-    gc_unprotect(2);  // frame, closure_env
+    gc_unprotect(2); // frame, closure_env
 
     // Create a temporary VM and run the code
     vm_state vm;
@@ -342,7 +342,8 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
         unsigned result = apply_primitive(prim_id, args);
         if (result == TOK_ERROR) {
             vm->error = true;
-            vm->error_msg = ctx.last_error[0] ? ctx.last_error : "primitive error";
+            vm->error_msg =
+                ctx.last_error[0] ? ctx.last_error : "primitive error";
             vm->running = false;
             return;
         }
@@ -393,10 +394,10 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
         unsigned params = code->constants[code->params];
         gc_protect(&params);
         unsigned frame = bind_params(params, args);
-        gc_unprotect(2);  // params, args
+        gc_unprotect(2); // params, args
         gc_protect(&frame);
         unsigned new_env = alloc_cons(frame, closure_env);
-        gc_unprotect(2);  // frame, closure_env
+        gc_unprotect(2); // frame, closure_env
 
         if (tail && vm->fp > 0) {
             // Tail call: reuse current frame
@@ -438,10 +439,10 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
         // Bind parameters
         gc_protect(&args);
         unsigned frame = bind_params(params, args);
-        gc_unprotect(1);  // args
+        gc_unprotect(1); // args
         gc_protect(&frame);
         unsigned new_env = alloc_cons(frame, def_env);
-        gc_unprotect(4);  // frame, def_env, body, params
+        gc_unprotect(4); // frame, def_env, body, params
 
         // Evaluate body using interpreter
         // For now, fall back to eval_cps
@@ -758,7 +759,8 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 gc_protect(&producer);
 
                 // Call producer with 0 args - handle different closure types
-                if (IS_PAIR(producer) && CELL_TYPE(car(producer)) == BT_CLOSURE) {
+                if (IS_PAIR(producer) &&
+                    CELL_TYPE(car(producer)) == BT_CLOSURE) {
                     // Bytecode closure - use vm_call_closure
                     result = vm_call_closure(producer, 0);
                 } else if (IS_FUNCTION(producer)) {
@@ -818,11 +820,12 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             if (prim_id == PINTERACTIONENV) {
                 if (argc != 0) {
                     vm->error = true;
-                    vm->error_msg = "interaction-environment: expected 0 arguments";
+                    vm->error_msg =
+                        "interaction-environment: expected 0 arguments";
                     vm->running = false;
                     break;
                 }
-                vm_push(vm, vm->env);  // Return current environment
+                vm_push(vm, vm->env); // Return current environment
                 break;
             }
 
@@ -836,8 +839,8 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 }
                 unsigned expr = car(args);
                 unsigned eval_env =
-                    (argc == 2) ? cadr(args) : vm->env; // Use current env if not
-                                                        // specified
+                    (argc == 2) ? cadr(args) : vm->env; // Use current env if
+                                                        // not specified
                 if (!ctx.eval_callback) {
                     vm->error = true;
                     vm->error_msg = "eval: callback not set";
@@ -858,7 +861,8 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             unsigned result = apply_primitive(prim_id, args);
             if (result == TOK_ERROR) {
                 vm->error = true;
-                vm->error_msg = ctx.last_error[0] ? ctx.last_error : "primitive error";
+                vm->error_msg =
+                    ctx.last_error[0] ? ctx.last_error : "primitive error";
                 vm->running = false;
                 break;
             }
@@ -875,7 +879,8 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
         case OP_CALLCC: {
             // Stack: [proc]
             unsigned proc = vm_pop(vm);
-            gc_protect(&proc);  // Protect across capture_continuation which allocs
+            gc_protect(
+                &proc); // Protect across capture_continuation which allocs
             unsigned cont = capture_continuation(vm);
             gc_unprotect(1);
             vm_push(vm, cont);
@@ -991,7 +996,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             unsigned lit_rules = alloc_cons(literals, rules);
             unsigned car_val = alloc_cons(ellipsis_cell, lit_rules);
             unsigned transformer = make_typed_cell(BT_SYNTAX, car_val, vm->env);
-            gc_unprotect(4);  // rules, literals, ellipsis_cell, transformer_form
+            gc_unprotect(4); // rules, literals, ellipsis_cell, transformer_form
 
             // Define in current environment
             unsigned atom = alloc();
@@ -1046,7 +1051,8 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
 
         case OP_PAIRP: {
             unsigned val = vm_pop(vm);
-            vm_push(vm, (val && CELL_TYPE(val) == BT_CONS) ? ctx.atom_true : ctx.atom_false);
+            vm_push(vm, (val && CELL_TYPE(val) == BT_CONS) ? ctx.atom_true
+                                                           : ctx.atom_false);
             break;
         }
 
@@ -1412,9 +1418,9 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
         case OP_JUMPIFZERO: {
             unsigned target = vm->code->code[vm->ip++];
             unsigned n = vm_pop(vm);
-            bool is_zero = (n == 0) ||
-                           (CELL_TYPE(n) == BT_NUM && CELL_ID(n) == 0) ||
-                           (CELL_TYPE(n) == BT_BIGNUM && bn_is_zero(get_bignum(n)));
+            bool is_zero =
+                (n == 0) || (CELL_TYPE(n) == BT_NUM && CELL_ID(n) == 0) ||
+                (CELL_TYPE(n) == BT_BIGNUM && bn_is_zero(get_bignum(n)));
             if (is_zero) {
                 vm->ip = target;
             }
@@ -1424,9 +1430,9 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
         case OP_JUMPIFNOTZERO: {
             unsigned target = vm->code->code[vm->ip++];
             unsigned n = vm_pop(vm);
-            bool is_zero = (n == 0) ||
-                           (CELL_TYPE(n) == BT_NUM && CELL_ID(n) == 0) ||
-                           (CELL_TYPE(n) == BT_BIGNUM && bn_is_zero(get_bignum(n)));
+            bool is_zero =
+                (n == 0) || (CELL_TYPE(n) == BT_NUM && CELL_ID(n) == 0) ||
+                (CELL_TYPE(n) == BT_BIGNUM && bn_is_zero(get_bignum(n)));
             if (!is_zero) {
                 vm->ip = target;
             }

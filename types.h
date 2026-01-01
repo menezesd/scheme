@@ -92,9 +92,9 @@ enum cont_type {
     CONT_COND_TEST, // Evaluated condition; data = (conseq . rest-clauses), env,
                     // next
     CONT_COND_ARROW, // Evaluated receiver expr; data = test-value, env, next
-    CONT_LET_VALS,  // Evaluating let values; data = (vars . (vals . (bindings .
-                    // body))), env, next
-    CONT_LET_BODY,  // Evaluating let body; data = remaining-body, new-env, next
+    CONT_LET_VALS, // Evaluating let values; data = (vars . (vals . (bindings .
+                   // body))), env, next
+    CONT_LET_BODY, // Evaluating let body; data = remaining-body, new-env, next
     CONT_LETSTAR_VALS, // Evaluating let* values; data = (bindings . body), env,
                        // next
     CONT_LETREC_INIT,  // Initializing letrec; data = (bindings . (vals-ptr .
@@ -259,19 +259,21 @@ typedef struct {
     int kw_ellipsis;
     int kw_underscore;
     int kw_else;
-    int kw_arrow;  // => for cond receiver syntax
+    int kw_arrow; // => for cond receiver syntax
     int kw_let_syntax;
     int kw_letrec_syntax;
-    int kw_protected;  // Marker for protected identifiers in hygiene
+    int kw_protected; // Marker for protected identifiers in hygiene
     unsigned atom_quasiquote;
     unsigned atom_unquote;
     unsigned atom_unquote_splicing;
     // Current ports for dynamic I/O
     FILE *current_input;
     FILE *current_output;
-    unsigned current_input_cell;  // Cell index for current input port (0 = use FILE*)
-    unsigned current_output_cell; // Cell index for current output port (0 = use FILE*)
-    FILE *transcript; // NULL if not recording
+    unsigned
+        current_input_cell; // Cell index for current input port (0 = use FILE*)
+    unsigned current_output_cell; // Cell index for current output port (0 = use
+                                  // FILE*)
+    FILE *transcript;             // NULL if not recording
     // Callbacks for VM special primitives (set by main.c)
     unsigned (*load_callback)(const char *filename,
                               unsigned *env); // Returns result or TOK_ERROR

@@ -28,8 +28,8 @@
  * The macro system uses a combination of techniques for hygiene:
  *
  * 1. **Gensym renaming**: Bindings introduced by the template (in let, lambda,
- *    etc.) are alpha-renamed to fresh gensyms. This prevents template-introduced
- *    bindings from capturing references in the macro use site.
+ *    etc.) are alpha-renamed to fresh gensyms. This prevents
+ * template-introduced bindings from capturing references in the macro use site.
  *
  * 2. **Protection markers**: When a pattern variable is substituted with an
  *    identifier, that identifier is wrapped as (##protected## . id). This marks
@@ -306,7 +306,8 @@ static bool id_in_list(int64_t id, unsigned list)
 }
 
 // Collect free identifiers from a template
-// Returns a list of unique atoms that are free (not pattern vars, not special forms)
+// Returns a list of unique atoms that are free (not pattern vars, not special
+// forms)
 static unsigned collect_free_ids(unsigned tmpl, unsigned bindings,
                                  unsigned collected, int64_t ellipsis_id)
 {
@@ -319,7 +320,8 @@ static unsigned collect_free_ids(unsigned tmpl, unsigned bindings,
 
     if (IS_ATOM(tmpl)) {
         int64_t id = CELL_ID(tmpl);
-        // Skip if special form, pattern variable, ellipsis, or already collected
+        // Skip if special form, pattern variable, ellipsis, or already
+        // collected
         if (!is_special_form(id) && !is_pattern_var(id, bindings) &&
             id != ellipsis_id && !id_in_list(id, collected)) {
             // Add to collected list
@@ -345,15 +347,16 @@ static unsigned collect_free_ids(unsigned tmpl, unsigned bindings,
                 gc_unprotect(3);
                 return collected;
             }
-            // For set! and define, skip the target variable but collect from expr
-            // (set! var expr) - skip var, collect from expr
-            // (define var expr) - skip var, collect from expr
+            // For set! and define, skip the target variable but collect from
+            // expr (set! var expr) - skip var, collect from expr (define var
+            // expr) - skip var, collect from expr
             if (head_id == ctx.kw_set || head_id == ctx.kw_define) {
-                // Collect only from the expression part (cddr), not the variable (cadr)
+                // Collect only from the expression part (cddr), not the
+                // variable (cadr)
                 unsigned expr = cddr(tmpl);
                 if (expr) {
-                    unsigned result =
-                        collect_free_ids(car(expr), bindings, collected, ellipsis_id);
+                    unsigned result = collect_free_ids(car(expr), bindings,
+                                                       collected, ellipsis_id);
                     gc_unprotect(3);
                     return result;
                 }
@@ -362,7 +365,8 @@ static unsigned collect_free_ids(unsigned tmpl, unsigned bindings,
             }
         }
         // Recursively collect from car and cdr
-        collected = collect_free_ids(car(tmpl), bindings, collected, ellipsis_id);
+        collected =
+            collect_free_ids(car(tmpl), bindings, collected, ellipsis_id);
         gc_protect(&collected);
         unsigned result =
             collect_free_ids(cdr(tmpl), bindings, collected, ellipsis_id);
@@ -578,8 +582,8 @@ static unsigned hygienize_let(unsigned tmpl, unsigned bindings, bool is_letrec)
     gc_protect(&binding_list);
     gc_protect(&body);
 
-    // For letrec, we need to rename in all vals too (they can reference each other)
-    // Collect all introduced bindings first
+    // For letrec, we need to rename in all vals too (they can reference each
+    // other) Collect all introduced bindings first
     unsigned renames = 0; // list of (old_id . new_sym)
     gc_protect(&renames);
 
@@ -626,7 +630,8 @@ static unsigned hygienize_let(unsigned tmpl, unsigned bindings, bool is_letrec)
 
         unsigned new_body = hygienize_template(body, bindings);
         gc_protect(&new_body);
-        unsigned result = alloc_cons(keyword, alloc_cons(new_bindings, new_body));
+        unsigned result =
+            alloc_cons(keyword, alloc_cons(new_bindings, new_body));
         gc_unprotect(9);
         return result;
     }
@@ -688,7 +693,8 @@ static unsigned hygienize_let(unsigned tmpl, unsigned bindings, bool is_letrec)
     gc_protect(&final_body);
     unsigned result =
         alloc_cons(keyword, alloc_cons(final_bindings, final_body));
-    gc_unprotect(11); // 5 initial + renames + new_binding_list + new_body + final_bindings + final_tail + final_body
+    gc_unprotect(11); // 5 initial + renames + new_binding_list + new_body +
+                      // final_bindings + final_tail + final_body
     return result;
 }
 
@@ -780,7 +786,8 @@ static unsigned hygienize_template(unsigned tmpl, unsigned bindings)
         unsigned head = car(tmpl);
 
         // Check for protected wrapper: (##protected## . identifier)
-        // These come from pattern variable substitution and should not be renamed
+        // These come from pattern variable substitution and should not be
+        // renamed
         if (IS_ATOM(head) && CELL_ID(head) == ctx.kw_protected) {
             gc_unprotect(2);
             return tmpl; // Return protected wrapper unchanged
@@ -831,7 +838,8 @@ static unsigned hygienize_template(unsigned tmpl, unsigned bindings)
                 gc_protect(&new_body);
                 unsigned result =
                     alloc_cons(head, alloc_cons(syn_bindings, new_body));
-                gc_unprotect(5); // new_body, syn_body, syn_bindings, tmpl, bindings
+                gc_unprotect(
+                    5); // new_body, syn_body, syn_bindings, tmpl, bindings
                 return result;
             }
         }
@@ -1070,7 +1078,8 @@ unsigned syntax_match(unsigned pattern, unsigned input, unsigned literals,
                     unsigned elem_pattern = car(pattern);
                     unsigned ellipsis_binding = 0;
                     gc_protect(&ellipsis_binding);
-                    gc_protect(&tentative);  // MUST protect before alloc - GC could happen!
+                    gc_protect(&tentative); // MUST protect before alloc - GC
+                                            // could happen!
                     ellipsis_binding = alloc_cons(elem_pattern, matches);
                     unsigned result = alloc_cons(ellipsis_binding, tentative);
                     gc_unprotect(8);
@@ -1102,7 +1111,8 @@ unsigned syntax_match(unsigned pattern, unsigned input, unsigned literals,
                 unsigned elem_pattern = car(pattern);
                 unsigned ellipsis_binding = 0;
                 gc_protect(&ellipsis_binding);
-                gc_protect(&tentative);  // MUST protect before alloc - GC could happen!
+                gc_protect(
+                    &tentative); // MUST protect before alloc - GC could happen!
                 ellipsis_binding = alloc_cons(elem_pattern, matches);
                 unsigned result = alloc_cons(ellipsis_binding, tentative);
                 gc_unprotect(8);
@@ -1173,7 +1183,8 @@ unsigned syntax_expand(unsigned tmpl, unsigned bindings, unsigned mark,
                 CELL_ID(protected_marker) = ctx.kw_protected;
                 gc_protect(&protected_marker);
                 unsigned wrapped = alloc_cons(protected_marker, lookup_result);
-                gc_unprotect(4); // protected_marker, lookup_result, bindings, tmpl
+                gc_unprotect(
+                    4); // protected_marker, lookup_result, bindings, tmpl
                 return wrapped;
             }
             gc_unprotect(3); // lookup_result, bindings, tmpl
@@ -1349,7 +1360,7 @@ unsigned syntax_expand(unsigned tmpl, unsigned bindings, unsigned mark,
             FORLIST(ev, ellipsis_values) { expanded_count++; }
 
             unsigned result = make_vector(expanded_count, 0);
-            gc_protect(&result);  // Protect result from GC
+            gc_protect(&result); // Protect result from GC
             unsigned idx = 0;
 
             // Expand elements before ellipsis
@@ -1420,13 +1431,13 @@ unsigned syntax_expand(unsigned tmpl, unsigned bindings, unsigned mark,
                                                    bindings, mark, ellipsis_id);
             }
 
-            gc_unprotect(3);  // result, tmpl, bindings
+            gc_unprotect(3); // result, tmpl, bindings
             return result;
         }
 
         // No ellipsis - expand each element
         unsigned result = make_vector(len, 0);
-        gc_protect(&result);  // Protect result from GC
+        gc_protect(&result); // Protect result from GC
         for (unsigned i = 0; i < len; i++) {
             // Refresh pointers - GC may have moved vectors
             unsigned *result_data = vector_data_ptr(result);
@@ -1434,7 +1445,7 @@ unsigned syntax_expand(unsigned tmpl, unsigned bindings, unsigned mark,
             result_data[i] =
                 syntax_expand(data[i], bindings, mark, ellipsis_id);
         }
-        gc_unprotect(3);  // result, tmpl, bindings
+        gc_unprotect(3); // result, tmpl, bindings
         return result;
     }
 
@@ -1538,12 +1549,14 @@ unsigned apply_syntax(unsigned transformer, unsigned input, unsigned use_env)
             gc_protect(&result);
             result = unwrap_protected(result);
             gc_unprotect(
-                13); // result, hygienic_tmpl, renamed_tmpl, rename_map, free_ids,
-                     // bindings, tmpl, rules, closure_env, literals, use_env, input, transformer
+                13); // result, hygienic_tmpl, renamed_tmpl, rename_map,
+                     // free_ids, bindings, tmpl, rules, closure_env, literals,
+                     // use_env, input, transformer
             return result;
         }
     }
-    gc_unprotect(7); // tmpl, rules, closure_env, literals, use_env, input, transformer
+    gc_unprotect(
+        7); // tmpl, rules, closure_env, literals, use_env, input, transformer
 
     show_error("syntax-rules: no matching pattern");
     return TOK_ERROR;
