@@ -320,7 +320,7 @@ Key constants in `types.h`:
 
 ## License
 
-This project is provided as-is for educational purposes.
+MIT
 
 ## References
 
