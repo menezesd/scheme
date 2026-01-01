@@ -556,11 +556,14 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
         case OP_DEFINE: {
             int64_t sym_id = vm->code->code[vm->ip++];
             unsigned val = vm_pop(vm);
+            // Protect val before alloc() which can trigger GC
+            gc_protect(&val);
             // Create atom for variable name
             unsigned atom = alloc();
             CELL_TYPE(atom) = BT_ATOM;
             CELL_ID(atom) = sym_id;
             defvar(atom, val, vm->env);
+            gc_unprotect(1);
             break;
         }
 
@@ -973,6 +976,10 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 break;
             }
 
+            // CRITICAL: Protect transformer_form before any allocations
+            // (store() calls alloc() which can trigger GC)
+            gc_protect(&transformer_form);
+
             // New transformer structure: (ellipsis_cell . (literals . rules))
             // Use default ellipsis for VM path
             unsigned ellipsis_cell = store(ctx.kw_ellipsis);
@@ -984,7 +991,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             unsigned lit_rules = alloc_cons(literals, rules);
             unsigned car_val = alloc_cons(ellipsis_cell, lit_rules);
             unsigned transformer = make_typed_cell(BT_SYNTAX, car_val, vm->env);
-            gc_unprotect(3);
+            gc_unprotect(4);  // rules, literals, ellipsis_cell, transformer_form
 
             // Define in current environment
             unsigned atom = alloc();

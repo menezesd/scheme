@@ -135,15 +135,21 @@ static bool load_from_port(FILE *f, unsigned *env, bool warn_on_error,
     gc_protect(&batch_tail);
     gc_protect(&all_exprs);
 
-    for (unsigned exprs = all_exprs; exprs; exprs = cdr(exprs)) {
+    // Protect loop variable - it can become stale if GC runs during eval
+    unsigned exprs = all_exprs;
+    gc_protect(&exprs);
+
+    for (; exprs; exprs = cdr(exprs)) {
         unsigned expr = car(exprs);
+        // Protect expr - it can become stale if GC runs during eval_batch
+        gc_protect(&expr);
 
         if (is_define_syntax(expr)) {
             // Evaluate any pending batch first
             if (batch) {
                 unsigned result = eval_batch(batch, *env);
                 if (result == TOK_ERROR) {
-                    gc_unprotect(3);
+                    gc_unprotect(5);  // expr, exprs, all_exprs, batch_tail, batch
                     reader_set_filename(old_filename);
                     if (warn_on_error)
                         fprintf(stderr, "Warning: error during load\n");
@@ -153,14 +159,16 @@ static bool load_from_port(FILE *f, unsigned *env, bool warn_on_error,
             }
             // Evaluate define-syntax immediately
             unsigned result = eval_expr(expr, *env);
+            gc_unprotect(1);  // expr
             if (result == TOK_ERROR) {
-                gc_unprotect(3);
+                gc_unprotect(4);  // exprs, all_exprs, batch_tail, batch
                 reader_set_filename(old_filename);
                 if (warn_on_error)
                     fprintf(stderr, "Warning: error during load\n");
                 return false;
             }
         } else {
+            gc_unprotect(1);  // expr (will be re-protected by list_append)
             // Add to batch
             gc_protect(&expr);
             list_append(&batch, &batch_tail, expr);
@@ -172,7 +180,7 @@ static bool load_from_port(FILE *f, unsigned *env, bool warn_on_error,
     if (batch) {
         unsigned result = eval_batch(batch, *env);
         if (result == TOK_ERROR) {
-            gc_unprotect(3);
+            gc_unprotect(4);  // exprs, all_exprs, batch_tail, batch
             reader_set_filename(old_filename);
             if (warn_on_error)
                 fprintf(stderr, "Warning: error during load\n");
@@ -180,7 +188,7 @@ static bool load_from_port(FILE *f, unsigned *env, bool warn_on_error,
         }
     }
 
-    gc_unprotect(3);
+    gc_unprotect(4);  // exprs, all_exprs, batch_tail, batch
     *env = gc(*env);
     reader_set_filename(old_filename);
     return true;
