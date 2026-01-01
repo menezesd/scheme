@@ -203,17 +203,19 @@ typedef struct {
 #define CARD_SIZE 512             // Cells per card (2KB on 64-bit)
 
 // Reserved cell IDs for permanent atoms (never garbage collected)
-#define CELL_ATOM_TRUE 10
-#define CELL_ATOM_QUOTE 11
-#define CELL_ATOM_QUASIQUOTE 12
-#define CELL_ATOM_UNQUOTE 13
-#define CELL_ATOM_UNQUOTE_SPLICING 14
+// Note: These must be >= 10 to avoid conflicts with the token enum (0-9)
+#define CELL_ATOM_FALSE 10
+#define CELL_ATOM_TRUE 11
+#define CELL_ATOM_QUOTE 12
+#define CELL_ATOM_QUASIQUOTE 13
+#define CELL_ATOM_UNQUOTE 14
+#define CELL_ATOM_UNQUOTE_SPLICING 15
 
-// Small integer cache: cells 15-270 hold integers 0-255
+// Small integer cache: cells 16-271 hold integers 0-255
 #define INT_CACHE_MIN 0
 #define INT_CACHE_MAX 255
-#define INT_CACHE_START 15    // First cell for cached integers
-#define HEAP_RESERVED 271     // Reserved cells (0-270)
+#define INT_CACHE_START 16    // First cell for cached integers
+#define HEAP_RESERVED 272     // Reserved cells (0-271)
 #define NUMBER_BUF_SIZE 128   // Buffer size for number->string conversion
 #define CHAR_NAME_BUF_SIZE 16 // Buffer size for character name parsing
 
@@ -227,6 +229,7 @@ typedef struct {
     unsigned atom_count;     // Number of atoms in table (for load factor)
     unsigned atom_quote;
     unsigned atom_true;
+    unsigned atom_false;
     // Generational GC state
     unsigned nursery_start; // Start of nursery region
     unsigned nursery_ptr;   // Next free cell in nursery (bump pointer)
@@ -547,6 +550,8 @@ const char *reader_get_filename(void);
 #define IS_CHAR(c) ((c) != 0 && CELL_TYPE(c) == BT_CHAR)
 #define IS_VECTOR(c) ((c) != 0 && CELL_TYPE(c) == BT_VECTOR)
 #define IS_NIL(c) ((c) == 0)
+#define IS_FALSE(c) ((c) == CELL_ATOM_FALSE)
+#define IS_TRUTHY(c) ((c) != CELL_ATOM_FALSE)
 #define IS_INEXACT(c) ((c) != 0 && CELL_TYPE(c) == BT_INEXACT)
 #define IS_RATIONAL(c) ((c) != 0 && CELL_TYPE(c) == BT_RATIONAL)
 #define IS_COMPLEX(c) ((c) != 0 && CELL_TYPE(c) == BT_COMPLEX)

@@ -498,6 +498,9 @@ unsigned default_environment(void)
 
     // Register special atoms
     defvar(ctx.atom_true, ctx.atom_true, env);
+    defvar(ctx.atom_false, ctx.atom_false, env);
+    // Make 't' an alias for true
+    defvar(atom_from_string("t"), ctx.atom_true, env);
 
     return env;
 }

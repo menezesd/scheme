@@ -516,8 +516,8 @@ static compile_result compile_if(unsigned expr, compile_ctx *cctx)
         cctx->code->code_len = saved_pos;
         cctx->tail_position = tail;
 
-        if (test_result.value) {
-            // Test is true - compile only then branch
+        if (IS_TRUTHY(test_result.value)) {
+            // Test is truthy - compile only then branch
             return compile_expr_internal(caddr(expr), cctx);
         } else {
             // Test is false - compile only else branch
@@ -805,13 +805,13 @@ static compile_result compile_and(unsigned expr, compile_ctx *cctx)
         compile_result result = compile_expr_internal(car(args), cctx);
 
         if (result.is_const) {
-            if (!result.value) {
+            if (IS_FALSE(result.value)) {
                 // Constant false - short-circuit, rewind all bytecode
                 cctx->code->code_len = saved_pos;
-                emit2(cctx, OP_CONST, code_add_const(cctx->code, 0));
-                return const_result(0);
+                emit2(cctx, OP_CONST, code_add_const(cctx->code, ctx.atom_false));
+                return const_result(ctx.atom_false);
             }
-            // Constant true - can skip this expression if not last
+            // Constant truthy - can skip this expression if not last
             if (!is_last) {
                 // Rewind bytecode for this constant true, continue with rest
                 cctx->code->code_len = expr_saved_pos;
@@ -846,8 +846,8 @@ static compile_result compile_or(unsigned expr, compile_ctx *cctx)
 
     if (!args) {
         // (or) => #f
-        emit2(cctx, OP_CONST, code_add_const(cctx->code, 0));
-        return const_result(0);
+        emit2(cctx, OP_CONST, code_add_const(cctx->code, ctx.atom_false));
+        return const_result(ctx.atom_false);
     }
 
     bool tail = cctx->tail_position;
@@ -865,8 +865,8 @@ static compile_result compile_or(unsigned expr, compile_ctx *cctx)
         compile_result result = compile_expr_internal(car(args), cctx);
 
         if (result.is_const) {
-            if (result.value) {
-                // Constant true - short-circuit, rewind all bytecode
+            if (IS_TRUTHY(result.value)) {
+                // Constant truthy - short-circuit, rewind all bytecode
                 cctx->code->code_len = saved_pos;
                 emit2(cctx, OP_CONST, code_add_const(cctx->code, result.value));
                 return const_result(result.value);

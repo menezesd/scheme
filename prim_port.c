@@ -63,11 +63,11 @@ unsigned apply_port_primitive(unsigned prim_id, unsigned args)
     }
     case PINPUTPORTP: {
         REQUIRE_ARGS(args, 1, 1, "input-port?");
-        return IS_INPUT_PORT(car(args)) ? ctx.atom_true : 0;
+        return IS_INPUT_PORT(car(args)) ? ctx.atom_true : ctx.atom_false;
     }
     case POUTPUTPORTP: {
         REQUIRE_ARGS(args, 1, 1, "output-port?");
-        return IS_OUTPUT_PORT(car(args)) ? ctx.atom_true : 0;
+        return IS_OUTPUT_PORT(car(args)) ? ctx.atom_true : ctx.atom_false;
     }
     case PCURRENTINPUT: {
         REQUIRE_ARGS(args, 0, 0, "current-input-port");
@@ -145,7 +145,7 @@ unsigned apply_port_primitive(unsigned prim_id, unsigned args)
     case PSTRINGPORTP: {
         REQUIRE_ARGS(args, 1, 1, "string-port?");
         unsigned a = car(args);
-        return (IS_STRINPORT(a) || IS_STROUTPORT(a)) ? ctx.atom_true : 0;
+        return (IS_STRINPORT(a) || IS_STROUTPORT(a)) ? ctx.atom_true : ctx.atom_false;
     }
     // Internal port setters (used by with-input-from-file etc.)
     case PSETCURRENTINPUT: {

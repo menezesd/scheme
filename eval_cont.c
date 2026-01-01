@@ -41,7 +41,7 @@ void handle_cont_halt(unsigned val, unsigned data, unsigned env, unsigned next)
  */
 void handle_cont_if(unsigned val, unsigned data, unsigned env, unsigned next)
 {
-    if (val) {
+    if (IS_TRUTHY(val)) {
         tramp_eval(car(data), env, next);
     } else {
         tramp_eval(cdr(data), env, next);
@@ -91,8 +91,8 @@ void handle_cont_define(unsigned val, unsigned data, unsigned env,
  */
 void handle_cont_and(unsigned val, unsigned data, unsigned env, unsigned next)
 {
-    if (!val) {
-        tramp_apply(0, next);
+    if (IS_FALSE(val)) {
+        tramp_apply(ctx.atom_false, next);
         return;
     }
     eval_seq(data, CONT_AND, env, next);
@@ -104,7 +104,7 @@ void handle_cont_and(unsigned val, unsigned data, unsigned env, unsigned next)
  */
 void handle_cont_or(unsigned val, unsigned data, unsigned env, unsigned next)
 {
-    if (val) {
+    if (IS_TRUTHY(val)) {
         tramp_apply(val, next);
         return;
     }
@@ -122,7 +122,7 @@ void handle_cont_cond_test(unsigned val, unsigned data, unsigned env,
 {
     unsigned conseq = car(data);
     unsigned rest = cdr(data);
-    if (val) {
+    if (IS_TRUTHY(val)) {
         if (!conseq) {
             // No consequent: return test value
             tramp_apply(val, next);

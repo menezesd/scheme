@@ -8,6 +8,7 @@ numeric tower support.
 
 - **Garbage Collection**: Semispace copying collector with Cheney's algorithm
 - **Tail Call Optimization**: Trampoline-based continuation-passing style (CPS)
+- **R5RS Booleans**: Proper distinction between `#f` and `'()` (only `#f` is false)
 - **Numeric Tower**: Integers, bignums, rationals, floats, and complex numbers
 - **Hygienic Macros**: Full `syntax-rules` with referential transparency and hygiene
 - **SRFI Support**: SRFI-1 (list library), SRFI-9 (records), SRFI-26 (cut/cute)
@@ -235,7 +236,7 @@ The interpreter uses a semispace copying garbage collector:
 
 - **Heap**: Two semispaces of 16M cells each (configurable via `SEMISPACE_SIZE`)
 - **Cells**: 12-byte tagged unions containing type, car/cdr or numeric value
-- **Reserved Space**: Cells 0-14 are permanent atoms (nil, #t, quote, etc.)
+- **Reserved Space**: Cells 0-271 are reserved (nil, booleans, quote atoms, integer cache 0-255)
 - **Allocation**: Bump pointer within current semispace
 - **Collection**: Cheney's algorithm copies live objects to other semispace
 
@@ -260,8 +261,7 @@ Cell types are tagged with a 4-bit enum:
 
 | Type | Description |
 |------|-------------|
-| `BT_NIL` | Empty list / false |
-| `BT_ATOM` | Interned symbol |
+| `BT_ATOM` | Interned symbol (includes `#t` and `#f`) |
 | `BT_NUM` | Exact integer (64-bit) |
 | `BT_BIGNUM` | Arbitrary precision integer |
 | `BT_RATIONAL` | Exact rational (num/denom) |
@@ -269,7 +269,7 @@ Cell types are tagged with a 4-bit enum:
 | `BT_COMPLEX` | Complex number (real/imag) |
 | `BT_CHAR` | Unicode character |
 | `BT_STRING` | Mutable string |
-| `BT_CONS` | Pair (car/cdr) |
+| `BT_CONS` | Pair (car/cdr); cell 0 is `'()` (nil) |
 | `BT_FUNCTION` | Lambda closure |
 | `BT_PRIMOP` | Built-in procedure |
 | `BT_VECTOR` | Fixed-size array |
@@ -306,8 +306,8 @@ Key constants in `types.h`:
 
 ```c
 #define SEMISPACE_SIZE (1 << 24)  // 16M cells per semispace
-#define HEAP_RESERVED 15          // Reserved permanent atoms
-#define INITIAL_STRING_CAP 64     // Initial string buffer size
+#define HEAP_RESERVED 272         // Reserved cells (atoms + integer cache)
+#define INITIAL_STRING_CAP 32     // Initial string buffer size
 #define CHAR_NAME_BUF_SIZE 16     // Character name buffer
 ```
 

@@ -1625,13 +1625,15 @@ void init_keywords(void)
     }
 
     // Initialize permanent atoms in reserved cells (never GC'd)
-    init_permanent_atom(CELL_ATOM_TRUE, "t");
+    init_permanent_atom(CELL_ATOM_FALSE, "false");
+    init_permanent_atom(CELL_ATOM_TRUE, "true");
     init_permanent_atom(CELL_ATOM_QUOTE, "quote");
     init_permanent_atom(CELL_ATOM_QUASIQUOTE, "quasiquote");
     init_permanent_atom(CELL_ATOM_UNQUOTE, "unquote");
     init_permanent_atom(CELL_ATOM_UNQUOTE_SPLICING, "unquote-splicing");
 
     ctx.atom_true = CELL_ATOM_TRUE;
+    ctx.atom_false = CELL_ATOM_FALSE;
     ctx.atom_quote = CELL_ATOM_QUOTE;
     ctx.atom_quasiquote = CELL_ATOM_QUASIQUOTE;
     ctx.atom_unquote = CELL_ATOM_UNQUOTE;

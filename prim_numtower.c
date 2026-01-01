@@ -270,12 +270,12 @@ unsigned apply_numtower_primitive(unsigned prim_id, unsigned args)
         unsigned x = car(args);
         if (CELL_TYPE(x) == BT_INEXACT) {
             double d = to_double(x);
-            return isfinite(d) ? ctx.atom_true : 0;
+            return isfinite(d) ? ctx.atom_true : ctx.atom_false;
         }
         if (CELL_TYPE(x) == BT_COMPLEX) {
             double real = to_double(CELL_CAR(x));
             double imag = to_double(CELL_CDR(x));
-            return (isfinite(real) && isfinite(imag)) ? ctx.atom_true : 0;
+            return (isfinite(real) && isfinite(imag)) ? ctx.atom_true : ctx.atom_false;
         }
         // All exact numbers are finite
         return ctx.atom_true;
@@ -285,30 +285,30 @@ unsigned apply_numtower_primitive(unsigned prim_id, unsigned args)
         unsigned x = car(args);
         if (CELL_TYPE(x) == BT_INEXACT) {
             double d = to_double(x);
-            return isinf(d) ? ctx.atom_true : 0;
+            return isinf(d) ? ctx.atom_true : ctx.atom_false;
         }
         if (CELL_TYPE(x) == BT_COMPLEX) {
             double real = to_double(CELL_CAR(x));
             double imag = to_double(CELL_CDR(x));
-            return (isinf(real) || isinf(imag)) ? ctx.atom_true : 0;
+            return (isinf(real) || isinf(imag)) ? ctx.atom_true : ctx.atom_false;
         }
         // Exact numbers are never infinite
-        return 0;
+        return ctx.atom_false;
     }
     case PNAN: {
         REQUIRE_ARGS(args, 1, 1, "nan?");
         unsigned x = car(args);
         if (CELL_TYPE(x) == BT_INEXACT) {
             double d = to_double(x);
-            return isnan(d) ? ctx.atom_true : 0;
+            return isnan(d) ? ctx.atom_true : ctx.atom_false;
         }
         if (CELL_TYPE(x) == BT_COMPLEX) {
             double real = to_double(CELL_CAR(x));
             double imag = to_double(CELL_CDR(x));
-            return (isnan(real) || isnan(imag)) ? ctx.atom_true : 0;
+            return (isnan(real) || isnan(imag)) ? ctx.atom_true : ctx.atom_false;
         }
         // Exact numbers are never NaN
-        return 0;
+        return ctx.atom_false;
     }
     default:
         return TOK_ERROR;

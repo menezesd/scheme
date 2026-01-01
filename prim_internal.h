@@ -388,12 +388,12 @@ static inline unsigned binary_div(unsigned a, unsigned b)
 }
 
 // Binary less-than comparison: a < b
-// Returns ctx.atom_true or 0
+// Returns ctx.atom_true or ctx.atom_false
 static inline unsigned binary_lt(unsigned a, unsigned b)
 {
     // Fast path: both are small integers
     if (IS_NUM(a) && IS_NUM(b)) {
-        return CELL_ID(a) < CELL_ID(b) ? ctx.atom_true : 0;
+        return CELL_ID(a) < CELL_ID(b) ? ctx.atom_true : ctx.atom_false;
     }
     // Fall back to full comparison
     gc_protect(&a);
@@ -408,7 +408,7 @@ static inline unsigned binary_numeq(unsigned a, unsigned b)
 {
     // Fast path: both are small integers
     if (IS_NUM(a) && IS_NUM(b)) {
-        return CELL_ID(a) == CELL_ID(b) ? ctx.atom_true : 0;
+        return CELL_ID(a) == CELL_ID(b) ? ctx.atom_true : ctx.atom_false;
     }
     // Fall back to full comparison
     gc_protect(&a);

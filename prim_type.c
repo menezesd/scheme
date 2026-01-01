@@ -12,58 +12,58 @@ unsigned apply_type_predicate(unsigned prim_id, unsigned args)
     unsigned arg = car(args);
     switch (prim_id) {
     case PSYMP:
-        return IS_ATOM(arg) ? ctx.atom_true : 0;
+        return IS_ATOM(arg) ? ctx.atom_true : ctx.atom_false;
     case PNUMP:
     case PNUMBERP:
-        return is_numeric(arg) ? ctx.atom_true : 0;
+        return is_numeric(arg) ? ctx.atom_true : ctx.atom_false;
     case PINTEGERP: {
         if (IS_NUM(arg) || IS_BIGNUM(arg))
             return ctx.atom_true;
         if (IS_INEXACT(arg)) {
             double d = to_double(arg);
-            return (floor(d) == d) ? ctx.atom_true : 0;
+            return (floor(d) == d) ? ctx.atom_true : ctx.atom_false;
         }
-        return 0;
+        return ctx.atom_false;
     }
     case PREALP: {
         if (is_numeric(arg) && !IS_COMPLEX(arg))
             return ctx.atom_true;
-        return 0;
+        return ctx.atom_false;
     }
     case PEXACTP:
-        return is_exact(arg) ? ctx.atom_true : 0;
+        return is_exact(arg) ? ctx.atom_true : ctx.atom_false;
     case PINEXACTP:
-        return (is_numeric(arg) && !is_exact(arg)) ? ctx.atom_true : 0;
+        return (is_numeric(arg) && !is_exact(arg)) ? ctx.atom_true : ctx.atom_false;
     case PCOMPLEXP:
-        return is_numeric(arg) ? ctx.atom_true : 0;
+        return is_numeric(arg) ? ctx.atom_true : ctx.atom_false;
     case PRATIONALP:
         return (IS_NUM(arg) || IS_BIGNUM(arg) || IS_RATIONAL(arg))
                    ? ctx.atom_true
-                   : 0;
+                   : ctx.atom_false;
     case PPROCP:
         // Check for bytecode closures: cons cell with BT_CLOSURE marker in car
         if (IS_PAIR(arg) && CELL_TYPE(car(arg)) == BT_CLOSURE)
             return ctx.atom_true;
         return (IS_FUNCTION(arg) || IS_BUILTIN(arg) || IS_CONT(arg))
                    ? ctx.atom_true
-                   : 0;
+                   : ctx.atom_false;
     case PCONSP:
-        return IS_PAIR(arg) ? ctx.atom_true : 0;
+        return IS_PAIR(arg) ? ctx.atom_true : ctx.atom_false;
     case PNULLP:
-        return arg == 0 ? ctx.atom_true : 0;
+        return IS_NIL(arg) ? ctx.atom_true : ctx.atom_false;
     case PSTRINGP:
-        return IS_STRING(arg) ? ctx.atom_true : 0;
+        return IS_STRING(arg) ? ctx.atom_true : ctx.atom_false;
     case PCHARP:
-        return IS_CHAR(arg) ? ctx.atom_true : 0;
+        return IS_CHAR(arg) ? ctx.atom_true : ctx.atom_false;
     case PVECTORP:
-        return IS_VECTOR(arg) ? ctx.atom_true : 0;
+        return IS_VECTOR(arg) ? ctx.atom_true : ctx.atom_false;
     case PBOOLP:
-        return (arg == 0 || arg == ctx.atom_true) ? ctx.atom_true : 0;
+        return (IS_FALSE(arg) || arg == ctx.atom_true) ? ctx.atom_true : ctx.atom_false;
     case PLISTP: {
         unsigned x = arg;
         while (IS_PAIR(x))
             x = cdr(x);
-        return x == 0 ? ctx.atom_true : 0;
+        return IS_NIL(x) ? ctx.atom_true : ctx.atom_false;
     }
     default:
         return TOK_ERROR;

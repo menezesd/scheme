@@ -214,7 +214,7 @@ bool handle_or(unsigned id, unsigned env, unsigned cont)
 {
     unsigned seq = cdr(id);
     if (!seq) {
-        tramp_apply(0, cont);
+        tramp_apply(ctx.atom_false, cont);
         return true;
     }
     if (!cdr(seq)) {

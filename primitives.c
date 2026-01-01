@@ -63,27 +63,27 @@ unsigned apply_primitive(unsigned prim_id, unsigned args)
     // Logic
     case PNOT:
         REQUIRE_ARGS(args, 1, 1, "not");
-        return car(args) ? 0 : ctx.atom_true;
+        return IS_FALSE(car(args)) ? ctx.atom_true : ctx.atom_false;
     case PEQ: {
         REQUIRE_ARGS(args, 2, 2, "eq?");
         unsigned arg1 = car(args);
         unsigned arg2 = cadr(args);
         if (CELL_TYPE(arg1) != CELL_TYPE(arg2))
-            return 0;
+            return ctx.atom_false;
         switch (CELL_TYPE(arg1)) {
         case BT_NUM:
         case BT_FUNCTION:
         case BT_BUILTIN:
         case BT_ATOM:
         case BT_CHAR:
-            return CELL_ID(arg1) == CELL_ID(arg2) ? ctx.atom_true : 0;
+            return CELL_ID(arg1) == CELL_ID(arg2) ? ctx.atom_true : ctx.atom_false;
         default:
-            return arg1 == arg2 ? ctx.atom_true : 0;
+            return arg1 == arg2 ? ctx.atom_true : ctx.atom_false;
         }
     }
     case PEQUALP:
         REQUIRE_ARGS(args, 2, 2, "equal?");
-        return deep_equal(car(args), cadr(args)) ? ctx.atom_true : 0;
+        return deep_equal(car(args), cadr(args)) ? ctx.atom_true : ctx.atom_false;
 
     // List operations
     case PCONS:
@@ -312,7 +312,7 @@ unsigned apply_primitive(unsigned prim_id, unsigned args)
         char *end;
         long long val = strtoll(s, &end, radix);
         if (end == s || *end != '\0') {
-            return 0; // Return #f for invalid number
+            return ctx.atom_false; // Return #f for invalid number
         }
         return store(val);
     }

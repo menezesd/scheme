@@ -222,7 +222,7 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned args)
         return (CELL_TYPE(arg) == BT_ATOM &&
                 strcmp(ctx.atom_table[CELL_ID(arg)], "eof-object") == 0)
                    ? ctx.atom_true
-                   : 0;
+                   : ctx.atom_false;
     }
     case PCHARREADY: {
         REQUIRE_ARGS(args, 0, 1, "char-ready?");
@@ -234,7 +234,7 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned args)
 
         if (ptype == 1) {
             // String port: ready if there are characters remaining
-            return (sport->pos < sport->len) ? ctx.atom_true : 0;
+            return (sport->pos < sport->len) ? ctx.atom_true : ctx.atom_false;
         }
 
         // File port: use poll() to check if data is available
@@ -246,7 +246,7 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned args)
 
         struct pollfd pfd = {.fd = fd, .events = POLLIN, .revents = 0};
         int ret = poll(&pfd, 1, 0);  // Non-blocking check
-        return (ret > 0 && (pfd.revents & POLLIN)) ? ctx.atom_true : 0;
+        return (ret > 0 && (pfd.revents & POLLIN)) ? ctx.atom_true : ctx.atom_false;
     }
     case PREADLINE: {
         REQUIRE_ARGS(args, 0, 1, "read-line");

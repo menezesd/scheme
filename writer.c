@@ -269,9 +269,11 @@ static void write_obj_fp(unsigned s, bool with_quotes, FILE *fp)
 
     switch (CELL_TYPE(s)) {
     case BT_ATOM:
-        // Print #t for the true atom
+        // Print #t and #f for boolean atoms
         if (s == ctx.atom_true) {
             fprintf(fp, "#t");
+        } else if (s == ctx.atom_false) {
+            fprintf(fp, "#f");
         } else {
             fprintf(fp, "%s", ctx.atom_table[CELL_ID(s)]);
         }

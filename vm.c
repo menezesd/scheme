@@ -636,7 +636,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
         case OP_JUMPIF: {
             unsigned target = vm->code->code[vm->ip++];
             unsigned val = vm_pop(vm);
-            if (val) { // Anything non-nil is truthy
+            if (IS_TRUTHY(val)) { // Only #f is falsy
                 vm->ip = target;
             }
             break;
@@ -645,7 +645,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
         case OP_JUMPIFNOT: {
             unsigned target = vm->code->code[vm->ip++];
             unsigned val = vm_pop(vm);
-            if (!val) { // Only nil is falsy
+            if (IS_FALSE(val)) { // Only #f is falsy
                 vm->ip = target;
             }
             break;
@@ -1040,13 +1040,13 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
 
         case OP_NULLP: {
             unsigned val = vm_pop(vm);
-            vm_push(vm, val == 0 ? ctx.atom_true : 0);
+            vm_push(vm, IS_NIL(val) ? ctx.atom_true : ctx.atom_false);
             break;
         }
 
         case OP_PAIRP: {
             unsigned val = vm_pop(vm);
-            vm_push(vm, (val && CELL_TYPE(val) == BT_CONS) ? ctx.atom_true : 0);
+            vm_push(vm, (val && CELL_TYPE(val) == BT_CONS) ? ctx.atom_true : ctx.atom_false);
             break;
         }
 
@@ -1120,13 +1120,13 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             } else if (CELL_TYPE(n) == BT_BIGNUM) {
                 is_zero = bn_is_zero(get_bignum(n));
             }
-            vm_push(vm, is_zero ? ctx.atom_true : 0);
+            vm_push(vm, is_zero ? ctx.atom_true : ctx.atom_false);
             break;
         }
 
         case OP_NOT: {
             unsigned val = vm_pop(vm);
-            vm_push(vm, val == 0 ? ctx.atom_true : 0);
+            vm_push(vm, IS_FALSE(val) ? ctx.atom_true : ctx.atom_false);
             break;
         }
 
@@ -1150,7 +1150,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                     break;
                 }
             }
-            vm_push(vm, eq ? ctx.atom_true : 0);
+            vm_push(vm, eq ? ctx.atom_true : ctx.atom_false);
             break;
         }
 

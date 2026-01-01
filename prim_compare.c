@@ -20,7 +20,7 @@ unsigned numeric_compare(unsigned args, cmp_op op)
                 goto slow_path;
             int64_t curr = CELL_ID(c);
             if (!APPLY_CMP_OP(op, prev, curr))
-                return 0;
+                return ctx.atom_false;
             prev = curr;
         }
         return ctx.atom_true;
@@ -42,7 +42,7 @@ slow_path:;
             ok = APPLY_CMP_OP(op, f, v);
         }
         if (!ok)
-            return 0;
+            return ctx.atom_false;
         prev = curr;
     }
     return ctx.atom_true;
@@ -57,7 +57,7 @@ unsigned char_compare(unsigned args, cmp_op op, bool case_insensitive)
         c1 = tolower(c1);
         c2 = tolower(c2);
     }
-    return APPLY_CMP_OP(op, c1, c2) ? ctx.atom_true : 0;
+    return APPLY_CMP_OP(op, c1, c2) ? ctx.atom_true : ctx.atom_false;
 }
 
 unsigned string_compare(unsigned args, cmp_op op, bool case_insensitive)
@@ -68,5 +68,5 @@ unsigned string_compare(unsigned args, cmp_op op, bool case_insensitive)
     char *s1 = GET_STRING_PTR(car(args));
     char *s2 = GET_STRING_PTR(cadr(args));
     int cmp = case_insensitive ? strcasecmp(s1, s2) : strcmp(s1, s2);
-    return APPLY_CMP_OP(op, cmp, 0) ? ctx.atom_true : 0;
+    return APPLY_CMP_OP(op, cmp, 0) ? ctx.atom_true : ctx.atom_false;
 }

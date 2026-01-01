@@ -358,7 +358,7 @@ unsigned read_token(void)
             } else if (c == 't' || c == 'T') {
                 return ctx.atom_true;
             } else if (c == 'f' || c == 'F') {
-                return 0;
+                return ctx.atom_false;
             } else if (isdigit(c)) {
                 // Datum label: #n= or #n#
                 int label = c - '0';
