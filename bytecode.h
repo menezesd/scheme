@@ -120,6 +120,11 @@ enum opcode {
     OP_JUMPIFNOTNULL, // Jump if top is not null: pop, if not null jump
     OP_JUMPIFZERO,    // Jump if top is zero: pop, if zero jump
     OP_JUMPIFNOTZERO, // Jump if top is not zero: pop, if not zero jump
+
+    // Letrec support for proper continuation behavior
+    OP_LETREC_MARK, // Mark letrec frame: LETREC_MARK n -> mark env frame as
+                    // letrec with n bindings
+    OP_LETREC_DONE, // End letrec init: clear letrec mark
 };
 
 // ============================================================================
@@ -214,6 +219,11 @@ typedef struct {
     code_object *code; // Current code object
     unsigned ip;       // Instruction pointer
     unsigned env;      // Current environment (cell index)
+
+    // Letrec support: save/restore binding values for proper continuation behavior
+    unsigned *letrec_saved;    // Saved values of letrec bindings (NULL if none)
+    unsigned letrec_saved_len; // Number of saved values
+    unsigned letrec_frame;     // The frame that was being initialized
 } vm_continuation;
 
 // ============================================================================
@@ -238,6 +248,10 @@ typedef struct {
     code_object *code; // Current code object
     unsigned ip;       // Instruction pointer
     unsigned env;      // Current environment
+
+    // Letrec initialization tracking
+    unsigned letrec_frame;   // Frame being initialized (0 if none)
+    unsigned letrec_count;   // Number of bindings in letrec
 
     // Status
     bool running;          // True while VM is executing

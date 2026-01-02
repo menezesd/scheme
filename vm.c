@@ -233,6 +233,28 @@ static unsigned capture_continuation(vm_state *vm)
     cont->ip = vm->ip;
     cont->env = vm->env;
 
+    // Save letrec values if we're in letrec initialization
+    cont->letrec_saved = NULL;
+    cont->letrec_saved_len = 0;
+    cont->letrec_frame = 0;
+
+    if (vm->letrec_frame && vm->letrec_count > 0) {
+        // Get the values list from the letrec frame
+        unsigned frame = car(vm->letrec_frame);
+        unsigned vals = cdr(frame);
+        unsigned count = vm->letrec_count;
+
+        // Allocate space for saved values
+        cont->letrec_saved = malloc(count * sizeof(unsigned));
+        cont->letrec_saved_len = count;
+        cont->letrec_frame = vm->letrec_frame;
+
+        // Save the current values
+        for (unsigned i = 0; i < count && vals; i++, vals = cdr(vals)) {
+            cont->letrec_saved[i] = car(vals);
+        }
+    }
+
     // Wrap in a cell
     unsigned cell = alloc();
     CELL_TYPE(cell) = BT_VMCONT;
@@ -245,6 +267,20 @@ static void restore_continuation(vm_state *vm, unsigned cont_cell,
                                  unsigned value)
 {
     vm_continuation *cont = (vm_continuation *)(intptr_t)CELL_ID(cont_cell);
+
+    // Restore letrec values if this continuation has them saved
+    // This must happen before restoring the environment
+    if (cont->letrec_saved && cont->letrec_saved_len > 0 && cont->letrec_frame) {
+        unsigned frame = car(cont->letrec_frame);
+        unsigned vals = cdr(frame);
+
+        // Restore the saved values to the frame
+        for (unsigned i = 0; i < cont->letrec_saved_len && vals;
+             i++, vals = cdr(vals)) {
+            write_barrier(vals, cont->letrec_saved[i]);
+            CELL_CAR(vals) = cont->letrec_saved[i];
+        }
+    }
 
     // Restore stack (with return value on top)
     if (vm->stack_cap < cont->sp + 1) {
@@ -919,6 +955,26 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             if (vm->env) {
                 vm->env = cdr(vm->env);
             }
+            // Clear letrec tracking if we're popping the letrec frame
+            if (vm->letrec_frame && vm->env != vm->letrec_frame) {
+                vm->letrec_frame = 0;
+                vm->letrec_count = 0;
+            }
+            break;
+        }
+
+        case OP_LETREC_MARK: {
+            // Mark the current environment frame as being letrec-initialized
+            unsigned count = vm->code->code[vm->ip++];
+            vm->letrec_frame = vm->env;
+            vm->letrec_count = count;
+            break;
+        }
+
+        case OP_LETREC_DONE: {
+            // End letrec initialization - clear the tracking
+            vm->letrec_frame = 0;
+            vm->letrec_count = 0;
             break;
         }
 

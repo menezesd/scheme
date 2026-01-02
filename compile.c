@@ -134,6 +134,22 @@ static inline compile_result dynamic_result(void)
     return (compile_result){false, 0};
 }
 
+// Check if a keyword is shadowed by a local binding
+// Returns true if shadowed (caller should treat as procedure call)
+static bool is_keyword_shadowed(int64_t kw, unsigned env)
+{
+    unsigned val = lookup_silent(kw, env);
+    // If not found, not shadowed
+    if (val == TOK_ERROR)
+        return false;
+    // If found but it's a syntax transformer, it's a macro override, not
+    // shadowing
+    if (IS_SYNTAX(val))
+        return false;
+    // Otherwise, it's shadowed by a regular binding
+    return true;
+}
+
 // ============================================================================
 // Compiler Forward Declarations
 // ============================================================================
@@ -346,7 +362,8 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
         if (IS_ATOM(head)) {
             int64_t kw = CELL_ID(head);
 
-            if (kw == ctx.kw_quote) {
+            // quote can be shadowed by local bindings (R5RS allows this)
+            if (kw == ctx.kw_quote && !is_keyword_shadowed(kw, cctx->env)) {
                 unsigned val = cadr(expr);
                 emit2(cctx, OP_CONST, code_add_const(cctx->code, val));
                 return const_result(val);
@@ -355,7 +372,8 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
                 return compile_if(expr, cctx);
             if (kw == ctx.kw_lambda)
                 return compile_lambda(expr, cctx);
-            if (kw == ctx.kw_begin)
+            // begin can be shadowed by local bindings (R5RS allows this)
+            if (kw == ctx.kw_begin && !is_keyword_shadowed(kw, cctx->env))
                 return compile_begin(cdr(expr), cctx);
             // For let/let*/letrec, check for macro override first
             // (e.g., stdlib defines let macro for named let)
@@ -482,10 +500,18 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
 
                 gc_unprotect(5);
 
-                // Compile body with new environment
+                // Push a new runtime frame for the body
+                // This ensures internal defines create local bindings
+                emit(cctx, OP_PUSHENV);
+
+                // Compile body with new compile-time environment
                 compile_ctx new_cctx = *cctx;
                 new_cctx.env = new_env;
-                return compile_begin(body, &new_cctx);
+                compile_begin(body, &new_cctx);
+
+                // Pop the runtime frame
+                emit(cctx, OP_POPENV);
+                return dynamic_result();
             }
 
             // Check for macro application (silent - don't warn if not found)
@@ -681,6 +707,110 @@ static compile_result compile_lambda(unsigned expr, compile_ctx *cctx)
     return dynamic_result();
 }
 
+// Helper to check if an expression is an internal define
+// Returns the variable name if it's a define, 0 otherwise
+static unsigned is_internal_define(unsigned expr)
+{
+    if (!IS_PAIR(expr))
+        return 0;
+    unsigned kw = car(expr);
+    if (!IS_KEYWORD(kw, ctx.kw_define))
+        return 0;
+    unsigned second = cadr(expr);
+    if (IS_PAIR(second)) {
+        // (define (name params...) body...)
+        return car(second);
+    } else {
+        // (define name expr)
+        return second;
+    }
+}
+
+// Scan body for internal defines and collect variable names
+// Internal defines can appear at the start of a body, including inside begin
+// Returns a list of variable names that are defined
+static unsigned scan_internal_defines(unsigned body, unsigned env)
+{
+    unsigned names = 0;
+    gc_protect(&names);
+    gc_protect(&body);
+
+    while (body) {
+        unsigned expr = car(body);
+        gc_protect(&expr);
+
+        // Check for direct define
+        unsigned name = is_internal_define(expr);
+        if (name) {
+            unsigned cell = alloc_cons(name, names);
+            names = cell;
+            body = cdr(body);
+            gc_unprotect(1);
+            continue;
+        }
+
+        // Check for begin containing defines (only if begin is not shadowed)
+        if (IS_PAIR(expr) && IS_KEYWORD(car(expr), ctx.kw_begin) &&
+            !is_keyword_shadowed(ctx.kw_begin, env)) {
+            // Scan inside the begin
+            unsigned begin_body = cdr(expr);
+            while (begin_body) {
+                unsigned inner = car(begin_body);
+                unsigned inner_name = is_internal_define(inner);
+                if (inner_name) {
+                    unsigned cell = alloc_cons(inner_name, names);
+                    names = cell;
+                    begin_body = cdr(begin_body);
+                } else {
+                    break; // Non-define in begin, stop scanning begin
+                }
+            }
+            // If begin was all defines, continue to next expr
+            if (!begin_body) {
+                body = cdr(body);
+                gc_unprotect(1);
+                continue;
+            }
+        }
+
+        // Not a define or begin-with-defines, stop scanning
+        gc_unprotect(1);
+        break;
+    }
+
+    gc_unprotect(2);
+    return names;
+}
+
+// Helper to extend compile-time env with a list of variable names
+static unsigned extend_compile_env_with_names(unsigned env, unsigned names)
+{
+    if (!names)
+        return env;
+
+    unsigned frame_vars = 0, frame_vals = 0;
+    gc_protect(&frame_vars);
+    gc_protect(&frame_vals);
+    gc_protect(&env);
+    gc_protect(&names);
+
+    FORLIST(n, names)
+    {
+        unsigned var = car(n);
+        gc_protect(&var);
+        unsigned vc = alloc_cons(var, frame_vars);
+        frame_vars = vc;
+        unsigned val = alloc_cons(0, frame_vals); // 0 = non-builtin placeholder
+        frame_vals = val;
+        gc_unprotect(1);
+    }
+
+    unsigned frame = alloc_cons(frame_vars, frame_vals);
+    unsigned new_env = alloc_cons(frame, env);
+    gc_unprotect(4);
+    return new_env;
+}
+
 // Compile sequence of expressions
 static compile_result compile_begin(unsigned exprs, compile_ctx *cctx)
 {
@@ -688,6 +818,18 @@ static compile_result compile_begin(unsigned exprs, compile_ctx *cctx)
         emit2(cctx, OP_CONST, code_add_const(cctx->code, 0)); // unspecified
         return const_result(0);
     }
+
+    // Scan for internal defines and extend compile-time environment
+    // This ensures defines shadow any macros from enclosing scopes
+    gc_protect(&exprs);
+    unsigned internal_defs = scan_internal_defines(exprs, cctx->env);
+    gc_protect(&internal_defs);
+
+    unsigned saved_env = cctx->env;
+    if (internal_defs) {
+        cctx->env = extend_compile_env_with_names(cctx->env, internal_defs);
+    }
+    gc_unprotect(2);
 
     bool tail = cctx->tail_position;
     compile_result result = dynamic_result();
@@ -704,6 +846,9 @@ static compile_result compile_begin(unsigned exprs, compile_ctx *cctx)
 
         exprs = cdr(exprs);
     }
+
+    // Restore compile-time environment
+    cctx->env = saved_env;
 
     return result;
 }
@@ -830,6 +975,10 @@ static compile_result compile_letrec(unsigned expr, compile_ctx *cctx)
     unsigned bindings = cadr(expr);
     unsigned body = cddr(expr);
 
+    // Count bindings
+    unsigned binding_count = 0;
+    FORLIST(b, bindings) { binding_count++; }
+
     // Push new environment frame
     emit(cctx, OP_PUSHENV);
 
@@ -840,6 +989,9 @@ static compile_result compile_letrec(unsigned expr, compile_ctx *cctx)
         emit2(cctx, OP_CONST, code_add_const(cctx->code, 0));
         emit2(cctx, OP_DEFINE, CELL_ID(car(binding)));
     }
+
+    // Mark this frame as letrec for continuation save/restore
+    emit2(cctx, OP_LETREC_MARK, binding_count);
 
     // Extend compile-time environment with all bindings
     // (letrec bindings are mutually recursive, all visible during value compilation)
@@ -855,6 +1007,9 @@ static compile_result compile_letrec(unsigned expr, compile_ctx *cctx)
         emit2(cctx, OP_SET, CELL_ID(car(binding)));
         emit(cctx, OP_POP); // Discard set! result
     }
+
+    // End letrec initialization - continuations after this won't restore values
+    emit(cctx, OP_LETREC_DONE);
 
     // Compile body in tail position
     cctx->tail_position = true;
@@ -1649,6 +1804,7 @@ static unsigned opcode_size(unsigned op)
     case OP_JUMPIFNOTZERO:
     case OP_VALUES:
     case OP_DEFSYNTAX:
+    case OP_LETREC_MARK:
         return 2; // opcode + 1 operand
     case OP_PRIM:
         return 3; // opcode + 2 operands
@@ -2037,6 +2193,8 @@ static const char *opcode_names[] = {
     [OP_JUMPIFNOTNULL] = "JUMPIFNOTNULL",
     [OP_JUMPIFZERO] = "JUMPIFZERO",
     [OP_JUMPIFNOTZERO] = "JUMPIFNOTZERO",
+    [OP_LETREC_MARK] = "LETREC_MARK",
+    [OP_LETREC_DONE] = "LETREC_DONE",
 };
 
 void disassemble(code_object *code, const char *name)
@@ -2089,6 +2247,7 @@ void disassemble(code_object *code, const char *name)
         case OP_CALL:
         case OP_TAILCALL:
         case OP_VALUES:
+        case OP_LETREC_MARK:
             printf(" %u", code->code[ip++]);
             break;
         case OP_JUMP:
