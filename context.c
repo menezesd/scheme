@@ -752,10 +752,6 @@ static bool is_number_start(const char *s)
 
 unsigned atom_from_string(const char *s)
 {
-    if (strcmp(s, "nil") == 0) {
-        return TOK_NIL;
-    }
-
     size_t n = strlen(s);
 
     // Check for pure imaginary: +i, -i (but not bare "i" - that's a symbol)

@@ -38,7 +38,7 @@
 const char *type_name(unsigned cell)
 {
     if (cell == 0)
-        return "nil";
+        return "()";
     switch (CELL_TYPE(cell)) {
     case BT_FREE:
         return "free-cell";

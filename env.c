@@ -482,6 +482,7 @@ static const struct {
     {"set-current-input-port!", PSETCURRENTINPUT},
     {"set-current-output-port!", PSETCURRENTOUTPUT},
     {"flush-output-port", PFLUSHOUTPUT},
+    {"flush-output", PFLUSHOUTPUT},
     {"current-second", PCURRENTSECOND},
 
     {NULL, 0}};

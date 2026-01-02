@@ -107,7 +107,7 @@ enum cont_type {
 };
 
 enum token {
-    TOK_NIL,
+    TOK_RESERVED_ZERO, // Keep TOK_ERROR != 0 (0 is empty list)
     TOK_ERROR,
     TOK_OPEN,
     TOK_CLOSE,

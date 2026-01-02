@@ -273,7 +273,7 @@
 (test "not false" #t (not #f))
 (test "not true" #f (not #t))
 (test "not 3" #f (not 3))
-(test "not list" #t (not '()))
+(test "not empty-list" #f (not '()))
 (test "boolean? true" #t (boolean? #t))
 (test "boolean? false" #t (boolean? #f))
 (test "boolean? 0" #f (boolean? 0))
@@ -312,6 +312,8 @@
 
 (test-section "6.3.3 Symbols")
 (test "symbol?" #t (symbol? 'foo))
+(test "symbol? nil" #t (symbol? 'nil))
+(test "symbol? not empty list" #f (symbol? '()))
 (test "symbol->string" "flying-fish" (symbol->string 'flying-fish))
 ;; Note: Reader folds case, so compare via symbol->string
 (test "string->symbol" "mISSISSIppi"
