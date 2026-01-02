@@ -708,6 +708,34 @@ static compile_result compile_begin(unsigned exprs, compile_ctx *cctx)
     return result;
 }
 
+// Helper to extend compile-time environment with variable bindings
+// This prevents primitive inlining for shadowed variables
+static unsigned extend_compile_env(unsigned env, unsigned bindings)
+{
+    // Build frame with variables -> 0 (non-builtin placeholder)
+    unsigned frame_vars = 0, frame_vals = 0;
+    gc_protect(&frame_vars);
+    gc_protect(&frame_vals);
+    gc_protect(&env);
+    gc_protect(&bindings);
+
+    FORLIST(b, bindings)
+    {
+        unsigned var = car(car(b));
+        gc_protect(&var);
+        unsigned vc = alloc_cons(var, frame_vars);
+        frame_vars = vc;
+        unsigned val = alloc_cons(0, frame_vals); // 0 = non-builtin
+        frame_vals = val;
+        gc_unprotect(1);
+    }
+
+    unsigned frame = alloc_cons(frame_vars, frame_vals);
+    unsigned new_env = alloc_cons(frame, env);
+    gc_unprotect(4);
+    return new_env;
+}
+
 // (let ((var val) ...) body...)
 static compile_result compile_let(unsigned expr, compile_ctx *cctx)
 {
@@ -736,9 +764,16 @@ static compile_result compile_let(unsigned expr, compile_ctx *cctx)
         emit2(cctx, OP_DEFINE, vars[j]);
     }
 
+    // Extend compile-time environment for body compilation
+    unsigned saved_env = cctx->env;
+    cctx->env = extend_compile_env(cctx->env, bindings);
+
     // Compile body in tail position
     cctx->tail_position = true;
     compile_result result = compile_begin(body, cctx);
+
+    // Restore compile-time environment
+    cctx->env = saved_env;
 
     // Pop environment frame
     emit(cctx, OP_POPENV);
@@ -757,18 +792,31 @@ static compile_result compile_letstar(unsigned expr, compile_ctx *cctx)
     // Push new environment frame
     emit(cctx, OP_PUSHENV);
 
+    // Save original compile-time environment
+    unsigned saved_env = cctx->env;
+
     // Compile and define each binding sequentially
+    // Each binding extends the compile-time environment for subsequent bindings
     cctx->tail_position = false;
     FORLIST(b, bindings)
     {
         unsigned binding = car(b);
         compile_expr_internal(cadr(binding), cctx);
         emit2(cctx, OP_DEFINE, CELL_ID(car(binding)));
+
+        // Extend compile-time env with this binding for next iteration
+        unsigned single_binding = alloc_cons(binding, 0);
+        gc_protect(&single_binding);
+        cctx->env = extend_compile_env(cctx->env, single_binding);
+        gc_unprotect(1);
     }
 
-    // Compile body in tail position
+    // Compile body in tail position (with all bindings visible)
     cctx->tail_position = true;
     compile_begin(body, cctx);
+
+    // Restore compile-time environment
+    cctx->env = saved_env;
 
     // Pop environment frame
     emit(cctx, OP_POPENV);
@@ -793,6 +841,11 @@ static compile_result compile_letrec(unsigned expr, compile_ctx *cctx)
         emit2(cctx, OP_DEFINE, CELL_ID(car(binding)));
     }
 
+    // Extend compile-time environment with all bindings
+    // (letrec bindings are mutually recursive, all visible during value compilation)
+    unsigned saved_env = cctx->env;
+    cctx->env = extend_compile_env(cctx->env, bindings);
+
     // Second pass: compile values and set variables
     cctx->tail_position = false;
     FORLIST(b, bindings)
@@ -806,6 +859,9 @@ static compile_result compile_letrec(unsigned expr, compile_ctx *cctx)
     // Compile body in tail position
     cctx->tail_position = true;
     compile_begin(body, cctx);
+
+    // Restore compile-time environment
+    cctx->env = saved_env;
 
     // Pop environment frame
     emit(cctx, OP_POPENV);
