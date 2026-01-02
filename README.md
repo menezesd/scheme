@@ -1,21 +1,19 @@
-# Scheme Interpreter
+# Vesper
 
-A compact R5RS-inspired Scheme interpreter written in C, featuring a semispace
-garbage collector, trampoline-based CPS evaluator, hygienic macros, and full
-numeric tower support.
+A compact R5RS-inspired Scheme interpreter written in C, featuring a bytecode
+compiler, semispace garbage collector, hygienic macros, and full numeric tower.
 
 ## Features
 
-- **Garbage Collection**: Semispace copying collector with Cheney's algorithm
-- **Tail Call Optimization**: Trampoline-based continuation-passing style (CPS)
-- **R5RS Booleans**: Proper distinction between `#f` and `'()` (only `#f` is false)
+- **Bytecode Compiler**: Compiles to bytecode for a stack-based VM with peephole optimization
+- **Garbage Collection**: Generational collector with semispace nursery (Cheney's algorithm)
+- **Tail Call Optimization**: Proper tail calls in both interpreter and VM
+- **R5RS Compliance**: Passes standard compliance tests including tricky edge cases
 - **Numeric Tower**: Integers, bignums, rationals, floats, and complex numbers
-- **Hygienic Macros**: Full `syntax-rules` with referential transparency and hygiene
-- **SRFI Support**: SRFI-1 (list library), SRFI-9 (records), SRFI-26 (cut/cute)
-- **Standard Library**: Comprehensive stdlib with list utilities, higher-order
-  functions, and more
+- **Hygienic Macros**: Full `syntax-rules` with referential transparency
+- **First-Class Continuations**: Full `call/cc` with multi-shot continuation support
+- **SRFI Support**: SRFI-1 (lists), SRFI-9 (records), SRFI-26 (cut/cute)
 - **Ports**: File I/O and string ports with standard Scheme port operations
-- **Vectors**: Mutable fixed-size arrays with standard vector operations
 
 ## Building
 
@@ -39,7 +37,7 @@ make clean    # Remove build artifacts
 ### Interactive REPL
 
 ```bash
-./lisp
+./vesper
 ]=> (+ 1 2 3)
 ;Value: 6
 ]=> (define (factorial n)
@@ -52,7 +50,16 @@ make clean    # Remove build artifacts
 ### Running Scripts
 
 ```bash
-./lisp script.scm
+./vesper script.scm
+```
+
+### Interpreter Mode
+
+By default, Vesper uses its bytecode compiler. For the tree-walking CPS
+interpreter (useful for debugging), use:
+
+```bash
+./vesper --interpreter script.scm
 ```
 
 ## Language Features
@@ -219,41 +226,45 @@ counter     ; => 1 (evaluated once at definition)
 | File | Description |
 |------|-------------|
 | `main.c` | Entry point, REPL, file loading |
-| `types.h` | Core type definitions, cell structure, constants |
+| `compile.c/h` | Bytecode compiler with constant folding |
+| `vm.c` | Stack-based virtual machine |
+| `bytecode.h` | Opcode definitions and VM structures |
+| `types.h` | Core type definitions, cell structure |
 | `context.c/h` | Memory management, GC, cell allocation |
 | `reader.c/h` | S-expression parser, tokenizer |
 | `writer.c/h` | S-expression printer with cycle detection |
-| `eval.c/h` | Trampoline evaluator, special forms |
+| `eval.c/h` | CPS interpreter (fallback mode) |
 | `env.c/h` | Environment frames, variable binding |
 | `primitives.c/h` | Built-in procedures (~150 primitives) |
-| `macros.c/h` | Hygienic macro expander (mark-based hygiene) |
+| `macros.c/h` | Hygienic macro expander |
 | `bignum.c/h` | Arbitrary precision integer arithmetic |
 | `stdlib.scm` | Standard library (Scheme code) |
 
 ### Memory Model
 
-The interpreter uses a semispace copying garbage collector:
+The interpreter uses a generational garbage collector:
 
-- **Heap**: Two semispaces of 16M cells each (configurable via `SEMISPACE_SIZE`)
+- **Nursery**: Semispace copying collector (Cheney's algorithm)
+- **Old Generation**: Mark-and-sweep for long-lived objects
 - **Cells**: 12-byte tagged unions containing type, car/cdr or numeric value
-- **Reserved Space**: Cells 0-271 are reserved (nil, booleans, quote atoms, integer cache 0-255)
-- **Allocation**: Bump pointer within current semispace
-- **Collection**: Cheney's algorithm copies live objects to other semispace
+- **Reserved Space**: Cells 0-271 (nil, booleans, atoms, integer cache 0-255)
 
-### Evaluation Model
+### Bytecode VM
 
-The evaluator uses trampolined continuation-passing style to achieve proper
-tail call optimization without growing the C stack:
+The default execution mode compiles Scheme to bytecode:
 
 ```
-┌──────────────┐    ┌──────────────┐    ┌──────────────┐
-│  TRAMP_EVAL  │───>│ TRAMP_APPLY  │───>│  TRAMP_DONE  │
-│  (evaluate)  │    │ (apply cont) │    │  (finished)  │
-└──────────────┘    └──────────────┘    └──────────────┘
-       │                   │
-       └───────────────────┘
-         (tail calls loop back)
+┌──────────┐    ┌──────────┐    ┌──────────┐
+│  Parse   │───>│ Compile  │───>│ Execute  │
+│ (reader) │    │(bytecode)│    │   (VM)   │
+└──────────┘    └──────────┘    └──────────┘
 ```
+
+Key optimizations:
+- Peephole optimization (fused compare-and-jump, etc.)
+- Specialized opcodes for common operations (car, cdr, +, -, etc.)
+- Constant folding for pure operations
+- Tail call optimization via dedicated TAILCALL opcode
 
 ### Type System
 
@@ -261,7 +272,7 @@ Cell types are tagged with a 4-bit enum:
 
 | Type | Description |
 |------|-------------|
-| `BT_ATOM` | Interned symbol (includes `#t` and `#f`) |
+| `BT_ATOM` | Interned symbol |
 | `BT_NUM` | Exact integer (64-bit) |
 | `BT_BIGNUM` | Arbitrary precision integer |
 | `BT_RATIONAL` | Exact rational (num/denom) |
@@ -269,13 +280,14 @@ Cell types are tagged with a 4-bit enum:
 | `BT_COMPLEX` | Complex number (real/imag) |
 | `BT_CHAR` | Unicode character |
 | `BT_STRING` | Mutable string |
-| `BT_CONS` | Pair (car/cdr); cell 0 is `'()` (nil) |
+| `BT_CONS` | Pair (car/cdr) |
 | `BT_FUNCTION` | Lambda closure |
 | `BT_PRIMOP` | Built-in procedure |
 | `BT_VECTOR` | Fixed-size array |
-| `BT_MACRO` | Macro transformer |
-| `BT_SYNTAX` | syntax-rules object |
+| `BT_SYNTAX` | syntax-rules transformer |
 | `BT_CONT` | First-class continuation |
+| `BT_CLOSURE` | VM closure (bytecode) |
+| `BT_VMCONT` | VM continuation |
 
 ## Testing
 
@@ -308,15 +320,7 @@ Key constants in `types.h`:
 #define SEMISPACE_SIZE (1 << 24)  // 16M cells per semispace
 #define HEAP_RESERVED 272         // Reserved cells (atoms + integer cache)
 #define INITIAL_STRING_CAP 32     // Initial string buffer size
-#define CHAR_NAME_BUF_SIZE 16     // Character name buffer
 ```
-
-## Limitations
-
-- No first-class environments
-- No weak references
-- Single-threaded only
-- No module system
 
 ## License
 

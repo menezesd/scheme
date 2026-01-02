@@ -15,7 +15,7 @@ HEADERS = types.h context.h reader.h writer.h env.h primitives.h macros.h eval.h
 GENERATED = stdlib_data.h
 
 # Target executable
-TARGET = lisp
+TARGET = vesper
 
 .PHONY: all clean distclean debug test test-c test-prop test-all
 
