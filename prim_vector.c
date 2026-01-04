@@ -4,13 +4,21 @@
  */
 
 #include "prim_internal.h"
+#include <limits.h>
 
 unsigned apply_vector_primitive(unsigned prim_id, unsigned args)
 {
     switch (prim_id) {
     case PMAKEVEC: {
         REQUIRE_ARGS(args, 1, 2, "make-vector");
-        unsigned len = CELL_ID(car(args));
+        int64_t len64;
+        if (!expect_nonneg_int64(car(args), &len64, "make-vector"))
+            return TOK_ERROR;
+        if ((uint64_t)len64 > UINT_MAX) {
+            show_error("make-vector: length too large");
+            return TOK_ERROR;
+        }
+        unsigned len = (unsigned)len64;
         unsigned fill = cdr(args) ? cadr(args) : 0;
         return make_vector(len, fill);
     }
@@ -29,7 +37,9 @@ unsigned apply_vector_primitive(unsigned prim_id, unsigned args)
         unsigned vec = car(args);
         if (!IS_VECTOR(vec))
             ERROR_RETURN("vector-ref: not a vector");
-        int64_t idx = CELL_ID(cadr(args));
+        int64_t idx;
+        if (!expect_nonneg_int64(cadr(args), &idx, "vector-ref"))
+            return TOK_ERROR;
         CHECK_VECTOR_BOUNDS(idx, vec, "vector-ref");
         return vector_data_ptr(vec)[idx];
     }
@@ -38,7 +48,9 @@ unsigned apply_vector_primitive(unsigned prim_id, unsigned args)
         unsigned vec = car(args);
         if (!IS_VECTOR(vec))
             ERROR_RETURN("vector-set!: not a vector");
-        int64_t idx = CELL_ID(cadr(args));
+        int64_t idx;
+        if (!expect_nonneg_int64(cadr(args), &idx, "vector-set!"))
+            return TOK_ERROR;
         CHECK_VECTOR_BOUNDS(idx, vec, "vector-set!");
         unsigned val = caddr(args);
         write_barrier(vec, val); // Generational GC write barrier
@@ -68,7 +80,14 @@ unsigned apply_vector_primitive(unsigned prim_id, unsigned args)
     case PLIST2VEC: {
         REQUIRE_ARGS(args, 1, 1, "list->vector");
         unsigned lst = car(args);
-        unsigned len = list_length(lst);
+        unsigned len = 0;
+        for (unsigned it = lst; it; it = cdr(it)) {
+            if (!IS_PAIR(it)) {
+                show_error("list->vector: improper list");
+                return TOK_ERROR;
+            }
+            len++;
+        }
         unsigned vec = make_vector(len, 0);
         unsigned *data = vector_data_ptr(vec);
         for (unsigned i = 0; lst; lst = cdr(lst), i++)

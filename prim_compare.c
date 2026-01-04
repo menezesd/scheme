@@ -51,8 +51,10 @@ slow_path:;
 unsigned char_compare(unsigned args, cmp_op op, bool case_insensitive)
 {
     REQUIRE_ARGS(args, 2, 2, "char comparison");
-    int c1 = (int)CELL_ID(car(args));
-    int c2 = (int)CELL_ID(cadr(args));
+    CHECK_CHAR(car(args), "char comparison");
+    CHECK_CHAR(cadr(args), "char comparison");
+    int c1 = (unsigned char)CELL_ID(car(args));
+    int c2 = (unsigned char)CELL_ID(cadr(args));
     if (case_insensitive) {
         c1 = tolower(c1);
         c2 = tolower(c2);

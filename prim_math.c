@@ -507,18 +507,9 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned args)
     case PRANDOMINTEGER: {
         REQUIRE_ARGS(args, 1, 1, "random-integer");
         unsigned x = car(args);
-        enum lisp_type t = CELL_TYPE(x);
-        if (t != BT_NUM && t != BT_BIGNUM) {
-            show_error("random-integer: expected positive integer");
-            return TOK_ERROR;
-        }
-        // Get value - for simplicity, convert via double for bignums
         int64_t n;
-        if (t == BT_NUM) {
-            n = CELL_ID(x);
-        } else {
-            n = (int64_t)to_double(x);
-        }
+        if (!expect_exact_int64(x, &n, "random-integer"))
+            return TOK_ERROR;
         if (n <= 0) {
             show_error("random-integer: expected positive integer");
             return TOK_ERROR;
@@ -546,7 +537,10 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned args)
         if (t == BT_NUM) {
             seed = (uint64_t)CELL_ID(x);
         } else if (t == BT_BIGNUM) {
-            seed = (uint64_t)to_double(x);
+            if (bn_to_uint64(get_bignum(x), &seed) != 0) {
+                show_error("random-seed!: integer out of range");
+                return TOK_ERROR;
+            }
         } else {
             seed = (uint64_t)time(NULL);
         }

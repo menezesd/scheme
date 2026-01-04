@@ -203,7 +203,8 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned args)
     }
     case PWRITECHAR: {
         REQUIRE_ARGS(args, 1, 2, "write-char");
-        int c = (int)CELL_ID(car(args));
+        CHECK_CHAR(car(args), "write-char");
+        int c = (unsigned char)CELL_ID(car(args));
         FILE *fport;
         string_port *sport;
         int ptype = extract_output_port_ex(args, &fport, &sport, "write-char");
@@ -307,11 +308,11 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned args)
         int code = 0;
         if (args) {
             unsigned arg = car(args);
-            if (!IS_EXACT_INT(arg)) {
-                show_error("exit: expected integer");
+            int64_t code64;
+            if (!expect_exact_int64(arg, &code64, "exit")) {
                 return TOK_ERROR;
             }
-            code = (int)CELL_ID(arg);
+            code = (int)code64;
         }
         exit(code);
     }

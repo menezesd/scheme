@@ -40,8 +40,16 @@ unsigned prim_substring(unsigned args)
     CHECK_STRING(car(args), "substring");
     char *s = GET_STRING_PTR(car(args));
     size_t slen = strlen(s);
-    int64_t start = CELL_ID(cadr(args));
-    int64_t end = cddr(args) ? CELL_ID(caddr(args)) : (int64_t)slen;
+    int64_t start;
+    if (!expect_nonneg_int64(cadr(args), &start, "substring"))
+        return TOK_ERROR;
+    int64_t end;
+    if (cddr(args)) {
+        if (!expect_nonneg_int64(caddr(args), &end, "substring"))
+            return TOK_ERROR;
+    } else {
+        end = (int64_t)slen;
+    }
     if (start < 0 || end < start || end > (int64_t)slen) {
         show_error("substring: invalid indices");
         return TOK_ERROR;

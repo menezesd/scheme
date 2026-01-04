@@ -256,6 +256,35 @@ static inline bool is_zero_cell(unsigned x)
     return false;
 }
 
+static inline bool expect_exact_int64(unsigned val, int64_t *out,
+                                      const char *name)
+{
+    if (IS_NUM(val)) {
+        *out = CELL_ID(val);
+        return true;
+    }
+    if (IS_BIGNUM(val)) {
+        if (bn_to_int64(get_bignum(val), out) == 0)
+            return true;
+        show_error("%s: integer too large", name);
+        return false;
+    }
+    show_error("%s: expected exact integer", name);
+    return false;
+}
+
+static inline bool expect_nonneg_int64(unsigned val, int64_t *out,
+                                       const char *name)
+{
+    if (!expect_exact_int64(val, out, name))
+        return false;
+    if (*out < 0) {
+        show_error("%s: expected non-negative integer", name);
+        return false;
+    }
+    return true;
+}
+
 // ============================================================================
 // Comparison Operations (type needed for binary functions below)
 // ============================================================================

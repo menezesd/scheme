@@ -214,7 +214,9 @@ unsigned apply_primitive(unsigned prim_id, unsigned args)
         CHECK_STRING(car(args), "string-ref");
         char *s = GET_STRING_PTR(car(args));
         size_t len = strlen(s);
-        int64_t idx = CELL_ID(cadr(args));
+        int64_t idx;
+        if (!expect_nonneg_int64(cadr(args), &idx, "string-ref"))
+            return TOK_ERROR;
         if (idx < 0 || (size_t)idx >= len) {
             show_error("string-ref: index out of bounds");
             return TOK_ERROR;
@@ -226,7 +228,10 @@ unsigned apply_primitive(unsigned prim_id, unsigned args)
         CHECK_STRING(car(args), "string-set!");
         char *s = GET_STRING_PTR(car(args));
         size_t len = strlen(s);
-        int64_t idx = CELL_ID(cadr(args));
+        int64_t idx;
+        if (!expect_nonneg_int64(cadr(args), &idx, "string-set!"))
+            return TOK_ERROR;
+        CHECK_CHAR(caddr(args), "string-set!");
         char c = (char)CELL_ID(caddr(args));
         if (idx < 0 || (size_t)idx >= len) {
             show_error("string-set!: index out of bounds");
@@ -254,7 +259,13 @@ unsigned apply_primitive(unsigned prim_id, unsigned args)
     case PNUM2STR: {
         REQUIRE_ARGS(args, 1, 2, "number->string");
         unsigned num = car(args);
-        int radix = cdr(args) ? (int)CELL_ID(cadr(args)) : 10;
+        int radix = 10;
+        if (cdr(args)) {
+            int64_t radix64;
+            if (!expect_exact_int64(cadr(args), &radix64, "number->string"))
+                return TOK_ERROR;
+            radix = (int)radix64;
+        }
         if (radix < 2 || radix > 36) {
             show_error("number->string: radix must be between 2 and 36");
             return TOK_ERROR;
@@ -301,7 +312,13 @@ unsigned apply_primitive(unsigned prim_id, unsigned args)
         REQUIRE_ARGS(args, 1, 2, "string->number");
         CHECK_STRING(car(args), "string->number");
         char *s = GET_STRING_PTR(car(args));
-        int radix = cdr(args) ? (int)CELL_ID(cadr(args)) : 10;
+        int radix = 10;
+        if (cdr(args)) {
+            int64_t radix64;
+            if (!expect_exact_int64(cadr(args), &radix64, "string->number"))
+                return TOK_ERROR;
+            radix = (int)radix64;
+        }
         if (radix < 2 || radix > 36) {
             show_error("string->number: radix must be between 2 and 36");
             return TOK_ERROR;
@@ -320,12 +337,18 @@ unsigned apply_primitive(unsigned prim_id, unsigned args)
     }
     case PMAKESTR: {
         REQUIRE_ARGS(args, 1, 2, "make-string");
-        int64_t len = CELL_ID(car(args));
-        if (len < 0) {
-            show_error("make-string: negative length");
+        int64_t len;
+        if (!expect_nonneg_int64(car(args), &len, "make-string"))
+            return TOK_ERROR;
+        if ((uint64_t)len > SIZE_MAX - 1) {
+            show_error("make-string: length too large");
             return TOK_ERROR;
         }
-        char fill = cdr(args) ? (char)CELL_ID(cadr(args)) : ' ';
+        char fill = ' ';
+        if (cdr(args)) {
+            CHECK_CHAR(cadr(args), "make-string");
+            fill = (char)CELL_ID(cadr(args));
+        }
         char *s = malloc(len + 1);
         if (!s) {
             show_error("make-string: out of memory");
@@ -355,7 +378,18 @@ unsigned apply_primitive(unsigned prim_id, unsigned args)
     case PLIST2STR: {
         REQUIRE_ARGS(args, 1, 1, "list->string");
         unsigned lst = car(args);
-        size_t len = list_length(lst);
+        size_t len = 0;
+        for (unsigned it = lst; it; it = cdr(it)) {
+            if (!IS_PAIR(it)) {
+                show_error("list->string: improper list");
+                return TOK_ERROR;
+            }
+            if (!IS_CHAR(car(it))) {
+                show_error("list->string: list elements must be characters");
+                return TOK_ERROR;
+            }
+            len++;
+        }
         char *s = malloc(len + 1);
         if (!s) {
             show_error("list->string: out of memory");
@@ -372,7 +406,8 @@ unsigned apply_primitive(unsigned prim_id, unsigned args)
         REQUIRE_ARGS(args, 2, 2, "string-fill!");
         CHECK_STRING(car(args), "string-fill!");
         char *s = GET_STRING_PTR(car(args));
-        int c = (int)CELL_ID(cadr(args));
+        CHECK_CHAR(cadr(args), "string-fill!");
+        int c = (unsigned char)CELL_ID(cadr(args));
         size_t len = strlen(s);
         for (size_t i = 0; i < len; i++)
             s[i] = c;
