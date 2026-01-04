@@ -89,16 +89,18 @@ unsigned defvar(unsigned var, unsigned aval, unsigned env)
     vars = car(frame);
     vals = cdr(frame);
     // Protect all variables used across allocations
-    gc_protect(&frame);
-    gc_protect(&var);
-    gc_protect(&vars);
-    gc_protect(&aval);
-    gc_protect(&vals);
-    unsigned new_vars = 0;
-    gc_protect(&new_vars);
-    new_vars = alloc_cons(var, vars);
-    unsigned new_vals = alloc_cons(aval, vals);
-    gc_unprotect(6);
+    unsigned new_vars, new_vals;
+    {
+        GC_GUARD;
+        gc_protect(&frame);
+        gc_protect(&var);
+        gc_protect(&vars);
+        gc_protect(&aval);
+        gc_protect(&vals);
+        new_vars = alloc_cons(var, vars);
+        gc_protect(&new_vars);
+        new_vals = alloc_cons(aval, vals);
+    }
     write_barrier(frame, new_vars); // Generational GC
     write_barrier(frame, new_vals);
     CELL_CAR(frame) = new_vars;
@@ -183,6 +185,7 @@ unsigned lookup_silent(int64_t var, unsigned env)
 
 unsigned bind_params(unsigned params, unsigned args)
 {
+    GC_GUARD;
     unsigned vars = 0, vals = 0;
     unsigned vars_tail = 0, vals_tail = 0;
 
@@ -203,13 +206,12 @@ unsigned bind_params(unsigned params, unsigned args)
             lisp_panic("bind_params: var is not BT_ATOM");
         }
 
-        unsigned vc = 0;
-        gc_protect(&var);
-        gc_protect(&val);
-        gc_protect(&vc);
-        vc = alloc_cons(var, 0);
-        unsigned ac = alloc_cons(val, 0);
-        gc_unprotect(3);
+        unsigned vc = 0, ac;
+        {
+            GC_PROTECT_GUARD3(&var, &val, &vc);
+            vc = alloc_cons(var, 0);
+            ac = alloc_cons(val, 0);
+        }
         if (!vars) {
             vars = vc;
             vals = ac;
@@ -228,11 +230,13 @@ unsigned bind_params(unsigned params, unsigned args)
 
     // Handle rest parameter (dotted notation)
     if (params && CELL_TYPE(params) == BT_ATOM) {
-        unsigned vc = 0;
-        gc_protect(&vc);
-        vc = alloc_cons(params, 0);
-        unsigned ac = alloc_cons(args, 0);
-        gc_unprotect(1);
+        unsigned vc, ac;
+        {
+            GC_PROTECT_GUARD;
+            gc_protect(&vc);
+            vc = alloc_cons(params, 0);
+            ac = alloc_cons(args, 0);
+        }
         if (!vars) {
             vars = vc;
             vals = ac;
@@ -244,9 +248,7 @@ unsigned bind_params(unsigned params, unsigned args)
         }
     }
 
-    unsigned result = alloc_cons(vars, vals);
-    gc_unprotect(6);
-    return result;
+    return alloc_cons(vars, vals);
 }
 
 unsigned mk_primop(int64_t id)

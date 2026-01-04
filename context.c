@@ -408,12 +408,12 @@ unsigned normalize_rational(int64_t num, int64_t denom)
         return store(num);
     }
     // Create rational - store components first, then allocate cell
+    GC_GUARD;
     unsigned num_cell = store(num);
     gc_protect(&num_cell);
     unsigned denom_cell = store(denom);
     gc_protect(&denom_cell);
     unsigned p = alloc();
-    gc_unprotect(2);
     CELL_TYPE(p) = BT_RATIONAL;
     CELL_CAR(p) = num_cell;
     CELL_CDR(p) = denom_cell;
@@ -462,14 +462,11 @@ unsigned negate_number(unsigned x)
 unsigned normalize_rational_cells(unsigned num_cell, unsigned denom_cell)
 {
     // Protect inputs from GC during allocations
-    gc_protect(&num_cell);
-    gc_protect(&denom_cell);
+    GC_PROTECT_GUARD2(&num_cell, &denom_cell);
 
     // Convert to bignums for GCD calculation
     bignum *num = to_bignum(num_cell);
     bignum *denom = to_bignum(denom_cell);
-
-    gc_unprotect(2);
 
     if (!num || !denom) {
         if (num)
@@ -510,14 +507,13 @@ unsigned normalize_rational_cells(unsigned num_cell, unsigned denom_cell)
     }
 
     // Store numerator and denominator as cells
+    GC_GUARD;
     unsigned num_stored = store_integer(reduced_num);
     gc_protect(&num_stored);
     unsigned denom_stored = store_integer(reduced_denom);
-    gc_protect(&denom_stored);
 
     // Create rational cell
     unsigned p = alloc();
-    gc_unprotect(2);
     CELL_TYPE(p) = BT_RATIONAL;
     CELL_CAR(p) = num_stored;
     CELL_CDR(p) = denom_stored;
@@ -530,10 +526,8 @@ unsigned store_complex(unsigned real_part, unsigned imag_part)
     if (CELL_TYPE(imag_part) == BT_NUM && CELL_ID(imag_part) == 0) {
         return real_part;
     }
-    gc_protect(&real_part);
-    gc_protect(&imag_part);
+    GC_PROTECT_GUARD2(&real_part, &imag_part);
     unsigned p = alloc();
-    gc_unprotect(2);
     CELL_TYPE(p) = BT_COMPLEX;
     CELL_CAR(p) = real_part;
     CELL_CDR(p) = imag_part;
@@ -659,6 +653,7 @@ unsigned make_cont(enum cont_type type, unsigned data, unsigned env,
                    unsigned next)
 {
     // Protect ALL values that will be used after allocation
+    GC_GUARD;
     gc_protect(&data);
     gc_protect(&env);
     gc_protect(&next);
@@ -670,7 +665,6 @@ unsigned make_cont(enum cont_type type, unsigned data, unsigned env,
     type_data = alloc_cons(type, data);
     env_next = alloc_cons(env, next);
     unsigned p = alloc();
-    gc_unprotect(5);
 
     // Set up continuation structure
     CELL_TYPE(p) = BT_CONT;
@@ -685,6 +679,7 @@ unsigned make_cont_from_protected(enum cont_type type, unsigned *data_ptr,
                                   unsigned *env_ptr, unsigned *next_ptr)
 {
     // Protect intermediate allocations too
+    GC_GUARD;
     unsigned type_data = 0, env_next = 0;
     gc_protect(&type_data);
     gc_protect(&env_next);
@@ -694,7 +689,6 @@ unsigned make_cont_from_protected(enum cont_type type, unsigned *data_ptr,
     type_data = alloc_cons(type, *data_ptr);
     env_next = alloc_cons(*env_ptr, *next_ptr);
     unsigned p = alloc();
-    gc_unprotect(2);
 
     // Set up continuation structure
     CELL_TYPE(p) = BT_CONT;
@@ -809,12 +803,15 @@ unsigned atom_from_string(const char *s)
                 double real_val = strtod(s, &endptr);
                 unsigned real_part =
                     (endptr == sep) ? store_inexact(real_val) : store(0);
-                gc_protect(&real_part);
 
                 // Parse imaginary part (without the trailing i)
-                double imag_val = strtod(sep, &endptr);
-                unsigned imag_part = store_inexact(imag_val);
-                gc_unprotect(1);
+                unsigned imag_part;
+                {
+                    GC_PROTECT_GUARD;
+                    gc_protect(&real_part);
+                    double imag_val = strtod(sep, &endptr);
+                    imag_part = store_inexact(imag_val);
+                }
 
                 return store_complex(real_part, imag_part);
             }
@@ -925,36 +922,35 @@ unsigned atom_from_string(const char *s)
             }
 
             // Parse denominator
-            gc_protect(&num_cell);
-            char *end2;
-            errno = 0;
-            int64_t denom_val = strtoll(slash + 1, &end2, 10);
-            unsigned denom_cell;
-            if (*end2 == '\0') {
-                // Parsed successfully to end
-                if (errno == ERANGE) {
-                    // Overflow - parse as bignum
-                    bignum *bn = bn_from_string(slash + 1, 10);
-                    if (!bn) {
-                        gc_unprotect(1);
-                        return TOK_ERROR;
+            {
+                GC_PROTECT_GUARD;
+                gc_protect(&num_cell);
+                char *end2;
+                errno = 0;
+                int64_t denom_val = strtoll(slash + 1, &end2, 10);
+                unsigned denom_cell;
+                if (*end2 == '\0') {
+                    // Parsed successfully to end
+                    if (errno == ERANGE) {
+                        // Overflow - parse as bignum
+                        bignum *bn = bn_from_string(slash + 1, 10);
+                        if (!bn) {
+                            return TOK_ERROR;
+                        }
+                        denom_cell = store_integer(bn);
+                    } else {
+                        denom_cell = store(denom_val);
                     }
-                    denom_cell = store_integer(bn);
-                } else {
-                    denom_cell = store(denom_val);
-                }
-                gc_unprotect(1);
-                return normalize_rational_cells(num_cell, denom_cell);
-            } else {
-                // Didn't parse to end - might be bignum
-                bignum *bn = bn_from_string(slash + 1, 10);
-                if (bn) {
-                    denom_cell = store_integer(bn);
-                    gc_unprotect(1);
                     return normalize_rational_cells(num_cell, denom_cell);
+                } else {
+                    // Didn't parse to end - might be bignum
+                    bignum *bn = bn_from_string(slash + 1, 10);
+                    if (bn) {
+                        denom_cell = store_integer(bn);
+                        return normalize_rational_cells(num_cell, denom_cell);
+                    }
                 }
             }
-            gc_unprotect(1);
         }
     not_rational:
 
@@ -1020,12 +1016,15 @@ void list_append(unsigned *head, unsigned *tail, unsigned elem)
     // CRITICAL: Protect elem - alloc() can trigger GC which may move elem.
     // If we pass elem by value to alloc_cons, GC could make that value stale.
     // By protecting elem here, we ensure it's updated if GC moves it.
-    gc_protect(&elem);
-    unsigned cell = alloc();
-    CELL_TYPE(cell) = BT_CONS;
-    CELL_CAR(cell) = elem; // elem is now up-to-date after any GC
-    CELL_CDR(cell) = 0;
-    gc_unprotect(1);
+    unsigned cell;
+    {
+        GC_PROTECT_GUARD;
+        gc_protect(&elem);
+        cell = alloc();
+        CELL_TYPE(cell) = BT_CONS;
+        CELL_CAR(cell) = elem; // elem is now up-to-date after any GC
+        CELL_CDR(cell) = 0;
+    }
     if (!*head) {
         *head = *tail = cell;
     } else {

@@ -551,41 +551,42 @@ static compile_result compile_lambda(unsigned expr, compile_ctx *cctx)
     // by lambda parameters (e.g., (lambda (exit) (exit 'x)) should not
     // call the exit primitive)
     unsigned lambda_env = cctx->env;
-    gc_protect(&lambda_env);
-    gc_protect(&params);
-    gc_protect(&body);
 
     // Build a dummy frame with parameters as vars, all bound to 0
-    unsigned vars = 0, vals = 0;
-    gc_protect(&vars);
-    gc_protect(&vals);
-    unsigned vars_tail = 0, vals_tail = 0;
-    gc_protect(&vars_tail);
-    gc_protect(&vals_tail);
+    {
+        GC_GUARD;
+        gc_protect(&lambda_env);
+        gc_protect(&params);
+        gc_protect(&body);
+        unsigned vars = 0, vals = 0;
+        gc_protect(&vars);
+        gc_protect(&vals);
+        unsigned vars_tail = 0, vals_tail = 0;
+        gc_protect(&vars_tail);
+        gc_protect(&vals_tail);
 
-    for (unsigned p = params; p; p = IS_PAIR(p) ? cdr(p) : 0) {
-        unsigned var = IS_PAIR(p) ? car(p) : p;
-        unsigned vc = alloc_cons(var, 0);
-        unsigned ac = alloc_cons(0, 0); // dummy value
-        if (!vars) {
-            vars = vc;
-            vals = ac;
-        } else {
-            CELL_CDR(vars_tail) = vc;
-            CELL_CDR(vals_tail) = ac;
+        for (unsigned p = params; p; p = IS_PAIR(p) ? cdr(p) : 0) {
+            unsigned var = IS_PAIR(p) ? car(p) : p;
+            unsigned vc = alloc_cons(var, 0);
+            unsigned ac = alloc_cons(0, 0); // dummy value
+            if (!vars) {
+                vars = vc;
+                vals = ac;
+            } else {
+                CELL_CDR(vars_tail) = vc;
+                CELL_CDR(vals_tail) = ac;
+            }
+            vars_tail = vc;
+            vals_tail = ac;
+            if (!IS_PAIR(p))
+                break; // rest param
         }
-        vars_tail = vc;
-        vals_tail = ac;
-        if (!IS_PAIR(p))
-            break; // rest param
-    }
 
-    if (vars) {
-        unsigned frame = alloc_cons(vars, vals);
-        lambda_env = alloc_cons(frame, lambda_env);
+        if (vars) {
+            unsigned frame = alloc_cons(vars, vals);
+            lambda_env = alloc_cons(frame, lambda_env);
+        }
     }
-
-    gc_unprotect(7);
 
     // Create new compilation context for lambda body with shadowed params
     compile_ctx *lambda_cctx = cctx_new(cctx, lambda_env);

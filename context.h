@@ -301,6 +301,11 @@ void gc_release(int mark);
 // Cleanup function for __attribute__((cleanup))
 static inline void gc_release_ptr(int *mark) { gc_release(*mark); }
 
+// Helper macros for unique variable names
+#define GC_CONCAT_(a, b) a##b
+#define GC_CONCAT(a, b) GC_CONCAT_(a, b)
+#define GC_UNIQUE_VAR GC_CONCAT(_gc_guard_, __LINE__)
+
 // GC_GUARD: RAII-style protection using cleanup attribute
 // Automatically releases all protected vars when the variable goes out of scope.
 // Usage:
@@ -309,7 +314,8 @@ static inline void gc_release_ptr(int *mark) { gc_release(*mark); }
 //   gc_protect(&b);
 //   ... allocations ...
 //   // Automatically released when scope exits (including early returns!)
-#define GC_GUARD __attribute__((cleanup(gc_release_ptr))) int _gc_guard = gc_mark()
+#define GC_GUARD                                                               \
+    __attribute__((cleanup(gc_release_ptr))) int GC_UNIQUE_VAR = gc_mark()
 
 // Convenience macros for protecting multiple values at once
 // Usage: GC_PROTECT2(&a, &b);  // Protects both, use GC_GUARD for auto-release
@@ -346,19 +352,18 @@ static inline void gc_protect4(unsigned *a, unsigned *b, unsigned *c,
 //       GC_PROTECT_GUARD2(&a, &b);
 //       ... allocations that may trigger GC ...
 //   } // a and b automatically unprotected here
-#define GC_PROTECT_GUARD                                                       \
-    __attribute__((cleanup(gc_release_ptr))) int _gc_guard = gc_mark()
+#define GC_PROTECT_GUARD GC_GUARD
 
 #define GC_PROTECT_GUARD2(a, b)                                                \
-    GC_PROTECT_GUARD;                                                          \
+    GC_GUARD;                                                                  \
     gc_protect2(a, b)
 
 #define GC_PROTECT_GUARD3(a, b, c)                                             \
-    GC_PROTECT_GUARD;                                                          \
+    GC_GUARD;                                                                  \
     gc_protect3(a, b, c)
 
 #define GC_PROTECT_GUARD4(a, b, c, d)                                          \
-    GC_PROTECT_GUARD;                                                          \
+    GC_GUARD;                                                                  \
     gc_protect4(a, b, c, d)
 
 // ============================================================================
