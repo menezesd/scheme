@@ -26,6 +26,7 @@
 #include "context.h"
 #include "bignum.h"
 #include "bytecode.h"
+#include "env.h"
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
@@ -1355,6 +1356,9 @@ unsigned gc(unsigned root)
     // Exit GC mode
     in_gc_mode = false;
 
+    // Invalidate environment lookup cache (cell references are now stale)
+    env_invalidate_cache();
+
     return root;
 }
 
@@ -1622,6 +1626,9 @@ unsigned minor_gc(unsigned root)
 
     // Reset nursery - all survivors are now in old gen
     ctx.nursery_ptr = ctx.nursery_start;
+
+    // Invalidate environment lookup cache (cell references may have moved)
+    env_invalidate_cache();
 
     return root;
 }

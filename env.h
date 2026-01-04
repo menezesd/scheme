@@ -59,6 +59,9 @@ unsigned lookup(int64_t var, unsigned env);
 // Look up a variable silently (no error if not found)
 unsigned lookup_silent(int64_t var, unsigned env);
 
+// Invalidate lookup cache (call after GC or major environment changes)
+void env_invalidate_cache(void);
+
 // Bind parameters to arguments, supporting variadic (a b . rest) syntax
 unsigned bind_params(unsigned params, unsigned args);
 

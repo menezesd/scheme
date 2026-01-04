@@ -31,6 +31,31 @@
 #include "context.h"
 
 // ============================================================================
+// Lookup Cache
+// ============================================================================
+// Single-entry cache for variable lookups. Most code has high locality -
+// the same variables are accessed repeatedly in loops. This cache avoids
+// redundant environment traversals.
+
+static struct {
+    int64_t var;      // Variable atom ID
+    unsigned env;     // Environment where found
+    unsigned val_cell; // Cell containing the value (so mutations are visible)
+} lookup_cache = {-1, 0, 0};
+
+// Invalidate cache when environment is modified
+static inline void invalidate_lookup_cache(void)
+{
+    lookup_cache.var = -1;
+}
+
+// Public function to invalidate cache (called after GC)
+void env_invalidate_cache(void)
+{
+    invalidate_lookup_cache();
+}
+
+// ============================================================================
 // Environment Structure
 // ============================================================================
 //
@@ -63,6 +88,9 @@ unsigned empty_environment(void)
 
 unsigned defvar(unsigned var, unsigned aval, unsigned env)
 {
+    // Invalidate lookup cache - new binding may shadow outer variables
+    invalidate_lookup_cache();
+
     unsigned frame = car(env);
     int64_t vid = CELL_ID(var);
     unsigned vals = cdr(frame);
@@ -145,19 +173,33 @@ unsigned setvar(int64_t var, unsigned aval, unsigned env)
 // Internal lookup - returns TOK_ERROR if not found (no error message)
 static unsigned lookup_internal(int64_t var, unsigned env)
 {
+    // Check cache first - same variable in same environment?
+    if (lookup_cache.var == var && lookup_cache.env == env) {
+        return car(lookup_cache.val_cell);
+    }
+
+    unsigned orig_env = env;
     while (env) {
         unsigned frame = car(env);
         for (unsigned vars = car(frame), vals = cdr(frame); vars;
              vars = cdr(vars), vals = cdr(vals)) {
             if (CELL_TYPE(vars) == BT_ATOM) {
                 if (CELL_ID(vars) == var) {
-                    return vals;
+                    // Cache hit location (vals is the cell containing value)
+                    lookup_cache.var = var;
+                    lookup_cache.env = orig_env;
+                    lookup_cache.val_cell = vals;
+                    return car(vals);
                 } else {
                     break;
                 }
             }
 
             if (CELL_ID(car(vars)) == var) {
+                // Cache hit location (vals is the cell containing value)
+                lookup_cache.var = var;
+                lookup_cache.env = orig_env;
+                lookup_cache.val_cell = vals;
                 return car(vals);
             }
         }
