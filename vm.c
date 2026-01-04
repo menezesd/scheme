@@ -627,8 +627,39 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
 
         unsigned op = vm->code->code[vm->ip++];
 
+        // Fast paths for most common opcodes (skip switch dispatch overhead)
+        if (op == OP_CONST) {
+            unsigned idx = vm->code->code[vm->ip++];
+            // Inline stack push with overflow check
+            if (__builtin_expect(vm->sp < vm->stack_cap, 1)) {
+                vm->stack[vm->sp++] = vm->code->constants[idx];
+            } else {
+                vm_push(vm, vm->code->constants[idx]);
+            }
+            continue;
+        }
+
+        if (op == OP_LOOKUP) {
+            int64_t sym_id = vm->code->code[vm->ip++];
+            unsigned val = lookup(sym_id, vm->env);
+            if (__builtin_expect(val != TOK_ERROR, 1)) {
+                // Inline stack push with overflow check
+                if (__builtin_expect(vm->sp < vm->stack_cap, 1)) {
+                    vm->stack[vm->sp++] = val;
+                } else {
+                    vm_push(vm, val);
+                }
+                continue;
+            }
+            vm->error = true;
+            vm->error_msg = "undefined variable";
+            vm->running = false;
+            break;
+        }
+
         switch (op) {
         case OP_CONST: {
+            // Fallback (shouldn't reach here normally)
             unsigned idx = vm->code->code[vm->ip++];
             vm_push(vm, vm->code->constants[idx]);
             break;
@@ -651,6 +682,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
         }
 
         case OP_LOOKUP: {
+            // Fallback (shouldn't reach here normally - fast path above)
             int64_t sym_id = vm->code->code[vm->ip++];
             unsigned val = lookup(sym_id, vm->env);
             if (val == TOK_ERROR) {

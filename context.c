@@ -724,8 +724,23 @@ static bool str_equals(const char *a, const char *b)
 // Maximum load factor before warning (70%)
 #define ATOM_TABLE_LOAD_WARN (TABLE_SIZE * 70 / 100)
 
+// Symbol interning cache - most code reuses the same symbols repeatedly
+#define INTERN_CACHE_SIZE 8
+static struct {
+    const char *str; // Pointer into atom_table (not owned)
+    int atom_id;
+} intern_cache[INTERN_CACHE_SIZE];
+static int intern_cache_next = 0;
+
 int intern(const char *s)
 {
+    // Check cache first - O(1) for recently used symbols
+    for (int i = 0; i < INTERN_CACHE_SIZE; i++) {
+        if (intern_cache[i].str && strcmp(intern_cache[i].str, s) == 0) {
+            return intern_cache[i].atom_id;
+        }
+    }
+
     int hash_value = hash_function(s);
     int original_hash = hash_value;
 
@@ -753,6 +768,12 @@ int intern(const char *s)
                     TABLE_SIZE);
         }
     }
+
+    // Update cache with this lookup (circular buffer)
+    intern_cache[intern_cache_next].str = ctx.atom_table[hash_value];
+    intern_cache[intern_cache_next].atom_id = hash_value;
+    intern_cache_next = (intern_cache_next + 1) % INTERN_CACHE_SIZE;
+
     return hash_value;
 }
 
