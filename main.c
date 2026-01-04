@@ -72,6 +72,7 @@ static unsigned eval_batch(unsigned exprs, unsigned env)
     if (!cdr(exprs))
         return eval_expr(car(exprs), env);
 
+    GC_GUARD;
     gc_protect(&exprs);
     int begin_id = intern("begin");
     unsigned begin_atom = alloc();
@@ -79,7 +80,6 @@ static unsigned eval_batch(unsigned exprs, unsigned env)
     CELL_ID(begin_atom) = begin_id;
     gc_protect(&begin_atom);
     unsigned begin_form = alloc_cons(begin_atom, exprs);
-    gc_unprotect(2);
 
     return eval_expr(begin_form, env);
 }
@@ -87,6 +87,7 @@ static unsigned eval_batch(unsigned exprs, unsigned env)
 static bool load_from_port(FILE *f, unsigned *env, bool warn_on_error,
                            const char *filename)
 {
+    GC_GUARD;
     const char *old_filename = reader_get_filename();
     reader_set_filename(filename);
     reader_reset_position();
@@ -106,7 +107,6 @@ static bool load_from_port(FILE *f, unsigned *env, bool warn_on_error,
 
         unsigned expr = read_obj_port(f);
         if (expr == TOK_ERROR) {
-            gc_unprotect(2);
             reader_set_filename(old_filename);
             return false;
         }
@@ -115,11 +115,9 @@ static bool load_from_port(FILE *f, unsigned *env, bool warn_on_error,
 
         gc_protect(&expr);
         list_append(&all_exprs, &all_tail, expr);
-        gc_unprotect(1);
+        gc_unprotect(1); // expr - per-iteration cleanup
         *env = maybe_gc(*env, 75);
     }
-
-    gc_unprotect(2);
 
     if (!all_exprs) {
         *env = gc(*env);
@@ -149,8 +147,6 @@ static bool load_from_port(FILE *f, unsigned *env, bool warn_on_error,
             if (batch) {
                 unsigned result = eval_batch(batch, *env);
                 if (result == TOK_ERROR) {
-                    gc_unprotect(
-                        5); // expr, exprs, all_exprs, batch_tail, batch
                     reader_set_filename(old_filename);
                     if (warn_on_error)
                         fprintf(stderr, "Warning: error during load\n");
@@ -160,20 +156,19 @@ static bool load_from_port(FILE *f, unsigned *env, bool warn_on_error,
             }
             // Evaluate define-syntax immediately
             unsigned result = eval_expr(expr, *env);
-            gc_unprotect(1); // expr
+            gc_unprotect(1); // expr - per-iteration cleanup
             if (result == TOK_ERROR) {
-                gc_unprotect(4); // exprs, all_exprs, batch_tail, batch
                 reader_set_filename(old_filename);
                 if (warn_on_error)
                     fprintf(stderr, "Warning: error during load\n");
                 return false;
             }
         } else {
-            gc_unprotect(1); // expr (will be re-protected by list_append)
+            gc_unprotect(1); // expr - will be re-protected by list_append
             // Add to batch
             gc_protect(&expr);
             list_append(&batch, &batch_tail, expr);
-            gc_unprotect(1);
+            gc_unprotect(1); // expr - per-iteration cleanup
         }
     }
 
@@ -181,7 +176,6 @@ static bool load_from_port(FILE *f, unsigned *env, bool warn_on_error,
     if (batch) {
         unsigned result = eval_batch(batch, *env);
         if (result == TOK_ERROR) {
-            gc_unprotect(4); // exprs, all_exprs, batch_tail, batch
             reader_set_filename(old_filename);
             if (warn_on_error)
                 fprintf(stderr, "Warning: error during load\n");
@@ -189,7 +183,6 @@ static bool load_from_port(FILE *f, unsigned *env, bool warn_on_error,
         }
     }
 
-    gc_unprotect(4); // exprs, all_exprs, batch_tail, batch
     *env = gc(*env);
     reader_set_filename(old_filename);
     return true;

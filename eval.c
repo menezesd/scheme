@@ -63,6 +63,7 @@ static unsigned qq_expand_depth(unsigned x, unsigned env, int depth)
         return x;
     }
 
+    GC_GUARD;
     unsigned head = car(x);
 
     // Check for (unquote expr) - only if unquote is not shadowed
@@ -78,7 +79,6 @@ static unsigned qq_expand_depth(unsigned x, unsigned env, int depth)
                 return TOK_ERROR;
             gc_protect(&inner);
             unsigned result = alloc_cons(head, alloc_cons(inner, 0));
-            gc_unprotect(1);
             return result;
         }
     }
@@ -96,7 +96,6 @@ static unsigned qq_expand_depth(unsigned x, unsigned env, int depth)
                 return TOK_ERROR;
             gc_protect(&inner);
             unsigned result = alloc_cons(head, alloc_cons(inner, 0));
-            gc_unprotect(1);
             return result;
         }
     }
@@ -109,7 +108,6 @@ static unsigned qq_expand_depth(unsigned x, unsigned env, int depth)
             return TOK_ERROR;
         gc_protect(&inner);
         unsigned result = alloc_cons(head, alloc_cons(inner, 0));
-        gc_unprotect(1);
         return result;
     }
 
@@ -128,38 +126,34 @@ static unsigned qq_expand_depth(unsigned x, unsigned env, int depth)
                 // Evaluate and splice
                 unsigned spliced = eval_cps(cadr(elem), env);
                 if (spliced == TOK_ERROR) {
-                    gc_unprotect(3);
                     return spliced;
                 }
                 gc_protect(&spliced);
                 for (; IS_PAIR(spliced); spliced = cdr(spliced)) {
                     list_append(&result, &tail, car(spliced));
                 }
-                gc_unprotect(1);
+                gc_unprotect(1); // spliced - per-iteration cleanup
             } else {
                 // Keep but expand inside
                 unsigned inner = qq_expand_depth(cadr(elem), env, depth - 1);
                 if (inner == TOK_ERROR) {
-                    gc_unprotect(3);
                     return inner;
                 }
                 gc_protect(&inner);
                 unsigned kept =
                     alloc_cons(ctx.kw_unquote_splicing, alloc_cons(inner, 0));
-                gc_unprotect(1);
+                gc_unprotect(1); // inner - per-iteration cleanup
                 list_append(&result, &tail, kept);
             }
         } else {
             unsigned expanded = qq_expand_depth(elem, env, depth);
             if (expanded == TOK_ERROR) {
-                gc_unprotect(3);
                 return expanded;
             }
             list_append(&result, &tail, expanded);
         }
-        gc_unprotect(1); // l
+        gc_unprotect(1); // l - per-iteration cleanup
     }
-    gc_unprotect(2); // tail, result
     return result;
 }
 
@@ -222,6 +216,7 @@ static void eval_step(void)
         // Not a special form - evaluate function position first
         // Protect head, arg_exprs, env and cont - use pointer version for GC
         // safety
+        GC_GUARD;
         unsigned arg_exprs = cdr(id);
         gc_protect(&head);
         gc_protect(&arg_exprs);
@@ -229,7 +224,6 @@ static void eval_step(void)
         gc_protect(&cont);
         unsigned k =
             make_cont_from_protected(CONT_EVAL_FN, &arg_exprs, &env, &cont);
-        gc_unprotect(4);
         tramp_eval(head, env, k);
         return;
     }
@@ -290,12 +284,12 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
                 tramp_error();
                 return;
             }
+            GC_GUARD;
             unsigned proc = car(args);
             gc_protect(&proc);
             gc_protect(&cont);
             gc_protect(&env);
             unsigned cont_args = alloc_cons(cont, 0);
-            gc_unprotect(3);
             apply_function(proc, cont_args, env, cont);
             return;
         }
@@ -308,6 +302,7 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
                 tramp_error();
                 return;
             }
+            GC_GUARD;
             unsigned proc = car(args);
             args = cdr(args);
 
@@ -333,7 +328,6 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
                 proc_args = alloc_cons(car(prefix), proc_args);
                 prefix = cdr(prefix);
             }
-            gc_unprotect(4);
 
             apply_function(proc, proc_args, env, cont);
             return;
@@ -346,6 +340,7 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
                 tramp_error();
                 return;
             }
+            GC_GUARD;
             unsigned producer = car(args);
             unsigned consumer = cadr(args);
             // Protect producer, consumer, env and cont across make_cont
@@ -355,7 +350,6 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
             gc_protect(&cont);
             // Create continuation to handle producer's result
             unsigned k = make_cont(CONT_CALLWITHVALUES, consumer, env, cont);
-            gc_unprotect(4);
             // Call producer with no arguments
             apply_function(producer, 0, env, k);
             return;
@@ -450,6 +444,7 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
             if (!cdr(exprs)) {
                 tramp_eval(car(exprs), env, cont);
             } else {
+                GC_GUARD;
                 unsigned first_expr = car(exprs);
                 unsigned rest = cdr(exprs);
                 gc_protect(&first_expr);
@@ -457,25 +452,27 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
                 gc_protect(&env);
                 gc_protect(&cont);
                 unsigned k = make_cont(CONT_BEGIN, rest, env, cont);
-                gc_unprotect(4);
                 tramp_eval(first_expr, env, k);
             }
             return;
         }
 
         // Protect cont across apply_primitive (which can allocate/trigger GC)
-        gc_protect(&cont);
-        unsigned result = apply_primitive(prim_id, args);
-        gc_unprotect(1);
-        if (result == TOK_ERROR) {
-            tramp_error();
+        {
+            GC_GUARD;
+            gc_protect(&cont);
+            unsigned result = apply_primitive(prim_id, args);
+            if (result == TOK_ERROR) {
+                tramp_error();
+                return;
+            }
+            tramp_apply(result, cont);
             return;
         }
-        tramp_apply(result, cont);
-        return;
     }
 
     if (IS_FUNCTION(fn)) {
+        GC_GUARD;
         unsigned params = car(fn);
         unsigned body_env = cdr(fn);
         unsigned body = car(body_env);
@@ -494,7 +491,6 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
         unsigned new_env = alloc_cons(frame, def_env);
 
         if (!cdr(body)) {
-            gc_unprotect(6); // params, args, body, def_env, cont, frame
             tramp_eval(car(body), new_env, cont);
         } else {
             unsigned first_expr = car(body);
@@ -503,8 +499,6 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
             gc_protect(&rest_body);
             gc_protect(&new_env);
             unsigned k = make_cont(CONT_APPLY_FUNC, rest_body, new_env, cont);
-            gc_unprotect(9); // first_expr, rest_body, new_env, frame, cont,
-                             // def_env, body, args, params
             tramp_eval(first_expr, new_env, k);
         }
         return;
@@ -542,10 +536,10 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
 unsigned eval_cps(unsigned expr, unsigned env)
 {
     // Protect expr and env across make_halt_cont() which can trigger GC
+    GC_GUARD;
     gc_protect(&expr);
     gc_protect(&env);
     unsigned halt_k = make_halt_cont();
-    gc_unprotect(2);
     tramp_eval(expr, env, halt_k);
 
     while (tramp.mode != TRAMP_DONE && tramp.mode != TRAMP_ERROR) {

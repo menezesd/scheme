@@ -467,6 +467,7 @@ unsigned apply_primitive(unsigned prim_id, unsigned args)
     }
     case PGCSTATS: {
         REQUIRE_ARGS(args, 0, 0, "gc-stats");
+        GC_GUARD;
         // Return ((minor . count) (major . count) (heap-used . bytes))
         unsigned minor = store(ctx.minor_gc_count);
         gc_protect(&minor);
@@ -475,7 +476,6 @@ unsigned apply_primitive(unsigned prim_id, unsigned args)
         unsigned heap_used = store(ctx.hptr - ctx.mmin);
         gc_protect(&heap_used);
         unsigned nursery_used = store(ctx.nursery_ptr - ctx.nursery_start);
-        gc_unprotect(3);
         unsigned result = alloc_cons(
             alloc_cons(atom_from_string("minor-gc"), minor),
             alloc_cons(
