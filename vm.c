@@ -341,7 +341,9 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
         int64_t prim_id = CELL_ID(fn);
 
         // Build argument list in correct order by iterating stack in reverse
+        GC_GUARD;
         unsigned args = 0;
+        gc_protect(&args);
         for (int i = (int)argc - 1; i >= 0; i--) {
             unsigned val = vm->stack[vm->sp - argc + i];
             args = alloc_cons(val, args);
@@ -360,6 +362,7 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
                 return;
             }
             unsigned proc = car(args);
+            gc_protect(&proc);
             unsigned cont = capture_continuation(vm);
             // Push continuation as argument and call proc
             vm_push(vm, cont);
@@ -376,11 +379,14 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
                 return;
             }
             unsigned proc = car(args);
+            gc_protect(&proc);
             args = cdr(args);
 
             // Collect all args except last, then append last list
             unsigned apply_args = 0;
             unsigned prefix = 0;
+            gc_protect(&apply_args);
+            gc_protect(&prefix);
             while (cdr(args)) {
                 prefix = alloc_cons(car(args), prefix);
                 args = cdr(args);
@@ -394,7 +400,14 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
             }
 
             // Count and push args
-            unsigned apply_argc = list_length(apply_args);
+            unsigned apply_argc = 0;
+            if (!list_length_checked(apply_args, &apply_argc, "apply")) {
+                vm->error = true;
+                vm->error_msg =
+                    ctx.last_error[0] ? ctx.last_error : "apply error";
+                vm->running = false;
+                return;
+            }
             FORLIST(a, apply_args) { vm_push(vm, car(a)); }
             vm_apply(vm, proc, apply_argc, tail);
             return;

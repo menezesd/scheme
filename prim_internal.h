@@ -285,6 +285,18 @@ static inline bool expect_nonneg_int64(unsigned val, int64_t *out,
     return true;
 }
 
+static inline bool check_numeric_args(unsigned args, const char *name)
+{
+    FORLIST(a, args)
+    {
+        if (!is_numeric(car(a))) {
+            show_error("%s: not a number", name);
+            return false;
+        }
+    }
+    return true;
+}
+
 // ============================================================================
 // Comparison Operations (type needed for binary functions below)
 // ============================================================================

@@ -216,6 +216,9 @@ unsigned atom_from_string(const char *s);
 // Count list length
 unsigned list_length(unsigned lst);
 
+// Count list length for proper lists; returns false and reports error on improper
+bool list_length_checked(unsigned lst, unsigned *len_out, const char *name);
+
 // Find last cons cell in a proper list (returns 0 for empty list)
 static inline unsigned list_last(unsigned lst)
 {

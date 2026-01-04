@@ -52,22 +52,6 @@ static inline compile_result dynamic_result(void)
     return (compile_result){false, 0};
 }
 
-// Check if a keyword is shadowed by a local binding
-// Returns true if shadowed (caller should treat as procedure call)
-static bool is_keyword_shadowed(int64_t kw, unsigned env)
-{
-    unsigned val = lookup_silent(kw, env);
-    // If not found, not shadowed
-    if (val == TOK_ERROR)
-        return false;
-    // If found but it's a syntax transformer, it's a macro override, not
-    // shadowing
-    if (IS_SYNTAX(val))
-        return false;
-    // Otherwise, it's shadowed by a regular binding
-    return true;
-}
-
 // Look up a variable in the known_lambdas alist
 // Returns the lambda expression if found, 0 otherwise
 static unsigned lookup_known_lambda(int64_t var_id, unsigned known_lambdas)
@@ -2051,6 +2035,5 @@ code_object *compile_toplevel(unsigned expr, unsigned env)
     cctx_free(cctx);
     return result;
 }
-
 
 

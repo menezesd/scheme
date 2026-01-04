@@ -10,6 +10,16 @@ unsigned numeric_compare(unsigned args, cmp_op op)
     if (!args)
         return ctx.atom_true;
 
+    static const char *cmp_names[] = {"=", "<", ">", "<=", ">="};
+    const char *name = (op <= CMP_GE) ? cmp_names[op] : "comparison";
+    FORLIST(a, args)
+    {
+        if (!is_numeric(car(a))) {
+            show_error("%s: not a number", name);
+            return TOK_ERROR;
+        }
+    }
+
     // Fast path: all BT_NUM - no type checks in loop
     unsigned first = car(args);
     if (IS_NUM(first)) {

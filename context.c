@@ -985,6 +985,21 @@ unsigned list_length(unsigned lst)
     return len;
 }
 
+bool list_length_checked(unsigned lst, unsigned *len_out, const char *name)
+{
+    unsigned len = 0;
+    for (unsigned it = lst; it; it = cdr(it)) {
+        if (!IS_PAIR(it)) {
+            show_error("%s: improper list", name);
+            return false;
+        }
+        len++;
+    }
+    if (len_out)
+        *len_out = len;
+    return true;
+}
+
 bool check_args(unsigned args, unsigned min, unsigned max, const char *name)
 {
     // Early-exit optimization: only count as many args as needed to decide.

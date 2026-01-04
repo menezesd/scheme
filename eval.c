@@ -50,12 +50,6 @@ static void apply_cont_step(void);
 // Quasiquote Expansion
 // ============================================================================
 
-// Helper to check if a keyword is shadowed in the environment
-static bool is_keyword_shadowed(int64_t kw, unsigned env)
-{
-    return lookup_silent(kw, env) != TOK_ERROR;
-}
-
 // Helper for nested quasiquote expansion with depth tracking
 static unsigned qq_expand_depth(unsigned x, unsigned env, int depth)
 {

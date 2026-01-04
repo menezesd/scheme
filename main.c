@@ -74,10 +74,9 @@ static unsigned eval_batch(unsigned exprs, unsigned env)
 
     GC_GUARD;
     gc_protect(&exprs);
-    int begin_id = intern("begin");
     unsigned begin_atom = alloc();
     CELL_TYPE(begin_atom) = BT_ATOM;
-    CELL_ID(begin_atom) = begin_id;
+    CELL_ID(begin_atom) = ctx.kw_begin;
     gc_protect(&begin_atom);
     unsigned begin_form = alloc_cons(begin_atom, exprs);
 

@@ -527,22 +527,6 @@ typedef struct {
 // Get keyword pointer by offset in lisp_context
 #define KW_ENTRY(name, handler_fn) {&ctx.kw_##name, handler_fn}
 
-// Check if a keyword is shadowed by a local binding
-// Returns true if shadowed (caller should treat as procedure call)
-static bool is_keyword_shadowed(int64_t kw, unsigned env)
-{
-    unsigned val = lookup_silent(kw, env);
-    // If not found, not shadowed
-    if (val == TOK_ERROR)
-        return false;
-    // If found but it's a syntax transformer, it's a macro override, not
-    // shadowing
-    if (IS_SYNTAX(val))
-        return false;
-    // Otherwise, it's shadowed by a regular binding
-    return true;
-}
-
 bool dispatch_special_form(int64_t kw, unsigned id, unsigned env, unsigned cont)
 {
     // Check each special form

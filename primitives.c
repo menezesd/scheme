@@ -124,7 +124,10 @@ unsigned apply_primitive(unsigned prim_id, unsigned args)
             return store(strlen((char *)(intptr_t)CELL_ID(lst)));
         if (CELL_TYPE(lst) == BT_VECTOR)
             return store(vector_len(lst));
-        return store(list_length(lst));
+        unsigned len = 0;
+        if (!list_length_checked(lst, &len, "length"))
+            return TOK_ERROR;
+        return store(len);
     }
     case PAPPEND:
         return prim_append(args);
@@ -369,7 +372,9 @@ unsigned apply_primitive(unsigned prim_id, unsigned args)
         CHECK_STRING(car(args), "string->list");
         char *s = GET_STRING_PTR(car(args));
         size_t len = strlen(s);
+        GC_GUARD;
         unsigned result = 0;
+        gc_protect(&result);
         for (size_t i = len; i > 0; i--) {
             result = alloc_cons(make_char(s[i - 1]), result);
         }

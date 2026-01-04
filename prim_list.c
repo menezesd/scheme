@@ -33,22 +33,30 @@ unsigned prim_append(unsigned args)
     gc_protect(&result);
     gc_protect(&tail);
     gc_protect(&a);
-    while (cdr(a)) {
+    for (; IS_PAIR(a) && cdr(a); a = cdr(a)) {
         unsigned lst = car(a);
         gc_protect(&lst);
         while (lst && CELL_TYPE(lst) == BT_CONS) {
             list_append(&result, &tail, car(lst));
             lst = cdr(lst);
         }
+        if (lst) {
+            gc_unprotect(1);
+            show_error("append: improper list");
+            return TOK_ERROR;
+        }
         gc_unprotect(1);
-        a = cdr(a);
     }
-    unsigned last = list_last(args);
+    if (!IS_PAIR(a)) {
+        show_error("append: improper argument list");
+        return TOK_ERROR;
+    }
+    unsigned last = car(a);
     if (tail) {
-        write_barrier(tail, car(last)); // tail may be in old gen
-        CELL_CDR(tail) = car(last);
+        write_barrier(tail, last); // tail may be in old gen
+        CELL_CDR(tail) = last;
     }
-    return result ? result : car(last);
+    return result ? result : last;
 }
 
 unsigned prim_reverse(unsigned args)
@@ -61,5 +69,9 @@ unsigned prim_reverse(unsigned args)
     gc_protect(&result);
     for (; lst && CELL_TYPE(lst) == BT_CONS; lst = cdr(lst))
         result = alloc_cons(car(lst), result);
+    if (lst) {
+        show_error("reverse: improper list");
+        return TOK_ERROR;
+    }
     return result;
 }

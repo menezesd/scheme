@@ -82,6 +82,10 @@ const char *type_name(unsigned cell)
         return "multiple-values";
     case BT_BUILTIN:
         return "primitive";
+    case BT_CLOSURE:
+        return "bytecode-closure";
+    case BT_VMCONT:
+        return "vm-continuation";
     default:
         return "unknown";
     }

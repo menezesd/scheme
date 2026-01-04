@@ -39,6 +39,8 @@ unsigned prim_plus(unsigned args)
     return store(v);
 
 slow_path:;
+    if (!check_numeric_args(args, "+"))
+        return TOK_ERROR;
     bool exact;
     numeric_level level = classify_args(args, &exact);
 
@@ -165,6 +167,8 @@ unsigned prim_mult(unsigned args)
     return store(v);
 
 slow_path:;
+    if (!check_numeric_args(args, "*"))
+        return TOK_ERROR;
     bool exact;
     numeric_level level = classify_args(args, &exact);
 
@@ -295,6 +299,8 @@ unsigned prim_minus(unsigned args)
     }
 
 slow_path:;
+    if (!check_numeric_args(args, "-"))
+        return TOK_ERROR;
     bool exact;
     numeric_level level = classify_args(args, &exact);
 
@@ -442,6 +448,8 @@ unsigned prim_div(unsigned args)
     }
 
 slow_path:;
+    if (!check_numeric_args(args, "/"))
+        return TOK_ERROR;
     bool exact;
     numeric_level level = classify_args(args, &exact);
 
@@ -591,6 +599,10 @@ unsigned prim_modulo(unsigned args)
 {
     REQUIRE_ARGS(args, 2, 2, "modulo");
     unsigned xa = car(args), xb = cadr(args);
+    if (!IS_EXACT_INT(xa) || !IS_EXACT_INT(xb)) {
+        show_error("modulo: expected exact integer");
+        return TOK_ERROR;
+    }
     // Handle bignums
     if (EITHER_BIGNUM(xa, xb)) {
         bignum *a = to_bignum(xa);
@@ -626,6 +638,10 @@ unsigned prim_remainder(unsigned args)
 {
     REQUIRE_ARGS(args, 2, 2, "remainder");
     unsigned xa = car(args), xb = cadr(args);
+    if (!IS_EXACT_INT(xa) || !IS_EXACT_INT(xb)) {
+        show_error("remainder: expected exact integer");
+        return TOK_ERROR;
+    }
     // Handle bignums
     if (EITHER_BIGNUM(xa, xb)) {
         bignum *a = to_bignum(xa);
@@ -651,6 +667,10 @@ unsigned prim_quotient(unsigned args)
 {
     REQUIRE_ARGS(args, 2, 2, "quotient");
     unsigned xa = car(args), xb = cadr(args);
+    if (!IS_EXACT_INT(xa) || !IS_EXACT_INT(xb)) {
+        show_error("quotient: expected exact integer");
+        return TOK_ERROR;
+    }
     // Handle bignums
     if (EITHER_BIGNUM(xa, xb)) {
         bignum *a = to_bignum(xa);

@@ -213,8 +213,7 @@ extern code_object *code_object_registry;
  * Stored as a cons cell: car = BT_CLOSURE marker cell, cdr = env
  * The marker cell's id holds the code_object pointer.
  */
-#define BT_CLOSURE 100 // New cell type for VM closures
-#define BT_VMCONT 101  // VM continuation (distinct from CPS BT_CONT)
+// BT_CLOSURE and BT_VMCONT are defined in enum lisp_type (types.h)
 
 // Accessor macros for closures - code_object* stored in separate cell's id
 #define GET_CLOSURE_CODE(c) ((code_object *)(intptr_t)CELL_ID(CELL_CAR(c)))

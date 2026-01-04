@@ -32,6 +32,22 @@ static inline bool is_syntax_rules(unsigned transformer_form)
     return IS_KEYWORD(car(transformer_form), ctx.kw_syntax_rules);
 }
 
+// Check if a keyword is shadowed by a local binding
+// Returns true if shadowed (caller should treat as procedure call)
+static inline bool is_keyword_shadowed(int64_t kw, unsigned env)
+{
+    unsigned val = lookup_silent(kw, env);
+    // If not found, not shadowed
+    if (val == TOK_ERROR)
+        return false;
+    // If found but it's a syntax transformer, it's a macro override, not
+    // shadowing
+    if (IS_SYNTAX(val))
+        return false;
+    // Otherwise, it's shadowed by a regular binding
+    return true;
+}
+
 // Evaluate a body sequence (handles single vs multiple expressions)
 static inline void eval_body(unsigned body, unsigned env, unsigned cont)
 {
