@@ -1540,6 +1540,93 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
         }
     }
 
+    // ========================================================================
+    // Lambda Inlining: ((lambda (params) body) args) -> inline as let
+    // ========================================================================
+    // This avoids closure allocation and function call overhead
+    if (IS_PAIR(fn_expr) && IS_ATOM(car(fn_expr)) &&
+        CELL_ID(car(fn_expr)) == ctx.kw_lambda &&
+        !is_keyword_shadowed(ctx.kw_lambda, cctx->env)) {
+
+        unsigned lambda_params = cadr(fn_expr);
+        unsigned lambda_body = cddr(fn_expr);
+
+        // Count params and check for rest parameter
+        unsigned param_count = 0;
+        bool has_rest = false;
+        for (unsigned p = lambda_params; p; p = cdr(p)) {
+            if (CELL_TYPE(p) == BT_ATOM) {
+                has_rest = true;
+                break;
+            }
+            param_count++;
+        }
+
+        // Count arguments
+        unsigned arg_count = list_length(args);
+
+        // Only inline if arity matches exactly (no rest params for now)
+        if (!has_rest && param_count == arg_count) {
+            // Save tail position before compiling arguments
+            bool tail = cctx->tail_position;
+
+            // Compile all argument values first (in current environment)
+            cctx->tail_position = false;
+            FORLIST(a, args) { compile_expr_internal(car(a), cctx); }
+
+            // Push new environment frame
+            emit(cctx, OP_PUSHENV);
+
+            // Collect parameter names
+            unsigned param_ids[256];
+            unsigned i = 0;
+            for (unsigned p = lambda_params; p && i < 256; p = cdr(p)) {
+                param_ids[i++] = CELL_ID(car(p));
+            }
+
+            // Define in reverse order (pop from stack)
+            for (int j = param_count - 1; j >= 0; j--) {
+                emit2(cctx, OP_DEFINE, param_ids[j]);
+            }
+
+            // Extend compile-time environment with params for body compilation
+            unsigned saved_env = cctx->env;
+            {
+                GC_GUARD;
+                gc_protect(&lambda_params);
+                gc_protect(&lambda_body);
+                unsigned frame_vars = 0, frame_vals = 0;
+                gc_protect(&frame_vars);
+                gc_protect(&frame_vals);
+
+                for (unsigned p = lambda_params; p; p = cdr(p)) {
+                    unsigned var = car(p);
+                    gc_protect(&var);
+                    unsigned vc = alloc_cons(var, frame_vars);
+                    frame_vars = vc;
+                    unsigned val = alloc_cons(0, frame_vals);
+                    frame_vals = val;
+                    gc_unprotect(1);
+                }
+
+                unsigned frame = alloc_cons(frame_vars, frame_vals);
+                cctx->env = alloc_cons(frame, cctx->env);
+            }
+
+            // Compile body in tail position
+            cctx->tail_position = tail;
+            compile_begin(lambda_body, cctx);
+
+            // Restore compile-time environment
+            cctx->env = saved_env;
+
+            // Pop environment frame
+            emit(cctx, OP_POPENV);
+
+            return dynamic_result();
+        }
+    }
+
     // General case: compile function and arguments
     unsigned argc = 0;
     bool tail = cctx->tail_position;
