@@ -340,28 +340,22 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
     if (IS_BUILTIN(fn)) {
         int64_t prim_id = CELL_ID(fn);
 
-        // Build argument list in correct order by iterating stack in reverse
-        GC_GUARD;
-        unsigned args = 0;
-        gc_protect(&args);
-        for (int i = (int)argc - 1; i >= 0; i--) {
-            unsigned val = vm->stack[vm->sp - argc + i];
-            args = alloc_cons(val, args);
-        }
+        // Get pointer to arguments on stack (no list building needed)
+        unsigned *argv = &vm->stack[vm->sp - argc];
 
-        // Pop arguments
-        vm->sp -= argc;
+        // GC_GUARD for automatic cleanup of any gc_protect calls
+        GC_GUARD;
 
         // Handle special primitives
         if (prim_id == PCALLCC) {
             // call/cc: pass continuation to procedure
             if (argc != 1) {
-                vm->error = true;
-                vm->error_msg = "call/cc: expected 1 argument";
-                vm->running = false;
+                vm->sp -= argc;
+                VM_ERROR(vm, "call/cc: expected 1 argument");
                 return;
             }
-            unsigned proc = car(args);
+            unsigned proc = argv[0];
+            vm->sp -= argc;
             gc_protect(&proc);
             unsigned cont = capture_continuation(vm);
             // Push continuation as argument and call proc
@@ -373,48 +367,50 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
         if (prim_id == PAPPLY) {
             // apply: (apply proc arg1 ... args-list)
             if (argc < 2) {
-                vm->error = true;
-                vm->error_msg = "apply: expected at least 2 arguments";
-                vm->running = false;
+                vm->sp -= argc;
+                VM_ERROR(vm, "apply: expected at least 2 arguments");
                 return;
             }
-            unsigned proc = car(args);
+            unsigned proc = argv[0];
+            unsigned last_list = argv[argc - 1];
+
+            // Copy middle args before popping (they'll be overwritten)
+            unsigned middle_count = (argc > 2) ? argc - 2 : 0;
+            unsigned middle_args[16]; // Should be enough for typical use
+            for (unsigned i = 0; i < middle_count && i < 16; i++) {
+                middle_args[i] = argv[i + 1];
+            }
+
+            // Pop args from stack
+            vm->sp -= argc;
+
+            // Protect values across allocations
             gc_protect(&proc);
-            args = cdr(args);
+            gc_protect(&last_list);
 
-            // Collect all args except last, then append last list
-            unsigned apply_args = 0;
-            unsigned prefix = 0;
-            gc_protect(&apply_args);
-            gc_protect(&prefix);
-            while (cdr(args)) {
-                prefix = alloc_cons(car(args), prefix);
-                args = cdr(args);
-            }
-            apply_args = car(args); // Last arg is the list
-
-            // Prepend reversed prefix
-            while (prefix) {
-                apply_args = alloc_cons(car(prefix), apply_args);
-                prefix = cdr(prefix);
-            }
-
-            // Count and push args
+            // Push middle args then append last list
             unsigned apply_argc = 0;
-            if (!list_length_checked(apply_args, &apply_argc, "apply")) {
-                vm->error = true;
-                vm->error_msg =
-                    ctx.last_error[0] ? ctx.last_error : "apply error";
-                vm->running = false;
-                return;
+            for (unsigned i = 0; i < middle_count && i < 16; i++) {
+                vm_push(vm, middle_args[i]);
+                apply_argc++;
             }
-            FORLIST(a, apply_args) { vm_push(vm, car(a)); }
+
+            // Append the last list's elements
+            FORLIST(a, last_list)
+            {
+                vm_push(vm, car(a));
+                apply_argc++;
+            }
+
             vm_apply(vm, proc, apply_argc, tail);
             return;
         }
 
-        // Regular primitive
-        unsigned result = apply_primitive(prim_id, args);
+        // Regular primitive - pass stack values directly as argv
+        // Note: We keep argv on the stack during the call for GC protection,
+        // then pop and push result in one operation (replacing args with result)
+        unsigned result = apply_primitive_argv(prim_id, argc, argv);
+        vm->sp -= argc; // Pop args after primitive returns
         if (result == TOK_ERROR) {
             vm->error = true;
             vm->error_msg =
@@ -737,56 +733,47 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             int64_t prim_id = vm->code->code[vm->ip++];
             unsigned argc = vm->code->code[vm->ip++];
 
-            // Build argument list in correct order by iterating in reverse
-            // Protect args from GC during list building
-            unsigned args = 0;
-            gc_protect(&args);
-            for (int i = (int)argc - 1; i >= 0; i--) {
-                args = alloc_cons(vm->stack[vm->sp - argc + i], args);
-            }
-            gc_unprotect(1);
-
-            vm->sp -= argc;
+            // Get pointer to arguments on stack (no list building needed)
+            unsigned *argv = &vm->stack[vm->sp - argc];
 
             // Handle special primitives that need full apply treatment
             if (prim_id == PAPPLY) {
                 // apply: (apply proc arg1 ... args-list)
                 if (argc < 2) {
-                    vm->error = true;
-                    vm->error_msg = "apply: expected at least 2 arguments";
-                    vm->running = false;
-                    break;
+                    VM_ERROR_BREAK(vm, "apply: expected at least 2 arguments");
                 }
-                unsigned proc = car(args);
-                args = cdr(args);
+                unsigned proc = argv[0];
+                unsigned last_list = argv[argc - 1];
+
+                // Copy middle args before popping (they'll be overwritten)
+                unsigned middle_count = (argc > 2) ? argc - 2 : 0;
+                unsigned middle_args[16]; // Should be enough for typical use
+                for (unsigned i = 0; i < middle_count && i < 16; i++) {
+                    middle_args[i] = argv[i + 1];
+                }
+
+                // Pop args from stack
+                vm->sp -= argc;
 
                 // Protect values across allocations
+                GC_GUARD;
                 gc_protect(&proc);
-                gc_protect(&args);
+                gc_protect(&last_list);
 
-                // Collect all args except last, then append last list
-                unsigned apply_args = 0;
-                unsigned prefix = 0;
-                gc_protect(&apply_args);
-                gc_protect(&prefix);
-
-                while (cdr(args)) {
-                    prefix = alloc_cons(car(args), prefix);
-                    args = cdr(args);
-                }
-                apply_args = car(args); // Last arg is the list
-
-                // Prepend reversed prefix
-                while (prefix) {
-                    apply_args = alloc_cons(car(prefix), apply_args);
-                    prefix = cdr(prefix);
+                // Push middle args then append last list
+                unsigned apply_argc = 0;
+                for (unsigned i = 0; i < middle_count && i < 16; i++) {
+                    vm_push(vm, middle_args[i]);
+                    apply_argc++;
                 }
 
-                gc_unprotect(4);
+                // Append the last list's elements
+                FORLIST(a, last_list)
+                {
+                    vm_push(vm, car(a));
+                    apply_argc++;
+                }
 
-                // Count and push args
-                unsigned apply_argc = list_length(apply_args);
-                FORLIST(a, apply_args) { vm_push(vm, car(a)); }
                 vm_apply(vm, proc, apply_argc, false);
                 break;
             }
@@ -794,31 +781,21 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             // Special handling for load - uses callback to main.c
             if (prim_id == PLOAD) {
                 if (argc != 1) {
-                    vm->error = true;
-                    vm->error_msg = "load: expected 1 argument";
-                    vm->running = false;
-                    break;
+                    vm->sp -= argc;
+                    VM_ERROR_BREAK(vm, "load: expected 1 argument");
                 }
-                unsigned filename_cell = car(args);
+                unsigned filename_cell = argv[0];
+                vm->sp -= argc;
                 if (CELL_TYPE(filename_cell) != BT_STRING) {
-                    vm->error = true;
-                    vm->error_msg = "load: expected string argument";
-                    vm->running = false;
-                    break;
+                    VM_ERROR_BREAK(vm, "load: expected string argument");
                 }
                 if (!ctx.load_callback) {
-                    vm->error = true;
-                    vm->error_msg = "load: callback not set";
-                    vm->running = false;
-                    break;
+                    VM_ERROR_BREAK(vm, "load: callback not set");
                 }
                 const char *filename = GET_STRING_PTR(filename_cell);
                 unsigned result = ctx.load_callback(filename, &vm->env);
                 if (result == TOK_ERROR) {
-                    vm->error = true;
-                    vm->error_msg = "load failed";
-                    vm->running = false;
-                    break;
+                    VM_ERROR_BREAK(vm, "load failed");
                 }
                 vm_push(vm, result);
                 break;
@@ -827,13 +804,13 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             // Special handling for call-with-values
             if (prim_id == PCALLWITHVALUES) {
                 if (argc != 2) {
-                    vm->error = true;
-                    vm->error_msg = "call-with-values: expected 2 arguments";
-                    vm->running = false;
-                    break;
+                    vm->sp -= argc;
+                    VM_ERROR_BREAK(vm,
+                                   "call-with-values: expected 2 arguments");
                 }
-                unsigned producer = car(args);
-                unsigned consumer = cadr(args);
+                unsigned producer = argv[0];
+                unsigned consumer = argv[1];
+                vm->sp -= argc;
                 unsigned result;
 
                 gc_protect(&consumer);
@@ -860,7 +837,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                     }
                 } else if (CELL_TYPE(producer) == BT_BUILTIN) {
                     // Builtin - call directly with no args
-                    result = apply_primitive(CELL_ID(producer), 0);
+                    result = apply_primitive_argv(CELL_ID(producer), 0, NULL);
                 } else {
                     gc_unprotect(2);
                     vm->error = true;
@@ -873,10 +850,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 gc_unprotect(2);
 
                 if (result == TOK_ERROR) {
-                    vm->error = true;
-                    vm->error_msg = "call-with-values: producer failed";
-                    vm->running = false;
-                    break;
+                    VM_ERROR_BREAK(vm, "call-with-values: producer failed");
                 }
 
                 // If result is multival, unpack values as args to consumer
@@ -899,12 +873,10 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
 
             // Special handling for interaction-environment
             if (prim_id == PINTERACTIONENV) {
+                vm->sp -= argc;
                 if (argc != 0) {
-                    vm->error = true;
-                    vm->error_msg =
-                        "interaction-environment: expected 0 arguments";
-                    vm->running = false;
-                    break;
+                    VM_ERROR_BREAK(
+                        vm, "interaction-environment: expected 0 arguments");
                 }
                 vm_push(vm, vm->env); // Return current environment
                 break;
@@ -913,33 +885,28 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             // Special handling for eval - uses callback to main.c
             if (prim_id == PEVAL) {
                 if (argc < 1 || argc > 2) {
-                    vm->error = true;
-                    vm->error_msg = "eval: expected 1 or 2 arguments";
-                    vm->running = false;
-                    break;
+                    vm->sp -= argc;
+                    VM_ERROR_BREAK(vm, "eval: expected 1 or 2 arguments");
                 }
-                unsigned expr = car(args);
-                unsigned eval_env =
-                    (argc == 2) ? cadr(args) : vm->env; // Use current env if
-                                                        // not specified
+                unsigned expr = argv[0];
+                unsigned eval_env = (argc == 2) ? argv[1] : vm->env;
+                vm->sp -= argc;
                 if (!ctx.eval_callback) {
-                    vm->error = true;
-                    vm->error_msg = "eval: callback not set";
-                    vm->running = false;
-                    break;
+                    VM_ERROR_BREAK(vm, "eval: callback not set");
                 }
                 unsigned result = ctx.eval_callback(expr, eval_env);
                 if (result == TOK_ERROR) {
-                    vm->error = true;
-                    vm->error_msg = "eval failed";
-                    vm->running = false;
-                    break;
+                    VM_ERROR_BREAK(vm, "eval failed");
                 }
                 vm_push(vm, result);
                 break;
             }
 
-            unsigned result = apply_primitive(prim_id, args);
+            // Regular primitive - pass stack values directly as argv
+            // Note: We keep argv on the stack during the call for GC protection,
+            // then pop and push result in one operation (replacing args with result)
+            unsigned result = apply_primitive_argv(prim_id, argc, argv);
+            vm->sp -= argc; // Pop args after primitive returns
             if (result == TOK_ERROR) {
                 vm->error = true;
                 vm->error_msg =

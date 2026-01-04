@@ -5,27 +5,21 @@
 
 #include "prim_internal.h"
 
-unsigned numeric_compare(unsigned args, cmp_op op)
+unsigned numeric_compare(unsigned argc, unsigned *argv, cmp_op op)
 {
-    if (!args)
+    if (argc == 0)
         return ctx.atom_true;
 
     static const char *cmp_names[] = {"=", "<", ">", "<=", ">="};
     const char *name = (op <= CMP_GE) ? cmp_names[op] : "comparison";
-    FORLIST(a, args)
-    {
-        if (!is_numeric(car(a))) {
-            show_error("%s: not a number", name);
-            return TOK_ERROR;
-        }
-    }
+    if (!check_numeric_argv(argc, argv, name))
+        return TOK_ERROR;
 
-    // Fast path: all BT_NUM - no type checks in loop
-    unsigned first = car(args);
+    unsigned first = argv[0];
     if (IS_NUM(first)) {
         int64_t prev = CELL_ID(first);
-        for (unsigned a = cdr(args); a; a = cdr(a)) {
-            unsigned c = car(a);
+        for (unsigned i = 1; i < argc; i++) {
+            unsigned c = argv[i];
             if (!IS_NUM(c))
                 goto slow_path;
             int64_t curr = CELL_ID(c);
@@ -37,12 +31,11 @@ unsigned numeric_compare(unsigned args, cmp_op op)
     }
 
 slow_path:;
-    unsigned prev = car(args);
-    for (unsigned a = cdr(args); a; a = cdr(a)) {
-        unsigned curr = car(a);
+    unsigned prev = argv[0];
+    for (unsigned i = 1; i < argc; i++) {
+        unsigned curr = argv[i];
         bool ok;
 
-        // Use exact comparison for exact integers
         if (IS_EXACT_INT(prev) && IS_EXACT_INT(curr)) {
             int cmp = compare_exact_integers(prev, curr);
             ok = APPLY_CMP_OP(op, cmp, 0);
@@ -58,13 +51,14 @@ slow_path:;
     return ctx.atom_true;
 }
 
-unsigned char_compare(unsigned args, cmp_op op, bool case_insensitive)
+unsigned char_compare(unsigned argc, unsigned *argv, cmp_op op,
+                      bool case_insensitive)
 {
-    REQUIRE_ARGS(args, 2, 2, "char comparison");
-    CHECK_CHAR(car(args), "char comparison");
-    CHECK_CHAR(cadr(args), "char comparison");
-    int c1 = (unsigned char)CELL_ID(car(args));
-    int c2 = (unsigned char)CELL_ID(cadr(args));
+    REQUIRE_ARGC(argc, 2, 2, "char comparison");
+    CHECK_CHAR(argv[0], "char comparison");
+    CHECK_CHAR(argv[1], "char comparison");
+    int c1 = (unsigned char)CELL_ID(argv[0]);
+    int c2 = (unsigned char)CELL_ID(argv[1]);
     if (case_insensitive) {
         c1 = tolower(c1);
         c2 = tolower(c2);
@@ -72,13 +66,14 @@ unsigned char_compare(unsigned args, cmp_op op, bool case_insensitive)
     return APPLY_CMP_OP(op, c1, c2) ? ctx.atom_true : ctx.atom_false;
 }
 
-unsigned string_compare(unsigned args, cmp_op op, bool case_insensitive)
+unsigned string_compare(unsigned argc, unsigned *argv, cmp_op op,
+                        bool case_insensitive)
 {
-    REQUIRE_ARGS(args, 2, 2, "string comparison");
-    CHECK_STRING(car(args), "string comparison");
-    CHECK_STRING(cadr(args), "string comparison");
-    char *s1 = GET_STRING_PTR(car(args));
-    char *s2 = GET_STRING_PTR(cadr(args));
+    REQUIRE_ARGC(argc, 2, 2, "string comparison");
+    CHECK_STRING(argv[0], "string comparison");
+    CHECK_STRING(argv[1], "string comparison");
+    char *s1 = GET_STRING_PTR(argv[0]);
+    char *s2 = GET_STRING_PTR(argv[1]);
     int cmp = case_insensitive ? strcasecmp(s1, s2) : strcmp(s1, s2);
     return APPLY_CMP_OP(op, cmp, 0) ? ctx.atom_true : ctx.atom_false;
 }

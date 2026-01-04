@@ -6,10 +6,11 @@
 #include "bytecode.h"
 #include "prim_internal.h"
 
-unsigned apply_type_predicate(unsigned prim_id, unsigned args)
+unsigned apply_type_predicate(unsigned prim_id, unsigned argc,
+                              unsigned *argv)
 {
-    REQUIRE_ARGS(args, 1, 1, "type predicate");
-    unsigned arg = car(args);
+    REQUIRE_ARGC(argc, 1, 1, "type predicate");
+    unsigned arg = argv[0];
     switch (prim_id) {
     case PSYMP:
         return IS_ATOM(arg) ? ctx.atom_true : ctx.atom_false;

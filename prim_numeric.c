@@ -21,16 +21,15 @@
 
 #include "prim_internal.h"
 
-unsigned prim_plus(unsigned args)
+unsigned prim_plus(unsigned argc, unsigned *argv)
 {
-    if (!args)
+    if (argc == 0)
         return store(0);
 
     // Fast path: try pure integer arithmetic with builtin overflow detection
     int64_t v = 0;
-    FORLIST(a, args)
-    {
-        unsigned x = car(a);
+    for (unsigned i = 0; i < argc; i++) {
+        unsigned x = argv[i];
         if (!IS_NUM(x))
             goto slow_path;
         if (__builtin_add_overflow(v, CELL_ID(x), &v))
@@ -39,103 +38,88 @@ unsigned prim_plus(unsigned args)
     return store(v);
 
 slow_path:;
-    if (!check_numeric_args(args, "+"))
+    if (!check_numeric_argv(argc, argv, "+"))
         return TOK_ERROR;
     bool exact;
-    numeric_level level = classify_args(args, &exact);
+    numeric_level level = classify_args_argv(argc, argv, &exact);
 
     switch (level) {
     case NUM_COMPLEX: {
-        // Check if all complex operands are exact
         bool all_complex_exact = true;
-        FORLIST(a, args)
-        {
-            if (!is_complex_exact(car(a))) {
+        for (unsigned i = 0; i < argc; i++) {
+            if (!is_complex_exact(argv[i])) {
                 all_complex_exact = false;
                 break;
             }
         }
 
         if (all_complex_exact) {
-            // Exact complex addition: (a+bi) + (c+di) = (a+c) + (b+d)i
             GC_GUARD;
             unsigned real_sum = store(0), imag_sum = store(0);
             gc_protect(&real_sum);
             gc_protect(&imag_sum);
-            FORLIST(a, args)
-            {
-                unsigned r, i;
-                get_complex_cells(car(a), &r, &i);
+            for (unsigned i = 0; i < argc; i++) {
+                unsigned r, im;
+                get_complex_cells(argv[i], &r, &im);
                 real_sum = binary_add(real_sum, r);
-                imag_sum = binary_add(imag_sum, i);
+                imag_sum = binary_add(imag_sum, im);
             }
             return make_complex_exact(real_sum, imag_sum);
         }
 
-        // Fall back to inexact
         double real = 0.0, imag = 0.0;
-        FORLIST(a, args)
-        {
-            double r, i;
-            get_complex_parts(car(a), &r, &i);
+        for (unsigned i = 0; i < argc; i++) {
+            double r, im;
+            get_complex_parts(argv[i], &r, &im);
             real += r;
-            imag += i;
+            imag += im;
         }
         return make_complex_result(real, imag, exact);
     }
     case NUM_INEXACT: {
         double sum = 0.0;
-        FORLIST(a, args)
-        sum += to_double(car(a));
+        for (unsigned i = 0; i < argc; i++)
+            sum += to_double(argv[i]);
         return store_inexact(sum);
     }
     case NUM_RATIONAL: {
-        // Rational addition: a/b + c/d = (ad + bc) / bd
-        // Use cell-based arithmetic to support bignum numerators/denominators
         GC_GUARD;
         unsigned num = store(0), denom = store(1);
         gc_protect(&num);
         gc_protect(&denom);
-        FORLIST(a, args)
-        {
+        for (unsigned i = 0; i < argc; i++) {
             unsigned n, d;
-            get_rational_cells(car(a), &n, &d);
-            // num = num * d + n * denom
+            get_rational_cells(argv[i], &n, &d);
             unsigned ad = multiply_cells(num, d);
             gc_protect(&ad);
             unsigned bc = multiply_cells(n, denom);
             num = add_cells(ad, bc);
             gc_unprotect(1);
-            // denom = denom * d
             denom = multiply_cells(denom, d);
         }
         return normalize_rational_cells(num, denom);
     }
     case NUM_BIGNUM: {
         bignum *result = bn_from_int(0);
-        FORLIST(a, args)
-        {
-            bignum *operand = to_bignum(car(a));
+        for (unsigned i = 0; i < argc; i++) {
+            bignum *operand = to_bignum(argv[i]);
             bn_add_ip(result, operand);
             bn_free(operand);
         }
         return store_integer(result);
     }
     case NUM_INTEGER: {
-        // Pure integer arithmetic with builtin overflow detection
         int64_t sum = 0;
-        FORLIST(a, args)
-        {
-            int64_t x = CELL_ID(car(a));
+        for (unsigned i = 0; i < argc; i++) {
+            int64_t x = CELL_ID(argv[i]);
             int64_t new_sum;
             if (__builtin_add_overflow(sum, x, &new_sum)) {
-                // Overflow - switch to bignum arithmetic
                 bignum *result = bn_from_int(sum);
                 bignum *operand = bn_from_int(x);
                 bn_add_ip(result, operand);
                 bn_free(operand);
-                for (a = cdr(a); a; a = cdr(a)) {
-                    operand = to_bignum(car(a));
+                for (unsigned j = i + 1; j < argc; j++) {
+                    operand = to_bignum(argv[j]);
                     bn_add_ip(result, operand);
                     bn_free(operand);
                 }
@@ -146,19 +130,17 @@ slow_path:;
         return store(sum);
     }
     }
-    return store(0); // Unreachable
+    return store(0);
 }
 
-unsigned prim_mult(unsigned args)
+unsigned prim_mult(unsigned argc, unsigned *argv)
 {
-    if (!args)
+    if (argc == 0)
         return store(1);
 
-    // Fast path: try pure integer arithmetic with builtin overflow detection
     int64_t v = 1;
-    FORLIST(a, args)
-    {
-        unsigned x = car(a);
+    for (unsigned i = 0; i < argc; i++) {
+        unsigned x = argv[i];
         if (!IS_NUM(x))
             goto slow_path;
         if (__builtin_mul_overflow(v, CELL_ID(x), &v))
@@ -167,41 +149,34 @@ unsigned prim_mult(unsigned args)
     return store(v);
 
 slow_path:;
-    if (!check_numeric_args(args, "*"))
+    if (!check_numeric_argv(argc, argv, "*"))
         return TOK_ERROR;
     bool exact;
-    numeric_level level = classify_args(args, &exact);
+    numeric_level level = classify_args_argv(argc, argv, &exact);
 
     switch (level) {
     case NUM_COMPLEX: {
-        // Check if all complex operands are exact
         bool all_complex_exact = true;
-        FORLIST(a, args)
-        {
-            if (!is_complex_exact(car(a))) {
+        for (unsigned i = 0; i < argc; i++) {
+            if (!is_complex_exact(argv[i])) {
                 all_complex_exact = false;
                 break;
             }
         }
 
         if (all_complex_exact) {
-            // Exact complex multiplication: (a+bi) * (c+di) = (ac-bd) +
-            // (ad+bc)i
             GC_GUARD;
             unsigned real_prod = store(1), imag_prod = store(0);
             gc_protect(&real_prod);
             gc_protect(&imag_prod);
-            FORLIST(a, args)
-            {
-                unsigned r, i;
-                get_complex_cells(car(a), &r, &i);
-                // nr = real*r - imag*i
-                // ni = real*i + imag*r
+            for (unsigned i = 0; i < argc; i++) {
+                unsigned r, im;
+                get_complex_cells(argv[i], &r, &im);
                 unsigned ac = binary_mul(real_prod, r);
                 gc_protect(&ac);
-                unsigned bd = binary_mul(imag_prod, i);
+                unsigned bd = binary_mul(imag_prod, im);
                 gc_protect(&bd);
-                unsigned ad = binary_mul(real_prod, i);
+                unsigned ad = binary_mul(real_prod, im);
                 gc_protect(&ad);
                 unsigned bc = binary_mul(imag_prod, r);
                 unsigned new_real = binary_sub(ac, bd);
@@ -213,14 +188,12 @@ slow_path:;
             return make_complex_exact(real_prod, imag_prod);
         }
 
-        // Fall back to inexact
         double real = 1.0, imag = 0.0;
-        FORLIST(a, args)
-        {
-            double r, i;
-            get_complex_parts(car(a), &r, &i);
-            double nr = real * r - imag * i;
-            double ni = real * i + imag * r;
+        for (unsigned i = 0; i < argc; i++) {
+            double r, im;
+            get_complex_parts(argv[i], &r, &im);
+            double nr = real * r - imag * im;
+            double ni = real * im + imag * r;
             real = nr;
             imag = ni;
         }
@@ -228,21 +201,18 @@ slow_path:;
     }
     case NUM_INEXACT: {
         double prod = 1.0;
-        FORLIST(a, args)
-        prod *= to_double(car(a));
+        for (unsigned i = 0; i < argc; i++)
+            prod *= to_double(argv[i]);
         return store_inexact(prod);
     }
     case NUM_RATIONAL: {
-        // Rational multiplication: a/b * c/d = ac/bd
-        // Use cell-based arithmetic to support bignum numerators/denominators
         GC_GUARD;
         unsigned num = store(1), denom = store(1);
         gc_protect(&num);
         gc_protect(&denom);
-        FORLIST(a, args)
-        {
+        for (unsigned i = 0; i < argc; i++) {
             unsigned n, d;
-            get_rational_cells(car(a), &n, &d);
+            get_rational_cells(argv[i], &n, &d);
             num = multiply_cells(num, n);
             denom = multiply_cells(denom, d);
         }
@@ -250,11 +220,9 @@ slow_path:;
     }
     case NUM_BIGNUM:
     case NUM_INTEGER: {
-        // Use bignum for safety with large numbers
         bignum *result = bn_from_int(1);
-        FORLIST(a, args)
-        {
-            bignum *operand = to_bignum(car(a));
+        for (unsigned i = 0; i < argc; i++) {
+            bignum *operand = to_bignum(argv[i]);
             if (!operand) {
                 show_error("*: not a number");
                 bn_free(result);
@@ -268,28 +236,25 @@ slow_path:;
         return store_integer(result);
     }
     }
-    return store(1); // Unreachable
+    return store(1);
 }
 
-unsigned prim_minus(unsigned args)
+unsigned prim_minus(unsigned argc, unsigned *argv)
 {
-    if (!args) {
+    if (argc == 0) {
         show_error("-: requires at least one argument");
         return TOK_ERROR;
     }
 
-    // Fast path: pure integer arithmetic with overflow detection
-    if (IS_NUM(car(args))) {
-        int64_t res = CELL_ID(car(args));
-        unsigned rargs = cdr(args);
-        if (!rargs) {
-            // Unary negation: check for INT64_MIN overflow
+    if (IS_NUM(argv[0])) {
+        int64_t res = CELL_ID(argv[0]);
+        if (argc == 1) {
             if (res == INT64_MIN)
                 goto slow_path;
             return store(-res);
         }
-        for (; rargs; rargs = cdr(rargs)) {
-            unsigned x = car(rargs);
+        for (unsigned i = 1; i < argc; i++) {
+            unsigned x = argv[i];
             if (!IS_NUM(x))
                 goto slow_path;
             if (__builtin_sub_overflow(res, CELL_ID(x), &res))
@@ -299,183 +264,161 @@ unsigned prim_minus(unsigned args)
     }
 
 slow_path:;
-    if (!check_numeric_args(args, "-"))
+    if (!check_numeric_argv(argc, argv, "-"))
         return TOK_ERROR;
     bool exact;
-    numeric_level level = classify_args(args, &exact);
+    numeric_level level = classify_args_argv(argc, argv, &exact);
 
     switch (level) {
     case NUM_COMPLEX: {
-        // Check if all complex operands are exact
         bool all_complex_exact = true;
-        FORLIST(a, args)
-        {
-            if (!is_complex_exact(car(a))) {
+        for (unsigned i = 0; i < argc; i++) {
+            if (!is_complex_exact(argv[i])) {
                 all_complex_exact = false;
                 break;
             }
         }
 
         if (all_complex_exact) {
-            // Exact complex subtraction: (a+bi) - (c+di) = (a-c) + (b-d)i
             GC_GUARD;
             unsigned real_res, imag_res;
-            get_complex_cells(car(args), &real_res, &imag_res);
+            get_complex_cells(argv[0], &real_res, &imag_res);
             gc_protect(&real_res);
             gc_protect(&imag_res);
-            unsigned rargs = cdr(args);
-            if (!rargs) {
-                // Unary negation
+            if (argc == 1) {
                 unsigned neg_real = negate_number(real_res);
                 gc_protect(&neg_real);
                 unsigned neg_imag = negate_number(imag_res);
                 return make_complex_exact(neg_real, neg_imag);
             }
-            for (; rargs; rargs = cdr(rargs)) {
-                unsigned r, i;
-                get_complex_cells(car(rargs), &r, &i);
+            for (unsigned i = 1; i < argc; i++) {
+                unsigned r, im;
+                get_complex_cells(argv[i], &r, &im);
                 real_res = binary_sub(real_res, r);
-                imag_res = binary_sub(imag_res, i);
+                imag_res = binary_sub(imag_res, im);
             }
             return make_complex_exact(real_res, imag_res);
         }
 
-        // Fall back to inexact
         double real, imag;
-        get_complex_parts(car(args), &real, &imag);
-        unsigned rargs = cdr(args);
-        if (!rargs) {
+        get_complex_parts(argv[0], &real, &imag);
+        if (argc == 1) {
             real = -real;
             imag = -imag;
         } else {
-            for (; rargs; rargs = cdr(rargs)) {
-                double r, i;
-                get_complex_parts(car(rargs), &r, &i);
+            for (unsigned i = 1; i < argc; i++) {
+                double r, im;
+                get_complex_parts(argv[i], &r, &im);
                 real -= r;
-                imag -= i;
+                imag -= im;
             }
         }
         return make_complex_result(real, imag, exact);
     }
     case NUM_INEXACT: {
-        double res = to_double(car(args));
-        unsigned rargs = cdr(args);
-        if (!rargs)
+        double res = to_double(argv[0]);
+        if (argc == 1)
             return store_inexact(-res);
-        for (; rargs; rargs = cdr(rargs))
-            res -= to_double(car(rargs));
+        for (unsigned i = 1; i < argc; i++)
+            res -= to_double(argv[i]);
         return store_inexact(res);
     }
     case NUM_RATIONAL: {
-        // Rational subtraction: a/b - c/d = (ad - bc) / bd
-        // Use cell-based arithmetic to support bignum numerators/denominators
         GC_GUARD;
         unsigned num, denom;
-        get_rational_cells(car(args), &num, &denom);
+        get_rational_cells(argv[0], &num, &denom);
         gc_protect(&num);
         gc_protect(&denom);
-        unsigned rargs = cdr(args);
-        if (!rargs) {
+        if (argc == 1) {
             return normalize_rational_cells(negate_number(num), denom);
         }
-        for (; rargs; rargs = cdr(rargs)) {
+        for (unsigned i = 1; i < argc; i++) {
             unsigned n, d;
-            get_rational_cells(car(rargs), &n, &d);
-            // num = num * d - n * denom
+            get_rational_cells(argv[i], &n, &d);
             unsigned ad = multiply_cells(num, d);
             gc_protect(&ad);
             unsigned bc = multiply_cells(n, denom);
             unsigned new_num = subtract_cells(ad, bc);
             gc_unprotect(1);
             num = new_num;
-            // denom = denom * d
             denom = multiply_cells(denom, d);
         }
         return normalize_rational_cells(num, denom);
     }
     case NUM_BIGNUM: {
-        bignum *result = to_bignum(car(args));
-        unsigned rargs = cdr(args);
-        if (!rargs) {
+        bignum *result = to_bignum(argv[0]);
+        if (argc == 1) {
             bn_neg_ip(result);
             return store_integer(result);
         }
-        for (; rargs; rargs = cdr(rargs)) {
-            bignum *operand = to_bignum(car(rargs));
+        for (unsigned i = 1; i < argc; i++) {
+            bignum *operand = to_bignum(argv[i]);
             bn_sub_ip(result, operand);
             bn_free(operand);
         }
         return store_integer(result);
     }
     case NUM_INTEGER: {
-        int64_t res = CELL_ID(car(args));
-        unsigned rargs = cdr(args);
-        if (!rargs)
+        int64_t res = CELL_ID(argv[0]);
+        if (argc == 1)
             return store(-res);
-        for (; rargs; rargs = cdr(rargs))
-            res -= CELL_ID(car(rargs));
+        for (unsigned i = 1; i < argc; i++)
+            res -= CELL_ID(argv[i]);
         return store(res);
     }
     }
-    return store(0); // Unreachable
+    return store(0);
 }
 
-unsigned prim_div(unsigned args)
+unsigned prim_div(unsigned argc, unsigned *argv)
 {
-    if (!args) {
+    if (argc == 0) {
         show_error("/: requires at least one argument");
         return TOK_ERROR;
     }
 
-    // Fast path: pure integer division -> rational
-    if (IS_NUM(car(args))) {
-        int64_t num = CELL_ID(car(args));
+    if (IS_NUM(argv[0])) {
+        int64_t num = CELL_ID(argv[0]);
         int64_t denom = 1;
-        unsigned rargs = cdr(args);
-        if (!rargs) {
+        if (argc == 1) {
             CHECK_DIV_ZERO(num, "/");
             return normalize_rational(1, num);
         }
-        for (; rargs; rargs = cdr(rargs)) {
-            unsigned x = car(rargs);
+        for (unsigned i = 1; i < argc; i++) {
+            unsigned x = argv[i];
             if (!IS_NUM(x))
                 goto slow_path;
             int64_t d = CELL_ID(x);
             CHECK_DIV_ZERO(d, "/");
-            denom *= d;
+            if (__builtin_mul_overflow(denom, d, &denom))
+                goto slow_path;
         }
         return normalize_rational(num, denom);
     }
 
 slow_path:;
-    if (!check_numeric_args(args, "/"))
+    if (!check_numeric_argv(argc, argv, "/"))
         return TOK_ERROR;
     bool exact;
-    numeric_level level = classify_args(args, &exact);
+    numeric_level level = classify_args_argv(argc, argv, &exact);
 
     switch (level) {
     case NUM_COMPLEX: {
-        // Check if all complex operands are exact
         bool all_complex_exact = true;
-        FORLIST(a, args)
-        {
-            if (!is_complex_exact(car(a))) {
+        for (unsigned i = 0; i < argc; i++) {
+            if (!is_complex_exact(argv[i])) {
                 all_complex_exact = false;
                 break;
             }
         }
 
         if (all_complex_exact) {
-            // Exact complex division: (a+bi)/(c+di) = (ac+bd)/(c²+d²) +
-            // (bc-ad)/(c²+d²)i
             GC_GUARD;
             unsigned real_res, imag_res;
-            get_complex_cells(car(args), &real_res, &imag_res);
+            get_complex_cells(argv[0], &real_res, &imag_res);
             gc_protect(&real_res);
             gc_protect(&imag_res);
-            unsigned rargs = cdr(args);
-            if (!rargs) {
-                // Reciprocal: 1/(a+bi) = a/(a²+b²) - b/(a²+b²)i
+            if (argc == 1) {
                 unsigned a2 = binary_mul(real_res, real_res);
                 gc_protect(&a2);
                 unsigned b2 = binary_mul(imag_res, imag_res);
@@ -491,10 +434,9 @@ slow_path:;
                 unsigned new_imag = binary_div(neg_imag, denom);
                 return make_complex_exact(new_real, new_imag);
             }
-            for (; rargs; rargs = cdr(rargs)) {
+            for (unsigned i = 1; i < argc; i++) {
                 unsigned c, d;
-                get_complex_cells(car(rargs), &c, &d);
-                // (a+bi)/(c+di) = (ac+bd)/(c²+d²) + (bc-ad)/(c²+d²)i
+                get_complex_cells(argv[i], &c, &d);
                 unsigned ac = binary_mul(real_res, c);
                 gc_protect(&ac);
                 unsigned bd = binary_mul(imag_res, d);
@@ -525,23 +467,21 @@ slow_path:;
             return make_complex_exact(real_res, imag_res);
         }
 
-        // Fall back to inexact
         double real, imag;
-        get_complex_parts(car(args), &real, &imag);
-        unsigned rargs = cdr(args);
-        if (!rargs) {
+        get_complex_parts(argv[0], &real, &imag);
+        if (argc == 1) {
             double d = real * real + imag * imag;
             CHECK_DIV_ZERO_DBL(d, "/");
             real = real / d;
             imag = -imag / d;
         } else {
-            for (; rargs; rargs = cdr(rargs)) {
-                double r, i;
-                get_complex_parts(car(rargs), &r, &i);
-                double d = r * r + i * i;
+            for (unsigned i = 1; i < argc; i++) {
+                double r, im;
+                get_complex_parts(argv[i], &r, &im);
+                double d = r * r + im * im;
                 CHECK_DIV_ZERO_DBL(d, "/");
-                double nr = (real * r + imag * i) / d;
-                double ni = (imag * r - real * i) / d;
+                double nr = (real * r + imag * im) / d;
+                double ni = (imag * r - real * im) / d;
                 real = nr;
                 imag = ni;
             }
@@ -549,14 +489,13 @@ slow_path:;
         return make_complex_inexact(real, imag);
     }
     case NUM_INEXACT: {
-        double res = to_double(car(args));
-        unsigned rargs = cdr(args);
-        if (!rargs) {
+        double res = to_double(argv[0]);
+        if (argc == 1) {
             CHECK_DIV_ZERO_DBL(res, "/");
             return store_inexact(1.0 / res);
         }
-        for (; rargs; rargs = cdr(rargs)) {
-            double divisor = to_double(car(rargs));
+        for (unsigned i = 1; i < argc; i++) {
+            double divisor = to_double(argv[i]);
             CHECK_DIV_ZERO_DBL(divisor, "/");
             res /= divisor;
         }
@@ -565,40 +504,35 @@ slow_path:;
     case NUM_RATIONAL:
     case NUM_BIGNUM:
     case NUM_INTEGER: {
-        // Rational division: (a/b) / (c/d) = ad / bc
-        // Use cell-based arithmetic to support bignum numerators/denominators
         GC_GUARD;
         unsigned num, denom;
-        get_rational_cells(car(args), &num, &denom);
+        get_rational_cells(argv[0], &num, &denom);
         gc_protect(&num);
         gc_protect(&denom);
-        unsigned rargs = cdr(args);
-        if (!rargs) {
-            // Reciprocal: 1 / (a/b) = b/a
+        if (argc == 1) {
             if (is_zero_cell(num))
                 ERROR_RETURN("/: division by zero");
             return normalize_rational_cells(denom, num);
         }
-        for (; rargs; rargs = cdr(rargs)) {
+        for (unsigned i = 1; i < argc; i++) {
             unsigned n, d;
-            get_rational_cells(car(rargs), &n, &d);
+            get_rational_cells(argv[i], &n, &d);
             if (is_zero_cell(n)) {
                 ERROR_RETURN("/: division by zero");
             }
-            // num = num * d, denom = denom * n
             num = multiply_cells(num, d);
             denom = multiply_cells(denom, n);
         }
         return normalize_rational_cells(num, denom);
     }
     }
-    return store(0); // Unreachable
+    return store(0);
 }
 
-unsigned prim_modulo(unsigned args)
+unsigned prim_modulo(unsigned argc, unsigned *argv)
 {
-    REQUIRE_ARGS(args, 2, 2, "modulo");
-    unsigned xa = car(args), xb = cadr(args);
+    REQUIRE_ARGC(argc, 2, 2, "modulo");
+    unsigned xa = argv[0], xb = argv[1];
     if (!IS_EXACT_INT(xa) || !IS_EXACT_INT(xb)) {
         show_error("modulo: expected exact integer");
         return TOK_ERROR;
@@ -634,10 +568,10 @@ unsigned prim_modulo(unsigned args)
     return store(r);
 }
 
-unsigned prim_remainder(unsigned args)
+unsigned prim_remainder(unsigned argc, unsigned *argv)
 {
-    REQUIRE_ARGS(args, 2, 2, "remainder");
-    unsigned xa = car(args), xb = cadr(args);
+    REQUIRE_ARGC(argc, 2, 2, "remainder");
+    unsigned xa = argv[0], xb = argv[1];
     if (!IS_EXACT_INT(xa) || !IS_EXACT_INT(xb)) {
         show_error("remainder: expected exact integer");
         return TOK_ERROR;
@@ -663,10 +597,10 @@ unsigned prim_remainder(unsigned args)
     return store(a % b);
 }
 
-unsigned prim_quotient(unsigned args)
+unsigned prim_quotient(unsigned argc, unsigned *argv)
 {
-    REQUIRE_ARGS(args, 2, 2, "quotient");
-    unsigned xa = car(args), xb = cadr(args);
+    REQUIRE_ARGC(argc, 2, 2, "quotient");
+    unsigned xa = argv[0], xb = argv[1];
     if (!IS_EXACT_INT(xa) || !IS_EXACT_INT(xb)) {
         show_error("quotient: expected exact integer");
         return TOK_ERROR;
@@ -692,10 +626,10 @@ unsigned prim_quotient(unsigned args)
     return store(a / b);
 }
 
-unsigned prim_abs(unsigned args)
+unsigned prim_abs(unsigned argc, unsigned *argv)
 {
-    REQUIRE_ARGS(args, 1, 1, "abs");
-    unsigned x = car(args);
+    REQUIRE_ARGC(argc, 1, 1, "abs");
+    unsigned x = argv[0];
     switch (CELL_TYPE(x)) {
     case BT_NUM: {
         int64_t n = CELL_ID(x);

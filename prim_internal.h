@@ -77,6 +77,46 @@ static inline numeric_level classify_args(unsigned args, bool *all_exact_out)
     return level;
 }
 
+static inline numeric_level classify_args_argv(unsigned argc, unsigned *argv,
+                                               bool *all_exact_out)
+{
+    numeric_level level = NUM_INTEGER;
+    bool all_ex = true;
+
+    for (unsigned i = 0; i < argc; i++) {
+        unsigned x = argv[i];
+        if (x == 0)
+            continue;
+
+        switch (CELL_TYPE(x)) {
+        case BT_COMPLEX:
+            level = NUM_COMPLEX;
+            break;
+        case BT_INEXACT:
+            all_ex = false;
+            if (level < NUM_INEXACT)
+                level = NUM_INEXACT;
+            break;
+        case BT_RATIONAL:
+            if (level < NUM_RATIONAL)
+                level = NUM_RATIONAL;
+            break;
+        case BT_BIGNUM:
+            if (level < NUM_BIGNUM)
+                level = NUM_BIGNUM;
+            break;
+        case BT_NUM:
+            break;
+        default:
+            break;
+        }
+    }
+
+    if (all_exact_out)
+        *all_exact_out = all_ex;
+    return level;
+}
+
 static inline bool all_exact(unsigned args)
 {
     bool exact;
@@ -297,6 +337,39 @@ static inline bool check_numeric_args(unsigned args, const char *name)
     return true;
 }
 
+static inline bool check_numeric_argv(unsigned argc, unsigned *argv,
+                                      const char *name)
+{
+    for (unsigned i = 0; i < argc; i++) {
+        if (!is_numeric(argv[i])) {
+            show_error("%s: not a number", name);
+            return false;
+        }
+    }
+    return true;
+}
+
+static inline bool check_argc(unsigned argc, unsigned min, unsigned max,
+                              const char *name)
+{
+    if (argc < min) {
+        show_error("%s: too few arguments (expected %u, got %u)", name, min,
+                   argc);
+        return false;
+    }
+    if (max != (unsigned)-1 && argc > max) {
+        show_error("%s: too many arguments (expected at most %u)", name, max);
+        return false;
+    }
+    return true;
+}
+
+#define REQUIRE_ARGC(argc, min, max, name)                                    \
+    do {                                                                       \
+        if (!check_argc(argc, min, max, name))                                 \
+            return TOK_ERROR;                                                  \
+    } while (0)
+
 // ============================================================================
 // Comparison Operations (type needed for binary functions below)
 // ============================================================================
@@ -316,12 +389,12 @@ typedef enum { CMP_EQ, CMP_LT, CMP_GT, CMP_LE, CMP_GE } cmp_op;
 // ============================================================================
 
 // Forward declarations for fallback paths
-unsigned prim_plus(unsigned args);
-unsigned prim_minus(unsigned args);
-unsigned prim_mult(unsigned args);
-unsigned prim_div(unsigned args);
-unsigned prim_modulo(unsigned args);
-unsigned numeric_compare(unsigned args, cmp_op op);
+unsigned prim_plus(unsigned argc, unsigned *argv);
+unsigned prim_minus(unsigned argc, unsigned *argv);
+unsigned prim_mult(unsigned argc, unsigned *argv);
+unsigned prim_div(unsigned argc, unsigned *argv);
+unsigned prim_modulo(unsigned argc, unsigned *argv);
+unsigned numeric_compare(unsigned argc, unsigned *argv, cmp_op op);
 
 // Binary addition: a + b without list building
 // Returns TOK_ERROR on non-numeric operands
@@ -343,11 +416,12 @@ static inline unsigned binary_add(unsigned a, unsigned b)
         return store_integer(ba);
     }
     // Fall back to full numeric tower
-    gc_protect(&a);
-    gc_protect(&b);
-    unsigned args = alloc_cons(a, alloc_cons(b, 0));
+    unsigned argv[2] = {a, b};
+    gc_protect(&argv[0]);
+    gc_protect(&argv[1]);
+    unsigned result = prim_plus(2, argv);
     gc_unprotect(2);
-    return prim_plus(args);
+    return result;
 }
 
 // Binary subtraction: a - b without list building
@@ -369,11 +443,12 @@ static inline unsigned binary_sub(unsigned a, unsigned b)
         return store_integer(ba);
     }
     // Fall back to full numeric tower
-    gc_protect(&a);
-    gc_protect(&b);
-    unsigned args = alloc_cons(a, alloc_cons(b, 0));
+    unsigned argv[2] = {a, b};
+    gc_protect(&argv[0]);
+    gc_protect(&argv[1]);
+    unsigned result = prim_minus(2, argv);
     gc_unprotect(2);
-    return prim_minus(args);
+    return result;
 }
 
 // Binary multiplication: a * b without list building
@@ -396,11 +471,12 @@ static inline unsigned binary_mul(unsigned a, unsigned b)
         return store_integer(br);
     }
     // Fall back to full numeric tower
-    gc_protect(&a);
-    gc_protect(&b);
-    unsigned args = alloc_cons(a, alloc_cons(b, 0));
+    unsigned argv[2] = {a, b};
+    gc_protect(&argv[0]);
+    gc_protect(&argv[1]);
+    unsigned result = prim_mult(2, argv);
     gc_unprotect(2);
-    return prim_mult(args);
+    return result;
 }
 
 // Binary division: a / b without list building
@@ -422,11 +498,12 @@ static inline unsigned binary_div(unsigned a, unsigned b)
         return normalize_rational(va, vb);
     }
     // Fall back to full numeric tower
-    gc_protect(&a);
-    gc_protect(&b);
-    unsigned args = alloc_cons(a, alloc_cons(b, 0));
+    unsigned argv[2] = {a, b};
+    gc_protect(&argv[0]);
+    gc_protect(&argv[1]);
+    unsigned result = prim_div(2, argv);
     gc_unprotect(2);
-    return prim_div(args);
+    return result;
 }
 
 // Binary modulo: a mod b
@@ -447,11 +524,12 @@ static inline unsigned binary_mod(unsigned a, unsigned b)
         return store(r);
     }
     // Fall back to full modulo with bignum support
-    gc_protect(&a);
-    gc_protect(&b);
-    unsigned args = alloc_cons(a, alloc_cons(b, 0));
+    unsigned argv[2] = {a, b};
+    gc_protect(&argv[0]);
+    gc_protect(&argv[1]);
+    unsigned result = prim_modulo(2, argv);
     gc_unprotect(2);
-    return prim_modulo(args);
+    return result;
 }
 
 // Binary less-than comparison: a < b
@@ -465,9 +543,9 @@ static inline unsigned binary_lt(unsigned a, unsigned b)
     // Fall back to full comparison
     gc_protect(&a);
     gc_protect(&b);
-    unsigned args = alloc_cons(a, alloc_cons(b, 0));
+    unsigned argv[2] = {a, b};
     gc_unprotect(2);
-    return numeric_compare(args, CMP_LT);
+    return numeric_compare(2, argv, CMP_LT);
 }
 
 // Binary numeric equality: a = b
@@ -480,9 +558,9 @@ static inline unsigned binary_numeq(unsigned a, unsigned b)
     // Fall back to full comparison
     gc_protect(&a);
     gc_protect(&b);
-    unsigned args = alloc_cons(a, alloc_cons(b, 0));
+    unsigned argv[2] = {a, b};
     gc_unprotect(2);
-    return numeric_compare(args, CMP_EQ);
+    return numeric_compare(2, argv, CMP_EQ);
 }
 
 // Binary greater-than comparison: a > b
@@ -495,9 +573,9 @@ static inline unsigned binary_gt(unsigned a, unsigned b)
     // Fall back to full comparison
     gc_protect(&a);
     gc_protect(&b);
-    unsigned args = alloc_cons(a, alloc_cons(b, 0));
+    unsigned argv[2] = {a, b};
     gc_unprotect(2);
-    return numeric_compare(args, CMP_GT);
+    return numeric_compare(2, argv, CMP_GT);
 }
 
 // Binary less-than-or-equal comparison: a <= b
@@ -510,9 +588,9 @@ static inline unsigned binary_le(unsigned a, unsigned b)
     // Fall back to full comparison
     gc_protect(&a);
     gc_protect(&b);
-    unsigned args = alloc_cons(a, alloc_cons(b, 0));
+    unsigned argv[2] = {a, b};
     gc_unprotect(2);
-    return numeric_compare(args, CMP_LE);
+    return numeric_compare(2, argv, CMP_LE);
 }
 
 // Binary greater-than-or-equal comparison: a >= b
@@ -525,9 +603,9 @@ static inline unsigned binary_ge(unsigned a, unsigned b)
     // Fall back to full comparison
     gc_protect(&a);
     gc_protect(&b);
-    unsigned args = alloc_cons(a, alloc_cons(b, 0));
+    unsigned argv[2] = {a, b};
     gc_unprotect(2);
-    return numeric_compare(args, CMP_GE);
+    return numeric_compare(2, argv, CMP_GE);
 }
 
 // ============================================================================
@@ -726,6 +804,57 @@ static inline int extract_port(unsigned args, port_dir dir, bool use_second_arg,
     return 0;
 }
 
+// Unified port extraction for argv-based primitives
+// port_index < 0 means use current port
+static inline int extract_port_argv(unsigned *argv, int port_index,
+                                    port_dir dir, FILE **file_out,
+                                    string_port **strport_out,
+                                    const char *fn_name)
+{
+    *file_out = (dir == PORT_INPUT) ? ctx.current_input : ctx.current_output;
+    *strport_out = NULL;
+
+    if (port_index < 0) {
+        unsigned current_cell = (dir == PORT_INPUT) ? ctx.current_input_cell
+                                                    : ctx.current_output_cell;
+        if (current_cell != 0) {
+            *strport_out = GET_STRPORT_PTR(current_cell);
+            if (!*strport_out) {
+                show_error("%s: current port is closed", fn_name);
+                return -1;
+            }
+            return 1;
+        }
+        return 0;
+    }
+
+    unsigned p = argv[port_index];
+
+    bool is_strport = (dir == PORT_INPUT) ? IS_STRINPORT(p) : IS_STROUTPORT(p);
+    if (is_strport) {
+        *strport_out = GET_STRPORT_PTR(p);
+        if (!*strport_out) {
+            show_error("%s: port is closed", fn_name);
+            return -1;
+        }
+        return 1;
+    }
+
+    bool is_fileport = (dir == PORT_INPUT) ? IS_INPORT(p) : IS_OUTPORT(p);
+    if (!is_fileport) {
+        show_error("%s: argument must be %s port", fn_name,
+                   dir == PORT_INPUT ? "input" : "output");
+        return -1;
+    }
+
+    *file_out = GET_PORT_PTR(p);
+    if (!*file_out) {
+        show_error("%s: port is closed", fn_name);
+        return -1;
+    }
+    return 0;
+}
+
 // Convenience wrappers
 static inline int extract_output_port_ex(unsigned args, FILE **file_out,
                                          string_port **strport_out,
@@ -792,47 +921,56 @@ static inline unsigned make_string_copy(const char *s)
 // ============================================================================
 
 // Numeric operations (prim_numeric.c)
-unsigned prim_plus(unsigned args);
-unsigned prim_minus(unsigned args);
-unsigned prim_mult(unsigned args);
-unsigned prim_div(unsigned args);
-unsigned prim_modulo(unsigned args);
-unsigned prim_remainder(unsigned args);
-unsigned prim_quotient(unsigned args);
-unsigned prim_abs(unsigned args);
+unsigned prim_plus(unsigned argc, unsigned *argv);
+unsigned prim_minus(unsigned argc, unsigned *argv);
+unsigned prim_mult(unsigned argc, unsigned *argv);
+unsigned prim_div(unsigned argc, unsigned *argv);
+unsigned prim_modulo(unsigned argc, unsigned *argv);
+unsigned prim_remainder(unsigned argc, unsigned *argv);
+unsigned prim_quotient(unsigned argc, unsigned *argv);
+unsigned prim_abs(unsigned argc, unsigned *argv);
 
 // Comparison operations (prim_compare.c)
-unsigned numeric_compare(unsigned args, cmp_op op);
-unsigned char_compare(unsigned args, cmp_op op, bool case_insensitive);
-unsigned string_compare(unsigned args, cmp_op op, bool case_insensitive);
+unsigned numeric_compare(unsigned argc, unsigned *argv, cmp_op op);
+unsigned char_compare(unsigned argc, unsigned *argv, cmp_op op,
+                      bool case_insensitive);
+unsigned string_compare(unsigned argc, unsigned *argv, cmp_op op,
+                        bool case_insensitive);
 
 // List operations (prim_list.c)
-unsigned prim_append(unsigned args);
-unsigned prim_reverse(unsigned args);
+unsigned prim_append(unsigned argc, unsigned *argv);
+unsigned prim_reverse(unsigned argc, unsigned *argv);
 
 // String operations (prim_string.c)
-unsigned prim_string_append(unsigned args);
-unsigned prim_substring(unsigned args);
+unsigned prim_string_append(unsigned argc, unsigned *argv);
+unsigned prim_substring(unsigned argc, unsigned *argv);
 
 // Type predicates (prim_type.c)
-unsigned apply_type_predicate(unsigned prim_id, unsigned args);
+unsigned apply_type_predicate(unsigned prim_id, unsigned argc,
+                              unsigned *argv);
 
 // Character operations (prim_char.c)
-unsigned apply_char_primitive(unsigned prim_id, unsigned args);
+unsigned apply_char_primitive(unsigned prim_id, unsigned argc,
+                              unsigned *argv);
 
 // Vector operations (prim_vector.c)
-unsigned apply_vector_primitive(unsigned prim_id, unsigned args);
+unsigned apply_vector_primitive(unsigned prim_id, unsigned argc,
+                                unsigned *argv);
 
 // Math operations (prim_math.c)
-unsigned apply_math_primitive(unsigned prim_id, unsigned args);
+unsigned apply_math_primitive(unsigned prim_id, unsigned argc,
+                              unsigned *argv);
 
 // I/O operations (prim_io.c)
-unsigned apply_io_primitive(unsigned prim_id, unsigned args);
+unsigned apply_io_primitive(unsigned prim_id, unsigned argc,
+                            unsigned *argv);
 
 // Port operations (prim_port.c)
-unsigned apply_port_primitive(unsigned prim_id, unsigned args);
+unsigned apply_port_primitive(unsigned prim_id, unsigned argc,
+                              unsigned *argv);
 
 // Numeric tower operations (prim_numtower.c)
-unsigned apply_numtower_primitive(unsigned prim_id, unsigned args);
+unsigned apply_numtower_primitive(unsigned prim_id, unsigned argc,
+                                  unsigned *argv);
 
 #endif // PRIM_INTERNAL_H

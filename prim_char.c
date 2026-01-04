@@ -20,39 +20,39 @@ static const char_pred_entry char_predicates[] = {
     {PCHARLOWER, islower, "char-lower-case?"},
     {0, NULL, NULL}};
 
-unsigned apply_char_primitive(unsigned prim_id, unsigned args)
+unsigned apply_char_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
 {
     // Check table-driven predicates first
     for (const char_pred_entry *e = char_predicates; e->predicate; e++) {
         if (e->id == prim_id) {
-            REQUIRE_ARGS(args, 1, 1, e->name);
-            CHECK_CHAR(car(args), e->name);
-            int c = (unsigned char)CELL_ID(car(args));
+            REQUIRE_ARGC(argc, 1, 1, e->name);
+            CHECK_CHAR(argv[0], e->name);
+            int c = (unsigned char)CELL_ID(argv[0]);
             return e->predicate(c) ? ctx.atom_true : ctx.atom_false;
         }
     }
 
     switch (prim_id) {
     case PCHARCODE:
-        REQUIRE_ARGS(args, 1, 1, "char->integer");
-        CHECK_CHAR(car(args), "char->integer");
-        return store(CELL_ID(car(args)));
+        REQUIRE_ARGC(argc, 1, 1, "char->integer");
+        CHECK_CHAR(argv[0], "char->integer");
+        return store(CELL_ID(argv[0]));
     case PCODECHAR:
-        REQUIRE_ARGS(args, 1, 1, "integer->char");
+        REQUIRE_ARGC(argc, 1, 1, "integer->char");
         {
             int64_t code;
-            if (!expect_exact_int64(car(args), &code, "integer->char"))
+            if (!expect_exact_int64(argv[0], &code, "integer->char"))
                 return TOK_ERROR;
             return make_char((int)code);
         }
     case PCHARUP:
-        REQUIRE_ARGS(args, 1, 1, "char-upcase");
-        CHECK_CHAR(car(args), "char-upcase");
-        return make_char(toupper((unsigned char)CELL_ID(car(args))));
+        REQUIRE_ARGC(argc, 1, 1, "char-upcase");
+        CHECK_CHAR(argv[0], "char-upcase");
+        return make_char(toupper((unsigned char)CELL_ID(argv[0])));
     case PCHARDOWN:
-        REQUIRE_ARGS(args, 1, 1, "char-downcase");
-        CHECK_CHAR(car(args), "char-downcase");
-        return make_char(tolower((unsigned char)CELL_ID(car(args))));
+        REQUIRE_ARGC(argc, 1, 1, "char-downcase");
+        CHECK_CHAR(argv[0], "char-downcase");
+        return make_char(tolower((unsigned char)CELL_ID(argv[0])));
     // Character comparisons (PCHAREQ..PCHARGEI are sequential)
     case PCHAREQ:
     case PCHARLT:
@@ -65,7 +65,7 @@ unsigned apply_char_primitive(unsigned prim_id, unsigned args)
     case PCHARLEI:
     case PCHARGEI: {
         unsigned offset = prim_id - PCHAREQ;
-        return char_compare(args, (cmp_op)(offset % 5), offset >= 5);
+        return char_compare(argc, argv, (cmp_op)(offset % 5), offset >= 5);
     }
     default:
         return TOK_ERROR;

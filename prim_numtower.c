@@ -87,12 +87,13 @@ static unsigned prim_inexact_to_exact(unsigned x)
     }
 }
 
-unsigned apply_numtower_primitive(unsigned prim_id, unsigned args)
+unsigned apply_numtower_primitive(unsigned prim_id, unsigned argc,
+                                  unsigned *argv)
 {
     switch (prim_id) {
     case PNUMERATOR: {
-        REQUIRE_ARGS(args, 1, 1, "numerator");
-        unsigned x = car(args);
+        REQUIRE_ARGC(argc, 1, 1, "numerator");
+        unsigned x = argv[0];
         switch (CELL_TYPE(x)) {
         case BT_NUM:
         case BT_BIGNUM:
@@ -112,8 +113,8 @@ unsigned apply_numtower_primitive(unsigned prim_id, unsigned args)
         }
     }
     case PDENOMINATOR: {
-        REQUIRE_ARGS(args, 1, 1, "denominator");
-        unsigned x = car(args);
+        REQUIRE_ARGC(argc, 1, 1, "denominator");
+        unsigned x = argv[0];
         switch (CELL_TYPE(x)) {
         case BT_NUM:
         case BT_BIGNUM:
@@ -133,18 +134,18 @@ unsigned apply_numtower_primitive(unsigned prim_id, unsigned args)
         }
     }
     case PMAKERECT: {
-        REQUIRE_ARGS(args, 2, 2, "make-rectangular");
-        unsigned real = car(args);
-        unsigned imag = cadr(args);
+        REQUIRE_ARGC(argc, 2, 2, "make-rectangular");
+        unsigned real = argv[0];
+        unsigned imag = argv[1];
         // If imaginary part is zero, return just the real
         if (to_double(imag) == 0.0)
             return real;
         return store_complex(real, imag);
     }
     case PMAKEPOLAR: {
-        REQUIRE_ARGS(args, 2, 2, "make-polar");
-        double mag = to_double(car(args));
-        double ang = to_double(cadr(args));
+        REQUIRE_ARGC(argc, 2, 2, "make-polar");
+        double mag = to_double(argv[0]);
+        double ang = to_double(argv[1]);
         double real = mag * cos(ang);
         double imag = mag * sin(ang);
         if (fabs(imag) < 1e-15)
@@ -152,24 +153,24 @@ unsigned apply_numtower_primitive(unsigned prim_id, unsigned args)
         return make_complex_inexact(real, imag);
     }
     case PREALPART: {
-        REQUIRE_ARGS(args, 1, 1, "real-part");
-        unsigned x = car(args);
+        REQUIRE_ARGC(argc, 1, 1, "real-part");
+        unsigned x = argv[0];
         if (CELL_TYPE(x) == BT_COMPLEX) {
             return CELL_CAR(x);
         }
         return x; // Real numbers are their own real part
     }
     case PIMAGPART: {
-        REQUIRE_ARGS(args, 1, 1, "imag-part");
-        unsigned x = car(args);
+        REQUIRE_ARGC(argc, 1, 1, "imag-part");
+        unsigned x = argv[0];
         if (CELL_TYPE(x) == BT_COMPLEX) {
             return CELL_CDR(x);
         }
         return store(0); // Real numbers have 0 imaginary part
     }
     case PMAGNITUDE: {
-        REQUIRE_ARGS(args, 1, 1, "magnitude");
-        unsigned x = car(args);
+        REQUIRE_ARGC(argc, 1, 1, "magnitude");
+        unsigned x = argv[0];
         if (CELL_TYPE(x) == BT_COMPLEX) {
             double real = to_double(CELL_CAR(x));
             double imag = to_double(CELL_CDR(x));
@@ -180,15 +181,15 @@ unsigned apply_numtower_primitive(unsigned prim_id, unsigned args)
         return is_exact(x) ? store((int64_t)fabs(d)) : store_inexact(fabs(d));
     }
     case PANGLE: {
-        REQUIRE_ARGS(args, 1, 1, "angle");
-        unsigned x = car(args);
+        REQUIRE_ARGC(argc, 1, 1, "angle");
+        unsigned x = argv[0];
         double real, imag;
         get_complex_parts(x, &real, &imag);
         return store_inexact(atan2(imag, real));
     }
     case PEXACT2INEXACT: {
-        REQUIRE_ARGS(args, 1, 1, "exact->inexact");
-        unsigned x = car(args);
+        REQUIRE_ARGC(argc, 1, 1, "exact->inexact");
+        unsigned x = argv[0];
         if (CELL_TYPE(x) == BT_COMPLEX) {
             return make_complex_inexact(to_double(CELL_CAR(x)),
                                         to_double(CELL_CDR(x)));
@@ -196,8 +197,8 @@ unsigned apply_numtower_primitive(unsigned prim_id, unsigned args)
         return store_inexact(to_double(x));
     }
     case PINEXACT2EXACT: {
-        REQUIRE_ARGS(args, 1, 1, "inexact->exact");
-        unsigned x = car(args);
+        REQUIRE_ARGC(argc, 1, 1, "inexact->exact");
+        unsigned x = argv[0];
 
         // Already exact? Return as-is
         if (is_exact(x))
@@ -215,10 +216,10 @@ unsigned apply_numtower_primitive(unsigned prim_id, unsigned args)
         return prim_inexact_to_exact(x);
     }
     case PRATIONALIZE: {
-        REQUIRE_ARGS(args, 2, 2, "rationalize");
+        REQUIRE_ARGC(argc, 2, 2, "rationalize");
         // Find simplest rational within epsilon using continued fractions
-        double x = to_double(car(args));
-        double epsilon = fabs(to_double(cadr(args)));
+        double x = to_double(argv[0]);
+        double epsilon = fabs(to_double(argv[1]));
 
         // Handle negative numbers
         bool negative = x < 0;
@@ -266,8 +267,8 @@ unsigned apply_numtower_primitive(unsigned prim_id, unsigned args)
         return normalize_rational(mid_n, mid_d);
     }
     case PFINITE: {
-        REQUIRE_ARGS(args, 1, 1, "finite?");
-        unsigned x = car(args);
+        REQUIRE_ARGC(argc, 1, 1, "finite?");
+        unsigned x = argv[0];
         if (CELL_TYPE(x) == BT_INEXACT) {
             double d = to_double(x);
             return isfinite(d) ? ctx.atom_true : ctx.atom_false;
@@ -282,8 +283,8 @@ unsigned apply_numtower_primitive(unsigned prim_id, unsigned args)
         return ctx.atom_true;
     }
     case PINFINITE: {
-        REQUIRE_ARGS(args, 1, 1, "infinite?");
-        unsigned x = car(args);
+        REQUIRE_ARGC(argc, 1, 1, "infinite?");
+        unsigned x = argv[0];
         if (CELL_TYPE(x) == BT_INEXACT) {
             double d = to_double(x);
             return isinf(d) ? ctx.atom_true : ctx.atom_false;
@@ -298,8 +299,8 @@ unsigned apply_numtower_primitive(unsigned prim_id, unsigned args)
         return ctx.atom_false;
     }
     case PNAN: {
-        REQUIRE_ARGS(args, 1, 1, "nan?");
-        unsigned x = car(args);
+        REQUIRE_ARGC(argc, 1, 1, "nan?");
+        unsigned x = argv[0];
         if (CELL_TYPE(x) == BT_INEXACT) {
             double d = to_double(x);
             return isnan(d) ? ctx.atom_true : ctx.atom_false;

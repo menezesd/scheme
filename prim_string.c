@@ -5,14 +5,12 @@
 
 #include "prim_internal.h"
 
-unsigned prim_string_append(unsigned args)
+unsigned prim_string_append(unsigned argc, unsigned *argv)
 {
-    // First pass: validate and compute total length
     size_t total = 0;
-    FORLIST(a, args)
-    {
-        CHECK_STRING(car(a), "string-append");
-        total += strlen(GET_STRING_PTR(car(a)));
+    for (unsigned i = 0; i < argc; i++) {
+        CHECK_STRING(argv[i], "string-append");
+        total += strlen(GET_STRING_PTR(argv[i]));
     }
 
     char *result = malloc(total + 1);
@@ -21,11 +19,9 @@ unsigned prim_string_append(unsigned args)
         return TOK_ERROR;
     }
 
-    // Second pass: copy strings (use pointer arithmetic to avoid strlen)
     char *pos = result;
-    FORLIST(a, args)
-    {
-        char *s = GET_STRING_PTR(car(a));
+    for (unsigned i = 0; i < argc; i++) {
+        char *s = GET_STRING_PTR(argv[i]);
         while (*s)
             *pos++ = *s++;
     }
@@ -34,18 +30,18 @@ unsigned prim_string_append(unsigned args)
     return make_string_owned(result);
 }
 
-unsigned prim_substring(unsigned args)
+unsigned prim_substring(unsigned argc, unsigned *argv)
 {
-    REQUIRE_ARGS(args, 2, 3, "substring");
-    CHECK_STRING(car(args), "substring");
-    char *s = GET_STRING_PTR(car(args));
+    REQUIRE_ARGC(argc, 2, 3, "substring");
+    CHECK_STRING(argv[0], "substring");
+    char *s = GET_STRING_PTR(argv[0]);
     size_t slen = strlen(s);
     int64_t start;
-    if (!expect_nonneg_int64(cadr(args), &start, "substring"))
+    if (!expect_nonneg_int64(argv[1], &start, "substring"))
         return TOK_ERROR;
     int64_t end;
-    if (cddr(args)) {
-        if (!expect_nonneg_int64(caddr(args), &end, "substring"))
+    if (argc == 3) {
+        if (!expect_nonneg_int64(argv[2], &end, "substring"))
             return TOK_ERROR;
     } else {
         end = (int64_t)slen;

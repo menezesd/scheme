@@ -155,13 +155,14 @@ static bignum *bn_exact_nth_root(const bignum *base, int64_t n)
     return NULL; // Not a perfect nth power
 }
 
-unsigned apply_math_primitive(unsigned prim_id, unsigned args)
+unsigned apply_math_primitive(unsigned prim_id, unsigned argc,
+                              unsigned *argv)
 {
     // Check simple unary functions via table
     for (const math_func_entry *e = math_funcs; e->func; e++) {
         if (e->id == prim_id) {
-            REQUIRE_ARGS(args, 1, 1, e->name);
-            return store_inexact(e->func(to_double(car(args))));
+            REQUIRE_ARGC(argc, 1, 1, e->name);
+            return store_inexact(e->func(to_double(argv[0])));
         }
     }
 
@@ -169,8 +170,8 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned args)
     case PSQRT: {
         // Complex sqrt: sqrt(a+bi) = sqrt((r+a)/2) + i*sign(b)*sqrt((r-a)/2)
         // where r = |a+bi| = sqrt(a^2+b^2)
-        REQUIRE_ARGS(args, 1, 1, "sqrt");
-        unsigned arg = car(args);
+        REQUIRE_ARGC(argc, 1, 1, "sqrt");
+        unsigned arg = argv[0];
         enum lisp_type t = CELL_TYPE(arg);
 
         // Handle complex numbers
@@ -219,9 +220,9 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned args)
     }
     case PEXPT: {
         // z^w = exp(w * log(z)) for complex numbers
-        REQUIRE_ARGS(args, 2, 2, "expt");
-        unsigned base_arg = car(args);
-        unsigned exp_arg = cadr(args);
+        REQUIRE_ARGC(argc, 2, 2, "expt");
+        unsigned base_arg = argv[0];
+        unsigned exp_arg = argv[1];
 
         // Exact base with exact integer exponent -> exact result
         // Covers integers, rationals, and complex with exact parts
@@ -252,8 +253,8 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned args)
             while (e > 0) {
                 if (e & 1) {
                     // result = result * base (exact multiplication)
-                    unsigned mul_args = alloc_cons(result, alloc_cons(base, 0));
-                    result = prim_mult(mul_args);
+                    unsigned mul_argv[2] = {result, base};
+                    result = prim_mult(2, mul_argv);
                     if (result == TOK_ERROR) {
                         return TOK_ERROR;
                     }
@@ -261,8 +262,8 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned args)
                 e >>= 1;
                 if (e > 0) {
                     // base = base * base
-                    unsigned sq_args = alloc_cons(base, alloc_cons(base, 0));
-                    base = prim_mult(sq_args);
+                    unsigned sq_argv[2] = {base, base};
+                    base = prim_mult(2, sq_argv);
                     if (base == TOK_ERROR) {
                         return TOK_ERROR;
                     }
@@ -273,8 +274,8 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned args)
                 // Return 1 / result
                 unsigned one = store(1);
                 gc_protect(&one);
-                unsigned div_args = alloc_cons(one, alloc_cons(result, 0));
-                return prim_div(div_args);
+                unsigned div_argv[2] = {one, result};
+                return prim_div(2, div_argv);
             }
             return result;
         }
@@ -390,18 +391,18 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned args)
         return store_inexact(result);
     }
     case PATAN: {
-        REQUIRE_ARGS(args, 1, 2, "atan");
-        double y = to_double(car(args));
-        if (cdr(args)) {
-            double x = to_double(cadr(args));
+        REQUIRE_ARGC(argc, 1, 2, "atan");
+        double y = to_double(argv[0]);
+        if (argc == 2) {
+            double x = to_double(argv[1]);
             return store_inexact(atan2(y, x));
         }
         return store_inexact(atan(y));
     }
     case PLOG: {
         // Complex logarithm: log(z) = ln|z| + i*arg(z)
-        REQUIRE_ARGS(args, 1, 1, "log");
-        unsigned arg = car(args);
+        REQUIRE_ARGC(argc, 1, 1, "log");
+        unsigned arg = argv[0];
 
         if (CELL_TYPE(arg) == BT_COMPLEX) {
             double real, imag;
@@ -420,8 +421,8 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned args)
     }
     case PEXP: {
         // Complex exp: e^(a+bi) = e^a * (cos(b) + i*sin(b))
-        REQUIRE_ARGS(args, 1, 1, "exp");
-        unsigned arg = car(args);
+        REQUIRE_ARGC(argc, 1, 1, "exp");
+        unsigned arg = argv[0];
 
         if (CELL_TYPE(arg) == BT_COMPLEX) {
             double real, imag;
@@ -433,8 +434,8 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned args)
     }
     case PSIN: {
         // Complex sin: sin(a+bi) = sin(a)*cosh(b) + i*cos(a)*sinh(b)
-        REQUIRE_ARGS(args, 1, 1, "sin");
-        unsigned arg = car(args);
+        REQUIRE_ARGC(argc, 1, 1, "sin");
+        unsigned arg = argv[0];
 
         if (CELL_TYPE(arg) == BT_COMPLEX) {
             double a, b;
@@ -445,8 +446,8 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned args)
     }
     case PCOS: {
         // Complex cos: cos(a+bi) = cos(a)*cosh(b) - i*sin(a)*sinh(b)
-        REQUIRE_ARGS(args, 1, 1, "cos");
-        unsigned arg = car(args);
+        REQUIRE_ARGC(argc, 1, 1, "cos");
+        unsigned arg = argv[0];
 
         if (CELL_TYPE(arg) == BT_COMPLEX) {
             double a, b;
@@ -457,8 +458,8 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned args)
     }
     case PTAN: {
         // Complex tan: tan(z) = sin(z)/cos(z)
-        REQUIRE_ARGS(args, 1, 1, "tan");
-        unsigned arg = car(args);
+        REQUIRE_ARGC(argc, 1, 1, "tan");
+        unsigned arg = argv[0];
 
         if (CELL_TYPE(arg) == BT_COMPLEX) {
             double a, b;
@@ -471,32 +472,32 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned args)
         return store_inexact(tan(to_double(arg)));
     }
     case PFLOOR: {
-        REQUIRE_ARGS(args, 1, 1, "floor");
-        unsigned x = car(args);
+        REQUIRE_ARGC(argc, 1, 1, "floor");
+        unsigned x = argv[0];
         if (CELL_TYPE(x) == BT_NUM)
             return x;
         double d = to_double(x);
         return is_exact(x) ? store((int64_t)floor(d)) : store_inexact(floor(d));
     }
     case PCEILING: {
-        REQUIRE_ARGS(args, 1, 1, "ceiling");
-        unsigned x = car(args);
+        REQUIRE_ARGC(argc, 1, 1, "ceiling");
+        unsigned x = argv[0];
         if (CELL_TYPE(x) == BT_NUM)
             return x;
         double d = to_double(x);
         return is_exact(x) ? store((int64_t)ceil(d)) : store_inexact(ceil(d));
     }
     case PTRUNCATE: {
-        REQUIRE_ARGS(args, 1, 1, "truncate");
-        unsigned x = car(args);
+        REQUIRE_ARGC(argc, 1, 1, "truncate");
+        unsigned x = argv[0];
         if (CELL_TYPE(x) == BT_NUM)
             return x;
         double d = to_double(x);
         return is_exact(x) ? store((int64_t)trunc(d)) : store_inexact(trunc(d));
     }
     case PROUND: {
-        REQUIRE_ARGS(args, 1, 1, "round");
-        unsigned x = car(args);
+        REQUIRE_ARGC(argc, 1, 1, "round");
+        unsigned x = argv[0];
         if (CELL_TYPE(x) == BT_NUM)
             return x;
         double d = to_double(x);
@@ -505,8 +506,8 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned args)
 
     // Random number generation (SRFI-27 style)
     case PRANDOMINTEGER: {
-        REQUIRE_ARGS(args, 1, 1, "random-integer");
-        unsigned x = car(args);
+        REQUIRE_ARGC(argc, 1, 1, "random-integer");
+        unsigned x = argv[0];
         int64_t n;
         if (!expect_exact_int64(x, &n, "random-integer"))
             return TOK_ERROR;
@@ -523,15 +524,15 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned args)
         return store((int64_t)(r % (uint64_t)n));
     }
     case PRANDOMREAL: {
-        REQUIRE_ARGS(args, 0, 0, "random-real");
+        REQUIRE_ARGC(argc, 0, 0, "random-real");
         // Convert 53 bits of randomness to [0, 1) double
         uint64_t r = xoshiro256ss() >> 11;
         double d = (double)r / (double)(1ULL << 53);
         return store_inexact(d);
     }
     case PRANDOMSEED: {
-        REQUIRE_ARGS(args, 1, 1, "random-seed!");
-        unsigned x = car(args);
+        REQUIRE_ARGC(argc, 1, 1, "random-seed!");
+        unsigned x = argv[0];
         enum lisp_type t = CELL_TYPE(x);
         uint64_t seed;
         if (t == BT_NUM) {
@@ -552,7 +553,7 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned args)
             z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
             rng_state[i] = z ^ (z >> 31);
         }
-        return car(args);
+        return argv[0];
     }
 
     default:

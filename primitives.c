@@ -27,47 +27,47 @@
 // Main Dispatch Function
 // ============================================================================
 
-unsigned apply_primitive(unsigned prim_id, unsigned args)
+unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
 {
     switch (prim_id) {
     // Arithmetic - delegated to prim_numeric.c
     case PPLUS:
-        return prim_plus(args);
+        return prim_plus(argc, argv);
     case PMINUS:
-        return prim_minus(args);
+        return prim_minus(argc, argv);
     case PTIMES:
-        return prim_mult(args);
+        return prim_mult(argc, argv);
     case PDIV:
-        return prim_div(args);
+        return prim_div(argc, argv);
     case PMOD:
-        return prim_modulo(args);
+        return prim_modulo(argc, argv);
     case PREMAINDER:
-        return prim_remainder(args);
+        return prim_remainder(argc, argv);
     case PQUOTIENT:
-        return prim_quotient(args);
+        return prim_quotient(argc, argv);
     case PABS:
-        return prim_abs(args);
+        return prim_abs(argc, argv);
 
     // Numeric comparison - delegated to prim_compare.c
     case PEQUAL:
-        return numeric_compare(args, CMP_EQ);
+        return numeric_compare(argc, argv, CMP_EQ);
     case PLT:
-        return numeric_compare(args, CMP_LT);
+        return numeric_compare(argc, argv, CMP_LT);
     case PGT:
-        return numeric_compare(args, CMP_GT);
+        return numeric_compare(argc, argv, CMP_GT);
     case PLEQ:
-        return numeric_compare(args, CMP_LE);
+        return numeric_compare(argc, argv, CMP_LE);
     case PGEQ:
-        return numeric_compare(args, CMP_GE);
+        return numeric_compare(argc, argv, CMP_GE);
 
     // Logic
     case PNOT:
-        REQUIRE_ARGS(args, 1, 1, "not");
-        return IS_FALSE(car(args)) ? ctx.atom_true : ctx.atom_false;
+        REQUIRE_ARGC(argc, 1, 1, "not");
+        return IS_FALSE(argv[0]) ? ctx.atom_true : ctx.atom_false;
     case PEQ: {
-        REQUIRE_ARGS(args, 2, 2, "eq?");
-        unsigned arg1 = car(args);
-        unsigned arg2 = cadr(args);
+        REQUIRE_ARGC(argc, 2, 2, "eq?");
+        unsigned arg1 = argv[0];
+        unsigned arg2 = argv[1];
         if (CELL_TYPE(arg1) != CELL_TYPE(arg2))
             return ctx.atom_false;
         switch (CELL_TYPE(arg1)) {
@@ -83,43 +83,53 @@ unsigned apply_primitive(unsigned prim_id, unsigned args)
         }
     }
     case PEQUALP:
-        REQUIRE_ARGS(args, 2, 2, "equal?");
-        return deep_equal(car(args), cadr(args)) ? ctx.atom_true
+        REQUIRE_ARGC(argc, 2, 2, "equal?");
+        return deep_equal(argv[0], argv[1]) ? ctx.atom_true
                                                  : ctx.atom_false;
 
     // List operations
     case PCONS:
-        REQUIRE_ARGS(args, 2, 2, "cons");
-        return alloc_cons(car(args), cadr(args));
+        REQUIRE_ARGC(argc, 2, 2, "cons");
+        return alloc_cons(argv[0], argv[1]);
     case PCAR:
-        REQUIRE_ARGS(args, 1, 1, "car");
-        return caar(args);
+        REQUIRE_ARGC(argc, 1, 1, "car");
+        CHECK_PAIR(argv[0], "car");
+        return car(argv[0]);
     case PCDR:
-        REQUIRE_ARGS(args, 1, 1, "cdr");
-        return cdar(args);
+        REQUIRE_ARGC(argc, 1, 1, "cdr");
+        CHECK_PAIR(argv[0], "cdr");
+        return cdr(argv[0]);
     case PSETCAR: {
-        REQUIRE_ARGS(args, 2, 2, "set-car!");
-        unsigned arg1 = car(args);
-        if (!IS_PAIR(arg1))
-            ERROR_RETURN("set-car!: not a pair");
-        unsigned arg2 = cadr(args);
+        REQUIRE_ARGC(argc, 2, 2, "set-car!");
+        unsigned arg1 = argv[0];
+        CHECK_PAIR(arg1, "set-car!");
+        unsigned arg2 = argv[1];
         write_barrier(arg1, arg2); // Generational GC write barrier
         return CELL_CAR(arg1) = arg2;
     }
     case PSETCDR: {
-        REQUIRE_ARGS(args, 2, 2, "set-cdr!");
-        unsigned arg1 = car(args);
-        if (!IS_PAIR(arg1))
-            ERROR_RETURN("set-cdr!: not a pair");
-        unsigned arg2 = cadr(args);
+        REQUIRE_ARGC(argc, 2, 2, "set-cdr!");
+        unsigned arg1 = argv[0];
+        CHECK_PAIR(arg1, "set-cdr!");
+        unsigned arg2 = argv[1];
         write_barrier(arg1, arg2); // Generational GC write barrier
         return CELL_CDR(arg1) = arg2;
     }
     case PLIST:
-        return args;
+        if (argc == 0)
+            return 0;
+        {
+            GC_GUARD;
+            unsigned result = 0;
+            gc_protect(&result);
+            for (unsigned i = argc; i > 0; i--) {
+                result = alloc_cons(argv[i - 1], result);
+            }
+            return result;
+        }
     case PLENGTH: {
-        REQUIRE_ARGS(args, 1, 1, "length");
-        unsigned lst = car(args);
+        REQUIRE_ARGC(argc, 1, 1, "length");
+        unsigned lst = argv[0];
         if (CELL_TYPE(lst) == BT_STRING)
             return store(strlen((char *)(intptr_t)CELL_ID(lst)));
         if (CELL_TYPE(lst) == BT_VECTOR)
@@ -130,19 +140,26 @@ unsigned apply_primitive(unsigned prim_id, unsigned args)
         return store(len);
     }
     case PAPPEND:
-        return prim_append(args);
+        return prim_append(argc, argv);
     case PREVERSE:
-        return prim_reverse(args);
+        return prim_reverse(argc, argv);
     case PLASTPAIR: {
-        REQUIRE_ARGS(args, 1, 1, "last-pair");
-        unsigned lst = car(args);
-        if (!lst || CELL_TYPE(lst) != BT_CONS) {
+        REQUIRE_ARGC(argc, 1, 1, "last-pair");
+        unsigned lst = argv[0];
+        if (!IS_PAIR(lst)) {
             show_error("last-pair: not a pair");
             return TOK_ERROR;
         }
-        while (cdr(lst) && CELL_TYPE(cdr(lst)) == BT_CONS)
-            lst = cdr(lst);
-        return lst;
+        for (;;) {
+            unsigned next = cdr(lst);
+            if (!next)
+                return lst;
+            if (!IS_PAIR(next)) {
+                show_error("last-pair: improper list");
+                return TOK_ERROR;
+            }
+            lst = next;
+        }
     }
 
     // Type predicates - delegated to prim_type.c
@@ -163,7 +180,7 @@ unsigned apply_primitive(unsigned prim_id, unsigned args)
     case PVECTORP:
     case PBOOLP:
     case PLISTP:
-        return apply_type_predicate(prim_id, args);
+        return apply_type_predicate(prim_id, argc, argv);
 
     // I/O - delegated to prim_io.c
     case PDISPLAY:
@@ -177,7 +194,7 @@ unsigned apply_primitive(unsigned prim_id, unsigned args)
     case PCHARREADY:
     case PREADLINE:
     case PEXIT:
-        return apply_io_primitive(prim_id, args);
+        return apply_io_primitive(prim_id, argc, argv);
 
     // Ports - delegated to prim_port.c
     case POPENINPUT:
@@ -195,11 +212,11 @@ unsigned apply_primitive(unsigned prim_id, unsigned args)
     case PSETCURRENTINPUT:
     case PSETCURRENTOUTPUT:
     case PFLUSHOUTPUT:
-        return apply_port_primitive(prim_id, args);
+        return apply_port_primitive(prim_id, argc, argv);
 
     // Time
     case PCURRENTSECOND: {
-        REQUIRE_ARGS(args, 0, 0, "current-second");
+        REQUIRE_ARGC(argc, 0, 0, "current-second");
         time_t now = time(NULL);
         // Return as inexact for sub-second precision compatibility
         return store_inexact((double)now);
@@ -207,18 +224,18 @@ unsigned apply_primitive(unsigned prim_id, unsigned args)
 
     // String operations
     case PSTRLEN: {
-        REQUIRE_ARGS(args, 1, 1, "string-length");
-        CHECK_STRING(car(args), "string-length");
-        char *s = GET_STRING_PTR(car(args));
+        REQUIRE_ARGC(argc, 1, 1, "string-length");
+        CHECK_STRING(argv[0], "string-length");
+        char *s = GET_STRING_PTR(argv[0]);
         return store(strlen(s));
     }
     case PSTRREF: {
-        REQUIRE_ARGS(args, 2, 2, "string-ref");
-        CHECK_STRING(car(args), "string-ref");
-        char *s = GET_STRING_PTR(car(args));
+        REQUIRE_ARGC(argc, 2, 2, "string-ref");
+        CHECK_STRING(argv[0], "string-ref");
+        char *s = GET_STRING_PTR(argv[0]);
         size_t len = strlen(s);
         int64_t idx;
-        if (!expect_nonneg_int64(cadr(args), &idx, "string-ref"))
+        if (!expect_nonneg_int64(argv[1], &idx, "string-ref"))
             return TOK_ERROR;
         if (idx < 0 || (size_t)idx >= len) {
             show_error("string-ref: index out of bounds");
@@ -227,15 +244,15 @@ unsigned apply_primitive(unsigned prim_id, unsigned args)
         return make_char(s[idx]);
     }
     case PSTRSET: {
-        REQUIRE_ARGS(args, 3, 3, "string-set!");
-        CHECK_STRING(car(args), "string-set!");
-        char *s = GET_STRING_PTR(car(args));
+        REQUIRE_ARGC(argc, 3, 3, "string-set!");
+        CHECK_STRING(argv[0], "string-set!");
+        char *s = GET_STRING_PTR(argv[0]);
         size_t len = strlen(s);
         int64_t idx;
-        if (!expect_nonneg_int64(cadr(args), &idx, "string-set!"))
+        if (!expect_nonneg_int64(argv[1], &idx, "string-set!"))
             return TOK_ERROR;
-        CHECK_CHAR(caddr(args), "string-set!");
-        char c = (char)CELL_ID(caddr(args));
+        CHECK_CHAR(argv[2], "string-set!");
+        char c = (char)CELL_ID(argv[2]);
         if (idx < 0 || (size_t)idx >= len) {
             show_error("string-set!: index out of bounds");
             return TOK_ERROR;
@@ -244,28 +261,28 @@ unsigned apply_primitive(unsigned prim_id, unsigned args)
         return 0;
     }
     case PSTRAPP:
-        return prim_string_append(args);
+        return prim_string_append(argc, argv);
     case PSUBSTR:
-        return prim_substring(args);
+        return prim_substring(argc, argv);
     case PSTR2SYM: {
-        REQUIRE_ARGS(args, 1, 1, "string->symbol");
-        CHECK_STRING(car(args), "string->symbol");
-        char *s = GET_STRING_PTR(car(args));
+        REQUIRE_ARGC(argc, 1, 1, "string->symbol");
+        CHECK_STRING(argv[0], "string->symbol");
+        char *s = GET_STRING_PTR(argv[0]);
         return atom_from_string(s);
     }
     case PSYM2STR: {
-        REQUIRE_ARGS(args, 1, 1, "symbol->string");
-        CHECK_SYMBOL(car(args), "symbol->string");
-        const char *s = ctx.atom_table[CELL_ID(car(args))];
+        REQUIRE_ARGC(argc, 1, 1, "symbol->string");
+        CHECK_SYMBOL(argv[0], "symbol->string");
+        const char *s = ctx.atom_table[CELL_ID(argv[0])];
         return make_string_copy(s);
     }
     case PNUM2STR: {
-        REQUIRE_ARGS(args, 1, 2, "number->string");
-        unsigned num = car(args);
+        REQUIRE_ARGC(argc, 1, 2, "number->string");
+        unsigned num = argv[0];
         int radix = 10;
-        if (cdr(args)) {
+        if (argc > 1) {
             int64_t radix64;
-            if (!expect_exact_int64(cadr(args), &radix64, "number->string"))
+            if (!expect_exact_int64(argv[1], &radix64, "number->string"))
                 return TOK_ERROR;
             radix = (int)radix64;
         }
@@ -312,13 +329,13 @@ unsigned apply_primitive(unsigned prim_id, unsigned args)
         return make_string_copy(buf);
     }
     case PSTR2NUM: {
-        REQUIRE_ARGS(args, 1, 2, "string->number");
-        CHECK_STRING(car(args), "string->number");
-        char *s = GET_STRING_PTR(car(args));
+        REQUIRE_ARGC(argc, 1, 2, "string->number");
+        CHECK_STRING(argv[0], "string->number");
+        char *s = GET_STRING_PTR(argv[0]);
         int radix = 10;
-        if (cdr(args)) {
+        if (argc > 1) {
             int64_t radix64;
-            if (!expect_exact_int64(cadr(args), &radix64, "string->number"))
+            if (!expect_exact_int64(argv[1], &radix64, "string->number"))
                 return TOK_ERROR;
             radix = (int)radix64;
         }
@@ -339,18 +356,18 @@ unsigned apply_primitive(unsigned prim_id, unsigned args)
         return store(val);
     }
     case PMAKESTR: {
-        REQUIRE_ARGS(args, 1, 2, "make-string");
+        REQUIRE_ARGC(argc, 1, 2, "make-string");
         int64_t len;
-        if (!expect_nonneg_int64(car(args), &len, "make-string"))
+        if (!expect_nonneg_int64(argv[0], &len, "make-string"))
             return TOK_ERROR;
         if ((uint64_t)len > SIZE_MAX - 1) {
             show_error("make-string: length too large");
             return TOK_ERROR;
         }
         char fill = ' ';
-        if (cdr(args)) {
-            CHECK_CHAR(cadr(args), "make-string");
-            fill = (char)CELL_ID(cadr(args));
+        if (argc > 1) {
+            CHECK_CHAR(argv[1], "make-string");
+            fill = (char)CELL_ID(argv[1]);
         }
         char *s = malloc(len + 1);
         if (!s) {
@@ -362,15 +379,15 @@ unsigned apply_primitive(unsigned prim_id, unsigned args)
         return make_string_owned(s);
     }
     case PSTRCOPY: {
-        REQUIRE_ARGS(args, 1, 1, "string-copy");
-        CHECK_STRING(car(args), "string-copy");
-        char *s = GET_STRING_PTR(car(args));
+        REQUIRE_ARGC(argc, 1, 1, "string-copy");
+        CHECK_STRING(argv[0], "string-copy");
+        char *s = GET_STRING_PTR(argv[0]);
         return make_string_copy(s);
     }
     case PSTR2LIST: {
-        REQUIRE_ARGS(args, 1, 1, "string->list");
-        CHECK_STRING(car(args), "string->list");
-        char *s = GET_STRING_PTR(car(args));
+        REQUIRE_ARGC(argc, 1, 1, "string->list");
+        CHECK_STRING(argv[0], "string->list");
+        char *s = GET_STRING_PTR(argv[0]);
         size_t len = strlen(s);
         GC_GUARD;
         unsigned result = 0;
@@ -381,8 +398,8 @@ unsigned apply_primitive(unsigned prim_id, unsigned args)
         return result;
     }
     case PLIST2STR: {
-        REQUIRE_ARGS(args, 1, 1, "list->string");
-        unsigned lst = car(args);
+        REQUIRE_ARGC(argc, 1, 1, "list->string");
+        unsigned lst = argv[0];
         size_t len = 0;
         for (unsigned it = lst; it; it = cdr(it)) {
             if (!IS_PAIR(it)) {
@@ -408,11 +425,11 @@ unsigned apply_primitive(unsigned prim_id, unsigned args)
         return make_string_owned(s);
     }
     case PSTRFILL: {
-        REQUIRE_ARGS(args, 2, 2, "string-fill!");
-        CHECK_STRING(car(args), "string-fill!");
-        char *s = GET_STRING_PTR(car(args));
-        CHECK_CHAR(cadr(args), "string-fill!");
-        int c = (unsigned char)CELL_ID(cadr(args));
+        REQUIRE_ARGC(argc, 2, 2, "string-fill!");
+        CHECK_STRING(argv[0], "string-fill!");
+        char *s = GET_STRING_PTR(argv[0]);
+        CHECK_CHAR(argv[1], "string-fill!");
+        int c = (unsigned char)CELL_ID(argv[1]);
         size_t len = strlen(s);
         for (size_t i = 0; i < len; i++)
             s[i] = c;
@@ -431,7 +448,7 @@ unsigned apply_primitive(unsigned prim_id, unsigned args)
     case PSTRLEI:
     case PSTRGEI: {
         unsigned offset = prim_id - PSTREQ;
-        return string_compare(args, (cmp_op)(offset % 5), offset >= 5);
+        return string_compare(argc, argv, (cmp_op)(offset % 5), offset >= 5);
     }
 
     // Character operations - delegated to prim_char.c
@@ -454,7 +471,7 @@ unsigned apply_primitive(unsigned prim_id, unsigned args)
     case PCHARWHITE:
     case PCHARUPPER:
     case PCHARLOWER:
-        return apply_char_primitive(prim_id, args);
+        return apply_char_primitive(prim_id, argc, argv);
 
     // Vector operations - delegated to prim_vector.c
     case PMAKEVEC:
@@ -465,7 +482,7 @@ unsigned apply_primitive(unsigned prim_id, unsigned args)
     case PVECFILL:
     case PLIST2VEC:
     case PVEC2LIST:
-        return apply_vector_primitive(prim_id, args);
+        return apply_vector_primitive(prim_id, argc, argv);
 
     // Math functions - delegated to prim_math.c
     case PSQRT:
@@ -485,28 +502,27 @@ unsigned apply_primitive(unsigned prim_id, unsigned args)
     case PRANDOMINTEGER:
     case PRANDOMREAL:
     case PRANDOMSEED:
-        return apply_math_primitive(prim_id, args);
+        return apply_math_primitive(prim_id, argc, argv);
 
     // Misc
     case PERROR: {
         fprintf(stderr, "error: ");
-        FORLIST(a, args)
-        {
-            display_obj(car(a));
-            if (cdr(a))
+        for (unsigned i = 0; i < argc; i++) {
+            display_obj(argv[i]);
+            if (i + 1 < argc)
                 fprintf(stderr, " ");
         }
         fprintf(stderr, "\n");
         return TOK_ERROR;
     }
     case PGENSYM: {
-        REQUIRE_ARGS(args, 0, 0, "gensym");
+        REQUIRE_ARGC(argc, 0, 0, "gensym");
         char buf[32];
         snprintf(buf, sizeof(buf), "g%u", gensym_counter++);
         return atom_from_string(buf);
     }
     case PGCSTATS: {
-        REQUIRE_ARGS(args, 0, 0, "gc-stats");
+        REQUIRE_ARGC(argc, 0, 0, "gc-stats");
         GC_GUARD;
         // Return ((minor . count) (major . count) (heap-used . bytes))
         unsigned minor = store(ctx.minor_gc_count);
@@ -543,40 +559,37 @@ unsigned apply_primitive(unsigned prim_id, unsigned args)
     case PFINITE:
     case PINFINITE:
     case PNAN:
-        return apply_numtower_primitive(prim_id, args);
+        return apply_numtower_primitive(prim_id, argc, argv);
 
     // String constructor
     case PSTRING: {
         // (string char ...) - construct string from characters
-        unsigned len = list_length(args);
-        char *s = malloc(len + 1);
+        char *s = malloc(argc + 1);
         if (!s) {
             show_error("string: out of memory");
             return TOK_ERROR;
         }
-        unsigned i = 0;
-        for (unsigned a = args; a; a = cdr(a), i++) {
-            unsigned ch = car(a);
-            if (!IS_CHAR(ch)) {
+        for (unsigned i = 0; i < argc; i++) {
+            if (!IS_CHAR(argv[i])) {
                 free(s);
                 show_error("string: argument is not a character");
                 return TOK_ERROR;
             }
-            s[i] = (char)CELL_ID(ch);
+            s[i] = (char)CELL_ID(argv[i]);
         }
-        s[len] = '\0';
+        s[argc] = '\0';
         return make_string_owned(s);
     }
 
     // Transcript
     case PTRANSCRIPTON: {
-        REQUIRE_ARGS(args, 1, 1, "transcript-on");
-        CHECK_STRING(car(args), "transcript-on");
+        REQUIRE_ARGC(argc, 1, 1, "transcript-on");
+        CHECK_STRING(argv[0], "transcript-on");
         if (ctx.transcript) {
             show_error("transcript-on: transcript already active");
             return TOK_ERROR;
         }
-        char *filename = GET_STRING_PTR(car(args));
+        char *filename = GET_STRING_PTR(argv[0]);
         ctx.transcript = fopen(filename, "w");
         if (!ctx.transcript) {
             show_error("transcript-on: cannot open %s", filename);
@@ -585,7 +598,7 @@ unsigned apply_primitive(unsigned prim_id, unsigned args)
         return 0;
     }
     case PTRANSCRIPTOFF: {
-        REQUIRE_ARGS(args, 0, 0, "transcript-off");
+        REQUIRE_ARGC(argc, 0, 0, "transcript-off");
         if (!ctx.transcript) {
             show_error("transcript-off: no transcript active");
             return TOK_ERROR;
@@ -600,22 +613,28 @@ unsigned apply_primitive(unsigned prim_id, unsigned args)
         // (values) => single unspecified value
         // (values x) => x
         // (values x y ...) => multiple values object
-        if (!args)
+        if (argc == 0)
             return 0; // No values = unspecified
-        if (!cdr(args))
-            return car(args); // Single value
+        if (argc == 1)
+            return argv[0]; // Single value
         // Multiple values - wrap in BT_MULTIVAL
+        GC_GUARD;
+        unsigned values = 0;
+        gc_protect(&values);
+        for (unsigned i = argc; i > 0; i--) {
+            values = alloc_cons(argv[i - 1], values);
+        }
         unsigned mv = alloc();
         CELL_TYPE(mv) = BT_MULTIVAL;
-        CELL_CAR(mv) = args;
+        CELL_CAR(mv) = values;
         CELL_CDR(mv) = 0;
         return mv;
     }
 
     // R5RS environment procedures
     case PSCHEMEENV: {
-        REQUIRE_ARGS(args, 1, 1, "scheme-report-environment");
-        int64_t version = CELL_ID(car(args));
+        REQUIRE_ARGC(argc, 1, 1, "scheme-report-environment");
+        int64_t version = CELL_ID(argv[0]);
         if (version != 5) {
             show_error("scheme-report-environment: unsupported version %lld",
                        (long long)version);
@@ -624,8 +643,8 @@ unsigned apply_primitive(unsigned prim_id, unsigned args)
         return default_environment();
     }
     case PNULLENV: {
-        REQUIRE_ARGS(args, 1, 1, "null-environment");
-        int64_t version = CELL_ID(car(args));
+        REQUIRE_ARGC(argc, 1, 1, "null-environment");
+        int64_t version = CELL_ID(argv[0]);
         if (version != 5) {
             show_error("null-environment: unsupported version %lld",
                        (long long)version);
@@ -667,4 +686,34 @@ unsigned apply_primitive(unsigned prim_id, unsigned args)
         show_error("unknown primitive: %u", prim_id);
         return TOK_ERROR;
     }
+}
+
+unsigned apply_primitive(unsigned prim_id, unsigned args)
+{
+    unsigned argc = 0;
+    if (!list_length_checked(args, &argc, "primitive"))
+        return TOK_ERROR;
+
+    unsigned argv_stack[8];
+    unsigned *argv = argv_stack;
+    if (argc > sizeof(argv_stack) / sizeof(argv_stack[0])) {
+        argv = malloc(argc * sizeof(*argv));
+        if (!argv) {
+            show_error("primitive: out of memory");
+            return TOK_ERROR;
+        }
+    }
+
+    unsigned i = 0;
+    for (unsigned it = args; it; it = cdr(it))
+        argv[i++] = car(it);
+
+    GC_GUARD;
+    for (i = 0; i < argc; i++)
+        gc_protect(&argv[i]);
+    unsigned result = apply_primitive_argv(prim_id, argc, argv);
+
+    if (argv != argv_stack)
+        free(argv);
+    return result;
 }

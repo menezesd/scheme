@@ -6,70 +6,69 @@
 #include "prim_internal.h"
 #include <limits.h>
 
-unsigned apply_vector_primitive(unsigned prim_id, unsigned args)
+unsigned apply_vector_primitive(unsigned prim_id, unsigned argc,
+                                unsigned *argv)
 {
     switch (prim_id) {
     case PMAKEVEC: {
-        REQUIRE_ARGS(args, 1, 2, "make-vector");
+        REQUIRE_ARGC(argc, 1, 2, "make-vector");
         int64_t len64;
-        if (!expect_nonneg_int64(car(args), &len64, "make-vector"))
+        if (!expect_nonneg_int64(argv[0], &len64, "make-vector"))
             return TOK_ERROR;
         if ((uint64_t)len64 > UINT_MAX) {
             show_error("make-vector: length too large");
             return TOK_ERROR;
         }
         unsigned len = (unsigned)len64;
-        unsigned fill = cdr(args) ? cadr(args) : 0;
+        unsigned fill = (argc == 2) ? argv[1] : 0;
         return make_vector(len, fill);
     }
     case PVECTOR: {
-        unsigned len = list_length(args);
+        unsigned len = argc;
         unsigned vec = make_vector(len, 0);
         unsigned *data = vector_data_ptr(vec);
-        unsigned i = 0;
-        for (unsigned a = args; a; a = cdr(a), i++) {
-            data[i] = car(a);
-        }
+        for (unsigned i = 0; i < len; i++)
+            data[i] = argv[i];
         return vec;
     }
     case PVECREF: {
-        REQUIRE_ARGS(args, 2, 2, "vector-ref");
-        unsigned vec = car(args);
+        REQUIRE_ARGC(argc, 2, 2, "vector-ref");
+        unsigned vec = argv[0];
         if (!IS_VECTOR(vec))
             ERROR_RETURN("vector-ref: not a vector");
         int64_t idx;
-        if (!expect_nonneg_int64(cadr(args), &idx, "vector-ref"))
+        if (!expect_nonneg_int64(argv[1], &idx, "vector-ref"))
             return TOK_ERROR;
         CHECK_VECTOR_BOUNDS(idx, vec, "vector-ref");
         return vector_data_ptr(vec)[idx];
     }
     case PVECSET: {
-        REQUIRE_ARGS(args, 3, 3, "vector-set!");
-        unsigned vec = car(args);
+        REQUIRE_ARGC(argc, 3, 3, "vector-set!");
+        unsigned vec = argv[0];
         if (!IS_VECTOR(vec))
             ERROR_RETURN("vector-set!: not a vector");
         int64_t idx;
-        if (!expect_nonneg_int64(cadr(args), &idx, "vector-set!"))
+        if (!expect_nonneg_int64(argv[1], &idx, "vector-set!"))
             return TOK_ERROR;
         CHECK_VECTOR_BOUNDS(idx, vec, "vector-set!");
-        unsigned val = caddr(args);
+        unsigned val = argv[2];
         write_barrier(vec, val); // Generational GC write barrier
         vector_data_ptr(vec)[idx] = val;
         return val;
     }
     case PVECLEN: {
-        REQUIRE_ARGS(args, 1, 1, "vector-length");
-        unsigned vec = car(args);
+        REQUIRE_ARGC(argc, 1, 1, "vector-length");
+        unsigned vec = argv[0];
         if (!IS_VECTOR(vec))
             ERROR_RETURN("vector-length: not a vector");
         return store(vector_len(vec));
     }
     case PVECFILL: {
-        REQUIRE_ARGS(args, 2, 2, "vector-fill!");
-        unsigned vec = car(args);
+        REQUIRE_ARGC(argc, 2, 2, "vector-fill!");
+        unsigned vec = argv[0];
         if (!IS_VECTOR(vec))
             ERROR_RETURN("vector-fill!: not a vector");
-        unsigned fill = cadr(args);
+        unsigned fill = argv[1];
         write_barrier(vec, fill); // Generational GC write barrier
         unsigned len = vector_len(vec);
         unsigned *data = vector_data_ptr(vec);
@@ -78,8 +77,8 @@ unsigned apply_vector_primitive(unsigned prim_id, unsigned args)
         return 0;
     }
     case PLIST2VEC: {
-        REQUIRE_ARGS(args, 1, 1, "list->vector");
-        unsigned lst = car(args);
+        REQUIRE_ARGC(argc, 1, 1, "list->vector");
+        unsigned lst = argv[0];
         unsigned len = 0;
         for (unsigned it = lst; it; it = cdr(it)) {
             if (!IS_PAIR(it)) {
@@ -95,8 +94,8 @@ unsigned apply_vector_primitive(unsigned prim_id, unsigned args)
         return vec;
     }
     case PVEC2LIST: {
-        REQUIRE_ARGS(args, 1, 1, "vector->list");
-        unsigned vec = car(args);
+        REQUIRE_ARGC(argc, 1, 1, "vector->list");
+        unsigned vec = argv[0];
         if (!IS_VECTOR(vec))
             ERROR_RETURN("vector->list: not a vector");
         unsigned len = vector_len(vec);

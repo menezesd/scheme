@@ -6,13 +6,13 @@
 #include "prim_internal.h"
 #include "writer.h"
 
-unsigned apply_port_primitive(unsigned prim_id, unsigned args)
+unsigned apply_port_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
 {
     switch (prim_id) {
     case POPENINPUT: {
-        REQUIRE_ARGS(args, 1, 1, "open-input-file");
-        CHECK_STRING(car(args), "open-input-file");
-        char *filename = GET_STRING_PTR(car(args));
+        REQUIRE_ARGC(argc, 1, 1, "open-input-file");
+        CHECK_STRING(argv[0], "open-input-file");
+        char *filename = GET_STRING_PTR(argv[0]);
         FILE *f = fopen(filename, "r");
         if (!f) {
             show_error("open-input-file: cannot open %s", filename);
@@ -24,9 +24,9 @@ unsigned apply_port_primitive(unsigned prim_id, unsigned args)
         return p;
     }
     case POPENOUTPUT: {
-        REQUIRE_ARGS(args, 1, 1, "open-output-file");
-        CHECK_STRING(car(args), "open-output-file");
-        char *filename = GET_STRING_PTR(car(args));
+        REQUIRE_ARGC(argc, 1, 1, "open-output-file");
+        CHECK_STRING(argv[0], "open-output-file");
+        char *filename = GET_STRING_PTR(argv[0]);
         FILE *f = fopen(filename, "w");
         if (!f) {
             show_error("open-output-file: cannot open %s", filename);
@@ -41,8 +41,8 @@ unsigned apply_port_primitive(unsigned prim_id, unsigned args)
     case PCLOSEOUTPUT: {
         const char *name =
             prim_id == PCLOSEINPUT ? "close-input-port" : "close-output-port";
-        REQUIRE_ARGS(args, 1, 1, name);
-        unsigned port = car(args);
+        REQUIRE_ARGC(argc, 1, 1, name);
+        unsigned port = argv[0];
         // Handle string ports
         if (IS_STRINPORT(port) || IS_STROUTPORT(port)) {
             string_port *sp = GET_STRPORT_PTR(port);
@@ -62,15 +62,15 @@ unsigned apply_port_primitive(unsigned prim_id, unsigned args)
         return 0;
     }
     case PINPUTPORTP: {
-        REQUIRE_ARGS(args, 1, 1, "input-port?");
-        return IS_INPUT_PORT(car(args)) ? ctx.atom_true : ctx.atom_false;
+        REQUIRE_ARGC(argc, 1, 1, "input-port?");
+        return IS_INPUT_PORT(argv[0]) ? ctx.atom_true : ctx.atom_false;
     }
     case POUTPUTPORTP: {
-        REQUIRE_ARGS(args, 1, 1, "output-port?");
-        return IS_OUTPUT_PORT(car(args)) ? ctx.atom_true : ctx.atom_false;
+        REQUIRE_ARGC(argc, 1, 1, "output-port?");
+        return IS_OUTPUT_PORT(argv[0]) ? ctx.atom_true : ctx.atom_false;
     }
     case PCURRENTINPUT: {
-        REQUIRE_ARGS(args, 0, 0, "current-input-port");
+        REQUIRE_ARGC(argc, 0, 0, "current-input-port");
         // Return string port if active, otherwise wrap FILE*
         if (ctx.current_input_cell != 0) {
             return ctx.current_input_cell;
@@ -81,7 +81,7 @@ unsigned apply_port_primitive(unsigned prim_id, unsigned args)
         return p;
     }
     case PCURRENTOUTPUT: {
-        REQUIRE_ARGS(args, 0, 0, "current-output-port");
+        REQUIRE_ARGC(argc, 0, 0, "current-output-port");
         // Return string port if active, otherwise wrap FILE*
         if (ctx.current_output_cell != 0) {
             return ctx.current_output_cell;
@@ -93,7 +93,7 @@ unsigned apply_port_primitive(unsigned prim_id, unsigned args)
     }
     // String ports
     case POPENOUTPUTSTRING: {
-        REQUIRE_ARGS(args, 0, 0, "open-output-string");
+        REQUIRE_ARGC(argc, 0, 0, "open-output-string");
         string_port *sp = strport_new();
         if (!sp) {
             show_error("open-output-string: out of memory");
@@ -105,8 +105,8 @@ unsigned apply_port_primitive(unsigned prim_id, unsigned args)
         return p;
     }
     case PGETOUTPUTSTRING: {
-        REQUIRE_ARGS(args, 1, 1, "get-output-string");
-        unsigned port = car(args);
+        REQUIRE_ARGC(argc, 1, 1, "get-output-string");
+        unsigned port = argv[0];
         if (!IS_STROUTPORT(port)) {
             show_error("get-output-string: not a string output port");
             return TOK_ERROR;
@@ -126,8 +126,8 @@ unsigned apply_port_primitive(unsigned prim_id, unsigned args)
         return make_string_owned(copy);
     }
     case POPENINPUTSTRING: {
-        REQUIRE_ARGS(args, 1, 1, "open-input-string");
-        unsigned str = car(args);
+        REQUIRE_ARGC(argc, 1, 1, "open-input-string");
+        unsigned str = argv[0];
         if (!IS_STRING(str)) {
             show_error("open-input-string: not a string");
             return TOK_ERROR;
@@ -143,15 +143,15 @@ unsigned apply_port_primitive(unsigned prim_id, unsigned args)
         return p;
     }
     case PSTRINGPORTP: {
-        REQUIRE_ARGS(args, 1, 1, "string-port?");
-        unsigned a = car(args);
+        REQUIRE_ARGC(argc, 1, 1, "string-port?");
+        unsigned a = argv[0];
         return (IS_STRINPORT(a) || IS_STROUTPORT(a)) ? ctx.atom_true
                                                      : ctx.atom_false;
     }
     // Internal port setters (used by with-input-from-file etc.)
     case PSETCURRENTINPUT: {
-        REQUIRE_ARGS(args, 1, 1, "set-current-input-port!");
-        unsigned port = car(args);
+        REQUIRE_ARGC(argc, 1, 1, "set-current-input-port!");
+        unsigned port = argv[0];
         if (IS_INPORT(port)) {
             ctx.current_input = GET_PORT_PTR(port);
             ctx.current_input_cell = 0; // Use FILE*
@@ -165,8 +165,8 @@ unsigned apply_port_primitive(unsigned prim_id, unsigned args)
         return port;
     }
     case PSETCURRENTOUTPUT: {
-        REQUIRE_ARGS(args, 1, 1, "set-current-output-port!");
-        unsigned port = car(args);
+        REQUIRE_ARGC(argc, 1, 1, "set-current-output-port!");
+        unsigned port = argv[0];
         if (IS_OUTPORT(port)) {
             ctx.current_output = GET_PORT_PTR(port);
             ctx.current_output_cell = 0; // Use FILE*
@@ -180,8 +180,8 @@ unsigned apply_port_primitive(unsigned prim_id, unsigned args)
         return port;
     }
     case PFLUSHOUTPUT: {
-        REQUIRE_ARGS(args, 0, 1, "flush-output-port");
-        if (!args) {
+        REQUIRE_ARGC(argc, 0, 1, "flush-output-port");
+        if (argc == 0) {
             // Flush current output port
             if (ctx.current_output_cell != 0) {
                 // String port - nothing to flush
@@ -189,7 +189,7 @@ unsigned apply_port_primitive(unsigned prim_id, unsigned args)
                 fflush(ctx.current_output);
             }
         } else {
-            unsigned port = car(args);
+            unsigned port = argv[0];
             if (IS_OUTPORT(port)) {
                 fflush(GET_PORT_PTR(port));
             } else if (IS_STROUTPORT(port)) {

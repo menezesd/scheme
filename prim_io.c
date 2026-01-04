@@ -28,15 +28,17 @@
 #include "prim_internal.h"
 #include <poll.h>
 
-unsigned apply_io_primitive(unsigned prim_id, unsigned args)
+unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
 {
     switch (prim_id) {
     case PDISPLAY: {
-        REQUIRE_ARGS(args, 1, 2, "display");
-        unsigned arg = car(args);
+        REQUIRE_ARGC(argc, 1, 2, "display");
+        unsigned arg = argv[0];
         FILE *fport;
         string_port *sport;
-        int ptype = extract_output_port_ex(args, &fport, &sport, "display");
+        int port_index = (argc == 2) ? 1 : -1;
+        int ptype = extract_port_argv(argv, port_index, PORT_OUTPUT, &fport,
+                                      &sport, "display");
         if (ptype < 0)
             return TOK_ERROR;
         if (ptype == 1) {
@@ -71,11 +73,13 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned args)
         return arg;
     }
     case PWRITE: {
-        REQUIRE_ARGS(args, 1, 2, "write");
-        unsigned arg = car(args);
+        REQUIRE_ARGC(argc, 1, 2, "write");
+        unsigned arg = argv[0];
         FILE *fport;
         string_port *sport;
-        int ptype = extract_output_port_ex(args, &fport, &sport, "write");
+        int port_index = (argc == 2) ? 1 : -1;
+        int ptype = extract_port_argv(argv, port_index, PORT_OUTPUT, &fport,
+                                      &sport, "write");
         if (ptype < 0)
             return TOK_ERROR;
         if (ptype == 1) {
@@ -98,10 +102,10 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned args)
         return arg;
     }
     case PNEWLINE: {
-        REQUIRE_ARGS(args, 0, 1, "newline");
+        REQUIRE_ARGC(argc, 0, 1, "newline");
         // newline takes optional port as first arg, not second
-        if (args) {
-            unsigned p = car(args);
+        if (argc == 1) {
+            unsigned p = argv[0];
             if (IS_STROUTPORT(p)) {
                 string_port *sport = GET_STRPORT_PTR(p);
                 if (!sport) {
@@ -140,10 +144,12 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned args)
         return 0;
     }
     case PREAD: {
-        REQUIRE_ARGS(args, 0, 1, "read");
+        REQUIRE_ARGC(argc, 0, 1, "read");
         FILE *fport;
         string_port *sport;
-        int ptype = extract_input_port_ex(args, &fport, &sport, "read");
+        int port_index = (argc == 1) ? 0 : -1;
+        int ptype = extract_port_argv(argv, port_index, PORT_INPUT, &fport,
+                                      &sport, "read");
         if (ptype < 0)
             return TOK_ERROR;
         if (ptype == 1) {
@@ -166,10 +172,12 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned args)
         return read_obj_port(fport);
     }
     case PREADCHAR: {
-        REQUIRE_ARGS(args, 0, 1, "read-char");
+        REQUIRE_ARGC(argc, 0, 1, "read-char");
         FILE *fport;
         string_port *sport;
-        int ptype = extract_input_port_ex(args, &fport, &sport, "read-char");
+        int port_index = (argc == 1) ? 0 : -1;
+        int ptype = extract_port_argv(argv, port_index, PORT_INPUT, &fport,
+                                      &sport, "read-char");
         if (ptype < 0)
             return TOK_ERROR;
         int c;
@@ -183,10 +191,12 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned args)
         return make_char(c);
     }
     case PPEEKCHAR: {
-        REQUIRE_ARGS(args, 0, 1, "peek-char");
+        REQUIRE_ARGC(argc, 0, 1, "peek-char");
         FILE *fport;
         string_port *sport;
-        int ptype = extract_input_port_ex(args, &fport, &sport, "peek-char");
+        int port_index = (argc == 1) ? 0 : -1;
+        int ptype = extract_port_argv(argv, port_index, PORT_INPUT, &fport,
+                                      &sport, "peek-char");
         if (ptype < 0)
             return TOK_ERROR;
         int c;
@@ -202,12 +212,14 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned args)
         return make_char(c);
     }
     case PWRITECHAR: {
-        REQUIRE_ARGS(args, 1, 2, "write-char");
-        CHECK_CHAR(car(args), "write-char");
-        int c = (unsigned char)CELL_ID(car(args));
+        REQUIRE_ARGC(argc, 1, 2, "write-char");
+        CHECK_CHAR(argv[0], "write-char");
+        int c = (unsigned char)CELL_ID(argv[0]);
         FILE *fport;
         string_port *sport;
-        int ptype = extract_output_port_ex(args, &fport, &sport, "write-char");
+        int port_index = (argc == 2) ? 1 : -1;
+        int ptype = extract_port_argv(argv, port_index, PORT_OUTPUT, &fport,
+                                      &sport, "write-char");
         if (ptype < 0)
             return TOK_ERROR;
         if (ptype == 1) {
@@ -219,18 +231,20 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned args)
         return 0;
     }
     case PEOF: {
-        REQUIRE_ARGS(args, 1, 1, "eof-object?");
-        unsigned arg = car(args);
+        REQUIRE_ARGC(argc, 1, 1, "eof-object?");
+        unsigned arg = argv[0];
         return (CELL_TYPE(arg) == BT_ATOM &&
                 strcmp(ctx.atom_table[CELL_ID(arg)], "eof-object") == 0)
                    ? ctx.atom_true
                    : ctx.atom_false;
     }
     case PCHARREADY: {
-        REQUIRE_ARGS(args, 0, 1, "char-ready?");
+        REQUIRE_ARGC(argc, 0, 1, "char-ready?");
         FILE *fport;
         string_port *sport;
-        int ptype = extract_input_port_ex(args, &fport, &sport, "char-ready?");
+        int port_index = (argc == 1) ? 0 : -1;
+        int ptype = extract_port_argv(argv, port_index, PORT_INPUT, &fport,
+                                      &sport, "char-ready?");
         if (ptype < 0)
             return TOK_ERROR;
 
@@ -252,10 +266,12 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned args)
                                                    : ctx.atom_false;
     }
     case PREADLINE: {
-        REQUIRE_ARGS(args, 0, 1, "read-line");
+        REQUIRE_ARGC(argc, 0, 1, "read-line");
         FILE *fport;
         string_port *sport;
-        int ptype = extract_input_port_ex(args, &fport, &sport, "read-line");
+        int port_index = (argc == 1) ? 0 : -1;
+        int ptype = extract_port_argv(argv, port_index, PORT_INPUT, &fport,
+                                      &sport, "read-line");
         if (ptype < 0)
             return TOK_ERROR;
 
@@ -304,10 +320,10 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned args)
     }
     case PEXIT: {
         // (exit) or (exit code)
-        REQUIRE_ARGS(args, 0, 1, "exit");
+        REQUIRE_ARGC(argc, 0, 1, "exit");
         int code = 0;
-        if (args) {
-            unsigned arg = car(args);
+        if (argc == 1) {
+            unsigned arg = argv[0];
             int64_t code64;
             if (!expect_exact_int64(arg, &code64, "exit")) {
                 return TOK_ERROR;

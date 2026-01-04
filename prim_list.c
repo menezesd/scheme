@@ -21,20 +21,17 @@
 
 #include "prim_internal.h"
 
-unsigned prim_append(unsigned args)
+unsigned prim_append(unsigned argc, unsigned *argv)
 {
-    if (!args)
+    if (argc == 0)
         return 0;
     GC_GUARD;
     unsigned result = 0, tail = 0;
-    unsigned a = args;
-    // Protect all variables that survive across allocations
-    gc_protect(&args);
     gc_protect(&result);
     gc_protect(&tail);
-    gc_protect(&a);
-    for (; IS_PAIR(a) && cdr(a); a = cdr(a)) {
-        unsigned lst = car(a);
+
+    for (unsigned i = 0; i + 1 < argc; i++) {
+        unsigned lst = argv[i];
         gc_protect(&lst);
         while (lst && CELL_TYPE(lst) == BT_CONS) {
             list_append(&result, &tail, car(lst));
@@ -47,23 +44,20 @@ unsigned prim_append(unsigned args)
         }
         gc_unprotect(1);
     }
-    if (!IS_PAIR(a)) {
-        show_error("append: improper argument list");
-        return TOK_ERROR;
-    }
-    unsigned last = car(a);
+
+    unsigned last = argv[argc - 1];
     if (tail) {
-        write_barrier(tail, last); // tail may be in old gen
+        write_barrier(tail, last);
         CELL_CDR(tail) = last;
     }
     return result ? result : last;
 }
 
-unsigned prim_reverse(unsigned args)
+unsigned prim_reverse(unsigned argc, unsigned *argv)
 {
-    REQUIRE_ARGS(args, 1, 1, "reverse");
+    REQUIRE_ARGC(argc, 1, 1, "reverse");
     GC_GUARD;
-    unsigned lst = car(args);
+    unsigned lst = argv[0];
     unsigned result = 0;
     gc_protect(&lst);
     gc_protect(&result);
