@@ -202,6 +202,14 @@ typedef struct {
 #define NURSERY_SIZE (256 * 1024) // Size of nursery (young generation)
 #define CARD_SIZE 512             // Cells per card (2KB on 64-bit)
 
+// Card table bitfield macros (8x memory savings over byte-per-card)
+// card = cell_index / CARD_SIZE
+#define CARD_BYTE(card) ((card) >> 3)
+#define CARD_BIT(card) (1u << ((card) & 7))
+#define CARD_MARK(tbl, card) ((tbl)[CARD_BYTE(card)] |= CARD_BIT(card))
+#define CARD_CLEAR(tbl, card) ((tbl)[CARD_BYTE(card)] &= ~CARD_BIT(card))
+#define CARD_IS_DIRTY(tbl, card) ((tbl)[CARD_BYTE(card)] & CARD_BIT(card))
+
 // Reserved cell IDs for permanent atoms (never garbage collected)
 // Note: These must be >= 10 to avoid conflicts with the token enum (0-9)
 #define CELL_ATOM_FALSE 10

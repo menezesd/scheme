@@ -506,6 +506,69 @@ void peephole_optimize(code_object *code)
             continue;
         }
 
+        // Pattern: CAR, CAR -> CAAR (car of car)
+        if (op == OP_CAR && i + 1 < len && c[i + 1] == OP_CAR &&
+            !is_jump_target[i + 1]) {
+            c[i] = OP_CAAR;
+            remove[i + 1] = true;
+            i += 1;
+            continue;
+        }
+
+        // Pattern: CDR, CDR, CDR -> CDDDR
+        if (op == OP_CDR && i + 2 < len && c[i + 1] == OP_CDR &&
+            c[i + 2] == OP_CDR && !is_jump_target[i + 1] &&
+            !is_jump_target[i + 2]) {
+            c[i] = OP_CDDDR;
+            remove[i + 1] = remove[i + 2] = true;
+            i += 2;
+            continue;
+        }
+
+        // Pattern: CDDR, CDR -> CDDDR
+        if (op == OP_CDDR && i + 1 < len && c[i + 1] == OP_CDR &&
+            !is_jump_target[i + 1]) {
+            c[i] = OP_CDDDR;
+            remove[i + 1] = true;
+            i += 1;
+            continue;
+        }
+
+        // Pattern: CDR, CDDR -> CDDDR
+        if (op == OP_CDR && i + 1 < len && c[i + 1] == OP_CDDR &&
+            !is_jump_target[i + 1]) {
+            c[i] = OP_CDDDR;
+            remove[i + 1] = true;
+            i += 1;
+            continue;
+        }
+
+        // Pattern: CADR, CDR -> CADDR
+        if (op == OP_CADR && i + 1 < len && c[i + 1] == OP_CDR &&
+            !is_jump_target[i + 1]) {
+            c[i] = OP_CADDR;
+            remove[i + 1] = true;
+            i += 1;
+            continue;
+        }
+
+        // Pattern: CDDR, CAR -> CADDR
+        if (op == OP_CDDR && i + 1 < len && c[i + 1] == OP_CAR &&
+            !is_jump_target[i + 1]) {
+            c[i] = OP_CADDR;
+            remove[i + 1] = true;
+            i += 1;
+            continue;
+        }
+
+        // Pattern: NEG, NEG -> nothing (double negation)
+        if (op == OP_NEG && i + 1 < len && c[i + 1] == OP_NEG &&
+            !is_jump_target[i + 1]) {
+            remove[i] = remove[i + 1] = true;
+            i += 2;
+            continue;
+        }
+
         // NOTE: CONST x, CONST x -> CONST x, DUP is handled in cse_pass()
         // which properly rebuilds the code array to handle size changes.
 

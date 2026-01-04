@@ -32,6 +32,21 @@
 #define MAX_STACK_SIZE (1024 * 1024)
 #define MAX_FRAMES_SIZE (64 * 1024)
 
+// Error handling macro - reduces boilerplate in dispatch loop
+#define VM_ERROR(vm, msg)                                                      \
+    do {                                                                       \
+        (vm)->error = true;                                                    \
+        (vm)->error_msg = (msg);                                               \
+        (vm)->running = false;                                                 \
+    } while (0)
+
+// Error handling with break for use in switch cases
+#define VM_ERROR_BREAK(vm, msg)                                                \
+    do {                                                                       \
+        VM_ERROR(vm, msg);                                                     \
+        break;                                                                 \
+    } while (0)
+
 // Global VM state for GC integration
 // When the VM is running, this points to the active VM state
 // so that GC can update VM roots
@@ -138,9 +153,7 @@ void vm_push(vm_state *vm, unsigned val)
 {
     if (vm->sp >= vm->stack_cap) {
         if (vm->stack_cap >= MAX_STACK_SIZE) {
-            vm->error = true;
-            vm->error_msg = "stack overflow";
-            vm->running = false;
+            VM_ERROR(vm, "stack overflow");
             return;
         }
         vm->stack_cap *= 2;
@@ -155,9 +168,7 @@ void vm_push(vm_state *vm, unsigned val)
 unsigned vm_pop(vm_state *vm)
 {
     if (vm->sp == 0) {
-        vm->error = true;
-        vm->error_msg = "stack underflow";
-        vm->running = false;
+        VM_ERROR(vm, "stack underflow");
         return 0;
     }
     return vm->stack[--vm->sp];
@@ -166,9 +177,7 @@ unsigned vm_pop(vm_state *vm)
 static unsigned vm_peek(vm_state *vm, unsigned depth)
 {
     if (depth >= vm->sp) {
-        vm->error = true;
-        vm->error_msg = "stack underflow";
-        vm->running = false;
+        VM_ERROR(vm, "stack underflow");
         return 0;
     }
     return vm->stack[vm->sp - 1 - depth];
@@ -184,9 +193,7 @@ static void push_frame(vm_state *vm, code_object *code, unsigned ip,
     LISP_ASSERT_MSG(code != NULL, "push_frame: null code object");
     if (vm->fp >= vm->frames_cap) {
         if (vm->frames_cap >= MAX_FRAMES_SIZE) {
-            vm->error = true;
-            vm->error_msg = "call stack overflow";
-            vm->running = false;
+            VM_ERROR(vm, "call stack overflow");
             return;
         }
         vm->frames_cap *= 2;
@@ -205,9 +212,7 @@ static void push_frame(vm_state *vm, code_object *code, unsigned ip,
 static void pop_frame(vm_state *vm)
 {
     if (vm->fp == 0) {
-        vm->error = true;
-        vm->error_msg = "frame stack underflow";
-        vm->running = false;
+        VM_ERROR(vm, "frame stack underflow");
         return;
     }
     vm->fp--;
@@ -1248,12 +1253,8 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             unsigned b = vm_pop(vm);
             unsigned a = vm_pop(vm);
             unsigned result = binary_add(a, b);
-            if (result == TOK_ERROR) {
-                vm->error = true;
-                vm->error_msg = "+: invalid operands";
-                vm->running = false;
-                break;
-            }
+            if (result == TOK_ERROR)
+                VM_ERROR_BREAK(vm, "+: invalid operands");
             vm_push(vm, result);
             break;
         }
@@ -1262,12 +1263,8 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             unsigned b = vm_pop(vm);
             unsigned a = vm_pop(vm);
             unsigned result = binary_sub(a, b);
-            if (result == TOK_ERROR) {
-                vm->error = true;
-                vm->error_msg = "-: invalid operands";
-                vm->running = false;
-                break;
-            }
+            if (result == TOK_ERROR)
+                VM_ERROR_BREAK(vm, "-: invalid operands");
             vm_push(vm, result);
             break;
         }
@@ -1276,12 +1273,8 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             unsigned b = vm_pop(vm);
             unsigned a = vm_pop(vm);
             unsigned result = binary_mul(a, b);
-            if (result == TOK_ERROR) {
-                vm->error = true;
-                vm->error_msg = "*: invalid operands";
-                vm->running = false;
-                break;
-            }
+            if (result == TOK_ERROR)
+                VM_ERROR_BREAK(vm, "*: invalid operands");
             vm_push(vm, result);
             break;
         }
@@ -1290,12 +1283,8 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             unsigned b = vm_pop(vm);
             unsigned a = vm_pop(vm);
             unsigned result = binary_div(a, b);
-            if (result == TOK_ERROR) {
-                vm->error = true;
-                vm->error_msg = "/: invalid operands or division by zero";
-                vm->running = false;
-                break;
-            }
+            if (result == TOK_ERROR)
+                VM_ERROR_BREAK(vm, "/: invalid operands or division by zero");
             vm_push(vm, result);
             break;
         }
@@ -1303,14 +1292,9 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
         case OP_MOD: {
             unsigned b = vm_pop(vm);
             unsigned a = vm_pop(vm);
-            unsigned args = alloc_cons(a, alloc_cons(b, 0));
-            unsigned result = apply_primitive(PMOD, args);
-            if (result == TOK_ERROR) {
-                vm->error = true;
-                vm->error_msg = "modulo: invalid operands";
-                vm->running = false;
-                break;
-            }
+            unsigned result = binary_mod(a, b);
+            if (result == TOK_ERROR)
+                VM_ERROR_BREAK(vm, "modulo: invalid operands");
             vm_push(vm, result);
             break;
         }
@@ -1320,12 +1304,8 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             unsigned b = vm_pop(vm);
             unsigned a = vm_pop(vm);
             unsigned result = binary_lt(a, b);
-            if (result == TOK_ERROR) {
-                vm->error = true;
-                vm->error_msg = "<: invalid operands";
-                vm->running = false;
-                break;
-            }
+            if (result == TOK_ERROR)
+                VM_ERROR_BREAK(vm, "<: invalid operands");
             vm_push(vm, result);
             break;
         }
@@ -1333,14 +1313,9 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
         case OP_GT: {
             unsigned b = vm_pop(vm);
             unsigned a = vm_pop(vm);
-            unsigned args = alloc_cons(a, alloc_cons(b, 0));
-            unsigned result = apply_primitive(PGT, args);
-            if (result == TOK_ERROR) {
-                vm->error = true;
-                vm->error_msg = ">: invalid operands";
-                vm->running = false;
-                break;
-            }
+            unsigned result = binary_gt(a, b);
+            if (result == TOK_ERROR)
+                VM_ERROR_BREAK(vm, ">: invalid operands");
             vm_push(vm, result);
             break;
         }
@@ -1348,14 +1323,9 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
         case OP_LE: {
             unsigned b = vm_pop(vm);
             unsigned a = vm_pop(vm);
-            unsigned args = alloc_cons(a, alloc_cons(b, 0));
-            unsigned result = apply_primitive(PLEQ, args);
-            if (result == TOK_ERROR) {
-                vm->error = true;
-                vm->error_msg = "<=: invalid operands";
-                vm->running = false;
-                break;
-            }
+            unsigned result = binary_le(a, b);
+            if (result == TOK_ERROR)
+                VM_ERROR_BREAK(vm, "<=: invalid operands");
             vm_push(vm, result);
             break;
         }
@@ -1363,14 +1333,9 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
         case OP_GE: {
             unsigned b = vm_pop(vm);
             unsigned a = vm_pop(vm);
-            unsigned args = alloc_cons(a, alloc_cons(b, 0));
-            unsigned result = apply_primitive(PGEQ, args);
-            if (result == TOK_ERROR) {
-                vm->error = true;
-                vm->error_msg = ">=: invalid operands";
-                vm->running = false;
-                break;
-            }
+            unsigned result = binary_ge(a, b);
+            if (result == TOK_ERROR)
+                VM_ERROR_BREAK(vm, ">=: invalid operands");
             vm_push(vm, result);
             break;
         }
@@ -1379,12 +1344,8 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             unsigned b = vm_pop(vm);
             unsigned a = vm_pop(vm);
             unsigned result = binary_numeq(a, b);
-            if (result == TOK_ERROR) {
-                vm->error = true;
-                vm->error_msg = "=: invalid operands";
-                vm->running = false;
-                break;
-            }
+            if (result == TOK_ERROR)
+                VM_ERROR_BREAK(vm, "=: invalid operands");
             vm_push(vm, result);
             break;
         }

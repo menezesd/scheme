@@ -279,6 +279,7 @@ unsigned prim_plus(unsigned args);
 unsigned prim_minus(unsigned args);
 unsigned prim_mult(unsigned args);
 unsigned prim_div(unsigned args);
+unsigned prim_modulo(unsigned args);
 unsigned numeric_compare(unsigned args, cmp_op op);
 
 // Binary addition: a + b without list building
@@ -387,6 +388,31 @@ static inline unsigned binary_div(unsigned a, unsigned b)
     return prim_div(args);
 }
 
+// Binary modulo: a mod b
+static inline unsigned binary_mod(unsigned a, unsigned b)
+{
+    // Fast path: both are small integers
+    if (IS_NUM(a) && IS_NUM(b)) {
+        int64_t va = CELL_ID(a);
+        int64_t vb = CELL_ID(b);
+        if (vb == 0) {
+            show_error("modulo: division by zero");
+            return TOK_ERROR;
+        }
+        // Scheme modulo: result has same sign as divisor
+        int64_t r = va % vb;
+        if ((r > 0 && vb < 0) || (r < 0 && vb > 0))
+            r += vb;
+        return store(r);
+    }
+    // Fall back to full modulo with bignum support
+    gc_protect(&a);
+    gc_protect(&b);
+    unsigned args = alloc_cons(a, alloc_cons(b, 0));
+    gc_unprotect(2);
+    return prim_modulo(args);
+}
+
 // Binary less-than comparison: a < b
 // Returns ctx.atom_true or ctx.atom_false
 static inline unsigned binary_lt(unsigned a, unsigned b)
@@ -416,6 +442,51 @@ static inline unsigned binary_numeq(unsigned a, unsigned b)
     unsigned args = alloc_cons(a, alloc_cons(b, 0));
     gc_unprotect(2);
     return numeric_compare(args, CMP_EQ);
+}
+
+// Binary greater-than comparison: a > b
+static inline unsigned binary_gt(unsigned a, unsigned b)
+{
+    // Fast path: both are small integers
+    if (IS_NUM(a) && IS_NUM(b)) {
+        return CELL_ID(a) > CELL_ID(b) ? ctx.atom_true : ctx.atom_false;
+    }
+    // Fall back to full comparison
+    gc_protect(&a);
+    gc_protect(&b);
+    unsigned args = alloc_cons(a, alloc_cons(b, 0));
+    gc_unprotect(2);
+    return numeric_compare(args, CMP_GT);
+}
+
+// Binary less-than-or-equal comparison: a <= b
+static inline unsigned binary_le(unsigned a, unsigned b)
+{
+    // Fast path: both are small integers
+    if (IS_NUM(a) && IS_NUM(b)) {
+        return CELL_ID(a) <= CELL_ID(b) ? ctx.atom_true : ctx.atom_false;
+    }
+    // Fall back to full comparison
+    gc_protect(&a);
+    gc_protect(&b);
+    unsigned args = alloc_cons(a, alloc_cons(b, 0));
+    gc_unprotect(2);
+    return numeric_compare(args, CMP_LE);
+}
+
+// Binary greater-than-or-equal comparison: a >= b
+static inline unsigned binary_ge(unsigned a, unsigned b)
+{
+    // Fast path: both are small integers
+    if (IS_NUM(a) && IS_NUM(b)) {
+        return CELL_ID(a) >= CELL_ID(b) ? ctx.atom_true : ctx.atom_false;
+    }
+    // Fall back to full comparison
+    gc_protect(&a);
+    gc_protect(&b);
+    unsigned args = alloc_cons(a, alloc_cons(b, 0));
+    gc_unprotect(2);
+    return numeric_compare(args, CMP_GE);
 }
 
 // ============================================================================

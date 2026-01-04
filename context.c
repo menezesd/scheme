@@ -85,7 +85,9 @@ void init_heap(void)
     // Generational GC enabled
     ctx.nursery_start = SEMISPACE_SIZE - NURSERY_SIZE;
     ctx.nursery_ptr = ctx.nursery_start;
-    size_t card_table_size = (2 * SEMISPACE_SIZE) / CARD_SIZE;
+    // Card table uses bitfields: 1 bit per card (8x memory savings)
+    size_t num_cards = (2 * SEMISPACE_SIZE) / CARD_SIZE;
+    size_t card_table_size = (num_cards + 7) / 8; // Round up to whole bytes
     ctx.card_table = malloc(card_table_size);
     if (!ctx.card_table) {
         fprintf(stderr, "Fatal: Cannot allocate card table\n");
@@ -1331,7 +1333,8 @@ unsigned gc(unsigned root)
 
     // Clear card table for the new semispace (if generational GC is enabled)
     if (ctx.card_table) {
-        memset(ctx.card_table, 0, (2 * SEMISPACE_SIZE) / CARD_SIZE);
+        size_t num_cards = (2 * SEMISPACE_SIZE) / CARD_SIZE;
+        memset(ctx.card_table, 0, (num_cards + 7) / 8);
     }
 
     // Exit GC mode
@@ -1369,7 +1372,8 @@ void write_barrier(unsigned target, unsigned value)
         return; // value not in nursery
 
     // Mark the card containing target as dirty - O(1) operation
-    ctx.card_table[target / CARD_SIZE] = 1;
+    unsigned card = target / CARD_SIZE;
+    CARD_MARK(ctx.card_table, card);
 }
 
 // ============================================================================
@@ -1544,7 +1548,7 @@ unsigned minor_gc(unsigned root)
         unsigned card_end =
             (scan + CARD_SIZE - 1) / CARD_SIZE; // Cards up to original hptr
         for (unsigned card = card_start; card < card_end; card++) {
-            if (!ctx.card_table[card])
+            if (!CARD_IS_DIRTY(ctx.card_table, card))
                 continue;
             // Scan all cells in this card
             unsigned cell_start = card * CARD_SIZE;
@@ -1581,7 +1585,7 @@ unsigned minor_gc(unsigned root)
                 }
             }
             // Clear the card
-            ctx.card_table[card] = 0;
+            CARD_CLEAR(ctx.card_table, card);
         }
     } // end if (ctx.card_table)
 
