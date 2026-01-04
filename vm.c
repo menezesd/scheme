@@ -144,7 +144,10 @@ void vm_push(vm_state *vm, unsigned val)
         }
         vm->stack_cap *= 2;
         vm->stack = realloc(vm->stack, vm->stack_cap * sizeof(unsigned));
+        LISP_ASSERT_MSG(vm->stack != NULL, "vm_push: realloc failed");
     }
+    LISP_ASSERT_FMT(vm->sp < vm->stack_cap,
+                    "vm_push: sp=%u >= stack_cap=%u", vm->sp, vm->stack_cap);
     vm->stack[vm->sp++] = val;
 }
 
@@ -177,6 +180,7 @@ static unsigned vm_peek(vm_state *vm, unsigned depth)
 static void push_frame(vm_state *vm, code_object *code, unsigned ip,
                        unsigned bp, unsigned env)
 {
+    LISP_ASSERT_MSG(code != NULL, "push_frame: null code object");
     if (vm->fp >= vm->frames_cap) {
         if (vm->frames_cap >= MAX_FRAMES_SIZE) {
             vm->error = true;
@@ -186,7 +190,10 @@ static void push_frame(vm_state *vm, code_object *code, unsigned ip,
         }
         vm->frames_cap *= 2;
         vm->frames = realloc(vm->frames, vm->frames_cap * sizeof(vm_frame));
+        LISP_ASSERT_MSG(vm->frames != NULL, "push_frame: realloc failed");
     }
+    LISP_ASSERT_FMT(vm->fp < vm->frames_cap,
+                    "push_frame: fp=%u >= frames_cap=%u", vm->fp, vm->frames_cap);
     vm->frames[vm->fp].code = code;
     vm->frames[vm->fp].ip = ip;
     vm->frames[vm->fp].bp = bp;
@@ -216,16 +223,25 @@ static void pop_frame(vm_state *vm)
 
 static unsigned capture_continuation(vm_state *vm)
 {
+    LISP_ASSERT_MSG(vm != NULL, "capture_continuation: null vm");
+    LISP_ASSERT_MSG(vm->stack != NULL, "capture_continuation: null stack");
+    LISP_ASSERT_MSG(vm->frames != NULL, "capture_continuation: null frames");
+
     vm_continuation *cont = malloc(sizeof(vm_continuation));
+    LISP_ASSERT_MSG(cont != NULL, "capture_continuation: malloc failed");
 
     // Copy stack
     cont->sp = vm->sp;
     cont->stack = malloc(cont->sp * sizeof(unsigned));
+    LISP_ASSERT_MSG(cont->sp == 0 || cont->stack != NULL,
+                    "capture_continuation: stack malloc failed");
     memcpy(cont->stack, vm->stack, cont->sp * sizeof(unsigned));
 
     // Copy frames
     cont->fp = vm->fp;
     cont->frames = malloc(cont->fp * sizeof(vm_frame));
+    LISP_ASSERT_MSG(cont->fp == 0 || cont->frames != NULL,
+                    "capture_continuation: frames malloc failed");
     memcpy(cont->frames, vm->frames, cont->fp * sizeof(vm_frame));
 
     // Copy execution state
@@ -266,7 +282,11 @@ static unsigned capture_continuation(vm_state *vm)
 static void restore_continuation(vm_state *vm, unsigned cont_cell,
                                  unsigned value)
 {
+    LISP_ASSERT_MSG(vm != NULL, "restore_continuation: null vm");
+    LISP_ASSERT_TYPE(cont_cell, BT_VMCONT);
+
     vm_continuation *cont = (vm_continuation *)(intptr_t)CELL_ID(cont_cell);
+    LISP_ASSERT_MSG(cont != NULL, "restore_continuation: null continuation");
 
     // Restore letrec values if this continuation has them saved
     // This must happen before restoring the environment
@@ -523,6 +543,12 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
 
 unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
 {
+    LISP_ASSERT_MSG(vm != NULL, "vm_run: null vm");
+    LISP_ASSERT_MSG(code != NULL, "vm_run: null code object");
+    LISP_ASSERT_MSG(code->code != NULL, "vm_run: null bytecode array");
+    LISP_ASSERT_FMT(code->code_len > 0, "vm_run: empty bytecode (len=%u)",
+                    code->code_len);
+
     vm->code = code;
     vm->ip = 0;
     vm->env = env;

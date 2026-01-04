@@ -703,4 +703,59 @@ const char *reader_get_filename(void);
             ERROR_RETURNF("%s: not an output port", name);                     \
     } while (0)
 
+// ============================================================================
+// Debug Assertions
+// ============================================================================
+//
+// These macros provide runtime invariant checking in debug builds.
+// They are compiled out in release builds (when NDEBUG is defined).
+//
+// Usage:
+//   LISP_ASSERT(condition) - panics with condition text if false
+//   LISP_ASSERT_MSG(condition, msg) - panics with custom message if false
+//   LISP_ASSERT_FMT(condition, fmt, ...) - panics with formatted message
+//
+// Unlike ERROR_RETURN, these indicate internal bugs, not user errors.
+
+#ifdef NDEBUG
+#define LISP_ASSERT(cond) ((void)0)
+#define LISP_ASSERT_MSG(cond, msg) ((void)0)
+#define LISP_ASSERT_FMT(cond, fmt, ...) ((void)0)
+#else
+#define LISP_ASSERT(cond)                                                      \
+    do {                                                                       \
+        if (!(cond)) {                                                         \
+            fprintf(stderr, "Assertion failed at %s:%d: %s\n", __FILE__,       \
+                    __LINE__, #cond);                                          \
+            lisp_panic("assertion failed");                                    \
+        }                                                                      \
+    } while (0)
+
+#define LISP_ASSERT_MSG(cond, msg)                                             \
+    do {                                                                       \
+        if (!(cond)) {                                                         \
+            fprintf(stderr, "Assertion failed at %s:%d: %s\n", __FILE__,       \
+                    __LINE__, (msg));                                          \
+            lisp_panic("assertion failed");                                    \
+        }                                                                      \
+    } while (0)
+
+#define LISP_ASSERT_FMT(cond, fmt, ...)                                        \
+    do {                                                                       \
+        if (!(cond)) {                                                         \
+            fprintf(stderr, "Assertion failed at %s:%d: " fmt "\n", __FILE__,  \
+                    __LINE__, __VA_ARGS__);                                    \
+            lisp_panic("assertion failed");                                    \
+        }                                                                      \
+    } while (0)
+#endif
+
+// Convenience macros for common invariants
+#define LISP_ASSERT_VALID_CELL(c)                                              \
+    LISP_ASSERT_FMT((c) < SEMISPACE_SIZE * 2, "invalid cell index: %u", (c))
+
+#define LISP_ASSERT_TYPE(c, expected)                                          \
+    LISP_ASSERT_FMT(CELL_TYPE(c) == (expected), "expected type %d, got %d",    \
+                    (expected), CELL_TYPE(c))
+
 #endif // TYPES_H

@@ -143,6 +143,7 @@ static void init_shadow_stack(void)
 
 void gc_protect(unsigned *ptr)
 {
+    LISP_ASSERT_MSG(ptr != NULL, "gc_protect: null pointer");
     init_shadow_stack();
     if (shadow_stack_top >= shadow_stack_size) {
         // Expand the shadow stack
@@ -155,11 +156,18 @@ void gc_protect(unsigned *ptr)
         shadow_stack = new_stack;
         shadow_stack_size = new_size;
     }
+    LISP_ASSERT_FMT(shadow_stack_top >= 0 && shadow_stack_top < shadow_stack_size,
+                    "gc_protect: invalid shadow_stack_top=%d (size=%d)",
+                    shadow_stack_top, shadow_stack_size);
     shadow_stack[shadow_stack_top++] = ptr;
 }
 
 void gc_unprotect(int count)
 {
+    LISP_ASSERT_FMT(count >= 0, "gc_unprotect: negative count %d", count);
+    LISP_ASSERT_FMT(count <= shadow_stack_top,
+                    "gc_unprotect: count %d > stack_top %d",
+                    count, shadow_stack_top);
     shadow_stack_top -= count;
     if (shadow_stack_top < 0) {
         lisp_panic("shadow stack underflow");
@@ -198,7 +206,11 @@ unsigned alloc(void)
             if (ctx.hptr >= limit) {
                 lisp_panic("out of memory (heap full during GC)");
             }
-            return ctx.hptr++;
+            unsigned cell = ctx.hptr++;
+            LISP_ASSERT_FMT(cell >= HEAP_RESERVED && cell < limit,
+                            "alloc: cell %u outside valid range [%u, %u)",
+                            cell, HEAP_RESERVED, limit);
+            return cell;
         }
 
         // Check if we're at 90% capacity - trigger major GC
@@ -212,7 +224,11 @@ unsigned alloc(void)
         if (ctx.hptr >= limit) {
             lisp_panic("out of memory (heap exhausted)");
         }
-        return ctx.hptr++;
+        unsigned cell = ctx.hptr++;
+        LISP_ASSERT_FMT(cell >= HEAP_RESERVED && cell < limit,
+                        "alloc: cell %u outside valid range [%u, %u)",
+                        cell, HEAP_RESERVED, limit);
+        return cell;
     }
 
     // Generational GC enabled - during GC, allocate directly to old generation
@@ -220,7 +236,11 @@ unsigned alloc(void)
         if (ctx.hptr >= ctx.nursery_start) {
             lisp_panic("out of memory (old gen full during GC)");
         }
-        return ctx.hptr++;
+        unsigned cell = ctx.hptr++;
+        LISP_ASSERT_FMT(cell >= HEAP_RESERVED && cell < ctx.nursery_start,
+                        "alloc (gc): cell %u outside old gen [%u, %u)",
+                        cell, HEAP_RESERVED, ctx.nursery_start);
+        return cell;
     }
 
     // Generational GC: allocate from nursery
@@ -253,6 +273,9 @@ unsigned alloc(void)
     }
 
     unsigned cell = ctx.nursery_ptr++;
+    LISP_ASSERT_FMT(cell >= ctx.nursery_start && cell < nursery_end,
+                    "alloc (nursery): cell %u outside nursery [%u, %u)",
+                    cell, ctx.nursery_start, nursery_end);
     return cell;
 }
 

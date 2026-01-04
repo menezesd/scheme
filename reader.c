@@ -43,16 +43,34 @@ static const char *reader_filename = "<stdin>";
 // Datum Labels (#n= and #n#)
 // ============================================================================
 
-#define MAX_DATUM_LABELS 256
+// Dynamic datum label storage - grows as needed
+#define INITIAL_DATUM_LABELS 64
 
-static struct {
+typedef struct {
     int label;
     unsigned value;
     bool defined;
-} datum_labels[MAX_DATUM_LABELS];
-static int datum_label_count = 0;
+} datum_label_entry;
 
-static void reset_datum_labels(void) { datum_label_count = 0; }
+static datum_label_entry *datum_labels = NULL;
+static int datum_label_count = 0;
+static int datum_label_cap = 0;
+
+static void reset_datum_labels(void)
+{
+    datum_label_count = 0;
+    // Keep the allocated buffer for reuse, just reset count
+}
+
+// Free datum labels - called during cleanup (currently unused, kept for future use)
+__attribute__((unused))
+static void free_datum_labels(void)
+{
+    free(datum_labels);
+    datum_labels = NULL;
+    datum_label_count = 0;
+    datum_label_cap = 0;
+}
 
 static int find_datum_label(int label)
 {
@@ -65,9 +83,18 @@ static int find_datum_label(int label)
 
 static int add_datum_label(int label)
 {
-    if (datum_label_count >= MAX_DATUM_LABELS) {
-        show_error("too many datum labels");
-        return -1;
+    // Grow the array if needed
+    if (datum_label_count >= datum_label_cap) {
+        int new_cap = datum_label_cap == 0 ? INITIAL_DATUM_LABELS
+                                           : datum_label_cap * 2;
+        datum_label_entry *new_labels =
+            realloc(datum_labels, new_cap * sizeof(datum_label_entry));
+        if (!new_labels) {
+            show_error("out of memory for datum labels");
+            return -1;
+        }
+        datum_labels = new_labels;
+        datum_label_cap = new_cap;
     }
     int idx = datum_label_count++;
     datum_labels[idx].label = label;
@@ -370,11 +397,6 @@ unsigned read_token(void)
                         return TOK_ERROR;
                     }
                     label = label * 10 + digit;
-                }
-                if (label >= MAX_DATUM_LABELS) {
-                    show_error("datum label too large (max %d)",
-                               MAX_DATUM_LABELS - 1);
-                    return TOK_ERROR;
                 }
                 if (c == '=') {
                     // Define label: #n=<datum>
