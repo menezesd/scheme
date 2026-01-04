@@ -47,6 +47,19 @@
         break;                                                                 \
     } while (0)
 
+// Type check macros that break on failure
+#define VM_CHECK_PAIR(vm, val, msg)                                            \
+    do {                                                                       \
+        if (!IS_PAIR(val))                                                     \
+            VM_ERROR_BREAK(vm, msg);                                           \
+    } while (0)
+
+#define VM_CHECK_TYPE(vm, val, expected_type, msg)                             \
+    do {                                                                       \
+        if (CELL_TYPE(val) != (expected_type))                                 \
+            VM_ERROR_BREAK(vm, msg);                                           \
+    } while (0)
+
 // Global VM state for GC integration
 // When the VM is running, this points to the active VM state
 // so that GC can update VM roots
@@ -174,7 +187,7 @@ unsigned vm_pop(vm_state *vm)
     return vm->stack[--vm->sp];
 }
 
-static unsigned vm_peek(vm_state *vm, unsigned depth)
+static inline unsigned vm_peek(vm_state *vm, unsigned depth)
 {
     if (depth >= vm->sp) {
         VM_ERROR(vm, "stack underflow");
@@ -209,7 +222,7 @@ static void push_frame(vm_state *vm, code_object *code, unsigned ip,
     vm->fp++;
 }
 
-static void pop_frame(vm_state *vm)
+static inline void pop_frame(vm_state *vm)
 {
     if (vm->fp == 0) {
         VM_ERROR(vm, "frame stack underflow");
@@ -233,22 +246,31 @@ static unsigned capture_continuation(vm_state *vm)
     LISP_ASSERT_MSG(vm->stack != NULL, "capture_continuation: null stack");
     LISP_ASSERT_MSG(vm->frames != NULL, "capture_continuation: null frames");
 
-    vm_continuation *cont = malloc(sizeof(vm_continuation));
-    LISP_ASSERT_MSG(cont != NULL, "capture_continuation: malloc failed");
+    // Calculate sizes for single allocation
+    unsigned letrec_count =
+        (vm->letrec_frame && vm->letrec_count > 0) ? vm->letrec_count : 0;
+    size_t stack_size = vm->sp * sizeof(unsigned);
+    size_t frames_size = vm->fp * sizeof(vm_frame);
+    size_t letrec_size = letrec_count * sizeof(unsigned);
+    size_t total_size =
+        sizeof(vm_continuation) + stack_size + frames_size + letrec_size;
+
+    // Single allocation for entire continuation
+    char *block = malloc(total_size);
+    LISP_ASSERT_MSG(block != NULL, "capture_continuation: malloc failed");
+
+    // Place struct at start, arrays after it
+    vm_continuation *cont = (vm_continuation *)block;
+    cont->stack = (unsigned *)(block + sizeof(vm_continuation));
+    cont->frames = (vm_frame *)(block + sizeof(vm_continuation) + stack_size);
 
     // Copy stack
     cont->sp = vm->sp;
-    cont->stack = malloc(cont->sp * sizeof(unsigned));
-    LISP_ASSERT_MSG(cont->sp == 0 || cont->stack != NULL,
-                    "capture_continuation: stack malloc failed");
-    memcpy(cont->stack, vm->stack, cont->sp * sizeof(unsigned));
+    memcpy(cont->stack, vm->stack, stack_size);
 
     // Copy frames
     cont->fp = vm->fp;
-    cont->frames = malloc(cont->fp * sizeof(vm_frame));
-    LISP_ASSERT_MSG(cont->fp == 0 || cont->frames != NULL,
-                    "capture_continuation: frames malloc failed");
-    memcpy(cont->frames, vm->frames, cont->fp * sizeof(vm_frame));
+    memcpy(cont->frames, vm->frames, frames_size);
 
     // Copy execution state
     cont->code = vm->code;
@@ -256,25 +278,23 @@ static unsigned capture_continuation(vm_state *vm)
     cont->env = vm->env;
 
     // Save letrec values if we're in letrec initialization
-    cont->letrec_saved = NULL;
-    cont->letrec_saved_len = 0;
-    cont->letrec_frame = 0;
-
-    if (vm->letrec_frame && vm->letrec_count > 0) {
-        // Get the values list from the letrec frame
-        unsigned frame = car(vm->letrec_frame);
-        unsigned vals = cdr(frame);
-        unsigned count = vm->letrec_count;
-
-        // Allocate space for saved values
-        cont->letrec_saved = malloc(count * sizeof(unsigned));
-        cont->letrec_saved_len = count;
+    if (letrec_count > 0) {
+        cont->letrec_saved =
+            (unsigned *)(block + sizeof(vm_continuation) + stack_size +
+                         frames_size);
+        cont->letrec_saved_len = letrec_count;
         cont->letrec_frame = vm->letrec_frame;
 
-        // Save the current values
-        for (unsigned i = 0; i < count && vals; i++, vals = cdr(vals)) {
+        // Get the values list and save current values
+        unsigned frame = car(vm->letrec_frame);
+        unsigned vals = cdr(frame);
+        for (unsigned i = 0; i < letrec_count && vals; i++, vals = cdr(vals)) {
             cont->letrec_saved[i] = car(vals);
         }
+    } else {
+        cont->letrec_saved = NULL;
+        cont->letrec_saved_len = 0;
+        cont->letrec_frame = 0;
     }
 
     // Wrap in a cell
@@ -335,6 +355,55 @@ static void restore_continuation(vm_state *vm, unsigned cont_cell,
 // Function Application
 // ============================================================================
 
+// Forward declaration for vm_handle_apply
+static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail);
+
+// Handle (apply proc arg1 ... args-list) - consolidated helper
+// Returns true if apply was handled, false on error
+static bool vm_handle_apply(vm_state *vm, unsigned argc, unsigned *argv,
+                            bool tail)
+{
+    if (argc < 2) {
+        VM_ERROR(vm, "apply: expected at least 2 arguments");
+        return false;
+    }
+
+    unsigned proc = argv[0];
+    unsigned last_list = argv[argc - 1];
+
+    // Copy middle args before popping (they'll be overwritten)
+    unsigned middle_count = (argc > 2) ? argc - 2 : 0;
+    unsigned middle_args[16]; // Should be enough for typical use
+    for (unsigned i = 0; i < middle_count && i < 16; i++) {
+        middle_args[i] = argv[i + 1];
+    }
+
+    // Pop args from stack
+    vm->sp -= argc;
+
+    // Protect values across allocations
+    GC_GUARD;
+    gc_protect(&proc);
+    gc_protect(&last_list);
+
+    // Push middle args then append last list
+    unsigned apply_argc = 0;
+    for (unsigned i = 0; i < middle_count && i < 16; i++) {
+        vm_push(vm, middle_args[i]);
+        apply_argc++;
+    }
+
+    // Append the last list's elements
+    FORLIST(a, last_list)
+    {
+        vm_push(vm, car(a));
+        apply_argc++;
+    }
+
+    vm_apply(vm, proc, apply_argc, tail);
+    return true;
+}
+
 static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
 {
     if (IS_BUILTIN(fn)) {
@@ -365,44 +434,7 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
         }
 
         if (prim_id == PAPPLY) {
-            // apply: (apply proc arg1 ... args-list)
-            if (argc < 2) {
-                vm->sp -= argc;
-                VM_ERROR(vm, "apply: expected at least 2 arguments");
-                return;
-            }
-            unsigned proc = argv[0];
-            unsigned last_list = argv[argc - 1];
-
-            // Copy middle args before popping (they'll be overwritten)
-            unsigned middle_count = (argc > 2) ? argc - 2 : 0;
-            unsigned middle_args[16]; // Should be enough for typical use
-            for (unsigned i = 0; i < middle_count && i < 16; i++) {
-                middle_args[i] = argv[i + 1];
-            }
-
-            // Pop args from stack
-            vm->sp -= argc;
-
-            // Protect values across allocations
-            gc_protect(&proc);
-            gc_protect(&last_list);
-
-            // Push middle args then append last list
-            unsigned apply_argc = 0;
-            for (unsigned i = 0; i < middle_count && i < 16; i++) {
-                vm_push(vm, middle_args[i]);
-                apply_argc++;
-            }
-
-            // Append the last list's elements
-            FORLIST(a, last_list)
-            {
-                vm_push(vm, car(a));
-                apply_argc++;
-            }
-
-            vm_apply(vm, proc, apply_argc, tail);
+            vm_handle_apply(vm, argc, argv, tail);
             return;
         }
 
@@ -738,43 +770,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
 
             // Handle special primitives that need full apply treatment
             if (prim_id == PAPPLY) {
-                // apply: (apply proc arg1 ... args-list)
-                if (argc < 2) {
-                    VM_ERROR_BREAK(vm, "apply: expected at least 2 arguments");
-                }
-                unsigned proc = argv[0];
-                unsigned last_list = argv[argc - 1];
-
-                // Copy middle args before popping (they'll be overwritten)
-                unsigned middle_count = (argc > 2) ? argc - 2 : 0;
-                unsigned middle_args[16]; // Should be enough for typical use
-                for (unsigned i = 0; i < middle_count && i < 16; i++) {
-                    middle_args[i] = argv[i + 1];
-                }
-
-                // Pop args from stack
-                vm->sp -= argc;
-
-                // Protect values across allocations
-                GC_GUARD;
-                gc_protect(&proc);
-                gc_protect(&last_list);
-
-                // Push middle args then append last list
-                unsigned apply_argc = 0;
-                for (unsigned i = 0; i < middle_count && i < 16; i++) {
-                    vm_push(vm, middle_args[i]);
-                    apply_argc++;
-                }
-
-                // Append the last list's elements
-                FORLIST(a, last_list)
-                {
-                    vm_push(vm, car(a));
-                    apply_argc++;
-                }
-
-                vm_apply(vm, proc, apply_argc, false);
+                vm_handle_apply(vm, argc, argv, false);
                 break;
             }
 
@@ -1082,24 +1078,14 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
         // Specialized opcodes for common operations
         case OP_CAR: {
             unsigned pair = vm_pop(vm);
-            if (!IS_PAIR(pair)) {
-                vm->error = true;
-                vm->error_msg = "car: not a pair";
-                vm->running = false;
-                break;
-            }
+            VM_CHECK_PAIR(vm, pair, "car: not a pair");
             vm_push(vm, car(pair));
             break;
         }
 
         case OP_CDR: {
             unsigned pair = vm_pop(vm);
-            if (!IS_PAIR(pair)) {
-                vm->error = true;
-                vm->error_msg = "cdr: not a pair";
-                vm->running = false;
-                break;
-            }
+            VM_CHECK_PAIR(vm, pair, "cdr: not a pair");
             vm_push(vm, cdr(pair));
             break;
         }
@@ -1333,38 +1319,18 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
         // More list operations
         case OP_CADR: {
             unsigned pair = vm_pop(vm);
-            if (!IS_PAIR(pair)) {
-                vm->error = true;
-                vm->error_msg = "cadr: not a pair";
-                vm->running = false;
-                break;
-            }
+            VM_CHECK_PAIR(vm, pair, "cadr: not a pair");
             unsigned inner = cdr(pair);
-            if (!IS_PAIR(inner)) {
-                vm->error = true;
-                vm->error_msg = "cadr: cdr not a pair";
-                vm->running = false;
-                break;
-            }
+            VM_CHECK_PAIR(vm, inner, "cadr: cdr not a pair");
             vm_push(vm, car(inner));
             break;
         }
 
         case OP_CDDR: {
             unsigned pair = vm_pop(vm);
-            if (!IS_PAIR(pair)) {
-                vm->error = true;
-                vm->error_msg = "cddr: not a pair";
-                vm->running = false;
-                break;
-            }
+            VM_CHECK_PAIR(vm, pair, "cddr: not a pair");
             unsigned inner = cdr(pair);
-            if (!IS_PAIR(inner)) {
-                vm->error = true;
-                vm->error_msg = "cddr: cdr not a pair";
-                vm->running = false;
-                break;
-            }
+            VM_CHECK_PAIR(vm, inner, "cddr: cdr not a pair");
             vm_push(vm, cdr(inner));
             break;
         }
@@ -1372,12 +1338,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
         case OP_SETCAR: {
             unsigned val = vm_pop(vm);
             unsigned pair = vm_pop(vm);
-            if (!IS_PAIR(pair)) {
-                vm->error = true;
-                vm->error_msg = "set-car!: not a pair";
-                vm->running = false;
-                break;
-            }
+            VM_CHECK_PAIR(vm, pair, "set-car!: not a pair");
             write_barrier(pair, val); // Generational GC
             CELL_CAR(pair) = val;
             vm_push(vm, val);
@@ -1387,12 +1348,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
         case OP_SETCDR: {
             unsigned val = vm_pop(vm);
             unsigned pair = vm_pop(vm);
-            if (!IS_PAIR(pair)) {
-                vm->error = true;
-                vm->error_msg = "set-cdr!: not a pair";
-                vm->running = false;
-                break;
-            }
+            VM_CHECK_PAIR(vm, pair, "set-cdr!: not a pair");
             write_barrier(pair, val); // Generational GC
             CELL_CDR(pair) = val;
             vm_push(vm, val);
@@ -1466,90 +1422,40 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
         // Additional list accessors
         case OP_CAAR: {
             unsigned pair = vm_pop(vm);
-            if (!IS_PAIR(pair)) {
-                vm->error = true;
-                vm->error_msg = "caar: not a pair";
-                vm->running = false;
-                break;
-            }
+            VM_CHECK_PAIR(vm, pair, "caar: not a pair");
             unsigned inner = car(pair);
-            if (!IS_PAIR(inner)) {
-                vm->error = true;
-                vm->error_msg = "caar: car not a pair";
-                vm->running = false;
-                break;
-            }
+            VM_CHECK_PAIR(vm, inner, "caar: car not a pair");
             vm_push(vm, car(inner));
             break;
         }
 
         case OP_CDAR: {
             unsigned pair = vm_pop(vm);
-            if (!IS_PAIR(pair)) {
-                vm->error = true;
-                vm->error_msg = "cdar: not a pair";
-                vm->running = false;
-                break;
-            }
+            VM_CHECK_PAIR(vm, pair, "cdar: not a pair");
             unsigned inner = car(pair);
-            if (!IS_PAIR(inner)) {
-                vm->error = true;
-                vm->error_msg = "cdar: car not a pair";
-                vm->running = false;
-                break;
-            }
+            VM_CHECK_PAIR(vm, inner, "cdar: car not a pair");
             vm_push(vm, cdr(inner));
             break;
         }
 
         case OP_CADDR: {
             unsigned pair = vm_pop(vm);
-            if (!IS_PAIR(pair)) {
-                vm->error = true;
-                vm->error_msg = "caddr: not a pair";
-                vm->running = false;
-                break;
-            }
+            VM_CHECK_PAIR(vm, pair, "caddr: not a pair");
             unsigned d = cdr(pair);
-            if (!IS_PAIR(d)) {
-                vm->error = true;
-                vm->error_msg = "caddr: cdr not a pair";
-                vm->running = false;
-                break;
-            }
+            VM_CHECK_PAIR(vm, d, "caddr: cdr not a pair");
             unsigned dd = cdr(d);
-            if (!IS_PAIR(dd)) {
-                vm->error = true;
-                vm->error_msg = "caddr: cddr not a pair";
-                vm->running = false;
-                break;
-            }
+            VM_CHECK_PAIR(vm, dd, "caddr: cddr not a pair");
             vm_push(vm, car(dd));
             break;
         }
 
         case OP_CDDDR: {
             unsigned pair = vm_pop(vm);
-            if (!IS_PAIR(pair)) {
-                vm->error = true;
-                vm->error_msg = "cdddr: not a pair";
-                vm->running = false;
-                break;
-            }
+            VM_CHECK_PAIR(vm, pair, "cdddr: not a pair");
             unsigned d = cdr(pair);
-            if (!IS_PAIR(d)) {
-                vm->error = true;
-                vm->error_msg = "cdddr: cdr not a pair";
-                vm->running = false;
-                break;
-            }
+            VM_CHECK_PAIR(vm, d, "cdddr: cdr not a pair");
             unsigned dd = cdr(d);
-            if (!IS_PAIR(dd)) {
-                vm->error = true;
-                vm->error_msg = "cdddr: cddr not a pair";
-                vm->running = false;
-                break;
-            }
+            VM_CHECK_PAIR(vm, dd, "cdddr: cddr not a pair");
             vm_push(vm, cdr(dd));
             break;
         }

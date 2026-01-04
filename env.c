@@ -33,20 +33,27 @@
 // ============================================================================
 // Lookup Cache
 // ============================================================================
-// Single-entry cache for variable lookups. Most code has high locality -
-// the same variables are accessed repeatedly in loops. This cache avoids
-// redundant environment traversals.
+// 4-entry associative cache for variable lookups. Most code has high locality -
+// the same variables are accessed repeatedly in loops. Multiple entries handle
+// cases like (let ((x 1) (y 2) (z 3)) ... x ... y ... z ...) without thrashing.
+
+#define LOOKUP_CACHE_SIZE 4
 
 static struct {
-    int64_t var;      // Variable atom ID
-    unsigned env;     // Environment where found
+    int64_t var;       // Variable atom ID (-1 = empty)
+    unsigned env;      // Environment where found
     unsigned val_cell; // Cell containing the value (so mutations are visible)
-} lookup_cache = {-1, 0, 0};
+} lookup_cache[LOOKUP_CACHE_SIZE];
 
-// Invalidate cache when environment is modified
+static int cache_next = 0; // Next slot to use (circular)
+
+// Invalidate all cache entries
 static inline void invalidate_lookup_cache(void)
 {
-    lookup_cache.var = -1;
+    for (int i = 0; i < LOOKUP_CACHE_SIZE; i++) {
+        lookup_cache[i].var = -1;
+    }
+    cache_next = 0;
 }
 
 // Public function to invalidate cache (called after GC)
@@ -173,9 +180,11 @@ unsigned setvar(int64_t var, unsigned aval, unsigned env)
 // Internal lookup - returns TOK_ERROR if not found (no error message)
 static unsigned lookup_internal(int64_t var, unsigned env)
 {
-    // Check cache first - same variable in same environment?
-    if (lookup_cache.var == var && lookup_cache.env == env) {
-        return car(lookup_cache.val_cell);
+    // Check cache first - scan all entries for match
+    for (int i = 0; i < LOOKUP_CACHE_SIZE; i++) {
+        if (lookup_cache[i].var == var && lookup_cache[i].env == env) {
+            return car(lookup_cache[i].val_cell);
+        }
     }
 
     unsigned orig_env = env;
@@ -185,10 +194,11 @@ static unsigned lookup_internal(int64_t var, unsigned env)
              vars = cdr(vars), vals = cdr(vals)) {
             if (CELL_TYPE(vars) == BT_ATOM) {
                 if (CELL_ID(vars) == var) {
-                    // Cache hit location (vals is the cell containing value)
-                    lookup_cache.var = var;
-                    lookup_cache.env = orig_env;
-                    lookup_cache.val_cell = vals;
+                    // Cache hit location using circular buffer
+                    lookup_cache[cache_next].var = var;
+                    lookup_cache[cache_next].env = orig_env;
+                    lookup_cache[cache_next].val_cell = vals;
+                    cache_next = (cache_next + 1) % LOOKUP_CACHE_SIZE;
                     return car(vals);
                 } else {
                     break;
@@ -196,10 +206,11 @@ static unsigned lookup_internal(int64_t var, unsigned env)
             }
 
             if (CELL_ID(car(vars)) == var) {
-                // Cache hit location (vals is the cell containing value)
-                lookup_cache.var = var;
-                lookup_cache.env = orig_env;
-                lookup_cache.val_cell = vals;
+                // Cache hit location using circular buffer
+                lookup_cache[cache_next].var = var;
+                lookup_cache[cache_next].env = orig_env;
+                lookup_cache[cache_next].val_cell = vals;
+                cache_next = (cache_next + 1) % LOOKUP_CACHE_SIZE;
                 return car(vals);
             }
         }
@@ -230,30 +241,32 @@ unsigned bind_params(unsigned params, unsigned args)
     GC_GUARD;
     unsigned vars = 0, vals = 0;
     unsigned vars_tail = 0, vals_tail = 0;
+    unsigned var = 0, val = 0, vc = 0, ac = 0;
 
-    // Protect all loop-carried variables
+    // Protect all variables once at function entry (not per-iteration)
     gc_protect(&vars);
     gc_protect(&vals);
     gc_protect(&vars_tail);
     gc_protect(&vals_tail);
     gc_protect(&params);
     gc_protect(&args);
+    gc_protect(&var);
+    gc_protect(&val);
+    gc_protect(&vc);
+    gc_protect(&ac);
 
     while (params && CELL_TYPE(params) == BT_CONS) {
-        unsigned var = car(params);
-        unsigned val = args ? car(args) : 0;
+        var = car(params);
+        val = args ? car(args) : 0;
 
         // Validate var is an atom before using it
         if (var && CELL_TYPE(var) != BT_ATOM) {
             lisp_panic("bind_params: var is not BT_ATOM");
         }
 
-        unsigned vc = 0, ac;
-        {
-            GC_PROTECT_GUARD3(&var, &val, &vc);
-            vc = alloc_cons(var, 0);
-            ac = alloc_cons(val, 0);
-        }
+        vc = alloc_cons(var, 0);
+        ac = alloc_cons(val, 0);
+
         if (!vars) {
             vars = vc;
             vals = ac;
@@ -272,13 +285,9 @@ unsigned bind_params(unsigned params, unsigned args)
 
     // Handle rest parameter (dotted notation)
     if (params && CELL_TYPE(params) == BT_ATOM) {
-        unsigned vc, ac;
-        {
-            GC_PROTECT_GUARD;
-            gc_protect(&vc);
-            vc = alloc_cons(params, 0);
-            ac = alloc_cons(args, 0);
-        }
+        vc = alloc_cons(params, 0);
+        ac = alloc_cons(args, 0);
+
         if (!vars) {
             vars = vc;
             vals = ac;
