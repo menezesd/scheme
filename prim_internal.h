@@ -254,6 +254,14 @@ static inline void get_rational_cells(unsigned x, unsigned *num,
 // need to survive potential GC during allocation.
 static inline unsigned multiply_cells(unsigned a, unsigned b)
 {
+    // Fast path: both are small integers and won't overflow
+    if (IS_NUM(a) && IS_NUM(b)) {
+        int64_t result;
+        if (!__builtin_mul_overflow(CELL_ID(a), CELL_ID(b), &result)) {
+            return store(result);
+        }
+    }
+    // Slow path: use bignum arithmetic
     bignum *ba = to_bignum(a);
     bignum *bb = to_bignum(b);
     bignum *result = bn_mul(ba, bb);
@@ -267,6 +275,14 @@ static inline unsigned multiply_cells(unsigned a, unsigned b)
 // need to survive potential GC during allocation.
 static inline unsigned add_cells(unsigned a, unsigned b)
 {
+    // Fast path: both are small integers and won't overflow
+    if (IS_NUM(a) && IS_NUM(b)) {
+        int64_t result;
+        if (!__builtin_add_overflow(CELL_ID(a), CELL_ID(b), &result)) {
+            return store(result);
+        }
+    }
+    // Slow path: use bignum arithmetic
     bignum *ba = to_bignum(a);
     bignum *bb = to_bignum(b);
     bn_add_ip(ba, bb);
@@ -279,6 +295,14 @@ static inline unsigned add_cells(unsigned a, unsigned b)
 // need to survive potential GC during allocation.
 static inline unsigned subtract_cells(unsigned a, unsigned b)
 {
+    // Fast path: both are small integers and won't overflow
+    if (IS_NUM(a) && IS_NUM(b)) {
+        int64_t result;
+        if (!__builtin_sub_overflow(CELL_ID(a), CELL_ID(b), &result)) {
+            return store(result);
+        }
+    }
+    // Slow path: use bignum arithmetic
     bignum *ba = to_bignum(a);
     bignum *bb = to_bignum(b);
     bn_sub_ip(ba, bb);

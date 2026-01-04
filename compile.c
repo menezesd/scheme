@@ -1430,6 +1430,34 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
                             return dynamic_result();
                         }
                     }
+
+                    // (* x 0) or (* 0 x) -> 0
+                    // (* x 1) or (* 1 x) -> x (identity)
+                    if (prim_id == PTIMES) {
+                        if ((arg0_const && val0 == 0) ||
+                            (arg1_const && val1 == 0)) {
+                            cctx->code->code_len = saved_pos;
+                            emit2(cctx, OP_CONST,
+                                  code_add_const(cctx->code, store(0)));
+                            return const_result(store(0));
+                        }
+                        if (arg1_const && val1 == 1) {
+                            cctx->code->code_len = saved_pos;
+                            return compile_expr_internal(car(args), cctx);
+                        }
+                        if (arg0_const && val0 == 1) {
+                            cctx->code->code_len = saved_pos;
+                            return compile_expr_internal(cadr(args), cctx);
+                        }
+                    }
+
+                    // (/ x 1) -> x (identity)
+                    if (prim_id == PDIV) {
+                        if (arg1_const && val1 == 1) {
+                            cctx->code->code_len = saved_pos;
+                            return compile_expr_internal(car(args), cctx);
+                        }
+                    }
                 }
 
                 emit3(cctx, OP_PRIM, prim_id, argc);

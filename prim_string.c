@@ -7,25 +7,39 @@
 
 unsigned prim_string_append(unsigned argc, unsigned *argv)
 {
+    // First pass: validate and compute total length, cache individual lengths
     size_t total = 0;
-    for (unsigned i = 0; i < argc; i++) {
-        CHECK_STRING(argv[i], "string-append");
-        total += strlen(GET_STRING_PTR(argv[i]));
-    }
-
-    char *result = malloc(total + 1);
-    if (!result) {
+    size_t lens[64];    // Stack-allocated for common case
+    size_t *lengths = (argc <= 64) ? lens : malloc(argc * sizeof(size_t));
+    if (!lengths) {
         show_error("string-append: out of memory");
         return TOK_ERROR;
     }
 
+    for (unsigned i = 0; i < argc; i++) {
+        CHECK_STRING(argv[i], "string-append");
+        lengths[i] = strlen(GET_STRING_PTR(argv[i]));
+        total += lengths[i];
+    }
+
+    char *result = malloc(total + 1);
+    if (!result) {
+        if (argc > 64)
+            free(lengths);
+        show_error("string-append: out of memory");
+        return TOK_ERROR;
+    }
+
+    // Second pass: copy using cached lengths and memcpy
     char *pos = result;
     for (unsigned i = 0; i < argc; i++) {
-        char *s = GET_STRING_PTR(argv[i]);
-        while (*s)
-            *pos++ = *s++;
+        memcpy(pos, GET_STRING_PTR(argv[i]), lengths[i]);
+        pos += lengths[i];
     }
     *pos = '\0';
+
+    if (argc > 64)
+        free(lengths);
 
     return make_string_owned(result);
 }
