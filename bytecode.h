@@ -125,6 +125,40 @@ enum opcode {
     OP_LETREC_MARK, // Mark letrec frame: LETREC_MARK n -> mark env frame as
                     // letrec with n bindings
     OP_LETREC_DONE, // End letrec init: clear letrec mark
+
+    // Additional list accessors
+    OP_CAAR,  // Inline caar: pop pair, push caar
+    OP_CDAR,  // Inline cdar: pop pair, push cdar
+    OP_CADDR, // Inline caddr: pop pair, push caddr
+    OP_CDDDR, // Inline cdddr: pop pair, push cdddr
+
+    // Type predicates
+    OP_SYMBOLP,  // Symbol predicate: pop val, push (symbol? val)
+    OP_NUMBERP,  // Number predicate: pop val, push (number? val)
+    OP_STRINGP,  // String predicate: pop val, push (string? val)
+    OP_VECTORP,  // Vector predicate: pop val, push (vector? val)
+    OP_BOOLEANP, // Boolean predicate: pop val, push (boolean? val)
+    OP_LISTP,    // List predicate: pop val, push (list? val)
+    OP_INTEGERP, // Integer predicate: pop val, push (integer? val)
+
+    // List operations
+    OP_LENGTH,  // List length: pop list, push (length list)
+    OP_APPEND,  // Append lists: pop b, pop a, push (append a b)
+    OP_REVERSE, // Reverse list: pop list, push (reverse list)
+    OP_MEMQ,    // Member by eq?: pop obj, pop list, push (memq obj list)
+
+    // Vector operations
+    OP_VECTORREF, // Vector ref: pop idx, pop vec, push (vector-ref vec idx)
+    OP_VECTORSET, // Vector set: pop val, pop idx, pop vec, vector-set!
+    OP_VECTORLEN, // Vector length: pop vec, push (vector-length vec)
+
+    // Numeric operations
+    OP_NEG,     // Unary negation: pop n, push (- n)
+    OP_ABS,     // Absolute value: pop n, push (abs n)
+    OP_POSITIVE, // Positive check: pop n, push (positive? n)
+    OP_NEGATIVE, // Negative check: pop n, push (negative? n)
+    OP_EVEN,    // Even check: pop n, push (even? n)
+    OP_ODD,     // Odd check: pop n, push (odd? n)
 };
 
 // ============================================================================

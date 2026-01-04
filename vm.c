@@ -1495,6 +1495,484 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             break;
         }
 
+        // Additional list accessors
+        case OP_CAAR: {
+            unsigned pair = vm_pop(vm);
+            if (!IS_PAIR(pair)) {
+                vm->error = true;
+                vm->error_msg = "caar: not a pair";
+                vm->running = false;
+                break;
+            }
+            unsigned inner = car(pair);
+            if (!IS_PAIR(inner)) {
+                vm->error = true;
+                vm->error_msg = "caar: car not a pair";
+                vm->running = false;
+                break;
+            }
+            vm_push(vm, car(inner));
+            break;
+        }
+
+        case OP_CDAR: {
+            unsigned pair = vm_pop(vm);
+            if (!IS_PAIR(pair)) {
+                vm->error = true;
+                vm->error_msg = "cdar: not a pair";
+                vm->running = false;
+                break;
+            }
+            unsigned inner = car(pair);
+            if (!IS_PAIR(inner)) {
+                vm->error = true;
+                vm->error_msg = "cdar: car not a pair";
+                vm->running = false;
+                break;
+            }
+            vm_push(vm, cdr(inner));
+            break;
+        }
+
+        case OP_CADDR: {
+            unsigned pair = vm_pop(vm);
+            if (!IS_PAIR(pair)) {
+                vm->error = true;
+                vm->error_msg = "caddr: not a pair";
+                vm->running = false;
+                break;
+            }
+            unsigned d = cdr(pair);
+            if (!IS_PAIR(d)) {
+                vm->error = true;
+                vm->error_msg = "caddr: cdr not a pair";
+                vm->running = false;
+                break;
+            }
+            unsigned dd = cdr(d);
+            if (!IS_PAIR(dd)) {
+                vm->error = true;
+                vm->error_msg = "caddr: cddr not a pair";
+                vm->running = false;
+                break;
+            }
+            vm_push(vm, car(dd));
+            break;
+        }
+
+        case OP_CDDDR: {
+            unsigned pair = vm_pop(vm);
+            if (!IS_PAIR(pair)) {
+                vm->error = true;
+                vm->error_msg = "cdddr: not a pair";
+                vm->running = false;
+                break;
+            }
+            unsigned d = cdr(pair);
+            if (!IS_PAIR(d)) {
+                vm->error = true;
+                vm->error_msg = "cdddr: cdr not a pair";
+                vm->running = false;
+                break;
+            }
+            unsigned dd = cdr(d);
+            if (!IS_PAIR(dd)) {
+                vm->error = true;
+                vm->error_msg = "cdddr: cddr not a pair";
+                vm->running = false;
+                break;
+            }
+            vm_push(vm, cdr(dd));
+            break;
+        }
+
+        // Type predicates
+        case OP_SYMBOLP: {
+            unsigned val = vm_pop(vm);
+            vm_push(vm, IS_ATOM(val) ? ctx.atom_true : ctx.atom_false);
+            break;
+        }
+
+        case OP_NUMBERP: {
+            unsigned val = vm_pop(vm);
+            bool is_num = (val != 0) && is_numeric(val);
+            vm_push(vm, is_num ? ctx.atom_true : ctx.atom_false);
+            break;
+        }
+
+        case OP_STRINGP: {
+            unsigned val = vm_pop(vm);
+            vm_push(vm, (val && CELL_TYPE(val) == BT_STRING) ? ctx.atom_true
+                                                             : ctx.atom_false);
+            break;
+        }
+
+        case OP_VECTORP: {
+            unsigned val = vm_pop(vm);
+            vm_push(vm, (val && CELL_TYPE(val) == BT_VECTOR) ? ctx.atom_true
+                                                             : ctx.atom_false);
+            break;
+        }
+
+        case OP_BOOLEANP: {
+            unsigned val = vm_pop(vm);
+            vm_push(vm, (val == ctx.atom_true || val == ctx.atom_false)
+                            ? ctx.atom_true
+                            : ctx.atom_false);
+            break;
+        }
+
+        case OP_LISTP: {
+            unsigned val = vm_pop(vm);
+            // A list is either null or a pair whose cdr is a list
+            bool is_list = true;
+            unsigned p = val;
+            while (p != 0) {
+                if (!IS_PAIR(p)) {
+                    is_list = false;
+                    break;
+                }
+                p = cdr(p);
+            }
+            vm_push(vm, is_list ? ctx.atom_true : ctx.atom_false);
+            break;
+        }
+
+        case OP_INTEGERP: {
+            unsigned val = vm_pop(vm);
+            bool is_int = (val != 0) && (CELL_TYPE(val) == BT_NUM ||
+                                         CELL_TYPE(val) == BT_BIGNUM);
+            vm_push(vm, is_int ? ctx.atom_true : ctx.atom_false);
+            break;
+        }
+
+        // List operations
+        case OP_LENGTH: {
+            unsigned list = vm_pop(vm);
+            unsigned len = 0;
+            for (unsigned p = list; p != 0; p = cdr(p)) {
+                if (!IS_PAIR(p)) {
+                    vm->error = true;
+                    vm->error_msg = "length: not a proper list";
+                    vm->running = false;
+                    break;
+                }
+                len++;
+            }
+            if (vm->running) {
+                vm_push(vm, store(len));
+            }
+            break;
+        }
+
+        case OP_APPEND: {
+            unsigned b = vm_pop(vm);
+            unsigned a = vm_pop(vm);
+            if (a == 0) {
+                vm_push(vm, b);
+                break;
+            }
+            // Build result by copying a, then appending b
+            gc_protect(&b);
+            gc_protect(&a);
+            unsigned result = 0;
+            unsigned tail = 0;
+            gc_protect(&result);
+            gc_protect(&tail);
+            for (unsigned p = a; p != 0; p = cdr(p)) {
+                if (!IS_PAIR(p)) {
+                    gc_unprotect(4);
+                    vm->error = true;
+                    vm->error_msg = "append: not a proper list";
+                    vm->running = false;
+                    break;
+                }
+                unsigned new_cell = alloc_cons(car(p), 0);
+                if (result == 0) {
+                    result = new_cell;
+                    tail = new_cell;
+                } else {
+                    CELL_CDR(tail) = new_cell;
+                    tail = new_cell;
+                }
+            }
+            if (vm->running) {
+                if (tail != 0) {
+                    CELL_CDR(tail) = b;
+                }
+                gc_unprotect(4);
+                vm_push(vm, result == 0 ? b : result);
+            }
+            break;
+        }
+
+        case OP_REVERSE: {
+            unsigned list = vm_pop(vm);
+            gc_protect(&list);
+            unsigned result = 0;
+            gc_protect(&result);
+            for (unsigned p = list; p != 0; p = cdr(p)) {
+                if (!IS_PAIR(p)) {
+                    gc_unprotect(2);
+                    vm->error = true;
+                    vm->error_msg = "reverse: not a proper list";
+                    vm->running = false;
+                    break;
+                }
+                result = alloc_cons(car(p), result);
+            }
+            if (vm->running) {
+                gc_unprotect(2);
+                vm_push(vm, result);
+            }
+            break;
+        }
+
+        case OP_MEMQ: {
+            unsigned list = vm_pop(vm);
+            unsigned obj = vm_pop(vm);
+            unsigned result = ctx.atom_false;
+            for (unsigned p = list; p != 0; p = cdr(p)) {
+                if (!IS_PAIR(p)) {
+                    break; // Not proper list, return #f
+                }
+                unsigned elem = car(p);
+                // eq? comparison
+                if (elem == obj ||
+                    (CELL_TYPE(elem) == CELL_TYPE(obj) &&
+                     (CELL_TYPE(elem) == BT_ATOM ||
+                      CELL_TYPE(elem) == BT_NUM ||
+                      CELL_TYPE(elem) == BT_CHAR) &&
+                     CELL_ID(elem) == CELL_ID(obj))) {
+                    result = p; // Return sublist starting at match
+                    break;
+                }
+            }
+            vm_push(vm, result);
+            break;
+        }
+
+        // Vector operations
+        case OP_VECTORREF: {
+            unsigned idx = vm_pop(vm);
+            unsigned vec = vm_pop(vm);
+            if (CELL_TYPE(vec) != BT_VECTOR) {
+                vm->error = true;
+                vm->error_msg = "vector-ref: not a vector";
+                vm->running = false;
+                break;
+            }
+            if (CELL_TYPE(idx) != BT_NUM) {
+                vm->error = true;
+                vm->error_msg = "vector-ref: index not an integer";
+                vm->running = false;
+                break;
+            }
+            int64_t i = CELL_ID(idx);
+            vector_data *vd = (vector_data *)(intptr_t)CELL_ID(vec);
+            if (i < 0 || (uint64_t)i >= vd->len) {
+                vm->error = true;
+                vm->error_msg = "vector-ref: index out of bounds";
+                vm->running = false;
+                break;
+            }
+            vm_push(vm, vd->data[i]);
+            break;
+        }
+
+        case OP_VECTORSET: {
+            unsigned val = vm_pop(vm);
+            unsigned idx = vm_pop(vm);
+            unsigned vec = vm_pop(vm);
+            if (CELL_TYPE(vec) != BT_VECTOR) {
+                vm->error = true;
+                vm->error_msg = "vector-set!: not a vector";
+                vm->running = false;
+                break;
+            }
+            if (CELL_TYPE(idx) != BT_NUM) {
+                vm->error = true;
+                vm->error_msg = "vector-set!: index not an integer";
+                vm->running = false;
+                break;
+            }
+            int64_t i = CELL_ID(idx);
+            vector_data *vd = (vector_data *)(intptr_t)CELL_ID(vec);
+            if (i < 0 || (uint64_t)i >= vd->len) {
+                vm->error = true;
+                vm->error_msg = "vector-set!: index out of bounds";
+                vm->running = false;
+                break;
+            }
+            write_barrier(vec, val);
+            vd->data[i] = val;
+            vm_push(vm, val);
+            break;
+        }
+
+        case OP_VECTORLEN: {
+            unsigned vec = vm_pop(vm);
+            if (CELL_TYPE(vec) != BT_VECTOR) {
+                vm->error = true;
+                vm->error_msg = "vector-length: not a vector";
+                vm->running = false;
+                break;
+            }
+            vector_data *vd = (vector_data *)(intptr_t)CELL_ID(vec);
+            vm_push(vm, store(vd->len));
+            break;
+        }
+
+        // Numeric operations
+        case OP_NEG: {
+            unsigned n = vm_pop(vm);
+            if (CELL_TYPE(n) == BT_NUM) {
+                int64_t val = CELL_ID(n);
+                if (val == INT64_MIN) {
+                    // Overflow to bignum
+                    bignum *bn = bn_from_int(val);
+                    bn_neg_ip(bn);
+                    vm_push(vm, store_integer(bn));
+                } else {
+                    vm_push(vm, store(-val));
+                }
+            } else if (CELL_TYPE(n) == BT_BIGNUM) {
+                bignum *bn = bn_neg(get_bignum(n));
+                vm_push(vm, store_integer(bn));
+            } else if (CELL_TYPE(n) == BT_INEXACT) {
+                vm_push(vm, store_inexact(-to_double(n)));
+            } else if (CELL_TYPE(n) == BT_RATIONAL) {
+                unsigned neg_num = negate_number(car(n));
+                gc_protect(&neg_num);
+                unsigned denom = cdr(n);
+                unsigned result = alloc();
+                gc_unprotect(1);
+                CELL_TYPE(result) = BT_RATIONAL;
+                CELL_CAR(result) = neg_num;
+                CELL_CDR(result) = denom;
+                vm_push(vm, result);
+            } else {
+                vm->error = true;
+                vm->error_msg = "-: not a number";
+                vm->running = false;
+            }
+            break;
+        }
+
+        case OP_ABS: {
+            unsigned n = vm_pop(vm);
+            if (CELL_TYPE(n) == BT_NUM) {
+                int64_t val = CELL_ID(n);
+                if (val == INT64_MIN) {
+                    bignum *bn = bn_from_int(val);
+                    bn_neg_ip(bn);
+                    vm_push(vm, store_integer(bn));
+                } else {
+                    vm_push(vm, store(val < 0 ? -val : val));
+                }
+            } else if (CELL_TYPE(n) == BT_BIGNUM) {
+                bignum *bn = get_bignum(n);
+                if (bn->sign) {
+                    bignum *result = bn_neg(bn);
+                    vm_push(vm, store_integer(result));
+                } else {
+                    vm_push(vm, n);
+                }
+            } else if (CELL_TYPE(n) == BT_INEXACT) {
+                double d = to_double(n);
+                vm_push(vm, store_inexact(d < 0 ? -d : d));
+            } else if (CELL_TYPE(n) == BT_RATIONAL) {
+                if (is_negative_number(car(n))) {
+                    unsigned abs_num = negate_number(car(n));
+                    gc_protect(&abs_num);
+                    unsigned denom = cdr(n);
+                    unsigned result = alloc();
+                    gc_unprotect(1);
+                    CELL_TYPE(result) = BT_RATIONAL;
+                    CELL_CAR(result) = abs_num;
+                    CELL_CDR(result) = denom;
+                    vm_push(vm, result);
+                } else {
+                    vm_push(vm, n);
+                }
+            } else {
+                vm->error = true;
+                vm->error_msg = "abs: not a number";
+                vm->running = false;
+            }
+            break;
+        }
+
+        case OP_POSITIVE: {
+            unsigned n = vm_pop(vm);
+            bool positive = false;
+            if (CELL_TYPE(n) == BT_NUM) {
+                positive = CELL_ID(n) > 0;
+            } else if (CELL_TYPE(n) == BT_BIGNUM) {
+                bignum *bn = get_bignum(n);
+                positive = !bn->sign && bn->len > 0;
+            } else if (CELL_TYPE(n) == BT_INEXACT) {
+                positive = to_double(n) > 0;
+            } else if (CELL_TYPE(n) == BT_RATIONAL) {
+                positive = !is_negative_number(car(n)) &&
+                           !(CELL_TYPE(car(n)) == BT_NUM && CELL_ID(car(n)) == 0);
+            }
+            vm_push(vm, positive ? ctx.atom_true : ctx.atom_false);
+            break;
+        }
+
+        case OP_NEGATIVE: {
+            unsigned n = vm_pop(vm);
+            bool negative = false;
+            if (CELL_TYPE(n) == BT_NUM) {
+                negative = CELL_ID(n) < 0;
+            } else if (CELL_TYPE(n) == BT_BIGNUM) {
+                negative = bn_sign(get_bignum(n)) < 0;
+            } else if (CELL_TYPE(n) == BT_INEXACT) {
+                negative = to_double(n) < 0;
+            } else if (CELL_TYPE(n) == BT_RATIONAL) {
+                negative = is_negative_number(car(n));
+            }
+            vm_push(vm, negative ? ctx.atom_true : ctx.atom_false);
+            break;
+        }
+
+        case OP_EVEN: {
+            unsigned n = vm_pop(vm);
+            bool even = false;
+            if (CELL_TYPE(n) == BT_NUM) {
+                even = (CELL_ID(n) & 1) == 0;
+            } else if (CELL_TYPE(n) == BT_BIGNUM) {
+                bignum *bn = get_bignum(n);
+                even = bn->len == 0 || (bn->limbs[0] & 1) == 0;
+            } else {
+                vm->error = true;
+                vm->error_msg = "even?: not an integer";
+                vm->running = false;
+                break;
+            }
+            vm_push(vm, even ? ctx.atom_true : ctx.atom_false);
+            break;
+        }
+
+        case OP_ODD: {
+            unsigned n = vm_pop(vm);
+            bool odd = false;
+            if (CELL_TYPE(n) == BT_NUM) {
+                odd = (CELL_ID(n) & 1) == 1;
+            } else if (CELL_TYPE(n) == BT_BIGNUM) {
+                bignum *bn = get_bignum(n);
+                odd = bn->len > 0 && (bn->limbs[0] & 1) == 1;
+            } else {
+                vm->error = true;
+                vm->error_msg = "odd?: not an integer";
+                vm->running = false;
+                break;
+            }
+            vm_push(vm, odd ? ctx.atom_true : ctx.atom_false);
+            break;
+        }
+
         default:
             vm->error = true;
             vm->error_msg = "unknown opcode";

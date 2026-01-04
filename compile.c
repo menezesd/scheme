@@ -12,6 +12,7 @@
  */
 
 #include "bytecode.h"
+#include "compile_internal.h"
 #include "context.h"
 #include "env.h"
 #include "eval.h"
@@ -30,89 +31,6 @@ unsigned qq_expand_cps(unsigned x, unsigned env);
 static void emit_gensym_definitions(compile_ctx *cctx, unsigned old_gensym,
                                     unsigned new_gensym);
 
-// ============================================================================
-// Code Object Management
-// ============================================================================
-
-// Global registry of all code objects for GC integration
-code_object *code_object_registry = NULL;
-
-// Register a code object with the GC registry
-void code_register(code_object *code)
-{
-    code->gc_next = code_object_registry;
-    code_object_registry = code;
-}
-
-code_object *code_new(void)
-{
-    code_object *c = calloc(1, sizeof(code_object));
-    c->code_cap = 64;
-    c->code = malloc(c->code_cap * sizeof(unsigned));
-    c->const_cap = 16;
-    c->constants = malloc(c->const_cap * sizeof(unsigned));
-    c->children_cap = 4;
-    c->children = malloc(c->children_cap * sizeof(code_object *));
-    // Register with GC
-    code_register(c);
-    return c;
-}
-
-void code_free(code_object *code)
-{
-    if (!code)
-        return;
-    free(code->code);
-    free(code->constants);
-    for (unsigned i = 0; i < code->children_len; i++) {
-        code_free(code->children[i]);
-    }
-    free(code->children);
-    free(code);
-}
-
-void code_emit(code_object *code, unsigned instr)
-{
-    if (code->code_len >= code->code_cap) {
-        code->code_cap *= 2;
-        code->code = realloc(code->code, code->code_cap * sizeof(unsigned));
-    }
-    code->code[code->code_len++] = instr;
-}
-
-unsigned code_add_const(code_object *code, unsigned val)
-{
-    // Check if constant already exists
-    for (unsigned i = 0; i < code->const_len; i++) {
-        if (code->constants[i] == val)
-            return i;
-    }
-    if (code->const_len >= code->const_cap) {
-        code->const_cap *= 2;
-        code->constants =
-            realloc(code->constants, code->const_cap * sizeof(unsigned));
-    }
-    code->constants[code->const_len] = val;
-    return code->const_len++;
-}
-
-unsigned code_add_child(code_object *code, code_object *child)
-{
-    if (code->children_len >= code->children_cap) {
-        code->children_cap *= 2;
-        code->children =
-            realloc(code->children, code->children_cap * sizeof(code_object *));
-    }
-    code->children[code->children_len] = child;
-    return code->children_len++;
-}
-
-unsigned code_current_pos(code_object *code) { return code->code_len; }
-
-void code_patch(code_object *code, unsigned pos, unsigned val)
-{
-    code->code[pos] = val;
-}
 
 // ============================================================================
 // Compile Result - tracks constant propagation
@@ -168,7 +86,6 @@ static compile_result compile_define(unsigned expr, compile_ctx *cctx);
 static compile_result compile_set(unsigned expr, compile_ctx *cctx);
 static compile_result compile_call(unsigned expr, compile_ctx *cctx);
 static compile_result compile_quasiquote(unsigned expr, compile_ctx *cctx);
-static void peephole_optimize(code_object *code);
 
 // ============================================================================
 // Constant Folding Helpers
@@ -1478,6 +1395,43 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
                 case PLIST:
                     emit(cctx, OP_LIST1);
                     return dynamic_result();
+                // Type predicates
+                case PSYMP:
+                    emit(cctx, OP_SYMBOLP);
+                    return dynamic_result();
+                case PNUMP:
+                    emit(cctx, OP_NUMBERP);
+                    return dynamic_result();
+                case PSTRINGP:
+                    emit(cctx, OP_STRINGP);
+                    return dynamic_result();
+                case PVECTORP:
+                    emit(cctx, OP_VECTORP);
+                    return dynamic_result();
+                case PBOOLP:
+                    emit(cctx, OP_BOOLEANP);
+                    return dynamic_result();
+                case PLISTP:
+                    emit(cctx, OP_LISTP);
+                    return dynamic_result();
+                case PINTEGERP:
+                    emit(cctx, OP_INTEGERP);
+                    return dynamic_result();
+                // List operations
+                case PLENGTH:
+                    emit(cctx, OP_LENGTH);
+                    return dynamic_result();
+                case PREVERSE:
+                    emit(cctx, OP_REVERSE);
+                    return dynamic_result();
+                // Vector operations
+                case PVECLEN:
+                    emit(cctx, OP_VECTORLEN);
+                    return dynamic_result();
+                // Numeric operations
+                case PABS:
+                    emit(cctx, OP_ABS);
+                    return dynamic_result();
                 default:
                     emit3(cctx, OP_PRIM, prim_id, 1);
                     return dynamic_result();
@@ -1534,18 +1488,35 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
                 case PLIST:
                     emit(cctx, OP_LIST2);
                     return dynamic_result();
+                // List operations
+                case PAPPEND:
+                    emit(cctx, OP_APPEND);
+                    return dynamic_result();
+                // Vector operations
+                case PVECREF:
+                    emit(cctx, OP_VECTORREF);
+                    return dynamic_result();
                 default:
                     emit3(cctx, OP_PRIM, prim_id, 2);
                     return dynamic_result();
                 }
             }
 
-            if (argc == 3 && prim_id == PLIST) {
-                compile_expr_internal(car(args), cctx);
-                compile_expr_internal(cadr(args), cctx);
-                compile_expr_internal(caddr(args), cctx);
-                emit(cctx, OP_LIST3);
-                return dynamic_result();
+            if (argc == 3) {
+                if (prim_id == PLIST) {
+                    compile_expr_internal(car(args), cctx);
+                    compile_expr_internal(cadr(args), cctx);
+                    compile_expr_internal(caddr(args), cctx);
+                    emit(cctx, OP_LIST3);
+                    return dynamic_result();
+                }
+                if (prim_id == PVECSET) {
+                    compile_expr_internal(car(args), cctx);    // vector
+                    compile_expr_internal(cadr(args), cctx);   // index
+                    compile_expr_internal(caddr(args), cctx);  // value
+                    emit(cctx, OP_VECTORSET);
+                    return dynamic_result();
+                }
             }
 
             // Compile arguments for general case
@@ -1780,501 +1751,5 @@ code_object *compile_toplevel(unsigned expr, unsigned env)
     return result;
 }
 
-// ============================================================================
-// Peephole Optimizer
-// ============================================================================
 
-// Get the size of an instruction (opcode + operands)
-static unsigned opcode_size(unsigned op)
-{
-    switch (op) {
-    case OP_CONST:
-    case OP_LOOKUP:
-    case OP_DEFINE:
-    case OP_SET:
-    case OP_CLOSURE:
-    case OP_CALL:
-    case OP_TAILCALL:
-    case OP_JUMP:
-    case OP_JUMPIF:
-    case OP_JUMPIFNOT:
-    case OP_JUMPIFNULL:
-    case OP_JUMPIFNOTNULL:
-    case OP_JUMPIFZERO:
-    case OP_JUMPIFNOTZERO:
-    case OP_VALUES:
-    case OP_DEFSYNTAX:
-    case OP_LETREC_MARK:
-        return 2; // opcode + 1 operand
-    case OP_PRIM:
-        return 3; // opcode + 2 operands
-    default:
-        return 1; // opcode only
-    }
-}
 
-// Peephole optimization with proper jump target fixup
-static void peephole_optimize(code_object *code)
-{
-    if (!code || code->code_len < 2)
-        return;
-
-    unsigned *c = code->code;
-    unsigned len = code->code_len;
-
-    // Collect all jump targets - needed to avoid unsafe fusions
-    bool *is_jump_target = calloc(len + 1, sizeof(bool));
-    if (!is_jump_target)
-        return;
-    for (unsigned i = 0; i < len;) {
-        unsigned op = c[i];
-        unsigned size = opcode_size(op);
-        if (op == OP_JUMP || op == OP_JUMPIF || op == OP_JUMPIFNOT ||
-            op == OP_JUMPIFNULL || op == OP_JUMPIFNOTNULL ||
-            op == OP_JUMPIFZERO || op == OP_JUMPIFNOTZERO) {
-            unsigned target = c[i + 1];
-            if (target <= len)
-                is_jump_target[target] = true;
-        }
-        i += size;
-    }
-
-    // First pass: identify which bytes to remove and build offset map
-    // offset_map[old] = new offset after compaction
-    unsigned *offset_map = malloc(len * sizeof(unsigned));
-    if (!offset_map) {
-        free(is_jump_target);
-        return;
-    }
-
-    bool *remove = calloc(len, sizeof(bool));
-    if (!remove) {
-        free(offset_map);
-        free(is_jump_target);
-        return;
-    }
-
-    // Mark patterns to remove
-    for (unsigned i = 0; i < len;) {
-        unsigned op = c[i];
-        unsigned size = opcode_size(op);
-
-        // Pattern: CONST x, POP -> nothing (dead code)
-        if (op == OP_CONST && i + 2 < len && c[i + 2] == OP_POP) {
-            remove[i] = remove[i + 1] = remove[i + 2] = true;
-            i += 3;
-            continue;
-        }
-
-        // Pattern: LOOKUP x, POP -> nothing (dead code)
-        if (op == OP_LOOKUP && i + 2 < len && c[i + 2] == OP_POP) {
-            remove[i] = remove[i + 1] = remove[i + 2] = true;
-            i += 3;
-            continue;
-        }
-
-        // Pattern: DUP, POP -> nothing
-        if (op == OP_DUP && i + 1 < len && c[i + 1] == OP_POP) {
-            remove[i] = remove[i + 1] = true;
-            i += 2;
-            continue;
-        }
-
-        // Pattern: SWAP, SWAP -> nothing (identity)
-        if (op == OP_SWAP && i + 1 < len && c[i + 1] == OP_SWAP) {
-            remove[i] = remove[i + 1] = true;
-            i += 2;
-            continue;
-        }
-
-        // Pattern: NOT, NOT -> nothing (double negation)
-        if (op == OP_NOT && i + 1 < len && c[i + 1] == OP_NOT) {
-            remove[i] = remove[i + 1] = true;
-            i += 2;
-            continue;
-        }
-
-        // Pattern: NOT, JUMPIFNOT -> JUMPIF (remove NOT, change jump type)
-        if (op == OP_NOT && i + 1 < len && c[i + 1] == OP_JUMPIFNOT) {
-            remove[i] = true;
-            c[i + 1] = OP_JUMPIF;
-            i += 1; // Continue from JUMPIF
-            continue;
-        }
-
-        // Pattern: NOT, JUMPIF -> JUMPIFNOT (remove NOT, change jump type)
-        if (op == OP_NOT && i + 1 < len && c[i + 1] == OP_JUMPIF) {
-            remove[i] = true;
-            c[i + 1] = OP_JUMPIFNOT;
-            i += 1;
-            continue;
-        }
-
-        // Pattern: JUMP to immediately next instruction -> nothing
-        if (op == OP_JUMP && i + 2 < len && c[i + 1] == i + 2) {
-            remove[i] = remove[i + 1] = true;
-            i += 2;
-            continue;
-        }
-
-        // Pattern: NULLP, JUMPIFNOT target -> JUMPIFNOTNULL target
-        // Only safe if no other code jumps to the JUMPIFNOT instruction
-        if (op == OP_NULLP && i + 1 < len && c[i + 1] == OP_JUMPIFNOT &&
-            !is_jump_target[i + 1]) {
-            remove[i] = true;            // Remove NULLP
-            c[i + 1] = OP_JUMPIFNOTNULL; // Replace with fused opcode
-            i += 1;
-            continue;
-        }
-
-        // Pattern: NULLP, JUMPIF target -> JUMPIFNULL target
-        // Only safe if no other code jumps to the JUMPIF instruction
-        if (op == OP_NULLP && i + 1 < len && c[i + 1] == OP_JUMPIF &&
-            !is_jump_target[i + 1]) {
-            remove[i] = true;
-            c[i + 1] = OP_JUMPIFNULL;
-            i += 1;
-            continue;
-        }
-
-        // Pattern: ZEROP, JUMPIFNOT target -> JUMPIFNOTZERO target
-        // Only safe if no other code jumps to the JUMPIFNOT instruction
-        if (op == OP_ZEROP && i + 1 < len && c[i + 1] == OP_JUMPIFNOT &&
-            !is_jump_target[i + 1]) {
-            remove[i] = true;
-            c[i + 1] = OP_JUMPIFNOTZERO;
-            i += 1;
-            continue;
-        }
-
-        // Pattern: ZEROP, JUMPIF target -> JUMPIFZERO target
-        // Only safe if no other code jumps to the JUMPIF instruction
-        if (op == OP_ZEROP && i + 1 < len && c[i + 1] == OP_JUMPIF &&
-            !is_jump_target[i + 1]) {
-            remove[i] = true;
-            c[i + 1] = OP_JUMPIFZERO;
-            i += 1;
-            continue;
-        }
-
-        // Pattern: ADD1, SUB1 -> nothing (identity)
-        if (op == OP_ADD1 && i + 1 < len && c[i + 1] == OP_SUB1) {
-            remove[i] = remove[i + 1] = true;
-            i += 2;
-            continue;
-        }
-
-        // Pattern: SUB1, ADD1 -> nothing (identity)
-        if (op == OP_SUB1 && i + 1 < len && c[i + 1] == OP_ADD1) {
-            remove[i] = remove[i + 1] = true;
-            i += 2;
-            continue;
-        }
-
-        // Pattern: CAR, CDR can be fused (if we add CADR) - already have
-        // OP_CADR Pattern: CDR, CDR can be fused (if we add CDDR) - already
-        // have OP_CDDR
-
-        // Pattern: PAIRP, NOT -> use directly in conditional
-        if (op == OP_PAIRP && i + 1 < len && c[i + 1] == OP_NOT &&
-            i + 2 < len && c[i + 2] == OP_JUMPIFNOT) {
-            // PAIRP, NOT, JUMPIFNOT -> PAIRP, JUMPIF
-            remove[i + 1] = true;
-            c[i + 2] = OP_JUMPIF;
-            i += 2;
-            continue;
-        }
-
-        i += size;
-    }
-
-    // Build offset map
-    unsigned new_offset = 0;
-    for (unsigned i = 0; i < len; i++) {
-        offset_map[i] = new_offset;
-        if (!remove[i])
-            new_offset++;
-    }
-    // Map for end-of-code (jump targets can point here)
-    unsigned final_len = new_offset;
-
-    // Second pass: compact code and fix jump targets
-    unsigned write = 0;
-    for (unsigned read = 0; read < len;) {
-        unsigned op = c[read];
-        unsigned size = opcode_size(op);
-
-        if (remove[read]) {
-            read += size;
-            continue;
-        }
-
-        // Copy opcode
-        c[write++] = op;
-
-        // Handle operands, fixing jump targets
-        if (op == OP_JUMP || op == OP_JUMPIF || op == OP_JUMPIFNOT ||
-            op == OP_JUMPIFNULL || op == OP_JUMPIFNOTNULL ||
-            op == OP_JUMPIFZERO || op == OP_JUMPIFNOTZERO) {
-            unsigned old_target = c[read + 1];
-            unsigned new_target =
-                (old_target < len) ? offset_map[old_target] : final_len;
-            c[write++] = new_target;
-            read += 2;
-        } else {
-            // Copy remaining operands as-is
-            for (unsigned j = 1; j < size; j++) {
-                c[write++] = c[read + j];
-            }
-            read += size;
-        }
-    }
-
-    code->code_len = write;
-
-    free(offset_map);
-    free(remove);
-    free(is_jump_target);
-
-    // Recursively optimize children
-    for (unsigned i = 0; i < code->children_len; i++) {
-        peephole_optimize(code->children[i]);
-    }
-}
-
-// ============================================================================
-// GC Integration
-// ============================================================================
-
-unsigned gc_collect_code(code_object *code)
-{
-    if (!code)
-        return 0;
-
-    // Collect constants
-    for (unsigned i = 0; i < code->const_len; i++) {
-        code->constants[i] = collect(code->constants[i]);
-    }
-
-    // Recursively collect children
-    for (unsigned i = 0; i < code->children_len; i++) {
-        gc_collect_code(code->children[i]);
-    }
-
-    return 0;
-}
-
-// Update all code object constants during GC
-// Called from gc() in context.c BEFORE the scan phase
-void gc_update_all_code_objects(void)
-{
-    for (code_object *code = code_object_registry; code; code = code->gc_next) {
-        // Collect constants - the scan phase will then process their CAR/CDR
-        for (unsigned i = 0; i < code->const_len; i++) {
-            code->constants[i] = collect(code->constants[i]);
-        }
-    }
-}
-
-// Mark a code object and all its children as reachable
-static void mark_code_object(code_object *code)
-{
-    if (!code || code->gc_marked)
-        return;
-    code->gc_marked = true;
-    // Mark children recursively
-    for (unsigned i = 0; i < code->children_len; i++) {
-        mark_code_object(code->children[i]);
-    }
-}
-
-// Sweep unreachable code objects after GC
-// Call this after the heap GC is complete
-void gc_sweep_code_objects(void)
-{
-    // First, clear all marks
-    for (code_object *code = code_object_registry; code; code = code->gc_next) {
-        code->gc_marked = false;
-    }
-
-    // Walk the heap and mark code objects referenced by closures
-    // Scan old generation: [mmin, hptr)
-    for (unsigned i = ctx.mmin; i < ctx.hptr; i++) {
-        if (CELL_TYPE(i) == BT_CLOSURE) {
-            code_object *code = (code_object *)(intptr_t)CELL_ID(i);
-            mark_code_object(code);
-        }
-    }
-    // Scan nursery if generational GC is enabled: [nursery_start, nursery_ptr)
-    if (ctx.card_table) {
-        for (unsigned i = ctx.nursery_start; i < ctx.nursery_ptr; i++) {
-            if (CELL_TYPE(i) == BT_CLOSURE) {
-                code_object *code = (code_object *)(intptr_t)CELL_ID(i);
-                mark_code_object(code);
-            }
-        }
-    }
-
-    // Sweep: remove unreachable code objects from registry
-    code_object **prev = &code_object_registry;
-    while (*prev) {
-        code_object *code = *prev;
-        if (!code->gc_marked) {
-            // Unlink from registry
-            *prev = code->gc_next;
-            // Free the code object (but not children - they're in registry too)
-            free(code->code);
-            free(code->constants);
-            free(code->children);
-            free(code);
-        } else {
-            prev = &code->gc_next;
-        }
-    }
-}
-
-// ============================================================================
-// Bytecode Disassembler
-// ============================================================================
-
-static const char *opcode_names[] = {
-    [OP_CONST] = "CONST",
-    [OP_POP] = "POP",
-    [OP_DUP] = "DUP",
-    [OP_SWAP] = "SWAP",
-    [OP_LOOKUP] = "LOOKUP",
-    [OP_DEFINE] = "DEFINE",
-    [OP_SET] = "SET",
-    [OP_CLOSURE] = "CLOSURE",
-    [OP_CALL] = "CALL",
-    [OP_TAILCALL] = "TAILCALL",
-    [OP_RETURN] = "RETURN",
-    [OP_JUMP] = "JUMP",
-    [OP_JUMPIF] = "JUMPIF",
-    [OP_JUMPIFNOT] = "JUMPIFNOT",
-    [OP_PRIM] = "PRIM",
-    [OP_PUSHCONT] = "PUSHCONT",
-    [OP_CALLCC] = "CALLCC",
-    [OP_APPLY] = "APPLY",
-    [OP_PUSHENV] = "PUSHENV",
-    [OP_POPENV] = "POPENV",
-    [OP_VALUES] = "VALUES",
-    [OP_CALLWITHVALUES] = "CALLWITHVALUES",
-    [OP_DEFSYNTAX] = "DEFSYNTAX",
-    [OP_HALT] = "HALT",
-    [OP_CAR] = "CAR",
-    [OP_CDR] = "CDR",
-    [OP_CONS] = "CONS",
-    [OP_NULLP] = "NULLP",
-    [OP_PAIRP] = "PAIRP",
-    [OP_ADD1] = "ADD1",
-    [OP_SUB1] = "SUB1",
-    [OP_ZEROP] = "ZEROP",
-    [OP_NOT] = "NOT",
-    [OP_EQ] = "EQ",
-    [OP_ADD] = "ADD",
-    [OP_SUB] = "SUB",
-    [OP_MUL] = "MUL",
-    [OP_DIV] = "DIV",
-    [OP_MOD] = "MOD",
-    [OP_LT] = "LT",
-    [OP_GT] = "GT",
-    [OP_LE] = "LE",
-    [OP_GE] = "GE",
-    [OP_NUMEQ] = "NUMEQ",
-    [OP_CADR] = "CADR",
-    [OP_CDDR] = "CDDR",
-    [OP_SETCAR] = "SETCAR",
-    [OP_SETCDR] = "SETCDR",
-    [OP_LIST1] = "LIST1",
-    [OP_LIST2] = "LIST2",
-    [OP_LIST3] = "LIST3",
-    [OP_JUMPIFNULL] = "JUMPIFNULL",
-    [OP_JUMPIFNOTNULL] = "JUMPIFNOTNULL",
-    [OP_JUMPIFZERO] = "JUMPIFZERO",
-    [OP_JUMPIFNOTZERO] = "JUMPIFNOTZERO",
-    [OP_LETREC_MARK] = "LETREC_MARK",
-    [OP_LETREC_DONE] = "LETREC_DONE",
-};
-
-void disassemble(code_object *code, const char *name)
-{
-    printf("=== %s ===\n", name ? name : "<anonymous>");
-    printf("arity: %u%s\n", code->arity, code->has_rest ? "+" : "");
-
-    // Print constants
-    if (code->const_len > 0) {
-        printf("constants:\n");
-        for (unsigned i = 0; i < code->const_len; i++) {
-            printf("  [%u] ", i);
-            unsigned c = code->constants[i];
-            if (c == 0) {
-                printf("nil");
-            } else {
-                write_obj(c);
-            }
-            printf("\n");
-        }
-    }
-
-    // Print code
-    printf("code:\n");
-    unsigned ip = 0;
-    while (ip < code->code_len) {
-        printf("  %04u: ", ip);
-        unsigned op = code->code[ip++];
-
-        if (op < sizeof(opcode_names) / sizeof(opcode_names[0]) &&
-            opcode_names[op]) {
-            printf("%-12s", opcode_names[op]);
-        } else {
-            printf("UNKNOWN(%u)", op);
-            printf("\n");
-            continue;
-        }
-
-        switch (op) {
-        case OP_CONST:
-        case OP_CLOSURE:
-            printf(" %u", code->code[ip++]);
-            break;
-        case OP_LOOKUP:
-        case OP_DEFINE:
-        case OP_SET:
-        case OP_DEFSYNTAX:
-            printf(" %s", ctx.atom_table[code->code[ip++]]);
-            break;
-        case OP_CALL:
-        case OP_TAILCALL:
-        case OP_VALUES:
-        case OP_LETREC_MARK:
-            printf(" %u", code->code[ip++]);
-            break;
-        case OP_JUMP:
-        case OP_JUMPIF:
-        case OP_JUMPIFNOT:
-        case OP_JUMPIFNULL:
-        case OP_JUMPIFNOTNULL:
-        case OP_JUMPIFZERO:
-        case OP_JUMPIFNOTZERO:
-            printf(" -> %u", code->code[ip++]);
-            break;
-        case OP_PRIM:
-            printf(" %u argc=%u", code->code[ip], code->code[ip + 1]);
-            ip += 2;
-            break;
-        default:
-            // No operands
-            break;
-        }
-        printf("\n");
-    }
-
-    // Recursively disassemble children
-    for (unsigned i = 0; i < code->children_len; i++) {
-        char child_name[64];
-        snprintf(child_name, sizeof(child_name), "%s/lambda%u",
-                 name ? name : "<anon>", i);
-        disassemble(code->children[i], child_name);
-    }
-}

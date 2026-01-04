@@ -612,12 +612,20 @@ static bignum *bn_lshift_limbs(const bignum *a, size_t k)
     return result;
 }
 
+// Forward declaration for mutual recursion
+static bignum *bn_mul_toom3(const bignum *a, const bignum *b);
+
 // Karatsuba multiplication O(n^1.585)
 static bignum *bn_mul_karatsuba(const bignum *a, const bignum *b)
 {
     // Base case: use schoolbook for small numbers
     if (a->len < KARATSUBA_THRESHOLD || b->len < KARATSUBA_THRESHOLD) {
         return bn_mul_schoolbook(a, b);
+    }
+
+    // Use Toom-3 for very large numbers
+    if (a->len >= TOOM3_THRESHOLD && b->len >= TOOM3_THRESHOLD) {
+        return bn_mul_toom3(a, b);
     }
 
     // Split at half of the larger length
@@ -663,6 +671,268 @@ static bignum *bn_mul_karatsuba(const bignum *a, const bignum *b)
     bn_free(z2_shifted);
     bn_free(temp);
 
+    return result;
+}
+
+// Split bignum into 3 parts for Toom-3
+// a = a0 + a1 * B^k + a2 * B^(2k)
+static void bn_split3(const bignum *a, size_t k, bignum **p0, bignum **p1,
+                      bignum **p2)
+{
+    // p0 = a mod B^k (lowest k limbs)
+    *p0 = bn_alloc(k > a->len ? a->len : k);
+    size_t p0_len = k < a->len ? k : a->len;
+    memcpy((*p0)->limbs, a->limbs, p0_len * sizeof(limb_t));
+    (*p0)->len = p0_len;
+    bn_normalize(*p0);
+
+    // p1 = (a / B^k) mod B^k (middle k limbs)
+    *p1 = bn_alloc(k);
+    if (a->len > k) {
+        size_t p1_len = (a->len - k) < k ? (a->len - k) : k;
+        memcpy((*p1)->limbs, a->limbs + k, p1_len * sizeof(limb_t));
+        (*p1)->len = p1_len;
+    }
+    bn_normalize(*p1);
+
+    // p2 = a / B^(2k) (highest limbs)
+    *p2 = bn_alloc(a->len > 2 * k ? a->len - 2 * k : 1);
+    if (a->len > 2 * k) {
+        memcpy((*p2)->limbs, a->limbs + 2 * k, (a->len - 2 * k) * sizeof(limb_t));
+        (*p2)->len = a->len - 2 * k;
+    }
+    bn_normalize(*p2);
+}
+
+// Toom-Cook-3 multiplication O(n^1.465)
+// Uses 5 evaluation points: 0, 1, -1, 2, infinity
+static bignum *bn_mul_toom3(const bignum *a, const bignum *b)
+{
+    // Fall back to Karatsuba for smaller numbers
+    if (a->len < TOOM3_THRESHOLD || b->len < TOOM3_THRESHOLD) {
+        // Avoid infinite recursion - use schoolbook for very small
+        if (a->len < KARATSUBA_THRESHOLD || b->len < KARATSUBA_THRESHOLD) {
+            return bn_mul_schoolbook(a, b);
+        }
+        // Use Karatsuba directly, bypassing Toom-3 check
+        size_t k = (a->len > b->len ? a->len : b->len) / 2;
+        bignum *a0, *a1, *b0, *b1;
+        bn_split(a, k, &a0, &a1);
+        bn_split(b, k, &b0, &b1);
+        bignum *z0 = bn_mul_karatsuba(a0, b0);
+        bignum *z2 = bn_mul_karatsuba(a1, b1);
+        bignum *a0_plus_a1 = bn_add(a0, a1);
+        bignum *b0_plus_b1 = bn_add(b0, b1);
+        bignum *z1_temp = bn_mul_karatsuba(a0_plus_a1, b0_plus_b1);
+        bignum *z1_temp2 = bn_sub(z1_temp, z0);
+        bignum *z1 = bn_sub(z1_temp2, z2);
+        bn_free(a0);
+        bn_free(a1);
+        bn_free(b0);
+        bn_free(b1);
+        bn_free(a0_plus_a1);
+        bn_free(b0_plus_b1);
+        bn_free(z1_temp);
+        bn_free(z1_temp2);
+        bignum *z1_shifted = bn_lshift_limbs(z1, k);
+        bignum *z2_shifted = bn_lshift_limbs(z2, 2 * k);
+        bignum *temp = bn_add(z0, z1_shifted);
+        bignum *result = bn_add(temp, z2_shifted);
+        bn_free(z0);
+        bn_free(z1);
+        bn_free(z2);
+        bn_free(z1_shifted);
+        bn_free(z2_shifted);
+        bn_free(temp);
+        return result;
+    }
+
+    // Split at 1/3 of the larger length
+    size_t n = (a->len > b->len ? a->len : b->len);
+    size_t k = (n + 2) / 3; // Ceiling division
+
+    // Split: a = a0 + a1*x + a2*x^2, b = b0 + b1*x + b2*x^2
+    bignum *a0, *a1, *a2, *b0, *b1, *b2;
+    bn_split3(a, k, &a0, &a1, &a2);
+    bn_split3(b, k, &b0, &b1, &b2);
+
+    // Evaluate at x=0: p0 = a0, q0 = b0
+    // r0 = a0 * b0
+    bignum *r0 = bn_mul_toom3(a0, b0);
+
+    // Evaluate at x=inf: p_inf = a2, q_inf = b2
+    // r_inf = a2 * b2
+    bignum *r_inf = bn_mul_toom3(a2, b2);
+
+    // Evaluate at x=1: p1 = a0+a1+a2, q1 = b0+b1+b2
+    bignum *p1_tmp = bn_add(a0, a1);
+    bignum *p1 = bn_add(p1_tmp, a2);
+    bn_free(p1_tmp);
+    bignum *q1_tmp = bn_add(b0, b1);
+    bignum *q1 = bn_add(q1_tmp, b2);
+    bn_free(q1_tmp);
+    // r1 = p1 * q1
+    bignum *r1 = bn_mul_toom3(p1, q1);
+    bn_free(p1);
+    bn_free(q1);
+
+    // Evaluate at x=-1: p_m1 = a0-a1+a2, q_m1 = b0-b1+b2
+    bignum *p_m1_tmp = bn_sub(a0, a1);
+    bignum *p_m1 = bn_add(p_m1_tmp, a2);
+    bn_free(p_m1_tmp);
+    bignum *q_m1_tmp = bn_sub(b0, b1);
+    bignum *q_m1 = bn_add(q_m1_tmp, b2);
+    bn_free(q_m1_tmp);
+    // r_m1 = p_m1 * q_m1
+    bignum *r_m1 = bn_mul_toom3(p_m1, q_m1);
+    bn_free(p_m1);
+    bn_free(q_m1);
+
+    // Evaluate at x=2: p2 = a0+2*a1+4*a2, q2 = b0+2*b1+4*b2
+    bignum *two = bn_from_int(2);
+    bignum *four = bn_from_int(4);
+    bignum *a1x2 = bn_mul(a1, two);
+    bignum *a2x4 = bn_mul(a2, four);
+    bignum *p2_tmp = bn_add(a0, a1x2);
+    bignum *p2 = bn_add(p2_tmp, a2x4);
+    bn_free(p2_tmp);
+    bn_free(a1x2);
+    bn_free(a2x4);
+
+    bignum *b1x2 = bn_mul(b1, two);
+    bignum *b2x4 = bn_mul(b2, four);
+    bignum *q2_tmp = bn_add(b0, b1x2);
+    bignum *q2 = bn_add(q2_tmp, b2x4);
+    bn_free(q2_tmp);
+    bn_free(b1x2);
+    bn_free(b2x4);
+    bn_free(two);
+    bn_free(four);
+    // r2 = p2 * q2
+    bignum *r2 = bn_mul_toom3(p2, q2);
+    bn_free(p2);
+    bn_free(q2);
+
+    // Free input splits
+    bn_free(a0);
+    bn_free(a1);
+    bn_free(a2);
+    bn_free(b0);
+    bn_free(b1);
+    bn_free(b2);
+
+    // Interpolation to get c0, c1, c2, c3, c4 where
+    // result = c0 + c1*B^k + c2*B^(2k) + c3*B^(3k) + c4*B^(4k)
+    //
+    // From the 5 evaluations:
+    // r0    = c0
+    // r1    = c0 + c1 + c2 + c3 + c4
+    // r_m1  = c0 - c1 + c2 - c3 + c4
+    // r2    = c0 + 2*c1 + 4*c2 + 8*c3 + 16*c4
+    // r_inf = c4
+    //
+    // Solving:
+    // c0 = r0
+    // c4 = r_inf
+    // c2 = (r1 + r_m1)/2 - r0 - r_inf
+    // c1 = (r1 - r_m1)/2 - c3
+    // c3 = (r2 - r0 - 4*c2 - 16*r_inf) / 2 - c1
+    //    which simplifies to a system we solve step by step
+
+    // c0 = r0
+    bignum *c0 = bn_copy(r0);
+
+    // c4 = r_inf
+    bignum *c4 = bn_copy(r_inf);
+
+    // t1 = (r1 + r_m1) / 2
+    bignum *sum_r1_rm1 = bn_add(r1, r_m1);
+    bignum *t1 = bn_rshift(sum_r1_rm1, 1); // divide by 2
+    bn_free(sum_r1_rm1);
+
+    // t2 = (r1 - r_m1) / 2
+    bignum *diff_r1_rm1 = bn_sub(r1, r_m1);
+    bignum *t2 = bn_rshift(diff_r1_rm1, 1); // divide by 2
+    bn_free(diff_r1_rm1);
+
+    // c2 = t1 - c0 - c4
+    bignum *c2_tmp = bn_sub(t1, c0);
+    bignum *c2 = bn_sub(c2_tmp, c4);
+    bn_free(c2_tmp);
+    bn_free(t1);
+
+    // For c1 and c3, we need more work:
+    // r2 = c0 + 2*c1 + 4*c2 + 8*c3 + 16*c4
+    // Let's compute: r2 - c0 - 4*c2 - 16*c4 = 2*c1 + 8*c3 = 2*(c1 + 4*c3)
+
+    bignum *sixteen = bn_from_int(16);
+    bignum *c4x16 = bn_mul(c4, sixteen);
+    bn_free(sixteen);
+
+    four = bn_from_int(4);
+    bignum *c2x4 = bn_mul(c2, four);
+    bn_free(four);
+
+    bignum *tmp1 = bn_sub(r2, c0);
+    bignum *tmp2 = bn_sub(tmp1, c2x4);
+    bn_free(tmp1);
+    bignum *tmp3 = bn_sub(tmp2, c4x16);
+    bn_free(tmp2);
+    bn_free(c2x4);
+    bn_free(c4x16);
+
+    // tmp3 = 2*(c1 + 4*c3)
+    // t3 = c1 + 4*c3
+    bignum *t3 = bn_rshift(tmp3, 1);
+    bn_free(tmp3);
+
+    // We also have t2 = c1 + c3 (from (r1 - r_m1)/2)
+    // So: t3 - t2 = 3*c3
+    // c3 = (t3 - t2) / 3
+
+    bignum *diff_t3_t2 = bn_sub(t3, t2);
+    bignum *three = bn_from_int(3);
+    bignum *c3 = bn_div(diff_t3_t2, three, NULL);
+    bn_free(diff_t3_t2);
+    bn_free(three);
+
+    // c1 = t2 - c3
+    bignum *c1 = bn_sub(t2, c3);
+    bn_free(t2);
+    bn_free(t3);
+
+    // Free evaluation results
+    bn_free(r0);
+    bn_free(r1);
+    bn_free(r_m1);
+    bn_free(r2);
+    bn_free(r_inf);
+
+    // result = c0 + c1*B^k + c2*B^(2k) + c3*B^(3k) + c4*B^(4k)
+    bignum *c1_shift = bn_lshift_limbs(c1, k);
+    bignum *c2_shift = bn_lshift_limbs(c2, 2 * k);
+    bignum *c3_shift = bn_lshift_limbs(c3, 3 * k);
+    bignum *c4_shift = bn_lshift_limbs(c4, 4 * k);
+
+    bignum *sum1 = bn_add(c0, c1_shift);
+    bignum *sum2 = bn_add(sum1, c2_shift);
+    bignum *sum3 = bn_add(sum2, c3_shift);
+    bignum *result = bn_add(sum3, c4_shift);
+
+    bn_free(c0);
+    bn_free(c1);
+    bn_free(c2);
+    bn_free(c3);
+    bn_free(c4);
+    bn_free(c1_shift);
+    bn_free(c2_shift);
+    bn_free(c3_shift);
+    bn_free(c4_shift);
+    bn_free(sum1);
+    bn_free(sum2);
+    bn_free(sum3);
+
+    bn_normalize(result);
     return result;
 }
 
