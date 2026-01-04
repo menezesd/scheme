@@ -56,6 +56,7 @@ slow_path:;
 
         if (all_complex_exact) {
             // Exact complex addition: (a+bi) + (c+di) = (a+c) + (b+d)i
+            GC_GUARD;
             unsigned real_sum = store(0), imag_sum = store(0);
             gc_protect(&real_sum);
             gc_protect(&imag_sum);
@@ -66,7 +67,6 @@ slow_path:;
                 real_sum = binary_add(real_sum, r);
                 imag_sum = binary_add(imag_sum, i);
             }
-            gc_unprotect(2);
             return make_complex_exact(real_sum, imag_sum);
         }
 
@@ -90,6 +90,7 @@ slow_path:;
     case NUM_RATIONAL: {
         // Rational addition: a/b + c/d = (ad + bc) / bd
         // Use cell-based arithmetic to support bignum numerators/denominators
+        GC_GUARD;
         unsigned num = store(0), denom = store(1);
         gc_protect(&num);
         gc_protect(&denom);
@@ -101,14 +102,11 @@ slow_path:;
             unsigned ad = multiply_cells(num, d);
             gc_protect(&ad);
             unsigned bc = multiply_cells(n, denom);
-            gc_protect(&bc);
-            unsigned new_num = add_cells(ad, bc);
-            gc_unprotect(2);
-            num = new_num;
+            num = add_cells(ad, bc);
+            gc_unprotect(1);
             // denom = denom * d
             denom = multiply_cells(denom, d);
         }
-        gc_unprotect(2);
         return normalize_rational_cells(num, denom);
     }
     case NUM_BIGNUM: {
@@ -185,6 +183,7 @@ slow_path:;
         if (all_complex_exact) {
             // Exact complex multiplication: (a+bi) * (c+di) = (ac-bd) +
             // (ad+bc)i
+            GC_GUARD;
             unsigned real_prod = store(1), imag_prod = store(0);
             gc_protect(&real_prod);
             gc_protect(&imag_prod);
@@ -201,14 +200,12 @@ slow_path:;
                 unsigned ad = binary_mul(real_prod, i);
                 gc_protect(&ad);
                 unsigned bc = binary_mul(imag_prod, r);
-                gc_protect(&bc);
                 unsigned new_real = binary_sub(ac, bd);
                 unsigned new_imag = binary_add(ad, bc);
-                gc_unprotect(4);
+                gc_unprotect(3);
                 real_prod = new_real;
                 imag_prod = new_imag;
             }
-            gc_unprotect(2);
             return make_complex_exact(real_prod, imag_prod);
         }
 
@@ -234,6 +231,7 @@ slow_path:;
     case NUM_RATIONAL: {
         // Rational multiplication: a/b * c/d = ac/bd
         // Use cell-based arithmetic to support bignum numerators/denominators
+        GC_GUARD;
         unsigned num = store(1), denom = store(1);
         gc_protect(&num);
         gc_protect(&denom);
@@ -244,7 +242,6 @@ slow_path:;
             num = multiply_cells(num, n);
             denom = multiply_cells(denom, d);
         }
-        gc_unprotect(2);
         return normalize_rational_cells(num, denom);
     }
     case NUM_BIGNUM:
@@ -315,6 +312,7 @@ slow_path:;
 
         if (all_complex_exact) {
             // Exact complex subtraction: (a+bi) - (c+di) = (a-c) + (b-d)i
+            GC_GUARD;
             unsigned real_res, imag_res;
             get_complex_cells(car(args), &real_res, &imag_res);
             gc_protect(&real_res);
@@ -325,7 +323,6 @@ slow_path:;
                 unsigned neg_real = negate_number(real_res);
                 gc_protect(&neg_real);
                 unsigned neg_imag = negate_number(imag_res);
-                gc_unprotect(3);
                 return make_complex_exact(neg_real, neg_imag);
             }
             for (; rargs; rargs = cdr(rargs)) {
@@ -334,7 +331,6 @@ slow_path:;
                 real_res = binary_sub(real_res, r);
                 imag_res = binary_sub(imag_res, i);
             }
-            gc_unprotect(2);
             return make_complex_exact(real_res, imag_res);
         }
 
@@ -367,13 +363,13 @@ slow_path:;
     case NUM_RATIONAL: {
         // Rational subtraction: a/b - c/d = (ad - bc) / bd
         // Use cell-based arithmetic to support bignum numerators/denominators
+        GC_GUARD;
         unsigned num, denom;
         get_rational_cells(car(args), &num, &denom);
         gc_protect(&num);
         gc_protect(&denom);
         unsigned rargs = cdr(args);
         if (!rargs) {
-            gc_unprotect(2);
             return normalize_rational_cells(negate_number(num), denom);
         }
         for (; rargs; rargs = cdr(rargs)) {
@@ -383,14 +379,12 @@ slow_path:;
             unsigned ad = multiply_cells(num, d);
             gc_protect(&ad);
             unsigned bc = multiply_cells(n, denom);
-            gc_protect(&bc);
             unsigned new_num = subtract_cells(ad, bc);
-            gc_unprotect(2);
+            gc_unprotect(1);
             num = new_num;
             // denom = denom * d
             denom = multiply_cells(denom, d);
         }
-        gc_unprotect(2);
         return normalize_rational_cells(num, denom);
     }
     case NUM_BIGNUM: {
@@ -466,6 +460,7 @@ slow_path:;
         if (all_complex_exact) {
             // Exact complex division: (a+bi)/(c+di) = (ac+bd)/(c²+d²) +
             // (bc-ad)/(c²+d²)i
+            GC_GUARD;
             unsigned real_res, imag_res;
             get_complex_cells(car(args), &real_res, &imag_res);
             gc_protect(&real_res);
@@ -476,20 +471,16 @@ slow_path:;
                 unsigned a2 = binary_mul(real_res, real_res);
                 gc_protect(&a2);
                 unsigned b2 = binary_mul(imag_res, imag_res);
-                gc_protect(&b2);
                 unsigned denom = binary_add(a2, b2);
-                gc_unprotect(2);
+                gc_unprotect(1);
                 gc_protect(&denom);
                 if (to_double(denom) == 0.0) {
-                    gc_unprotect(3);
                     ERROR_RETURN("/: division by zero");
                 }
                 unsigned new_real = binary_div(real_res, denom);
                 gc_protect(&new_real);
                 unsigned neg_imag = negate_number(imag_res);
-                gc_protect(&neg_imag);
                 unsigned new_imag = binary_div(neg_imag, denom);
-                gc_unprotect(5);
                 return make_complex_exact(new_real, new_imag);
             }
             for (; rargs; rargs = cdr(rargs)) {
@@ -507,12 +498,10 @@ slow_path:;
                 unsigned c2 = binary_mul(c, c);
                 gc_protect(&c2);
                 unsigned d2 = binary_mul(d, d);
-                gc_protect(&d2);
                 unsigned denom = binary_add(c2, d2);
-                gc_unprotect(2);
+                gc_unprotect(1);
                 gc_protect(&denom);
                 if (to_double(denom) == 0.0) {
-                    gc_unprotect(6);
                     ERROR_RETURN("/: division by zero");
                 }
                 unsigned num_real = binary_add(ac, bd);
@@ -525,7 +514,6 @@ slow_path:;
                 imag_res = binary_div(num_imag, denom);
                 gc_unprotect(3);
             }
-            gc_unprotect(2);
             return make_complex_exact(real_res, imag_res);
         }
 
@@ -571,6 +559,7 @@ slow_path:;
     case NUM_INTEGER: {
         // Rational division: (a/b) / (c/d) = ad / bc
         // Use cell-based arithmetic to support bignum numerators/denominators
+        GC_GUARD;
         unsigned num, denom;
         get_rational_cells(car(args), &num, &denom);
         gc_protect(&num);
@@ -578,7 +567,6 @@ slow_path:;
         unsigned rargs = cdr(args);
         if (!rargs) {
             // Reciprocal: 1 / (a/b) = b/a
-            gc_unprotect(2);
             if (is_zero_cell(num))
                 ERROR_RETURN("/: division by zero");
             return normalize_rational_cells(denom, num);
@@ -587,14 +575,12 @@ slow_path:;
             unsigned n, d;
             get_rational_cells(car(rargs), &n, &d);
             if (is_zero_cell(n)) {
-                gc_unprotect(2);
                 ERROR_RETURN("/: division by zero");
             }
             // num = num * d, denom = denom * n
             num = multiply_cells(num, d);
             denom = multiply_cells(denom, n);
         }
-        gc_unprotect(2);
         return normalize_rational_cells(num, denom);
     }
     }

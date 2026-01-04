@@ -191,6 +191,7 @@ static unsigned unwrap_protected(unsigned expr)
     if (!expr)
         return 0;
 
+    GC_GUARD;
     gc_protect(&expr);
 
     // Check for protected wrapper
@@ -198,14 +199,12 @@ static unsigned unwrap_protected(unsigned expr)
         unsigned head = car(expr);
         if (IS_ATOM(head) && CELL_ID(head) == ctx.kw_protected) {
             // Unwrap: (##protected## . x) → x
-            gc_unprotect(1);
             return cdr(expr);
         }
 
         // Don't unwrap inside syntax-rules - those templates will be
         // processed later by their own apply_syntax
         if (IS_ATOM(head) && CELL_ID(head) == ctx.kw_syntax_rules) {
-            gc_unprotect(1);
             return expr;
         }
 
@@ -213,14 +212,12 @@ static unsigned unwrap_protected(unsigned expr)
         unsigned new_car = unwrap_protected(car(expr));
         gc_protect(&new_car);
         unsigned new_cdr = unwrap_protected(cdr(expr));
-        gc_protect(&new_cdr);
         unsigned result;
         if (new_car == car(expr) && new_cdr == cdr(expr))
             result = expr;
         else {
             result = alloc_cons(new_car, new_cdr);
         }
-        gc_unprotect(3);
         return result;
     }
 
@@ -238,7 +235,6 @@ static unsigned unwrap_protected(unsigned expr)
         }
 
         if (!changed) {
-            gc_unprotect(1);
             return expr;
         }
 
@@ -250,11 +246,9 @@ static unsigned unwrap_protected(unsigned expr)
             unsigned *new_data = vector_data_ptr(new_vec);
             new_data[i] = unwrap_protected(data[i]);
         }
-        gc_unprotect(2);
         return new_vec;
     }
 
-    gc_unprotect(1);
     return expr;
 }
 
@@ -314,6 +308,7 @@ static unsigned collect_free_ids(unsigned tmpl, unsigned bindings,
     if (!tmpl)
         return collected;
 
+    GC_GUARD;
     gc_protect(&tmpl);
     gc_protect(&bindings);
     gc_protect(&collected);
@@ -325,11 +320,8 @@ static unsigned collect_free_ids(unsigned tmpl, unsigned bindings,
         if (!is_special_form(id) && !is_pattern_var(id, bindings) &&
             id != ellipsis_id && !id_in_list(id, collected)) {
             // Add to collected list
-            unsigned new_collected = alloc_cons(tmpl, collected);
-            gc_unprotect(3);
-            return new_collected;
+            return alloc_cons(tmpl, collected);
         }
-        gc_unprotect(3);
         return collected;
     }
 
@@ -339,12 +331,10 @@ static unsigned collect_free_ids(unsigned tmpl, unsigned bindings,
         if (IS_ATOM(head)) {
             int64_t head_id = CELL_ID(head);
             if (head_id == ctx.kw_protected || head_id == ctx.kw_syntax_rules) {
-                gc_unprotect(3);
                 return collected;
             }
             // For quote, skip the quoted data
             if (head_id == ctx.kw_quote) {
-                gc_unprotect(3);
                 return collected;
             }
             // For set! and define, skip the target variable but collect from
@@ -355,12 +345,9 @@ static unsigned collect_free_ids(unsigned tmpl, unsigned bindings,
                 // variable (cadr)
                 unsigned expr = cddr(tmpl);
                 if (expr) {
-                    unsigned result = collect_free_ids(car(expr), bindings,
-                                                       collected, ellipsis_id);
-                    gc_unprotect(3);
-                    return result;
+                    return collect_free_ids(car(expr), bindings, collected,
+                                            ellipsis_id);
                 }
-                gc_unprotect(3);
                 return collected;
             }
         }
@@ -368,10 +355,7 @@ static unsigned collect_free_ids(unsigned tmpl, unsigned bindings,
         collected =
             collect_free_ids(car(tmpl), bindings, collected, ellipsis_id);
         gc_protect(&collected);
-        unsigned result =
-            collect_free_ids(cdr(tmpl), bindings, collected, ellipsis_id);
-        gc_unprotect(4);
-        return result;
+        return collect_free_ids(cdr(tmpl), bindings, collected, ellipsis_id);
     }
 
     if (IS_VECTOR(tmpl)) {
@@ -382,11 +366,9 @@ static unsigned collect_free_ids(unsigned tmpl, unsigned bindings,
             collected =
                 collect_free_ids(data[i], bindings, collected, ellipsis_id);
         }
-        gc_unprotect(3);
         return collected;
     }
 
-    gc_unprotect(3);
     return collected;
 }
 
@@ -397,6 +379,7 @@ static unsigned rename_free_ids(unsigned tmpl, unsigned rename_map)
     if (!tmpl || !rename_map)
         return tmpl;
 
+    GC_GUARD;
     gc_protect(&tmpl);
     gc_protect(&rename_map);
 
@@ -406,11 +389,9 @@ static unsigned rename_free_ids(unsigned tmpl, unsigned rename_map)
         for (unsigned m = rename_map; m; m = cdr(m)) {
             unsigned entry = car(m);
             if (IS_ATOM(car(entry)) && CELL_ID(car(entry)) == id) {
-                gc_unprotect(2);
                 return cdr(entry); // Return the gensym
             }
         }
-        gc_unprotect(2);
         return tmpl;
     }
 
@@ -420,11 +401,9 @@ static unsigned rename_free_ids(unsigned tmpl, unsigned rename_map)
         if (IS_ATOM(head)) {
             int64_t head_id = CELL_ID(head);
             if (head_id == ctx.kw_protected || head_id == ctx.kw_syntax_rules) {
-                gc_unprotect(2);
                 return tmpl;
             }
             if (head_id == ctx.kw_quote) {
-                gc_unprotect(2);
                 return tmpl;
             }
             // For set! and define, don't rename the target variable
@@ -436,26 +415,18 @@ static unsigned rename_free_ids(unsigned tmpl, unsigned rename_map)
                 if (expr) {
                     unsigned new_expr = rename_free_ids(car(expr), rename_map);
                     gc_protect(&new_expr);
-                    unsigned result = alloc_cons(
-                        head, alloc_cons(var, alloc_cons(new_expr, 0)));
-                    gc_unprotect(3);
-                    return result;
+                    return alloc_cons(head,
+                                      alloc_cons(var, alloc_cons(new_expr, 0)));
                 }
-                gc_unprotect(2);
                 return tmpl;
             }
         }
         unsigned new_car = rename_free_ids(car(tmpl), rename_map);
         gc_protect(&new_car);
         unsigned new_cdr = rename_free_ids(cdr(tmpl), rename_map);
-        gc_protect(&new_cdr);
-        unsigned result;
         if (new_car == car(tmpl) && new_cdr == cdr(tmpl))
-            result = tmpl;
-        else
-            result = alloc_cons(new_car, new_cdr);
-        gc_unprotect(4);
-        return result;
+            return tmpl;
+        return alloc_cons(new_car, new_cdr);
     }
 
     if (IS_VECTOR(tmpl)) {
@@ -470,7 +441,6 @@ static unsigned rename_free_ids(unsigned tmpl, unsigned rename_map)
                 changed = true;
         }
         if (!changed) {
-            gc_unprotect(2);
             return tmpl;
         }
         unsigned new_vec = make_vector(len, 0);
@@ -481,11 +451,9 @@ static unsigned rename_free_ids(unsigned tmpl, unsigned rename_map)
             unsigned *new_data = vector_data_ptr(new_vec);
             new_data[i] = rename_free_ids(data[i], rename_map);
         }
-        gc_unprotect(3);
         return new_vec;
     }
 
-    gc_unprotect(2);
     return tmpl;
 }
 
@@ -497,11 +465,11 @@ static unsigned rename_in_template(unsigned tmpl, int64_t old_id,
     if (!tmpl)
         return 0;
 
+    GC_GUARD;
     gc_protect(&tmpl);
     gc_protect(&new_sym);
 
     if (IS_ATOM(tmpl)) {
-        gc_unprotect(2);
         if (CELL_ID(tmpl) == old_id)
             return new_sym;
         return tmpl;
@@ -511,21 +479,14 @@ static unsigned rename_in_template(unsigned tmpl, int64_t old_id,
         // Skip protected wrappers - they should not be renamed
         unsigned head = car(tmpl);
         if (IS_ATOM(head) && CELL_ID(head) == ctx.kw_protected) {
-            gc_unprotect(2);
             return tmpl;
         }
         unsigned new_car = rename_in_template(car(tmpl), old_id, new_sym);
         gc_protect(&new_car);
         unsigned new_cdr = rename_in_template(cdr(tmpl), old_id, new_sym);
-        gc_protect(&new_cdr);
-        // Now 4 protected: tmpl, new_sym, new_car, new_cdr
-        unsigned result;
         if (new_car == car(tmpl) && new_cdr == cdr(tmpl))
-            result = tmpl;
-        else
-            result = alloc_cons(new_car, new_cdr);
-        gc_unprotect(4);
-        return result;
+            return tmpl;
+        return alloc_cons(new_car, new_cdr);
     }
 
     if (IS_VECTOR(tmpl)) {
@@ -543,7 +504,6 @@ static unsigned rename_in_template(unsigned tmpl, int64_t old_id,
         }
 
         if (!changed) {
-            gc_unprotect(2);
             return tmpl;
         }
 
@@ -556,11 +516,9 @@ static unsigned rename_in_template(unsigned tmpl, int64_t old_id,
             unsigned *new_data = vector_data_ptr(new_vec);
             new_data[i] = rename_in_template(data[i], old_id, new_sym);
         }
-        gc_unprotect(3);
         return new_vec;
     }
 
-    gc_unprotect(2);
     return tmpl;
 }
 

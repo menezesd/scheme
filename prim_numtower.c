@@ -75,13 +75,13 @@ static unsigned prim_inexact_to_exact(unsigned x)
             return normalize_rational(num, denom);
         } else {
             // Large denominator - use bignums
+            GC_GUARD;
             unsigned numer = store(num);
             gc_protect(&numer);
             bignum *denom_bn = bn_from_int(1);
             bignum *shifted = bn_lshift(denom_bn, (int)denom_exp);
             bn_free(denom_bn);
             unsigned denom = store_integer(shifted);
-            gc_unprotect(1);
             return normalize_rational_cells(numer, denom);
         }
     }
@@ -205,10 +205,10 @@ unsigned apply_numtower_primitive(unsigned prim_id, unsigned args)
 
         if (CELL_TYPE(x) == BT_COMPLEX) {
             // Convert both parts to exact
+            GC_GUARD;
             unsigned real_exact = prim_inexact_to_exact(CELL_CAR(x));
             gc_protect(&real_exact);
             unsigned imag_exact = prim_inexact_to_exact(CELL_CDR(x));
-            gc_unprotect(1);
             return store_complex(real_exact, imag_exact);
         }
 

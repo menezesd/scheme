@@ -243,6 +243,7 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned args)
             bool neg_exp = exp_val < 0;
             uint64_t e = neg_exp ? (uint64_t)(-exp_val) : (uint64_t)exp_val;
 
+            GC_GUARD;
             unsigned result = store(1);
             unsigned base = base_arg;
             gc_protect(&result);
@@ -252,11 +253,8 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned args)
                 if (e & 1) {
                     // result = result * base (exact multiplication)
                     unsigned mul_args = alloc_cons(result, alloc_cons(base, 0));
-                    gc_protect(&mul_args);
                     result = prim_mult(mul_args);
-                    gc_unprotect(1);
                     if (result == TOK_ERROR) {
-                        gc_unprotect(2);
                         return TOK_ERROR;
                     }
                 }
@@ -264,25 +262,18 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned args)
                 if (e > 0) {
                     // base = base * base
                     unsigned sq_args = alloc_cons(base, alloc_cons(base, 0));
-                    gc_protect(&sq_args);
                     base = prim_mult(sq_args);
-                    gc_unprotect(1);
                     if (base == TOK_ERROR) {
-                        gc_unprotect(2);
                         return TOK_ERROR;
                     }
                 }
             }
 
-            gc_unprotect(2);
-
             if (neg_exp) {
                 // Return 1 / result
                 unsigned one = store(1);
                 gc_protect(&one);
-                gc_protect(&result);
                 unsigned div_args = alloc_cons(one, alloc_cons(result, 0));
-                gc_unprotect(2);
                 return prim_div(div_args);
             }
             return result;
@@ -340,10 +331,10 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned args)
                     bn_free(num_root);
                     bn_free(den_root);
 
+                    GC_GUARD;
                     unsigned result_num = store_integer(num_power);
                     gc_protect(&result_num);
                     unsigned result_den = store_integer(den_power);
-                    gc_unprotect(1);
 
                     if (neg_exp) {
                         // Swap numerator and denominator
