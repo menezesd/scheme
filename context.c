@@ -281,10 +281,8 @@ unsigned alloc(void)
 
 unsigned alloc_cons(unsigned car_val, unsigned cdr_val)
 {
-    gc_protect(&car_val);
-    gc_protect(&cdr_val);
+    GC_PROTECT_GUARD2(&car_val, &cdr_val);
     unsigned p = alloc();
-    gc_unprotect(2);
     CELL_TYPE(p) = BT_CONS;
     CELL_CAR(p) = car_val;
     CELL_CDR(p) = cdr_val;

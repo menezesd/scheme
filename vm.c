@@ -102,14 +102,15 @@ unsigned vm_call_closure(unsigned closure, unsigned args)
 
     // Bind parameters to arguments
     unsigned params = code->constants[code->params];
-    gc_protect(&closure_env);
-    gc_protect(&args);
-    gc_protect(&params);
-    unsigned frame = bind_params(params, args);
-    gc_unprotect(2); // args, params no longer needed
-    gc_protect(&frame);
-    unsigned new_env = alloc_cons(frame, closure_env);
-    gc_unprotect(2); // frame, closure_env
+    unsigned frame, new_env;
+    {
+        GC_PROTECT_GUARD3(&closure_env, &args, &params);
+        frame = bind_params(params, args);
+    }
+    {
+        GC_PROTECT_GUARD2(&frame, &closure_env);
+        new_env = alloc_cons(frame, closure_env);
+    }
 
     // Create a temporary VM and run the code
     vm_state vm;

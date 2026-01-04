@@ -295,6 +295,73 @@ void gc_release(int mark);
          gc_release(_gc_mark), _gc_once = 0)
 
 // ============================================================================
+// RAII-style GC Protection Macros
+// ============================================================================
+
+// Cleanup function for __attribute__((cleanup))
+static inline void gc_release_ptr(int *mark) { gc_release(*mark); }
+
+// GC_GUARD: RAII-style protection using cleanup attribute
+// Automatically releases all protected vars when the variable goes out of scope.
+// Usage:
+//   GC_GUARD;           // Place at start of scope
+//   gc_protect(&a);
+//   gc_protect(&b);
+//   ... allocations ...
+//   // Automatically released when scope exits (including early returns!)
+#define GC_GUARD __attribute__((cleanup(gc_release_ptr))) int _gc_guard = gc_mark()
+
+// Convenience macros for protecting multiple values at once
+// Usage: GC_PROTECT2(&a, &b);  // Protects both, use GC_GUARD for auto-release
+
+static inline void gc_protect2(unsigned *a, unsigned *b)
+{
+    gc_protect(a);
+    gc_protect(b);
+}
+
+static inline void gc_protect3(unsigned *a, unsigned *b, unsigned *c)
+{
+    gc_protect(a);
+    gc_protect(b);
+    gc_protect(c);
+}
+
+static inline void gc_protect4(unsigned *a, unsigned *b, unsigned *c,
+                               unsigned *d)
+{
+    gc_protect(a);
+    gc_protect(b);
+    gc_protect(c);
+    gc_protect(d);
+}
+
+#define GC_PROTECT2(a, b) gc_protect2(a, b)
+#define GC_PROTECT3(a, b, c) gc_protect3(a, b, c)
+#define GC_PROTECT4(a, b, c, d) gc_protect4(a, b, c, d)
+
+// Combined RAII + multi-protect: protect multiple values with automatic cleanup
+// Usage:
+//   {
+//       GC_PROTECT_GUARD2(&a, &b);
+//       ... allocations that may trigger GC ...
+//   } // a and b automatically unprotected here
+#define GC_PROTECT_GUARD                                                       \
+    __attribute__((cleanup(gc_release_ptr))) int _gc_guard = gc_mark()
+
+#define GC_PROTECT_GUARD2(a, b)                                                \
+    GC_PROTECT_GUARD;                                                          \
+    gc_protect2(a, b)
+
+#define GC_PROTECT_GUARD3(a, b, c)                                             \
+    GC_PROTECT_GUARD;                                                          \
+    gc_protect3(a, b, c)
+
+#define GC_PROTECT_GUARD4(a, b, c, d)                                          \
+    GC_PROTECT_GUARD;                                                          \
+    gc_protect4(a, b, c, d)
+
+// ============================================================================
 // Initialization
 // ============================================================================
 
