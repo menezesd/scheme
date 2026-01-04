@@ -305,6 +305,7 @@ typedef struct compile_ctx {
     struct compile_ctx *parent; // Parent context (for nested lambdas)
     unsigned env;               // Compile-time environment (for macros)
     bool tail_position;         // True if compiling in tail position
+    unsigned known_lambdas;     // Alist of (var-id . lambda-expr) for inlining
 } compile_ctx;
 
 // ============================================================================

@@ -68,6 +68,58 @@ static bool is_keyword_shadowed(int64_t kw, unsigned env)
     return true;
 }
 
+// Look up a variable in the known_lambdas alist
+// Returns the lambda expression if found, 0 otherwise
+static unsigned lookup_known_lambda(int64_t var_id, unsigned known_lambdas)
+{
+    FORLIST(entry, known_lambdas)
+    {
+        unsigned pair = car(entry);
+        if (IS_PAIR(pair) && IS_ATOM(car(pair)) &&
+            CELL_ID(car(pair)) == var_id) {
+            return cdr(pair); // Return the lambda expression
+        }
+    }
+    return 0;
+}
+
+// Check if expr contains a reference to var_id (for detecting self-reference)
+static bool contains_reference(unsigned expr, int64_t var_id)
+{
+    if (!expr)
+        return false;
+    if (IS_ATOM(expr))
+        return CELL_ID(expr) == var_id;
+    if (!IS_PAIR(expr))
+        return false;
+
+    // Skip quoted expressions
+    if (IS_ATOM(car(expr)) && CELL_ID(car(expr)) == ctx.kw_quote)
+        return false;
+
+    // Check lambda - don't descend if var_id is shadowed by a parameter
+    if (IS_ATOM(car(expr)) && CELL_ID(car(expr)) == ctx.kw_lambda) {
+        unsigned params = cadr(expr);
+        // Check if var_id is in params
+        if (CELL_TYPE(params) == BT_ATOM && CELL_ID(params) == var_id)
+            return false; // Shadowed by rest param
+        if (IS_PAIR(params)) {
+            for (unsigned p = params; p; p = cdr(p)) {
+                if (CELL_TYPE(p) == BT_ATOM && CELL_ID(p) == var_id)
+                    return false; // Shadowed by rest param
+                if (IS_PAIR(p) && IS_ATOM(car(p)) && CELL_ID(car(p)) == var_id)
+                    return false; // Shadowed by regular param
+            }
+        }
+        // Check body
+        return contains_reference(cddr(expr), var_id);
+    }
+
+    // Recursively check car and cdr
+    return contains_reference(car(expr), var_id) ||
+           contains_reference(cdr(expr), var_id);
+}
+
 // ============================================================================
 // Compiler Forward Declarations
 // ============================================================================
@@ -174,15 +226,18 @@ static compile_ctx *cctx_new(compile_ctx *parent, unsigned env)
     cctx->parent = parent;
     cctx->env = env;
     cctx->tail_position = false;
-    // Protect env so it's updated if GC runs during compilation
+    // Inherit known_lambdas from parent (they're still in scope)
+    cctx->known_lambdas = parent ? parent->known_lambdas : 0;
+    // Protect env and known_lambdas so they're updated if GC runs
     gc_protect(&cctx->env);
+    gc_protect(&cctx->known_lambdas);
     return cctx;
 }
 
 static void cctx_free(compile_ctx *cctx)
 {
-    // Unprotect env that was protected in cctx_new
-    gc_unprotect(1);
+    // Unprotect env and known_lambdas that were protected in cctx_new
+    gc_unprotect(2);
     // Note: code is transferred out, not freed here
     free(cctx);
 }
@@ -831,12 +886,38 @@ static compile_result compile_let(unsigned expr, compile_ctx *cctx)
     unsigned saved_env = cctx->env;
     cctx->env = extend_compile_env(cctx->env, bindings);
 
+    // Track lambda bindings for escape analysis inlining
+    // Save and extend known_lambdas for bindings of form (var (lambda ...))
+    // Only track non-self-referential lambdas (self-ref needs letrec semantics)
+    unsigned saved_known = cctx->known_lambdas;
+    FORLIST(b, bindings)
+    {
+        unsigned binding = car(b);
+        unsigned var = car(binding);
+        unsigned val_expr = cadr(binding);
+
+        // Check if value is a lambda expression
+        if (IS_PAIR(val_expr) && IS_ATOM(car(val_expr)) &&
+            CELL_ID(car(val_expr)) == ctx.kw_lambda &&
+            !is_keyword_shadowed(ctx.kw_lambda, cctx->env)) {
+            // Only inline if the lambda doesn't reference the bound variable
+            // (self-referential lambdas need letrec semantics to work)
+            unsigned lambda_body = cddr(val_expr);
+            if (!contains_reference(lambda_body, CELL_ID(var))) {
+                // Add (var . lambda-expr) to known_lambdas
+                unsigned pair = alloc_cons(var, val_expr);
+                cctx->known_lambdas = alloc_cons(pair, cctx->known_lambdas);
+            }
+        }
+    }
+
     // Compile body in tail position
     cctx->tail_position = true;
     compile_result result = compile_begin(body, cctx);
 
-    // Restore compile-time environment
+    // Restore compile-time environment and known_lambdas
     cctx->env = saved_env;
+    cctx->known_lambdas = saved_known;
 
     // Pop environment frame
     emit(cctx, OP_POPENV);
@@ -1541,6 +1622,38 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
     }
 
     // ========================================================================
+    // Escape Analysis Inlining: (f args) where f is a known lambda
+    // ========================================================================
+    // If f is bound to a lambda in a let, we can inline it at the call site
+    if (IS_ATOM(fn_expr) && cctx->known_lambdas) {
+        int64_t var_id = CELL_ID(fn_expr);
+        unsigned lambda_expr = lookup_known_lambda(var_id, cctx->known_lambdas);
+        if (lambda_expr) {
+            // Found a known lambda - construct ((lambda ...) args) and recurse
+            // to use the existing lambda inlining code.
+            // Remove this binding from known_lambdas to prevent infinite
+            // recursion if the lambda calls itself (recursive functions).
+            unsigned saved_known = cctx->known_lambdas;
+            unsigned new_known = 0;
+            FORLIST(entry, cctx->known_lambdas)
+            {
+                unsigned pair = car(entry);
+                if (!IS_PAIR(pair) || !IS_ATOM(car(pair)) ||
+                    CELL_ID(car(pair)) != var_id) {
+                    new_known = alloc_cons(pair, new_known);
+                }
+            }
+            cctx->known_lambdas = new_known;
+
+            unsigned inlined_call = alloc_cons(lambda_expr, args);
+            compile_result result = compile_call(inlined_call, cctx);
+
+            cctx->known_lambdas = saved_known;
+            return result;
+        }
+    }
+
+    // ========================================================================
     // Lambda Inlining: ((lambda (params) body) args) -> inline as let
     // ========================================================================
     // This avoids closure allocation and function call overhead
@@ -1552,39 +1665,96 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
         unsigned lambda_body = cddr(fn_expr);
 
         // Count params and check for rest parameter
+        // Handle two cases:
+        // 1. (lambda args body) - params is just an atom, all args go to rest
+        // 2. (lambda (x y . rest) body) - some fixed params, then rest
         unsigned param_count = 0;
         bool has_rest = false;
-        for (unsigned p = lambda_params; p; p = cdr(p)) {
-            if (CELL_TYPE(p) == BT_ATOM) {
-                has_rest = true;
-                break;
+        unsigned rest_param = 0;
+
+        if (CELL_TYPE(lambda_params) == BT_ATOM) {
+            // Case 1: (lambda args body) - entire params is the rest param
+            has_rest = true;
+            rest_param = lambda_params;
+            param_count = 0;
+        } else {
+            // Case 2: (lambda (x y ...) body) or (lambda (x y . rest) body)
+            for (unsigned p = lambda_params; p; p = cdr(p)) {
+                if (CELL_TYPE(p) == BT_ATOM) {
+                    // Found rest param at end of dotted list
+                    has_rest = true;
+                    rest_param = p;
+                    break;
+                }
+                param_count++;
             }
-            param_count++;
         }
 
         // Count arguments
         unsigned arg_count = list_length(args);
 
-        // Only inline if arity matches exactly (no rest params for now)
-        if (!has_rest && param_count == arg_count) {
+        // Inline if: exact match, OR rest param with enough args
+        bool can_inline = (!has_rest && param_count == arg_count) ||
+                          (has_rest && arg_count >= param_count);
+
+        if (can_inline) {
             // Save tail position before compiling arguments
             bool tail = cctx->tail_position;
-
-            // Compile all argument values first (in current environment)
             cctx->tail_position = false;
-            FORLIST(a, args) { compile_expr_internal(car(a), cctx); }
+
+            // Compile fixed arguments first
+            unsigned args_remaining = args;
+            for (unsigned i = 0; i < param_count; i++) {
+                compile_expr_internal(car(args_remaining), cctx);
+                args_remaining = cdr(args_remaining);
+            }
+
+            // For rest parameters, build a list from remaining args
+            if (has_rest) {
+                unsigned rest_count = arg_count - param_count;
+                if (rest_count == 0) {
+                    // Empty rest list
+                    emit2(cctx, OP_CONST, code_add_const(cctx->code, 0));
+                } else {
+                    // Compile rest args and build list
+                    // Stack after compiling: [arg1 arg2 arg3]
+                    // We want (arg1 arg2 arg3) = (cons arg1 (cons arg2 (cons arg3 '())))
+                    FORLIST(a, args_remaining)
+                    {
+                        compile_expr_internal(car(a), cctx);
+                    }
+                    // Push nil: [arg1 arg2 arg3 nil]
+                    emit2(cctx, OP_CONST, code_add_const(cctx->code, 0));
+                    // CONS takes car from second-top, cdr from top
+                    // After CONS: [arg1 arg2 (arg3 . nil)] = [arg1 arg2 (arg3)]
+                    // After CONS: [arg1 (arg2 . (arg3))] = [arg1 (arg2 arg3)]
+                    // After CONS: [(arg1 . (arg2 arg3))] = [(arg1 arg2 arg3)]
+                    for (unsigned i = 0; i < rest_count; i++) {
+                        emit(cctx, OP_CONS);
+                    }
+                }
+            }
 
             // Push new environment frame
             emit(cctx, OP_PUSHENV);
 
-            // Collect parameter names
+            // Collect parameter names (only if params is a list)
             unsigned param_ids[256];
             unsigned i = 0;
-            for (unsigned p = lambda_params; p && i < 256; p = cdr(p)) {
-                param_ids[i++] = CELL_ID(car(p));
+            if (CELL_TYPE(lambda_params) == BT_CONS) {
+                for (unsigned p = lambda_params; p && i < 256; p = cdr(p)) {
+                    if (CELL_TYPE(p) == BT_ATOM)
+                        break; // Stop at rest param
+                    param_ids[i++] = CELL_ID(car(p));
+                }
             }
 
-            // Define in reverse order (pop from stack)
+            // Define rest param first (it's on top of stack)
+            if (has_rest) {
+                emit2(cctx, OP_DEFINE, CELL_ID(rest_param));
+            }
+
+            // Define fixed params in reverse order (pop from stack)
             for (int j = param_count - 1; j >= 0; j--) {
                 emit2(cctx, OP_DEFINE, param_ids[j]);
             }
@@ -1595,30 +1765,73 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
                 GC_GUARD;
                 gc_protect(&lambda_params);
                 gc_protect(&lambda_body);
+                gc_protect(&rest_param);
                 unsigned frame_vars = 0, frame_vals = 0;
                 gc_protect(&frame_vars);
                 gc_protect(&frame_vals);
 
-                for (unsigned p = lambda_params; p; p = cdr(p)) {
-                    unsigned var = car(p);
-                    gc_protect(&var);
-                    unsigned vc = alloc_cons(var, frame_vars);
+                // Add fixed params (only if lambda_params is a list)
+                if (CELL_TYPE(lambda_params) == BT_CONS) {
+                    for (unsigned p = lambda_params; p; p = cdr(p)) {
+                        if (CELL_TYPE(p) == BT_ATOM)
+                            break;
+                        unsigned var = car(p);
+                        gc_protect(&var);
+                        unsigned vc = alloc_cons(var, frame_vars);
+                        frame_vars = vc;
+                        unsigned val = alloc_cons(0, frame_vals);
+                        frame_vals = val;
+                        gc_unprotect(1);
+                    }
+                }
+
+                // Add rest param if present
+                if (has_rest) {
+                    unsigned vc = alloc_cons(rest_param, frame_vars);
                     frame_vars = vc;
                     unsigned val = alloc_cons(0, frame_vals);
                     frame_vals = val;
-                    gc_unprotect(1);
                 }
 
                 unsigned frame = alloc_cons(frame_vars, frame_vals);
                 cctx->env = alloc_cons(frame, cctx->env);
             }
 
+            // Track lambda arguments for escape analysis inlining
+            // When ((lambda (var) body) (lambda ...)) is inlined, we can inline
+            // calls to var within body if the lambda doesn't self-reference var
+            unsigned saved_known = cctx->known_lambdas;
+            {
+                unsigned a = args;
+                if (CELL_TYPE(lambda_params) == BT_CONS) {
+                    for (unsigned p = lambda_params; p && a; p = cdr(p)) {
+                        if (CELL_TYPE(p) == BT_ATOM)
+                            break;
+                        unsigned var = car(p);
+                        unsigned val_expr = car(a);
+                        // Check if arg is a lambda that doesn't self-reference
+                        if (IS_PAIR(val_expr) && IS_ATOM(car(val_expr)) &&
+                            CELL_ID(car(val_expr)) == ctx.kw_lambda &&
+                            !is_keyword_shadowed(ctx.kw_lambda, cctx->env)) {
+                            unsigned arg_body = cddr(val_expr);
+                            if (!contains_reference(arg_body, CELL_ID(var))) {
+                                unsigned pair = alloc_cons(var, val_expr);
+                                cctx->known_lambdas =
+                                    alloc_cons(pair, cctx->known_lambdas);
+                            }
+                        }
+                        a = cdr(a);
+                    }
+                }
+            }
+
             // Compile body in tail position
             cctx->tail_position = tail;
             compile_begin(lambda_body, cctx);
 
-            // Restore compile-time environment
+            // Restore compile-time environment and known_lambdas
             cctx->env = saved_env;
+            cctx->known_lambdas = saved_known;
 
             // Pop environment frame
             emit(cctx, OP_POPENV);
