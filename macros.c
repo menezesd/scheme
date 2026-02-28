@@ -181,6 +181,30 @@ static unsigned find_ellipsis_binding(unsigned var, unsigned bindings)
     return cons_match;
 }
 
+// Find an ellipsis-bound pattern variable inside a template (recursive)
+// Returns the binding if found, 0 otherwise
+static unsigned find_ellipsis_var_in_template(unsigned tmpl, unsigned bindings)
+{
+    if (!tmpl)
+        return 0;
+
+    if (IS_ATOM(tmpl)) {
+        unsigned binding = find_ellipsis_binding(tmpl, bindings);
+        if (binding && IS_PAIR(cdr(binding)))
+            return binding;
+        return 0;
+    }
+
+    if (IS_PAIR(tmpl)) {
+        unsigned result = find_ellipsis_var_in_template(car(tmpl), bindings);
+        if (result)
+            return result;
+        return find_ellipsis_var_in_template(cdr(tmpl), bindings);
+    }
+
+    return 0;
+}
+
 // ============================================================================
 // Hygienic Renaming
 // ============================================================================
@@ -1168,31 +1192,13 @@ unsigned syntax_expand(unsigned tmpl, unsigned bindings, unsigned mark,
             if (IS_ATOM(elem_tmpl)) {
                 ellipsis_binding = find_ellipsis_binding(elem_tmpl, bindings);
             } else if (IS_PAIR(elem_tmpl)) {
-                for (unsigned b = bindings; b && !ellipsis_binding;
-                     b = cdr(b)) {
-                    unsigned binding = car(b);
-                    unsigned pvar = car(binding);
-                    if (IS_PAIR(pvar)) {
-                        ellipsis_binding = binding;
-                    }
-                }
+                // Search for ellipsis-bound pattern variables inside template
+                ellipsis_binding = find_ellipsis_var_in_template(elem_tmpl, bindings);
             }
 
             if (ellipsis_binding) {
                 ellipsis_pattern = car(ellipsis_binding);
                 ellipsis_values = cdr(ellipsis_binding);
-            } else {
-                // Fallback: look for any list-valued binding
-                FORLIST(b, bindings)
-                {
-                    unsigned binding = car(b);
-                    unsigned val = cdr(binding);
-                    if (IS_PAIR(val)) {
-                        ellipsis_pattern = car(binding);
-                        ellipsis_values = val;
-                        break;
-                    }
-                }
             }
 
             // Expand template for each ellipsis value
@@ -1228,6 +1234,13 @@ unsigned syntax_expand(unsigned tmpl, unsigned bindings, unsigned mark,
                         }
                         gc_unprotect(1); // sb
                     }
+                } else if (ellipsis_pattern && IS_ATOM(ellipsis_pattern)) {
+                    // Pattern variable is an atom - bind it to current value
+                    unsigned temp_binding = 0;
+                    gc_protect(&temp_binding);
+                    temp_binding = alloc_cons(ellipsis_pattern, current_value);
+                    iter_bindings = alloc_cons(temp_binding, iter_bindings);
+                    gc_unprotect(1);
                 } else if (IS_ATOM(elem_tmpl)) {
                     unsigned temp_binding = 0;
                     gc_protect(&temp_binding);
