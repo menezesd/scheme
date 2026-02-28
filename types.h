@@ -200,7 +200,7 @@ typedef struct {
 #define SEMISPACE_SIZE (16384 * 1024) // Size of each GC semispace (16M cells)
 #define INITIAL_STRING_CAP 32         // Initial capacity for string buffers
 
-// Generational GC settings (currently disabled due to bugs)
+// Generational GC settings
 #define NURSERY_SIZE (256 * 1024) // Size of nursery (young generation)
 #define CARD_SIZE 512             // Cells per card (2KB on 64-bit)
 
