@@ -259,11 +259,133 @@ static void patch_jump(compile_ctx *cctx, unsigned pos)
     code_patch(cctx->code, pos, code_current_pos(cctx->code));
 }
 
+// Forward declarations for template helpers
+static unsigned collect_template_free_vars(unsigned tmpl, unsigned pattern_vars,
+                                           unsigned collected, int64_t ellipsis);
+static unsigned rename_template_vars(unsigned tmpl, unsigned rename_map);
+
+// Collect free variables from a syntax-rules template
+// pattern_vars: list of pattern variable atoms
+// Returns: list of free variable atoms
+static unsigned collect_template_free_vars(unsigned tmpl, unsigned pattern_vars,
+                                           unsigned collected, int64_t ellipsis)
+{
+    if (!tmpl)
+        return collected;
+
+    if (IS_ATOM(tmpl)) {
+        int64_t id = CELL_ID(tmpl);
+        // Skip if pattern variable, ellipsis, or already collected
+        if (id == ellipsis)
+            return collected;
+        for (unsigned p = pattern_vars; p; p = cdr(p)) {
+            if (IS_ATOM(car(p)) && CELL_ID(car(p)) == id)
+                return collected;
+        }
+        for (unsigned c = collected; c; c = cdr(c)) {
+            if (IS_ATOM(car(c)) && CELL_ID(car(c)) == id)
+                return collected;
+        }
+        // Skip special forms
+        if (id == ctx.kw_quote || id == ctx.kw_lambda || id == ctx.kw_if ||
+            id == ctx.kw_begin || id == ctx.kw_set || id == ctx.kw_define ||
+            id == ctx.kw_let || id == ctx.kw_letstar || id == ctx.kw_letrec ||
+            id == ctx.kw_syntax_rules)
+            return collected;
+        return alloc_cons(tmpl, collected);
+    }
+
+    if (IS_PAIR(tmpl)) {
+        // Skip quote's contents
+        if (IS_ATOM(car(tmpl)) && CELL_ID(car(tmpl)) == ctx.kw_quote)
+            return collected;
+        collected =
+            collect_template_free_vars(car(tmpl), pattern_vars, collected, ellipsis);
+        return collect_template_free_vars(cdr(tmpl), pattern_vars, collected, ellipsis);
+    }
+
+    return collected;
+}
+
+// Rename free variables in template according to rename_map
+// rename_map: list of (orig_atom . gensym_atom)
+static unsigned rename_template_vars(unsigned tmpl, unsigned rename_map)
+{
+    if (!tmpl || !rename_map)
+        return tmpl;
+
+    if (IS_ATOM(tmpl)) {
+        int64_t id = CELL_ID(tmpl);
+        for (unsigned m = rename_map; m; m = cdr(m)) {
+            unsigned entry = car(m);
+            if (IS_ATOM(car(entry)) && CELL_ID(car(entry)) == id)
+                return cdr(entry);
+        }
+        return tmpl;
+    }
+
+    if (IS_PAIR(tmpl)) {
+        // Skip quote's contents
+        if (IS_ATOM(car(tmpl)) && CELL_ID(car(tmpl)) == ctx.kw_quote)
+            return tmpl;
+        gc_protect(&tmpl);
+        gc_protect(&rename_map);
+        unsigned new_car = rename_template_vars(car(tmpl), rename_map);
+        gc_protect(&new_car);
+        unsigned new_cdr = rename_template_vars(cdr(tmpl), rename_map);
+        gc_unprotect(3);
+        if (new_car == car(tmpl) && new_cdr == cdr(tmpl))
+            return tmpl;
+        return alloc_cons(new_car, new_cdr);
+    }
+
+    return tmpl;
+}
+
+// Extract pattern variables from a syntax-rules pattern
+static unsigned collect_pattern_vars(unsigned pattern, unsigned collected,
+                                     int64_t ellipsis, unsigned literals)
+{
+    if (!pattern)
+        return collected;
+
+    if (IS_ATOM(pattern)) {
+        int64_t id = CELL_ID(pattern);
+        // Skip ellipsis, underscore, literals
+        if (id == ellipsis || id == ctx.kw_underscore)
+            return collected;
+        for (unsigned l = literals; l; l = cdr(l)) {
+            if (IS_ATOM(car(l)) && CELL_ID(car(l)) == id)
+                return collected;
+        }
+        // Check if already collected
+        for (unsigned c = collected; c; c = cdr(c)) {
+            if (IS_ATOM(car(c)) && CELL_ID(car(c)) == id)
+                return collected;
+        }
+        return alloc_cons(pattern, collected);
+    }
+
+    if (IS_PAIR(pattern)) {
+        collected = collect_pattern_vars(car(pattern), collected, ellipsis, literals);
+        return collect_pattern_vars(cdr(pattern), collected, ellipsis, literals);
+    }
+
+    return collected;
+}
+
 // Emit bytecode to define gensyms created during macro expansion
 // This ensures gensyms from referential transparency are available at runtime
 static void emit_gensym_definitions(compile_ctx *cctx, unsigned old_gensym,
                                     unsigned new_gensym)
 {
+    // Get the runtime lookup marker atom ID once
+    static int64_t runtime_lookup_id = 0;
+    if (runtime_lookup_id == 0) {
+        unsigned marker_atom = atom_from_string("##runtime-lookup##");
+        runtime_lookup_id = CELL_ID(marker_atom);
+    }
+
     for (unsigned g = old_gensym; g < new_gensym; g++) {
         char name[20];
         snprintf(name, sizeof(name), "g%u", g);
@@ -273,9 +395,21 @@ static void emit_gensym_definitions(compile_ctx *cctx, unsigned old_gensym,
         // Look up the gensym value in the compile-time environment
         unsigned val = lookup_silent(gensym_id, cctx->env);
         if (val != TOK_ERROR) {
-            // Emit code to define this gensym at runtime
-            emit2(cctx, OP_CONST, code_add_const(cctx->code, val));
-            emit2(cctx, OP_DEFINE, gensym_id);
+            // Check if this is a runtime lookup marker
+            // Marker format: (##runtime-lookup## . original_var_atom)
+            if (IS_PAIR(val) && IS_ATOM(car(val)) &&
+                CELL_ID(car(val)) == runtime_lookup_id) {
+                // Runtime lookup: emit code to look up original var and define
+                // gensym
+                unsigned orig_var = cdr(val);
+                int64_t orig_var_id = CELL_ID(orig_var);
+                emit2(cctx, OP_LOOKUP, orig_var_id);
+                emit2(cctx, OP_DEFINE, gensym_id);
+            } else {
+                // Constant value: emit const and define
+                emit2(cctx, OP_CONST, code_add_const(cctx->code, val));
+                emit2(cctx, OP_DEFINE, gensym_id);
+            }
         }
     }
 }
@@ -388,7 +522,7 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
                     return compile_begin(body, cctx);
                 }
 
-                // Create a new compile-time environment
+                GC_GUARD;
                 gc_protect(&bindings);
                 gc_protect(&body);
 
@@ -398,20 +532,92 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
                 gc_protect(&frame_vars);
                 gc_protect(&frame_vals);
 
-                // For let-syntax, closure env is outer env
-                // For letrec-syntax, closure env is new env (set after frame
-                // created)
-                unsigned closure_env = cctx->env;
+                // Collect free variables from all templates and create rename map
+                unsigned rename_map = 0;
+                gc_protect(&rename_map);
+                unsigned gensym_bindings = 0; // List of (gensym . orig_var_id)
+                gc_protect(&gensym_bindings);
 
-                // First pass: create frame with placeholder values for
-                // letrec-syntax
+                // First pass: create frame with placeholder values for letrec-syntax
                 if (kw == ctx.kw_letrec_syntax) {
                     unsigned frame = alloc_cons(0, 0);
                     new_env = alloc_cons(frame, cctx->env);
-                    closure_env = new_env;
                 }
 
-                // Bind each syntax transformer
+                int64_t ellipsis_id = ctx.kw_ellipsis;
+
+                // First pass: collect all free variables from all templates
+                for (unsigned b = bindings; b; b = cdr(b)) {
+                    unsigned binding = car(b);
+                    unsigned transformer_form = cadr(binding);
+
+                    if (!IS_PAIR(transformer_form) ||
+                        !IS_KEYWORD(car(transformer_form), ctx.kw_syntax_rules))
+                        continue;
+
+                    unsigned literals = cadr(transformer_form);
+                    unsigned rules = cddr(transformer_form);
+
+                    for (unsigned r = rules; r; r = cdr(r)) {
+                        unsigned rule = car(r);
+                        unsigned pattern = car(rule);
+                        unsigned tmpl = cadr(rule);
+
+                        // Skip macro name in pattern
+                        if (IS_PAIR(pattern))
+                            pattern = cdr(pattern);
+
+                        // Collect pattern variables
+                        unsigned pattern_vars =
+                            collect_pattern_vars(pattern, 0, ellipsis_id, literals);
+                        gc_protect(&pattern_vars);
+
+                        // Collect free variables from template
+                        unsigned free_vars = collect_template_free_vars(
+                            tmpl, pattern_vars, 0, ellipsis_id);
+                        gc_unprotect(1);
+
+                        // For each free var, create gensym if bound in outer scope
+                        for (unsigned fv = free_vars; fv; fv = cdr(fv)) {
+                            unsigned var_atom = car(fv);
+                            int64_t var_id = CELL_ID(var_atom);
+
+                            // Check if already in rename_map
+                            bool already_mapped = false;
+                            for (unsigned m = rename_map; m; m = cdr(m)) {
+                                if (CELL_ID(car(car(m))) == var_id) {
+                                    already_mapped = true;
+                                    break;
+                                }
+                            }
+                            if (already_mapped)
+                                continue;
+
+                            // Check if bound in outer scope (compile-time env)
+                            unsigned val = lookup_silent(var_id, cctx->env);
+                            if (val != TOK_ERROR) {
+                                // Create gensym
+                                extern unsigned gensym_counter;
+                                char name[20];
+                                snprintf(name, sizeof(name), "g%u", gensym_counter++);
+                                unsigned gensym_atom = atom_from_string(name);
+                                gc_protect(&gensym_atom);
+
+                                // Add to rename map: (var_atom . gensym_atom)
+                                unsigned entry = alloc_cons(var_atom, gensym_atom);
+                                rename_map = alloc_cons(entry, rename_map);
+
+                                // Record for runtime binding: (gensym_id . var_id)
+                                unsigned bind_entry = alloc_cons(gensym_atom, var_atom);
+                                gensym_bindings = alloc_cons(bind_entry, gensym_bindings);
+
+                                gc_unprotect(1);
+                            }
+                        }
+                    }
+                }
+
+                // Second pass: create transformers with renamed templates
                 for (unsigned b = bindings; b; b = cdr(b)) {
                     unsigned binding = car(b);
                     unsigned name = car(binding);
@@ -419,19 +625,60 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
 
                     // Check it's a syntax-rules form
                     if (!IS_PAIR(transformer_form) ||
-                        !IS_KEYWORD(car(transformer_form),
-                                    ctx.kw_syntax_rules)) {
+                        !IS_KEYWORD(car(transformer_form), ctx.kw_syntax_rules)) {
                         show_error("%s: expected syntax-rules",
                                    kw == ctx.kw_let_syntax ? "let-syntax"
                                                            : "letrec-syntax");
-                        gc_unprotect(5);
                         emit(cctx, OP_HALT);
                         return dynamic_result();
                     }
 
-                    // Create syntax transformer
-                    unsigned transformer =
-                        make_syntax_transformer(transformer_form, closure_env);
+                    // Rename free vars in templates
+                    unsigned renamed_form = transformer_form;
+                    if (rename_map) {
+                        gc_protect(&transformer_form);
+                        gc_protect(&renamed_form);
+
+                        // Rebuild syntax-rules with renamed templates
+                        unsigned literals = cadr(transformer_form);
+                        unsigned rules = cddr(transformer_form);
+                        gc_protect(&literals);
+                        gc_protect(&rules);
+
+                        unsigned renamed_rules = 0;
+                        gc_protect(&renamed_rules);
+                        unsigned renamed_tail = 0;
+                        gc_protect(&renamed_tail);
+
+                        for (unsigned r = rules; r; r = cdr(r)) {
+                            unsigned rule = car(r);
+                            unsigned pattern = car(rule);
+                            unsigned tmpl = cadr(rule);
+
+                            unsigned renamed_tmpl = rename_template_vars(tmpl, rename_map);
+                            gc_protect(&renamed_tmpl);
+                            unsigned new_rule = alloc_cons(pattern, alloc_cons(renamed_tmpl, 0));
+                            gc_unprotect(1);
+
+                            unsigned new_cell = alloc_cons(new_rule, 0);
+                            if (!renamed_rules) {
+                                renamed_rules = new_cell;
+                                renamed_tail = new_cell;
+                            } else {
+                                CELL_CDR(renamed_tail) = new_cell;
+                                renamed_tail = new_cell;
+                            }
+                        }
+
+                        unsigned sr_atom = car(transformer_form);
+                        renamed_form = alloc_cons(sr_atom,
+                                          alloc_cons(literals, renamed_rules));
+                        gc_unprotect(6);
+                    }
+
+                    // Create syntax transformer with renamed form
+                    // Use empty closure_env since free vars are pre-renamed
+                    unsigned transformer = make_syntax_transformer(renamed_form, 0);
 
                     // Add to frame
                     gc_protect(&name);
@@ -454,11 +701,40 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
                     CELL_CDR(frame) = frame_vals;
                 }
 
-                gc_unprotect(5);
-
                 // Push a new runtime frame for the body
-                // This ensures internal defines create local bindings
                 emit(cctx, OP_PUSHENV);
+
+                // Emit gensym bindings: look up original var, define gensym
+                // This happens at let-syntax entry, BEFORE any inner scopes
+                for (unsigned gb = gensym_bindings; gb; gb = cdr(gb)) {
+                    unsigned entry = car(gb);
+                    unsigned gensym_atom = car(entry);
+                    unsigned var_atom = cdr(entry);
+                    int64_t gensym_id = CELL_ID(gensym_atom);
+                    int64_t var_id = CELL_ID(var_atom);
+
+                    emit2(cctx, OP_LOOKUP, var_id);
+                    emit2(cctx, OP_DEFINE, gensym_id);
+                }
+
+                // Add gensyms to compile-time env so they're visible in body
+                if (gensym_bindings) {
+                    unsigned gensym_frame_vars = 0, gensym_frame_vals = 0;
+                    gc_protect(&gensym_frame_vars);
+                    gc_protect(&gensym_frame_vals);
+
+                    for (unsigned gb = gensym_bindings; gb; gb = cdr(gb)) {
+                        unsigned entry = car(gb);
+                        unsigned gensym_atom = car(entry);
+                        // Use a placeholder value - actual value is set at runtime
+                        gensym_frame_vars = alloc_cons(gensym_atom, gensym_frame_vars);
+                        gensym_frame_vals = alloc_cons(gensym_atom, gensym_frame_vals);
+                    }
+
+                    unsigned gensym_frame = alloc_cons(gensym_frame_vars, gensym_frame_vals);
+                    new_env = alloc_cons(gensym_frame, new_env);
+                    gc_unprotect(2);
+                }
 
                 // Compile body with new compile-time environment
                 compile_ctx new_cctx = *cctx;

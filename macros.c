@@ -205,6 +205,39 @@ static unsigned find_ellipsis_var_in_template(unsigned tmpl, unsigned bindings)
     return 0;
 }
 
+// Collect ALL ellipsis-bound variables from a template into a list
+// Returns list of bindings: ((var1 . values1) (var2 . values2) ...)
+static unsigned collect_ellipsis_vars(unsigned tmpl, unsigned bindings,
+                                      unsigned collected)
+{
+    if (!tmpl)
+        return collected;
+
+    if (IS_ATOM(tmpl)) {
+        unsigned binding = find_ellipsis_binding(tmpl, bindings);
+        if (binding && IS_PAIR(cdr(binding))) {
+            // Check if already collected
+            for (unsigned c = collected; c; c = cdr(c)) {
+                if (car(car(c)) == car(binding))
+                    return collected; // Already have it
+            }
+            gc_protect(&collected);
+            gc_protect(&binding);
+            unsigned result = alloc_cons(binding, collected);
+            gc_unprotect(2);
+            return result;
+        }
+        return collected;
+    }
+
+    if (IS_PAIR(tmpl)) {
+        collected = collect_ellipsis_vars(car(tmpl), bindings, collected);
+        return collect_ellipsis_vars(cdr(tmpl), bindings, collected);
+    }
+
+    return collected;
+}
+
 // ============================================================================
 // Hygienic Renaming
 // ============================================================================
@@ -1184,79 +1217,58 @@ unsigned syntax_expand(unsigned tmpl, unsigned bindings, unsigned mark,
             unsigned elem_tmpl = car(tmpl);
             unsigned rest_tmpl = cddr(tmpl);
 
-            // Find the ellipsis binding
-            unsigned ellipsis_binding = 0;
-            unsigned ellipsis_pattern = 0;
-            unsigned ellipsis_values = 0;
+            // Collect ALL ellipsis-bound variables in the template
+            unsigned ellipsis_vars = collect_ellipsis_vars(elem_tmpl, bindings, 0);
+            gc_protect(&ellipsis_vars);
 
-            if (IS_ATOM(elem_tmpl)) {
-                ellipsis_binding = find_ellipsis_binding(elem_tmpl, bindings);
-            } else if (IS_PAIR(elem_tmpl)) {
-                // Search for ellipsis-bound pattern variables inside template
-                ellipsis_binding = find_ellipsis_var_in_template(elem_tmpl, bindings);
+            // Find iteration count from first variable's values
+            unsigned iter_count = 0;
+            if (ellipsis_vars) {
+                unsigned first_values = cdr(car(ellipsis_vars));
+                for (unsigned v = first_values; v; v = cdr(v))
+                    iter_count++;
             }
 
-            if (ellipsis_binding) {
-                ellipsis_pattern = car(ellipsis_binding);
-                ellipsis_values = cdr(ellipsis_binding);
-            }
-
-            // Expand template for each ellipsis value
-            // Protect loop variables that survive across allocations
+            // Expand template for each iteration
             unsigned result = 0, result_tail = 0;
             gc_protect(&result);
             gc_protect(&result_tail);
-            gc_protect(&ellipsis_values);
             gc_protect(&elem_tmpl);
             gc_protect(&rest_tmpl);
-            gc_protect(&ellipsis_pattern);
-            for (; ellipsis_values; ellipsis_values = cdr(ellipsis_values)) {
-                unsigned current_value = car(ellipsis_values);
 
-                // Create iteration bindings
+            for (unsigned i = 0; i < iter_count; i++) {
+                // Create iteration bindings for ALL ellipsis variables
                 unsigned iter_bindings = bindings;
                 gc_protect(&iter_bindings);
-                gc_protect(&current_value);
-                if (ellipsis_pattern && IS_PAIR(ellipsis_pattern)) {
-                    // Re-match to extract nested bindings
-                    unsigned sub_bindings = syntax_match(
-                        ellipsis_pattern, current_value, 0, 0, ellipsis_id);
-                    if (sub_bindings != TOK_ERROR) {
-                        // Protect sub_bindings across allocations
-                        unsigned sb = sub_bindings;
-                        gc_protect(&sb);
-                        while (sb) {
-                            unsigned sb_car = car(sb);
-                            gc_protect(&sb_car);
-                            iter_bindings = alloc_cons(sb_car, iter_bindings);
-                            gc_unprotect(1); // sb_car
-                            sb = cdr(sb);
-                        }
-                        gc_unprotect(1); // sb
-                    }
-                } else if (ellipsis_pattern && IS_ATOM(ellipsis_pattern)) {
-                    // Pattern variable is an atom - bind it to current value
-                    unsigned temp_binding = 0;
-                    gc_protect(&temp_binding);
-                    temp_binding = alloc_cons(ellipsis_pattern, current_value);
-                    iter_bindings = alloc_cons(temp_binding, iter_bindings);
-                    gc_unprotect(1);
-                } else if (IS_ATOM(elem_tmpl)) {
-                    unsigned temp_binding = 0;
-                    gc_protect(&temp_binding);
-                    temp_binding = alloc_cons(elem_tmpl, current_value);
-                    iter_bindings = alloc_cons(temp_binding, bindings);
-                    gc_unprotect(1);
+
+                // For each ellipsis variable, bind to i-th value
+                for (unsigned ev = ellipsis_vars; ev; ev = cdr(ev)) {
+                    unsigned binding = car(ev);
+                    unsigned var = car(binding);
+                    unsigned values = cdr(binding);
+
+                    // Get i-th value
+                    unsigned val = values;
+                    for (unsigned j = 0; j < i && val; j++)
+                        val = cdr(val);
+                    if (val)
+                        val = car(val);
+
+                    gc_protect(&var);
+                    gc_protect(&val);
+                    unsigned new_binding = alloc_cons(var, val);
+                    iter_bindings = alloc_cons(new_binding, iter_bindings);
+                    gc_unprotect(2);
                 }
 
                 unsigned expanded =
                     syntax_expand(elem_tmpl, iter_bindings, mark, ellipsis_id);
                 gc_protect(&expanded);
                 list_append(&result, &result_tail, expanded);
-                gc_unprotect(3); // expanded, current_value, iter_bindings
+                gc_unprotect(2); // expanded, iter_bindings
             }
-            gc_unprotect(6); // ellipsis_pattern, rest_tmpl, elem_tmpl,
-                             // ellipsis_values, result_tail, result
+            gc_unprotect(5); // rest_tmpl, elem_tmpl, result_tail, result,
+                             // ellipsis_vars
 
             // Append expanded rest
             gc_protect(&result);
@@ -1491,14 +1503,29 @@ unsigned apply_syntax(unsigned transformer, unsigned input, unsigned use_env)
 
                 // Look up in closure environment (macro definition site)
                 unsigned closure_val = lookup_silent(free_id, closure_env);
+
                 if (closure_val != TOK_ERROR) {
                     // Found in closure env - create gensym and bind in use_env
                     unsigned gensym = do_gensym();
                     gc_protect(&gensym);
                     gc_protect(&closure_val);
 
-                    // Define gensym in use_env with the closure value
-                    defvar(gensym, closure_val, use_env);
+                    // Check if this is a compile-time env (empty/placeholder value)
+                    // If so, create a runtime lookup marker
+                    // The marker is (##runtime-lookup## . original_var_id)
+                    unsigned bind_val;
+                    if (closure_val == 0 || CELL_TYPE(closure_val) == BT_FREE) {
+                        // Create runtime lookup marker
+                        unsigned marker_atom = atom_from_string("##runtime-lookup##");
+                        gc_protect(&marker_atom);
+                        bind_val = alloc_cons(marker_atom, free_atom);
+                        gc_unprotect(1);
+                    } else {
+                        bind_val = closure_val;
+                    }
+
+                    // Define gensym in use_env
+                    defvar(gensym, bind_val, use_env);
 
                     // Add to rename map: (free_atom . gensym)
                     unsigned entry = alloc_cons(free_atom, gensym);
