@@ -20,7 +20,7 @@ unsigned apply_port_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         }
         unsigned p = alloc();
         CELL_TYPE(p) = BT_INPORT;
-        CELL_ID(p) = STORE_PTR(f);
+        CELL_PTR(p) = f;
         return p;
     }
     case POPENOUTPUT: {
@@ -34,7 +34,7 @@ unsigned apply_port_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         }
         unsigned p = alloc();
         CELL_TYPE(p) = BT_OUTPORT;
-        CELL_ID(p) = STORE_PTR(f);
+        CELL_PTR(p) = f;
         return p;
     }
     case PCLOSEINPUT:
@@ -77,7 +77,7 @@ unsigned apply_port_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         }
         unsigned p = alloc();
         CELL_TYPE(p) = BT_INPORT;
-        CELL_ID(p) = STORE_PTR(ctx.current_input);
+        CELL_PTR(p) = ctx.current_input;
         return p;
     }
     case PCURRENTOUTPUT: {
@@ -88,7 +88,7 @@ unsigned apply_port_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         }
         unsigned p = alloc();
         CELL_TYPE(p) = BT_OUTPORT;
-        CELL_ID(p) = STORE_PTR(ctx.current_output);
+        CELL_PTR(p) = ctx.current_output;
         return p;
     }
     // String ports
@@ -101,7 +101,7 @@ unsigned apply_port_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         }
         unsigned p = alloc();
         CELL_TYPE(p) = BT_STROUTPORT;
-        CELL_ID(p) = STORE_PTR(sp);
+        CELL_PTR(p) = sp;
         return p;
     }
     case PGETOUTPUTSTRING: {
@@ -139,7 +139,7 @@ unsigned apply_port_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         }
         unsigned p = alloc();
         CELL_TYPE(p) = BT_STRINPORT;
-        CELL_ID(p) = STORE_PTR(sp);
+        CELL_PTR(p) = sp;
         return p;
     }
     case PSTRINGPORTP: {

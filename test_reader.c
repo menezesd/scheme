@@ -83,7 +83,7 @@ TEST(read_simple_string)
 {
     unsigned x = read_from_string("\"hello\"");
     ASSERT(CELL_TYPE(x) == BT_STRING);
-    const char *str = (const char *)(intptr_t)CELL_ID(x);
+    const char *str = GET_STRING_PTR(x);
     ASSERT_STR_EQ(str, "hello");
     PASS();
 }
@@ -92,7 +92,7 @@ TEST(read_string_with_escapes)
 {
     unsigned x = read_from_string("\"hello\\nworld\"");
     ASSERT(CELL_TYPE(x) == BT_STRING);
-    const char *str = (const char *)(intptr_t)CELL_ID(x);
+    const char *str = GET_STRING_PTR(x);
     ASSERT_STR_EQ(str, "hello\nworld");
     PASS();
 }
@@ -101,7 +101,7 @@ TEST(read_empty_string)
 {
     unsigned x = read_from_string("\"\"");
     ASSERT(CELL_TYPE(x) == BT_STRING);
-    const char *str = (const char *)(intptr_t)CELL_ID(x);
+    const char *str = GET_STRING_PTR(x);
     ASSERT_STR_EQ(str, "");
     PASS();
 }

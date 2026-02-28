@@ -294,7 +294,7 @@ static unsigned read_string_literal(void)
 
     unsigned x = alloc();
     CELL_TYPE(x) = BT_STRING;
-    CELL_ID(x) = (int64_t)(intptr_t)sb_finish(&sb);
+    CELL_PTR(x) = sb_finish(&sb);
     return x;
 }
 

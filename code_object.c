@@ -168,7 +168,7 @@ void gc_sweep_code_objects(void)
     // Scan old generation: [mmin, hptr)
     for (unsigned i = ctx.mmin; i < ctx.hptr; i++) {
         if (CELL_TYPE(i) == BT_CLOSURE) {
-            code_object *code = (code_object *)(intptr_t)CELL_ID(i);
+            code_object *code = (code_object *)CELL_PTR(i);
             mark_code_object(code);
         }
     }
@@ -176,7 +176,7 @@ void gc_sweep_code_objects(void)
     if (ctx.card_table) {
         for (unsigned i = ctx.nursery_start; i < ctx.nursery_ptr; i++) {
             if (CELL_TYPE(i) == BT_CLOSURE) {
-                code_object *code = (code_object *)(intptr_t)CELL_ID(i);
+                code_object *code = (code_object *)CELL_PTR(i);
                 mark_code_object(code);
             }
         }

@@ -925,7 +925,7 @@ static inline unsigned make_string_owned(char *s)
 {
     unsigned p = alloc();
     CELL_TYPE(p) = BT_STRING;
-    CELL_ID(p) = STORE_PTR(s);
+    CELL_PTR(p) = s;
     return p;
 }
 

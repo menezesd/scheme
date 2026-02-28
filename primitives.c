@@ -131,7 +131,7 @@ unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
         REQUIRE_ARGC(argc, 1, 1, "length");
         unsigned lst = argv[0];
         if (CELL_TYPE(lst) == BT_STRING)
-            return store(strlen((char *)(intptr_t)CELL_ID(lst)));
+            return store(strlen(GET_STRING_PTR(lst)));
         if (CELL_TYPE(lst) == BT_VECTOR)
             return store(vector_len(lst));
         unsigned len = 0;

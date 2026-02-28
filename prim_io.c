@@ -315,7 +315,7 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         buf[len] = '\0';
         unsigned result = alloc();
         CELL_TYPE(result) = BT_STRING;
-        CELL_ID(result) = (int64_t)(intptr_t)buf; // Transfer ownership
+        CELL_PTR(result) = buf; // Transfer ownership
         return result;
     }
     case PEXIT: {

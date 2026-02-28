@@ -215,8 +215,8 @@ extern code_object *code_object_registry;
  */
 // BT_CLOSURE and BT_VMCONT are defined in enum lisp_type (types.h)
 
-// Accessor macros for closures - code_object* stored in separate cell's id
-#define GET_CLOSURE_CODE(c) ((code_object *)(intptr_t)CELL_ID(CELL_CAR(c)))
+// Accessor macros for closures - code_object* stored in separate cell's ptr
+#define GET_CLOSURE_CODE(c) ((code_object *)CELL_PTR(CELL_CAR(c)))
 #define GET_CLOSURE_ENV(c) (CELL_CDR(c))
 
 // ============================================================================

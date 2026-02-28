@@ -322,8 +322,7 @@ unsigned store_bignum(bignum *bn)
 {
     unsigned p = alloc();
     CELL_TYPE(p) = BT_BIGNUM;
-    // Store pointer in id field
-    CELL_ID(p) = (int64_t)(intptr_t)bn;
+    CELL_PTR(p) = bn;
     return p;
 }
 
@@ -331,7 +330,7 @@ bignum *get_bignum(unsigned x)
 {
     if (CELL_TYPE(x) != BT_BIGNUM)
         return NULL;
-    return (bignum *)(intptr_t)CELL_ID(x);
+    return (bignum *)CELL_PTR(x);
 }
 
 bignum *to_bignum(unsigned x)
@@ -631,19 +630,19 @@ unsigned make_vector(unsigned len, unsigned fill)
     }
     unsigned p = alloc();
     CELL_TYPE(p) = BT_VECTOR;
-    CELL_ID(p) = (int64_t)(intptr_t)vd;
+    CELL_PTR(p) = vd;
     return p;
 }
 
 unsigned vector_len(unsigned vec)
 {
-    vector_data *vd = (vector_data *)(intptr_t)CELL_ID(vec);
+    vector_data *vd = (vector_data *)CELL_PTR(vec);
     return vd->len;
 }
 
 unsigned *vector_data_ptr(unsigned vec)
 {
-    vector_data *vd = (vector_data *)(intptr_t)CELL_ID(vec);
+    vector_data *vd = (vector_data *)CELL_PTR(vec);
     return vd->data;
 }
 
@@ -1097,8 +1096,7 @@ bool deep_equal(unsigned a, unsigned b)
     case BT_COMPLEX:
         return deep_equal(car(a), car(b)) && deep_equal(cdr(a), cdr(b));
     case BT_STRING:
-        return strcmp((char *)(intptr_t)CELL_ID(a),
-                      (char *)(intptr_t)CELL_ID(b)) == 0;
+        return strcmp(GET_STRING_PTR(a), GET_STRING_PTR(b)) == 0;
     case BT_CONS:
         return deep_equal(car(a), car(b)) && deep_equal(cdr(a), cdr(b));
     case BT_VECTOR: {
@@ -1190,7 +1188,7 @@ unsigned collect(unsigned x)
         CELL_TYPE(x) = BT_BROKENHEART;
         CELL_CAR(x) = xx;
         // Now safe to collect elements - cycles will see BROKENHEART
-        vector_data *vd = (vector_data *)(intptr_t)CELL_ID(xx);
+        vector_data *vd = (vector_data *)CELL_PTR(xx);
         for (unsigned i = 0; i < vd->len; i++) {
             vd->data[i] = collect(vd->data[i]);
         }
@@ -1204,7 +1202,7 @@ unsigned collect(unsigned x)
         // collection; only unreachable ports in the old region are freed.
         unsigned xx = alloc();
         CELL_TYPE(xx) = CELL_TYPE(x);
-        CELL_ID(xx) = CELL_ID(x);
+        CELL_PTR(xx) = CELL_PTR(x);
         CELL_TYPE(x) = BT_BROKENHEART;
         CELL_CAR(x) = xx;
         return xx;
@@ -1215,11 +1213,11 @@ unsigned collect(unsigned x)
         // The vm_continuation struct has stack values, env, and frame envs.
         unsigned xx = alloc();
         CELL_TYPE(xx) = BT_VMCONT;
-        CELL_ID(xx) = CELL_ID(x);
+        CELL_PTR(xx) = CELL_PTR(x);
         CELL_TYPE(x) = BT_BROKENHEART;
         CELL_CAR(x) = xx;
         // Now update all cell references in the continuation
-        vm_continuation *cont = (vm_continuation *)(intptr_t)CELL_ID(xx);
+        vm_continuation *cont = (vm_continuation *)CELL_PTR(xx);
         // Update stack values
         for (unsigned i = 0; i < cont->sp; i++) {
             cont->stack[i] = collect(cont->stack[i]);
@@ -1339,23 +1337,23 @@ unsigned gc(unsigned root)
         if (CELL_TYPE(i) == BT_BIGNUM) {
             free_bignum_cell(i);
         } else if (CELL_TYPE(i) == BT_VECTOR) {
-            vector_data *vd = (vector_data *)(intptr_t)CELL_ID(i);
+            vector_data *vd = (vector_data *)CELL_PTR(i);
             if (vd)
                 free(vd);
-            CELL_ID(i) = 0;
+            CELL_PTR(i) = NULL;
         } else if (CELL_TYPE(i) == BT_STRING) {
-            char *str = (char *)(intptr_t)CELL_ID(i);
+            char *str = (char *)CELL_PTR(i);
             if (str)
                 free(str);
-            CELL_ID(i) = 0;
+            CELL_PTR(i) = NULL;
         } else if (CELL_TYPE(i) == BT_STRINPORT ||
                    CELL_TYPE(i) == BT_STROUTPORT) {
-            string_port *sp = (string_port *)(intptr_t)CELL_ID(i);
+            string_port *sp = (string_port *)CELL_PTR(i);
             if (sp) {
                 free(sp->data);
                 free(sp);
             }
-            CELL_ID(i) = 0;
+            CELL_PTR(i) = NULL;
         }
         CELL_TYPE(i) = BT_FREE;
     }
@@ -1475,11 +1473,11 @@ static unsigned collect_to_old(unsigned x)
             lisp_panic("old generation full during minor GC");
         }
         CELL_TYPE(xx) = BT_VECTOR;
-        CELL_ID(xx) = CELL_ID(x);
+        CELL_PTR(xx) = CELL_PTR(x);
         CELL_TYPE(x) = BT_BROKENHEART;
         CELL_CAR(x) = xx;
         // Collect vector elements
-        vector_data *vd = (vector_data *)(intptr_t)CELL_ID(xx);
+        vector_data *vd = (vector_data *)CELL_PTR(xx);
         for (unsigned i = 0; i < vd->len; i++) {
             vd->data[i] = collect_to_old(vd->data[i]);
         }
@@ -1493,7 +1491,7 @@ static unsigned collect_to_old(unsigned x)
             lisp_panic("old generation full during minor GC");
         }
         CELL_TYPE(xx) = CELL_TYPE(x);
-        CELL_ID(xx) = CELL_ID(x);
+        CELL_PTR(xx) = CELL_PTR(x);
         CELL_TYPE(x) = BT_BROKENHEART;
         CELL_CAR(x) = xx;
         return xx;
@@ -1506,11 +1504,11 @@ static unsigned collect_to_old(unsigned x)
             lisp_panic("old generation full during minor GC");
         }
         CELL_TYPE(xx) = BT_VMCONT;
-        CELL_ID(xx) = CELL_ID(x);
+        CELL_PTR(xx) = CELL_PTR(x);
         CELL_TYPE(x) = BT_BROKENHEART;
         CELL_CAR(x) = xx;
         // Update all cell references in the continuation
-        vm_continuation *cont = (vm_continuation *)(intptr_t)CELL_ID(xx);
+        vm_continuation *cont = (vm_continuation *)CELL_PTR(xx);
         for (unsigned i = 0; i < cont->sp; i++) {
             cont->stack[i] = collect_to_old(cont->stack[i]);
         }
@@ -1606,14 +1604,13 @@ unsigned minor_gc(unsigned root)
                     CELL_CAR(cell) = collect_to_old(CELL_CAR(cell));
                     CELL_CDR(cell) = collect_to_old(CELL_CDR(cell));
                 } else if (t == BT_VECTOR) {
-                    vector_data *vd = (vector_data *)(intptr_t)CELL_ID(cell);
+                    vector_data *vd = (vector_data *)CELL_PTR(cell);
                     for (unsigned j = 0; j < vd->len; j++) {
                         vd->data[j] = collect_to_old(vd->data[j]);
                     }
                 } else if (t == BT_VMCONT) {
                     // VM continuation: update cell references inside struct
-                    vm_continuation *cont =
-                        (vm_continuation *)(intptr_t)CELL_ID(cell);
+                    vm_continuation *cont = (vm_continuation *)CELL_PTR(cell);
                     for (unsigned j = 0; j < cont->sp; j++) {
                         cont->stack[j] = collect_to_old(cont->stack[j]);
                     }

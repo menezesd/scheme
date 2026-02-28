@@ -153,7 +153,8 @@ typedef struct __attribute__((packed)) {
             unsigned car; // First element / head
             unsigned cdr; // Rest / tail
         };
-        int64_t id; // Immediate value or pointer (reinterpret cast)
+        int64_t id;  // Immediate value (atoms, numbers, chars)
+        void *ptr;   // External data pointer (strings, vectors, bignums, ports)
     };
 } cons_cell;
 
@@ -587,12 +588,12 @@ const char *reader_get_filename(void);
 // Pointer Accessor Macros (for type-safe access to pointer-based cells)
 // ============================================================================
 
-#define GET_STRING_PTR(c) ((char *)(intptr_t)CELL_ID(c))
-#define GET_VECTOR_PTR(c) ((vector_data *)(intptr_t)CELL_ID(c))
-#define GET_PORT_PTR(c) ((FILE *)(intptr_t)CELL_ID(c))
-#define GET_STRPORT_PTR(c) ((string_port *)(intptr_t)CELL_ID(c))
+#define CELL_PTR(c) (ctx.cons_cells[(c)].ptr)
+#define GET_STRING_PTR(c) ((char *)CELL_PTR(c))
+#define GET_VECTOR_PTR(c) ((vector_data *)CELL_PTR(c))
+#define GET_PORT_PTR(c) ((FILE *)CELL_PTR(c))
+#define GET_STRPORT_PTR(c) ((string_port *)CELL_PTR(c))
 #define GET_CHAR_CODE(c) ((int)CELL_ID(c))
-#define STORE_PTR(ptr) ((int64_t)(intptr_t)(ptr))
 
 // ============================================================================
 // Argument Checking Macros

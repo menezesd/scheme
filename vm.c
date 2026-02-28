@@ -300,7 +300,7 @@ static unsigned capture_continuation(vm_state *vm)
     // Wrap in a cell
     unsigned cell = alloc();
     CELL_TYPE(cell) = BT_VMCONT;
-    CELL_ID(cell) = (int64_t)(intptr_t)cont;
+    CELL_PTR(cell) = cont;
 
     return cell;
 }
@@ -311,7 +311,7 @@ static void restore_continuation(vm_state *vm, unsigned cont_cell,
     LISP_ASSERT_MSG(vm != NULL, "restore_continuation: null vm");
     LISP_ASSERT_TYPE(cont_cell, BT_VMCONT);
 
-    vm_continuation *cont = (vm_continuation *)(intptr_t)CELL_ID(cont_cell);
+    vm_continuation *cont = (vm_continuation *)CELL_PTR(cont_cell);
     LISP_ASSERT_MSG(cont != NULL, "restore_continuation: null continuation");
 
     // Restore letrec values if this continuation has them saved
@@ -727,10 +727,10 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             unsigned child_idx = vm->code->code[vm->ip++];
             code_object *child = vm->code->children[child_idx];
 
-            // Create code pointer cell (stores code_object* in id field)
+            // Create code pointer cell (stores code_object* in ptr field)
             unsigned code_cell = alloc();
             CELL_TYPE(code_cell) = BT_CLOSURE;
-            CELL_ID(code_cell) = (int64_t)(intptr_t)child;
+            CELL_PTR(code_cell) = child;
 
             // Create closure cell: car = code_cell, cdr = env
             // Protect code_cell from GC during alloc_cons
@@ -1675,7 +1675,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 break;
             }
             int64_t i = CELL_ID(idx);
-            vector_data *vd = (vector_data *)(intptr_t)CELL_ID(vec);
+            vector_data *vd = GET_VECTOR_PTR(vec);
             if (i < 0 || (uint64_t)i >= vd->len) {
                 vm->error = true;
                 vm->error_msg = "vector-ref: index out of bounds";
@@ -1703,7 +1703,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 break;
             }
             int64_t i = CELL_ID(idx);
-            vector_data *vd = (vector_data *)(intptr_t)CELL_ID(vec);
+            vector_data *vd = GET_VECTOR_PTR(vec);
             if (i < 0 || (uint64_t)i >= vd->len) {
                 vm->error = true;
                 vm->error_msg = "vector-set!: index out of bounds";
@@ -1724,7 +1724,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 vm->running = false;
                 break;
             }
-            vector_data *vd = (vector_data *)(intptr_t)CELL_ID(vec);
+            vector_data *vd = GET_VECTOR_PTR(vec);
             vm_push(vm, store(vd->len));
             break;
         }
