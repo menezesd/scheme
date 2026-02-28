@@ -73,7 +73,8 @@ void init_heap(void)
     memset(ctx.cons_cells, 0, heap_size);
 
     // Allocate atom table
-    size_t table_size = TABLE_SIZE * sizeof(const char *);
+    ctx.atom_table_cap = TABLE_SIZE;
+    size_t table_size = ctx.atom_table_cap * sizeof(const char *);
     ctx.atom_table = malloc(table_size);
     if (!ctx.atom_table) {
         fprintf(stderr, "Fatal: failed to allocate %zu bytes for atom table\n",
@@ -705,23 +706,26 @@ unsigned make_halt_cont(void) { return make_cont(CONT_HALT, 0, 0, 0); }
 // Atom/String Interning
 // ============================================================================
 
-int hash_function(const char *s)
+// Hash function using current table capacity
+static int hash_with_cap(const char *s, unsigned cap)
 {
     uint64_t h = FNV_OFFSET_BASIS;
     for (const char *p = s; *p; ++p) {
         h ^= (uint64_t)(*p);
         h *= FNV_PRIME;
     }
-    return (int)(h % TABLE_SIZE);
+    return (int)(h % cap);
 }
+
+int hash_function(const char *s) { return hash_with_cap(s, ctx.atom_table_cap); }
 
 static bool str_equals(const char *a, const char *b)
 {
     return strcmp(a, b) == 0;
 }
 
-// Maximum load factor before warning (70%)
-#define ATOM_TABLE_LOAD_WARN (TABLE_SIZE * 70 / 100)
+// Load factor threshold for rehashing (70%)
+#define ATOM_TABLE_LOAD_THRESHOLD 70
 
 // Symbol interning cache - most code reuses the same symbols repeatedly
 #define INTERN_CACHE_SIZE 8
@@ -730,6 +734,69 @@ static struct {
     int atom_id;
 } intern_cache[INTERN_CACHE_SIZE];
 static int intern_cache_next = 0;
+
+// Check if n is prime (simple trial division)
+static bool is_prime(unsigned n)
+{
+    if (n < 2)
+        return false;
+    if (n == 2)
+        return true;
+    if (n % 2 == 0)
+        return false;
+    for (unsigned i = 3; i * i <= n; i += 2) {
+        if (n % i == 0)
+            return false;
+    }
+    return true;
+}
+
+// Find next prime >= n
+static unsigned next_prime(unsigned n)
+{
+    while (!is_prime(n))
+        n++;
+    return n;
+}
+
+// Rehash atom table to new capacity
+static void rehash_atom_table(void)
+{
+    unsigned old_cap = ctx.atom_table_cap;
+    unsigned new_cap = next_prime(old_cap * 2);
+
+    const char **new_table = calloc(new_cap, sizeof(const char *));
+    if (!new_table) {
+        // Can't resize - continue with current table
+        fprintf(stderr, "Warning: failed to resize atom table\n");
+        return;
+    }
+
+    // Rehash all existing entries
+    for (unsigned i = 0; i < old_cap; i++) {
+        if (ctx.atom_table[i]) {
+            int h = hash_with_cap(ctx.atom_table[i], new_cap);
+            int probe = h;
+            int j = 1;
+            while (new_table[probe]) {
+                probe = (h + j) % new_cap;
+                j++;
+            }
+            new_table[probe] = ctx.atom_table[i];
+        }
+    }
+
+    // Invalidate interning cache (slot IDs changed)
+    for (int i = 0; i < INTERN_CACHE_SIZE; i++) {
+        intern_cache[i].str = NULL;
+        intern_cache[i].atom_id = 0;
+    }
+    intern_cache_next = 0;
+
+    free(ctx.atom_table);
+    ctx.atom_table = new_table;
+    ctx.atom_table_cap = new_cap;
+}
 
 int intern(const char *s)
 {
@@ -740,15 +807,20 @@ int intern(const char *s)
         }
     }
 
+    // Check if we need to resize (load factor > 70%)
+    if (ctx.atom_count * 100 >= ctx.atom_table_cap * ATOM_TABLE_LOAD_THRESHOLD) {
+        rehash_atom_table();
+    }
+
     int hash_value = hash_function(s);
     int original_hash = hash_value;
 
     for (int i = 1; ctx.atom_table[hash_value] &&
                     !str_equals(ctx.atom_table[hash_value], s);
          i++) {
-        hash_value = (original_hash + i) % TABLE_SIZE;
-        // Prevent infinite loop on full table
-        if (i >= TABLE_SIZE) {
+        hash_value = (original_hash + i) % (int)ctx.atom_table_cap;
+        // Prevent infinite loop on full table (shouldn't happen with rehashing)
+        if ((unsigned)i >= ctx.atom_table_cap) {
             lisp_panic("atom table full");
         }
     }
@@ -759,13 +831,6 @@ int intern(const char *s)
             lisp_panic("failed to allocate memory for atom");
         }
         ctx.atom_count++;
-
-        // Warn once when load factor exceeds threshold
-        if (ctx.atom_count == ATOM_TABLE_LOAD_WARN) {
-            fprintf(stderr, "Warning: atom table %.0f%% full (%u/%d symbols)\n",
-                    100.0 * ctx.atom_count / TABLE_SIZE, ctx.atom_count,
-                    TABLE_SIZE);
-        }
     }
 
     // Update cache with this lookup (circular buffer)

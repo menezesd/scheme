@@ -238,6 +238,7 @@ typedef struct {
     cons_cell *cons_cells;   // Dynamically allocated heap
     const char **atom_table; // Dynamically allocated atom table
     unsigned atom_count;     // Number of atoms in table (for load factor)
+    unsigned atom_table_cap; // Current capacity of atom table
     unsigned atom_quote;
     unsigned atom_true;
     unsigned atom_false;
