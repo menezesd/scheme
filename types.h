@@ -76,6 +76,7 @@ enum lisp_type {
     BT_BUILTIN,         // Built-in primitive: id = primitive_id enum value
     BT_CLOSURE = 100,   // VM closure (bytecode)
     BT_VMCONT = 101,    // VM continuation (distinct from CPS BT_CONT)
+    BT_COMPILED_PATTERN = 102, // Compiled pattern: ptr = compiled_pattern*
     BT_BROKENHEART = -1 // GC forwarding pointer: car = new location
 };
 

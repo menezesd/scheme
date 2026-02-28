@@ -26,6 +26,7 @@
 #include "context.h"
 #include "bignum.h"
 #include "bytecode.h"
+#include "compiled_pattern.h"
 #include "env.h"
 #include <ctype.h>
 #include <errno.h>
@@ -1378,6 +1379,7 @@ unsigned gc(unsigned root)
     // Collect code object constants BEFORE scan phase so their
     // CAR/CDR are recursively processed
     gc_update_all_code_objects();
+    gc_update_all_patterns();
 
     while (scan != ctx.hptr) {
         enum lisp_type t = CELL_TYPE(scan);

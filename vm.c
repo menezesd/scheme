@@ -13,6 +13,7 @@
  */
 
 #include "bytecode.h"
+#include "compiled_pattern.h"
 #include "context.h"
 #include "env.h"
 #include "eval.h"
@@ -1078,21 +1079,62 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             }
 
             // CRITICAL: Protect transformer_form before any allocations
-            // (store() calls alloc() which can trigger GC)
             gc_protect(&transformer_form);
 
-            // New transformer structure: (ellipsis_cell . (literals . rules))
             // Use default ellipsis for VM path
-            unsigned ellipsis_cell = store(ctx.kw_ellipsis);
+            int64_t ellipsis_id = ctx.kw_ellipsis;
+            unsigned ellipsis_cell = store(ellipsis_id);
             unsigned literals = cadr(transformer_form);
             unsigned rules = cddr(transformer_form);
             gc_protect(&ellipsis_cell);
             gc_protect(&literals);
             gc_protect(&rules);
-            unsigned lit_rules = alloc_cons(literals, rules);
+
+            // Compile patterns for each rule
+            unsigned compiled_rules = 0;
+            gc_protect(&compiled_rules);
+            unsigned compiled_tail = 0;
+            gc_protect(&compiled_tail);
+
+            for (unsigned r = rules; r; r = cdr(r)) {
+                unsigned rule = car(r);
+                unsigned pattern = car(rule);
+                unsigned tmpl = cadr(rule);
+
+                // Skip the macro name in pattern
+                if (IS_PAIR(pattern))
+                    pattern = cdr(pattern);
+
+                // Compile the pattern
+                compiled_pattern *cpat =
+                    compile_pattern(pattern, literals, ellipsis_id);
+
+                // Create cell to hold compiled pattern
+                unsigned cpat_cell = alloc();
+                CELL_TYPE(cpat_cell) = BT_COMPILED_PATTERN;
+                CELL_PTR(cpat_cell) = cpat;
+
+                // Build compiled rule: (cpat_cell . template)
+                gc_protect(&cpat_cell);
+                gc_protect(&tmpl);
+                unsigned new_rule = alloc_cons(cpat_cell, tmpl);
+                unsigned new_node = alloc_cons(new_rule, 0);
+                gc_unprotect(2);
+
+                if (!compiled_rules) {
+                    compiled_rules = new_node;
+                    compiled_tail = new_node;
+                } else {
+                    CELL_CDR(compiled_tail) = new_node;
+                    compiled_tail = new_node;
+                }
+            }
+
+            // Build transformer structure
+            unsigned lit_rules = alloc_cons(literals, compiled_rules);
             unsigned car_val = alloc_cons(ellipsis_cell, lit_rules);
             unsigned transformer = make_typed_cell(BT_SYNTAX, car_val, vm->env);
-            gc_unprotect(4); // rules, literals, ellipsis_cell, transformer_form
+            gc_unprotect(6);
 
             // Define in current environment
             unsigned atom = alloc();

@@ -73,6 +73,7 @@
  */
 
 #include "macros.h"
+#include "compiled_pattern.h"
 #include "context.h"
 #include "env.h"
 #include <string.h>
@@ -1439,21 +1440,20 @@ unsigned apply_syntax(unsigned transformer, unsigned input, unsigned use_env)
     unsigned tmpl = 0;
     gc_protect(&tmpl);
 
-    // Try each rule
+    // Try each rule (rules now contain compiled patterns)
     for (; rules; rules = cdr(rules)) {
         unsigned rule = car(rules);
-        unsigned pattern = car(rule);
-        tmpl = cadr(rule);
+        unsigned cpat_cell = car(rule);
+        tmpl = cdr(rule);
 
-        // Skip the keyword in pattern (first element is macro name)
-        if (IS_PAIR(pattern))
-            pattern = cdr(pattern);
+        // Get compiled pattern from cell
+        compiled_pattern *cpat = (compiled_pattern *)CELL_PTR(cpat_cell);
 
         // Skip the keyword in input
         unsigned input_args = cdr(input);
 
-        unsigned bindings =
-            syntax_match(pattern, input_args, literals, 0, ellipsis_id);
+        // Execute compiled pattern
+        unsigned bindings = execute_pattern(cpat, input_args);
 
         if (bindings != TOK_ERROR) {
             // Generate unique mark for hygiene

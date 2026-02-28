@@ -6,6 +6,7 @@
 #ifndef EVAL_INTERNAL_H
 #define EVAL_INTERNAL_H
 
+#include "compiled_pattern.h"
 #include "context.h"
 #include "env.h"
 #include "macros.h"
@@ -120,13 +121,53 @@ static inline unsigned make_syntax_transformer(unsigned transformer_form,
     gc_protect(&closure_env);
     gc_protect(&literals);
     gc_protect(&rules);
+
+    // Compile patterns for each rule
+    unsigned compiled_rules = 0;
+    gc_protect(&compiled_rules);
+    unsigned compiled_tail = 0;
+    gc_protect(&compiled_tail);
+
+    for (unsigned r = rules; r; r = cdr(r)) {
+        unsigned rule = car(r);
+        unsigned pattern = car(rule);
+        unsigned tmpl = cadr(rule);
+
+        // Skip the macro name in pattern (first element)
+        if (IS_PAIR(pattern))
+            pattern = cdr(pattern);
+
+        // Compile the pattern
+        compiled_pattern *cpat = compile_pattern(pattern, literals, ellipsis_id);
+
+        // Create a cell to hold the compiled pattern pointer
+        unsigned cpat_cell = alloc();
+        CELL_TYPE(cpat_cell) = BT_COMPILED_PATTERN;
+        CELL_PTR(cpat_cell) = cpat;
+
+        // Build compiled rule: (cpat_cell . template)
+        gc_protect(&cpat_cell);
+        gc_protect(&tmpl);
+        unsigned new_rule = alloc_cons(cpat_cell, tmpl);
+        unsigned new_node = alloc_cons(new_rule, 0);
+        gc_unprotect(2);
+
+        if (!compiled_rules) {
+            compiled_rules = new_node;
+            compiled_tail = new_node;
+        } else {
+            CELL_CDR(compiled_tail) = new_node;
+            compiled_tail = new_node;
+        }
+    }
+
     // Store ellipsis_id as a number cell
     unsigned ellipsis_cell = store(ellipsis_id);
-    // Store: (ellipsis_cell . (literals . rules))
-    unsigned lit_rules = alloc_cons(literals, rules);
+    // Store: (ellipsis_cell . (literals . compiled_rules))
+    unsigned lit_rules = alloc_cons(literals, compiled_rules);
     unsigned car_val = alloc_cons(ellipsis_cell, lit_rules);
     unsigned result = make_typed_cell(BT_SYNTAX, car_val, closure_env);
-    gc_unprotect(3);
+    gc_unprotect(5);
     return result;
 }
 
