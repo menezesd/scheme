@@ -727,13 +727,35 @@ static bool str_equals(const char *a, const char *b)
 // Load factor threshold for rehashing (70%)
 #define ATOM_TABLE_LOAD_THRESHOLD 70
 
-// Symbol interning cache - most code reuses the same symbols repeatedly
-#define INTERN_CACHE_SIZE 8
-static struct {
+// Symbol interning cache with move-to-front (LRU approximation)
+#define INTERN_CACHE_SIZE 16
+typedef struct {
     const char *str; // Pointer into atom_table (not owned)
     int atom_id;
-} intern_cache[INTERN_CACHE_SIZE];
-static int intern_cache_next = 0;
+} intern_cache_entry;
+static intern_cache_entry intern_cache[INTERN_CACHE_SIZE];
+
+// Move cache entry at index i to front
+static inline void intern_cache_move_to_front(int i)
+{
+    if (i == 0)
+        return;
+    intern_cache_entry tmp = intern_cache[i];
+    for (int j = i; j > 0; j--) {
+        intern_cache[j] = intern_cache[j - 1];
+    }
+    intern_cache[0] = tmp;
+}
+
+// Insert new entry at front, shifting others down
+static inline void intern_cache_insert_front(const char *str, int atom_id)
+{
+    for (int j = INTERN_CACHE_SIZE - 1; j > 0; j--) {
+        intern_cache[j] = intern_cache[j - 1];
+    }
+    intern_cache[0].str = str;
+    intern_cache[0].atom_id = atom_id;
+}
 
 // Check if n is prime (simple trial division)
 static bool is_prime(unsigned n)
@@ -791,7 +813,6 @@ static void rehash_atom_table(void)
         intern_cache[i].str = NULL;
         intern_cache[i].atom_id = 0;
     }
-    intern_cache_next = 0;
 
     free(ctx.atom_table);
     ctx.atom_table = new_table;
@@ -800,10 +821,11 @@ static void rehash_atom_table(void)
 
 int intern(const char *s)
 {
-    // Check cache first - O(1) for recently used symbols
+    // Check cache first - move to front on hit
     for (int i = 0; i < INTERN_CACHE_SIZE; i++) {
         if (intern_cache[i].str && strcmp(intern_cache[i].str, s) == 0) {
-            return intern_cache[i].atom_id;
+            intern_cache_move_to_front(i);
+            return intern_cache[0].atom_id;
         }
     }
 
@@ -833,10 +855,8 @@ int intern(const char *s)
         ctx.atom_count++;
     }
 
-    // Update cache with this lookup (circular buffer)
-    intern_cache[intern_cache_next].str = ctx.atom_table[hash_value];
-    intern_cache[intern_cache_next].atom_id = hash_value;
-    intern_cache_next = (intern_cache_next + 1) % INTERN_CACHE_SIZE;
+    // Insert at front of cache
+    intern_cache_insert_front(ctx.atom_table[hash_value], hash_value);
 
     return hash_value;
 }

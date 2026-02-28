@@ -33,19 +33,19 @@
 // ============================================================================
 // Lookup Cache
 // ============================================================================
-// 4-entry associative cache for variable lookups. Most code has high locality -
-// the same variables are accessed repeatedly in loops. Multiple entries handle
-// cases like (let ((x 1) (y 2) (z 3)) ... x ... y ... z ...) without thrashing.
+// 8-entry associative cache for variable lookups with move-to-front on hit.
+// Most code has high locality - the same variables are accessed repeatedly.
+// Move-to-front keeps hot entries at the front, approximating LRU eviction.
 
-#define LOOKUP_CACHE_SIZE 4
+#define LOOKUP_CACHE_SIZE 8
 
-static struct {
+typedef struct {
     int64_t var;       // Variable atom ID (-1 = empty)
     unsigned env;      // Environment where found
     unsigned val_cell; // Cell containing the value (so mutations are visible)
-} lookup_cache[LOOKUP_CACHE_SIZE];
+} lookup_cache_entry;
 
-static int cache_next = 0; // Next slot to use (circular)
+static lookup_cache_entry lookup_cache[LOOKUP_CACHE_SIZE];
 
 // Invalidate all cache entries
 static inline void invalidate_lookup_cache(void)
@@ -53,7 +53,6 @@ static inline void invalidate_lookup_cache(void)
     for (int i = 0; i < LOOKUP_CACHE_SIZE; i++) {
         lookup_cache[i].var = -1;
     }
-    cache_next = 0;
 }
 
 // Public function to invalidate cache (called after GC)
@@ -177,13 +176,39 @@ unsigned setvar(int64_t var, unsigned aval, unsigned env)
     return TOK_ERROR;
 }
 
+// Move cache entry at index i to front (index 0), shifting others down
+static inline void cache_move_to_front(int i)
+{
+    if (i == 0)
+        return;
+    lookup_cache_entry tmp = lookup_cache[i];
+    for (int j = i; j > 0; j--) {
+        lookup_cache[j] = lookup_cache[j - 1];
+    }
+    lookup_cache[0] = tmp;
+}
+
+// Insert new entry at front, shifting others down (evicts last)
+static inline void cache_insert_front(int64_t var, unsigned env,
+                                      unsigned val_cell)
+{
+    for (int j = LOOKUP_CACHE_SIZE - 1; j > 0; j--) {
+        lookup_cache[j] = lookup_cache[j - 1];
+    }
+    lookup_cache[0].var = var;
+    lookup_cache[0].env = env;
+    lookup_cache[0].val_cell = val_cell;
+}
+
 // Internal lookup - returns TOK_ERROR if not found (no error message)
 static unsigned lookup_internal(int64_t var, unsigned env)
 {
     // Check cache first - scan all entries for match
     for (int i = 0; i < LOOKUP_CACHE_SIZE; i++) {
         if (lookup_cache[i].var == var && lookup_cache[i].env == env) {
-            return car(lookup_cache[i].val_cell);
+            // Move to front on hit (LRU approximation)
+            cache_move_to_front(i);
+            return car(lookup_cache[0].val_cell);
         }
     }
 
@@ -194,11 +219,8 @@ static unsigned lookup_internal(int64_t var, unsigned env)
              vars = cdr(vars), vals = cdr(vals)) {
             if (CELL_TYPE(vars) == BT_ATOM) {
                 if (CELL_ID(vars) == var) {
-                    // Cache hit location using circular buffer
-                    lookup_cache[cache_next].var = var;
-                    lookup_cache[cache_next].env = orig_env;
-                    lookup_cache[cache_next].val_cell = vals;
-                    cache_next = (cache_next + 1) % LOOKUP_CACHE_SIZE;
+                    // Insert at front on miss
+                    cache_insert_front(var, orig_env, vals);
                     return car(vals);
                 } else {
                     break;
@@ -206,11 +228,8 @@ static unsigned lookup_internal(int64_t var, unsigned env)
             }
 
             if (CELL_ID(car(vars)) == var) {
-                // Cache hit location using circular buffer
-                lookup_cache[cache_next].var = var;
-                lookup_cache[cache_next].env = orig_env;
-                lookup_cache[cache_next].val_cell = vals;
-                cache_next = (cache_next + 1) % LOOKUP_CACHE_SIZE;
+                // Insert at front on miss
+                cache_insert_front(var, orig_env, vals);
                 return car(vals);
             }
         }
