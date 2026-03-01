@@ -79,7 +79,7 @@ static int is_bool(unsigned x, int val)
     if (val)
         return x == ctx.atom_true;
     else
-        return x == 0; // #f is represented as 0 (nil)
+        return x == ctx.atom_false;
 }
 
 // ============================================================================
@@ -114,7 +114,7 @@ TEST(eval_false)
 {
     unsigned env = default_environment();
     unsigned result = eval_string("#f", env);
-    ASSERT(result == 0);
+    ASSERT(result == ctx.atom_false);
     PASS();
 }
 

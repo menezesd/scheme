@@ -417,9 +417,14 @@ static void compile_pattern_node(unsigned pattern, pattern_compile_ctx *pctx)
         pattern_emit(pctx->pattern, PAT_CHECK_VECTOR, 0);
         pattern_emit(pctx->pattern, PAT_CHECK_VECLEN, len);
 
-        // TODO: Handle vector ellipsis and element matching
-        // For now, just check length - full vector pattern support later
-        (void)len;  // Suppress unused warning
+        // TODO: Handle vector ellipsis patterns (e.g., #(a b ...))
+        // For now, match each element directly
+        for (unsigned i = 0; i < len; i++) {
+            unsigned elem = vector_data_ptr(pattern)[i];
+            pattern_emit(pctx->pattern, PAT_INPUT_VECREF, i);
+            compile_pattern_node(elem, pctx);
+            pattern_emit(pctx->pattern, PAT_INPUT_POP, 0);
+        }
         return;
     }
 
@@ -618,6 +623,11 @@ unsigned execute_pattern(compiled_pattern *pat, unsigned input)
             state.input = cdr(state.input);
             break;
 
+        case PAT_INPUT_VECREF:
+            push_input(&state, state.input);
+            state.input = vector_data_ptr(state.input)[instr->operand];
+            break;
+
         case PAT_CHECK_PAIR:
             if (!IS_PAIR(state.input)) {
                 if (!backtrack(&state))
@@ -664,9 +674,7 @@ unsigned execute_pattern(compiled_pattern *pat, unsigned input)
 
         case PAT_MATCH_LITERAL: {
             unsigned expected = pat->constants[instr->operand];
-            // Simple equality check (TODO: proper equal?)
-            if (CELL_TYPE(state.input) != CELL_TYPE(expected) ||
-                CELL_ID(state.input) != CELL_ID(expected)) {
+            if (!deep_equal(state.input, expected)) {
                 if (!backtrack(&state))
                     failed = true;
             }

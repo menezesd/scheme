@@ -36,6 +36,7 @@ enum pat_opcode {
     PAT_INPUT_CDR,       // Push input, set input = cdr(input)
     PAT_INPUT_POP,       // Pop and restore previous input
     PAT_INPUT_ADVANCE,   // Set input = cdr(input) without push (for ellipsis)
+    PAT_INPUT_VECREF,    // Push input, set input = vector_data_ptr(input)[operand]
 
     // Type checks - fail (backtrack) if check fails
     PAT_CHECK_PAIR,      // Fail if !IS_PAIR(input)

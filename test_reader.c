@@ -184,7 +184,7 @@ TEST(read_true)
 TEST(read_false)
 {
     unsigned x = read_from_string("#f");
-    ASSERT(x == 0);
+    ASSERT(x == ctx.atom_false);
     PASS();
 }
 

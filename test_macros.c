@@ -186,6 +186,21 @@ TEST(match_vector_simple)
 
     unsigned bindings = syntax_match(pattern, input, 0, 0, ctx.kw_ellipsis);
     ASSERT(bindings != TOK_ERROR);
+
+    // Check bindings contain ((y . 2) (x . 1))
+    ASSERT(IS_PAIR(bindings));
+    // First binding should be (y . 2)
+    unsigned b1 = car(bindings);
+    ASSERT(IS_PAIR(b1));
+    ASSERT_STR_EQ(ctx.atom_table[CELL_ID(car(b1))], "y");
+    ASSERT_EQ(CELL_ID(cdr(b1)), 2);
+    // Second binding should be (x . 1)
+    ASSERT(IS_PAIR(cdr(bindings)));
+    unsigned b2 = car(cdr(bindings));
+    ASSERT(IS_PAIR(b2));
+    ASSERT_STR_EQ(ctx.atom_table[CELL_ID(car(b2))], "x");
+    ASSERT_EQ(CELL_ID(cdr(b2)), 1);
+
     PASS();
 }
 
