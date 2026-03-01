@@ -8,6 +8,7 @@
 #include "context.h"
 #include "test_framework.h"
 #include "types.h"
+#include <string.h>
 
 // ============================================================================
 // Helpers
@@ -286,6 +287,150 @@ TEST(execute_ellipsis_empty)
 }
 
 // ============================================================================
+// Vector Tests
+// ============================================================================
+
+TEST(execute_vector_simple)
+{
+    // Pattern: #(x y)
+    unsigned pat = make_vector(2, 0);
+    unsigned *data = vector_data_ptr(pat);
+    data[0] = atom("x");
+    data[1] = atom("y");
+
+    compiled_pattern *cpat = compile_pattern(pat, 0, ctx.kw_ellipsis);
+
+    // Input: #(1 2)
+    unsigned input = make_vector(2, 0);
+    unsigned *inp_data = vector_data_ptr(input);
+    inp_data[0] = store(1);
+    inp_data[1] = store(2);
+
+    unsigned bindings = execute_pattern(cpat, input);
+    ASSERT(bindings != TOK_ERROR);
+
+    // Check bindings
+    unsigned b1 = car(bindings);
+    ASSERT(CELL_ID(cdr(b1)) == 2);  // y = 2
+    unsigned b2 = car(cdr(bindings));
+    ASSERT(CELL_ID(cdr(b2)) == 1);  // x = 1
+    PASS();
+}
+
+TEST(execute_vector_length_mismatch)
+{
+    // Pattern: #(x y)
+    unsigned pat = make_vector(2, 0);
+    unsigned *data = vector_data_ptr(pat);
+    data[0] = atom("x");
+    data[1] = atom("y");
+
+    compiled_pattern *cpat = compile_pattern(pat, 0, ctx.kw_ellipsis);
+
+    // Input: #(1 2 3) - too many elements
+    unsigned input = make_vector(3, 0);
+    unsigned *inp_data = vector_data_ptr(input);
+    inp_data[0] = store(1);
+    inp_data[1] = store(2);
+    inp_data[2] = store(3);
+
+    unsigned bindings = execute_pattern(cpat, input);
+    ASSERT(bindings == TOK_ERROR);
+    PASS();
+}
+
+TEST(execute_vector_ellipsis)
+{
+    // Pattern: #(x ...)
+    unsigned pat = make_vector(2, 0);
+    unsigned *data = vector_data_ptr(pat);
+    data[0] = atom("x");
+    data[1] = atom("...");
+
+    compiled_pattern *cpat = compile_pattern(pat, 0, ctx.kw_ellipsis);
+
+    // Input: #(1 2 3)
+    unsigned input = make_vector(3, 0);
+    unsigned *inp_data = vector_data_ptr(input);
+    inp_data[0] = store(1);
+    inp_data[1] = store(2);
+    inp_data[2] = store(3);
+
+    unsigned bindings = execute_pattern(cpat, input);
+    ASSERT(bindings != TOK_ERROR);
+
+    // x should be bound to (1 2 3)
+    unsigned binding = car(bindings);
+    unsigned value = cdr(binding);
+    ASSERT(IS_PAIR(value));
+    PASS();
+}
+
+TEST(execute_vector_ellipsis_empty)
+{
+    // Pattern: #(x ...)
+    unsigned pat = make_vector(2, 0);
+    unsigned *data = vector_data_ptr(pat);
+    data[0] = atom("x");
+    data[1] = atom("...");
+
+    compiled_pattern *cpat = compile_pattern(pat, 0, ctx.kw_ellipsis);
+
+    // Input: #() - empty vector
+    unsigned input = make_vector(0, 0);
+
+    unsigned bindings = execute_pattern(cpat, input);
+    ASSERT(bindings != TOK_ERROR);
+
+    // x should be bound to ()
+    unsigned binding = car(bindings);
+    unsigned value = cdr(binding);
+    ASSERT(value == 0);  // Empty list
+    PASS();
+}
+
+TEST(execute_vector_ellipsis_with_pre_post)
+{
+    // Pattern: #(first x ... last)
+    unsigned pat = make_vector(4, 0);
+    unsigned *data = vector_data_ptr(pat);
+    data[0] = atom("first");
+    data[1] = atom("x");
+    data[2] = atom("...");
+    data[3] = atom("last");
+
+    compiled_pattern *cpat = compile_pattern(pat, 0, ctx.kw_ellipsis);
+
+    // Input: #(1 2 3 4 5)
+    unsigned input = make_vector(5, 0);
+    unsigned *inp_data = vector_data_ptr(input);
+    inp_data[0] = store(1);
+    inp_data[1] = store(2);
+    inp_data[2] = store(3);
+    inp_data[3] = store(4);
+    inp_data[4] = store(5);
+
+    unsigned bindings = execute_pattern(cpat, input);
+    ASSERT(bindings != TOK_ERROR);
+
+    // Should have bindings for first, x, last
+    // Order depends on implementation - just check we got them
+    int found_first = 0, found_last = 0, found_x = 0;
+    for (unsigned b = bindings; b; b = cdr(b)) {
+        unsigned binding = car(b);
+        unsigned name = car(binding);
+        if (IS_ATOM(name)) {
+            const char *s = ctx.atom_table[CELL_ID(name)];
+            if (strcmp(s, "first") == 0) found_first = 1;
+            if (strcmp(s, "last") == 0) found_last = 1;
+            if (strcmp(s, "x") == 0) found_x = 1;
+        }
+    }
+    ASSERT(found_first && found_last && found_x);
+    PASS();
+}
+
+// ============================================================================
 // Disassembly Test (visual inspection)
 // ============================================================================
 
@@ -342,6 +487,14 @@ int main(void)
     RUN_TEST(execute_literal);
     RUN_TEST(execute_ellipsis_simple);
     RUN_TEST(execute_ellipsis_empty);
+
+    // Vector tests
+    printf("\nVector:\n");
+    RUN_TEST(execute_vector_simple);
+    RUN_TEST(execute_vector_length_mismatch);
+    RUN_TEST(execute_vector_ellipsis);
+    RUN_TEST(execute_vector_ellipsis_empty);
+    RUN_TEST(execute_vector_ellipsis_with_pre_post);
 
     // Visual inspection
     printf("\nVisual Inspection:\n");

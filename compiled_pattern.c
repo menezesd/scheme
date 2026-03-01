@@ -414,16 +414,99 @@ static void compile_pattern_node(unsigned pattern, pattern_compile_ctx *pctx)
     // Vector: check type and match elements
     if (IS_VECTOR(pattern)) {
         unsigned len = vector_len(pattern);
-        pattern_emit(pctx->pattern, PAT_CHECK_VECTOR, 0);
-        pattern_emit(pctx->pattern, PAT_CHECK_VECLEN, len);
+        unsigned *data = vector_data_ptr(pattern);
 
-        // TODO: Handle vector ellipsis patterns (e.g., #(a b ...))
-        // For now, match each element directly
+        // Check for ellipsis in vector
+        unsigned ellipsis_pos = len;
         for (unsigned i = 0; i < len; i++) {
-            unsigned elem = vector_data_ptr(pattern)[i];
-            pattern_emit(pctx->pattern, PAT_INPUT_VECREF, i);
-            compile_pattern_node(elem, pctx);
+            if (is_ellipsis(data[i], pctx->ellipsis_id)) {
+                ellipsis_pos = i;
+                break;
+            }
+        }
+
+        pattern_emit(pctx->pattern, PAT_CHECK_VECTOR, 0);
+
+        if (ellipsis_pos < len) {
+            // Vector has ellipsis at ellipsis_pos
+            // Element before ellipsis is the repeated pattern
+            if (ellipsis_pos == 0) {
+                // No pattern before ellipsis - error
+                pattern_emit(pctx->pattern, PAT_CHECK_NULL, 0);  // Force fail
+                return;
+            }
+
+            unsigned elem_pattern = data[ellipsis_pos - 1];
+            unsigned pre_count = ellipsis_pos - 1;
+            unsigned post_count = len - ellipsis_pos - 1;
+
+            // Check minimum length
+            pattern_emit(pctx->pattern, PAT_CHECK_VECLEN_MIN,
+                         pre_count + post_count);
+
+            // Match pre-ellipsis elements (before the repeated pattern)
+            for (unsigned i = 0; i < pre_count; i++) {
+                pattern_emit(pctx->pattern, PAT_INPUT_VECREF, i);
+                compile_pattern_node(data[i], pctx);
+                pattern_emit(pctx->pattern, PAT_INPUT_POP, 0);
+            }
+
+            // Setup ellipsis iteration
+            pctx->ellipsis_depth++;
+            unsigned var_start = pctx->pattern->var_count;
+
+            // Encode pre_count and post_count in single operand
+            unsigned init_operand = pre_count | (post_count << 16);
+            pattern_emit(pctx->pattern, PAT_VEC_ELLIPSIS_INIT, init_operand);
+
+            // Loop start
+            unsigned loop_start = pattern_current_pos(pctx->pattern);
+
+            // Check if done, jump to done_label
+            pattern_emit(pctx->pattern, PAT_VEC_ELLIPSIS_NEXT, 0);  // Placeholder
+            unsigned done_patch = pattern_current_pos(pctx->pattern) - 1;
+
+            // Save and match element
+            pattern_emit(pctx->pattern, PAT_ELLIPSIS_SAVE, 0);
+            pattern_emit(pctx->pattern, PAT_INPUT_VEC_ITER, 0);
+            compile_pattern_node(elem_pattern, pctx);
             pattern_emit(pctx->pattern, PAT_INPUT_POP, 0);
+
+            // Accumulate
+            pattern_emit(pctx->pattern, PAT_ELLIPSIS_ACCUM, pctx->ellipsis_depth);
+
+            // Jump back to loop start
+            pattern_emit(pctx->pattern, PAT_JUMP, loop_start);
+
+            // Done label
+            unsigned done_label = pattern_current_pos(pctx->pattern);
+            pattern_patch(pctx->pattern, done_patch, done_label);
+
+            // Emit ELLIPSIS_LIST for variables
+            for (unsigned i = var_start; i < pctx->pattern->var_count; i++) {
+                if (pctx->pattern->var_slots[i].is_ellipsis &&
+                    pctx->pattern->var_slots[i].depth == pctx->ellipsis_depth) {
+                    pattern_emit(pctx->pattern, PAT_ELLIPSIS_LIST, i);
+                }
+            }
+
+            pctx->ellipsis_depth--;
+
+            // Match post-ellipsis elements (from end of vector)
+            for (unsigned i = 0; i < post_count; i++) {
+                pattern_emit(pctx->pattern, PAT_INPUT_VECREF_END, post_count - 1 - i);
+                compile_pattern_node(data[ellipsis_pos + 1 + i], pctx);
+                pattern_emit(pctx->pattern, PAT_INPUT_POP, 0);
+            }
+        } else {
+            // No ellipsis - exact length match
+            pattern_emit(pctx->pattern, PAT_CHECK_VECLEN, len);
+
+            for (unsigned i = 0; i < len; i++) {
+                pattern_emit(pctx->pattern, PAT_INPUT_VECREF, i);
+                compile_pattern_node(data[i], pctx);
+                pattern_emit(pctx->pattern, PAT_INPUT_POP, 0);
+            }
         }
         return;
     }
@@ -542,7 +625,12 @@ static void push_choice(pat_match_state *state, unsigned retry_ip)
     cp->input = state->input;
     cp->ip = retry_ip;
     // Save ellipsis accumulator lengths
-    cp->accum_len = 0;  // TODO: proper save
+    // Note: Accumulator save/restore for backtracking is not implemented.
+    // The current greedy ellipsis strategy only backtracks when rest-pattern
+    // fails, not when element-pattern fails mid-accumulation. This works
+    // correctly for non-nested ellipsis. Nested ellipsis (e.g., ((x ...) ...))
+    // would require per-depth accumulator tracking which is not yet supported.
+    cp->accum_len = 0;
 }
 
 // Backtrack to previous choice point
@@ -555,7 +643,8 @@ static bool backtrack(pat_match_state *state)
     pat_choice_point *cp = &state->choices[--state->choice_sp];
     state->input = cp->input;
     state->ip = cp->ip;
-    // Restore ellipsis accumulators (TODO)
+    // Note: Ellipsis accumulators are not restored on backtrack.
+    // See push_choice() comment for explanation.
 
     return true;
 }
@@ -738,6 +827,50 @@ unsigned execute_pattern(compiled_pattern *pat, unsigned input)
 
         case PAT_SUCCESS:
             matched = true;
+            break;
+
+        case PAT_CHECK_VECLEN_MIN:
+            if (!IS_VECTOR(state.input) ||
+                vector_len(state.input) < instr->operand) {
+                if (!backtrack(&state))
+                    failed = true;
+            }
+            break;
+
+        case PAT_VEC_ELLIPSIS_INIT: {
+            // Setup vector ellipsis iteration
+            // operand = pre_count | (post_count << 16)
+            unsigned pre_count = instr->operand & 0xFFFF;
+            unsigned post_count = instr->operand >> 16;
+            unsigned len = vector_len(state.input);
+            state.vec_iter_vec = state.input;
+            state.vec_iter_pre = pre_count;
+            state.vec_iter_count = len - pre_count - post_count;
+            state.vec_iter_idx = 0;
+            break;
+        }
+
+        case PAT_VEC_ELLIPSIS_NEXT:
+            // Check if iteration is done
+            if (state.vec_iter_idx >= state.vec_iter_count) {
+                state.ip = instr->operand;  // Jump to done label
+            } else {
+                state.vec_iter_idx++;
+            }
+            break;
+
+        case PAT_INPUT_VEC_ITER:
+            // Access current ellipsis iteration element
+            push_input(&state, state.input);
+            state.input = vector_data_ptr(state.vec_iter_vec)
+                [state.vec_iter_pre + state.vec_iter_idx - 1];
+            break;
+
+        case PAT_INPUT_VECREF_END:
+            // Access element from end of vector (operand = offset from end)
+            push_input(&state, state.input);
+            state.input = vector_data_ptr(state.input)
+                [vector_len(state.input) - 1 - instr->operand];
             break;
 
         default:

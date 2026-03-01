@@ -44,6 +44,13 @@ enum pat_opcode {
     PAT_CHECK_ATOM,      // Fail if !IS_ATOM(input)
     PAT_CHECK_VECTOR,    // Fail if !IS_VECTOR(input)
     PAT_CHECK_VECLEN,    // Fail if vector_len(input) != operand
+    PAT_CHECK_VECLEN_MIN,// Fail if vector_len(input) < operand
+
+    // Vector ellipsis iteration
+    PAT_VEC_ELLIPSIS_INIT,  // Setup iteration: operand = pre_count
+    PAT_VEC_ELLIPSIS_NEXT,  // If done, jump to operand; else advance
+    PAT_INPUT_VEC_ITER,     // Push input, set input = vec[pre_count + iter_idx]
+    PAT_INPUT_VECREF_END,   // Push input, set input = vec[len - 1 - operand]
 
     // Matching - compare input against expected value
     PAT_MATCH_ATOM_ID,   // Fail if !IS_ATOM(input) || CELL_ID(input) != operand
@@ -152,6 +159,12 @@ typedef struct {
     pat_choice_point *choices;
     unsigned choice_sp;
     unsigned choice_cap;
+
+    // Vector ellipsis iteration state
+    unsigned vec_iter_vec;   // Vector being iterated
+    unsigned vec_iter_idx;   // Current iteration index
+    unsigned vec_iter_count; // Total iterations
+    unsigned vec_iter_pre;   // Pre-ellipsis element count
 } pat_match_state;
 
 // ============================================================================
