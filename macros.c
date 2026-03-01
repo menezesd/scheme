@@ -334,7 +334,7 @@ static bool is_pattern_var(int64_t sym_id, unsigned bindings)
 }
 
 // Check if an identifier is a special form keyword
-static bool is_special_form(int64_t id)
+bool is_special_form(int64_t id)
 {
     return id == ctx.kw_lambda || id == ctx.kw_if || id == ctx.kw_define ||
            id == ctx.kw_set || id == ctx.kw_quote || id == ctx.kw_begin ||
@@ -1510,22 +1510,8 @@ unsigned apply_syntax(unsigned transformer, unsigned input, unsigned use_env)
                     gc_protect(&gensym);
                     gc_protect(&closure_val);
 
-                    // Check if this is a compile-time env (empty/placeholder value)
-                    // If so, create a runtime lookup marker
-                    // The marker is (##runtime-lookup## . original_var_id)
-                    unsigned bind_val;
-                    if (closure_val == 0 || CELL_TYPE(closure_val) == BT_FREE) {
-                        // Create runtime lookup marker
-                        unsigned marker_atom = atom_from_string("##runtime-lookup##");
-                        gc_protect(&marker_atom);
-                        bind_val = alloc_cons(marker_atom, free_atom);
-                        gc_unprotect(1);
-                    } else {
-                        bind_val = closure_val;
-                    }
-
-                    // Define gensym in use_env
-                    defvar(gensym, bind_val, use_env);
+                    // Define gensym in use_env with the closure value
+                    defvar(gensym, closure_val, use_env);
 
                     // Add to rename map: (free_atom . gensym)
                     unsigned entry = alloc_cons(free_atom, gensym);

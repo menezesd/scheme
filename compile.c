@@ -287,10 +287,7 @@ static unsigned collect_template_free_vars(unsigned tmpl, unsigned pattern_vars,
                 return collected;
         }
         // Skip special forms
-        if (id == ctx.kw_quote || id == ctx.kw_lambda || id == ctx.kw_if ||
-            id == ctx.kw_begin || id == ctx.kw_set || id == ctx.kw_define ||
-            id == ctx.kw_let || id == ctx.kw_letstar || id == ctx.kw_letrec ||
-            id == ctx.kw_syntax_rules)
+        if (is_special_form(id))
             return collected;
         return alloc_cons(tmpl, collected);
     }
@@ -302,6 +299,15 @@ static unsigned collect_template_free_vars(unsigned tmpl, unsigned pattern_vars,
         collected =
             collect_template_free_vars(car(tmpl), pattern_vars, collected, ellipsis);
         return collect_template_free_vars(cdr(tmpl), pattern_vars, collected, ellipsis);
+    }
+
+    if (CELL_TYPE(tmpl) == BT_VECTOR) {
+        vector_data *vec = GET_VECTOR_PTR(tmpl);
+        for (unsigned i = 0; i < vec->len; i++) {
+            collected = collect_template_free_vars(vec->data[i],
+                                                   pattern_vars, collected, ellipsis);
+        }
+        return collected;
     }
 
     return collected;
@@ -339,6 +345,24 @@ static unsigned rename_template_vars(unsigned tmpl, unsigned rename_map)
         return alloc_cons(new_car, new_cdr);
     }
 
+    if (CELL_TYPE(tmpl) == BT_VECTOR) {
+        vector_data *vec = GET_VECTOR_PTR(tmpl);
+        gc_protect(&tmpl);
+        gc_protect(&rename_map);
+        unsigned new_vec = make_vector(vec->len, 0);
+        gc_protect(&new_vec);
+        bool changed = false;
+        for (unsigned i = 0; i < vec->len; i++) {
+            unsigned old_elem = vec->data[i];
+            unsigned new_elem = rename_template_vars(old_elem, rename_map);
+            GET_VECTOR_PTR(new_vec)->data[i] = new_elem;
+            if (new_elem != old_elem)
+                changed = true;
+        }
+        gc_unprotect(3);
+        return changed ? new_vec : tmpl;
+    }
+
     return tmpl;
 }
 
@@ -371,6 +395,15 @@ static unsigned collect_pattern_vars(unsigned pattern, unsigned collected,
         return collect_pattern_vars(cdr(pattern), collected, ellipsis, literals);
     }
 
+    if (CELL_TYPE(pattern) == BT_VECTOR) {
+        vector_data *vec = GET_VECTOR_PTR(pattern);
+        for (unsigned i = 0; i < vec->len; i++) {
+            collected = collect_pattern_vars(vec->data[i], collected,
+                                             ellipsis, literals);
+        }
+        return collected;
+    }
+
     return collected;
 }
 
@@ -379,13 +412,6 @@ static unsigned collect_pattern_vars(unsigned pattern, unsigned collected,
 static void emit_gensym_definitions(compile_ctx *cctx, unsigned old_gensym,
                                     unsigned new_gensym)
 {
-    // Get the runtime lookup marker atom ID once
-    static int64_t runtime_lookup_id = 0;
-    if (runtime_lookup_id == 0) {
-        unsigned marker_atom = atom_from_string("##runtime-lookup##");
-        runtime_lookup_id = CELL_ID(marker_atom);
-    }
-
     for (unsigned g = old_gensym; g < new_gensym; g++) {
         char name[20];
         snprintf(name, sizeof(name), "g%u", g);
@@ -395,21 +421,9 @@ static void emit_gensym_definitions(compile_ctx *cctx, unsigned old_gensym,
         // Look up the gensym value in the compile-time environment
         unsigned val = lookup_silent(gensym_id, cctx->env);
         if (val != TOK_ERROR) {
-            // Check if this is a runtime lookup marker
-            // Marker format: (##runtime-lookup## . original_var_atom)
-            if (IS_PAIR(val) && IS_ATOM(car(val)) &&
-                CELL_ID(car(val)) == runtime_lookup_id) {
-                // Runtime lookup: emit code to look up original var and define
-                // gensym
-                unsigned orig_var = cdr(val);
-                int64_t orig_var_id = CELL_ID(orig_var);
-                emit2(cctx, OP_LOOKUP, orig_var_id);
-                emit2(cctx, OP_DEFINE, gensym_id);
-            } else {
-                // Constant value: emit const and define
-                emit2(cctx, OP_CONST, code_add_const(cctx->code, val));
-                emit2(cctx, OP_DEFINE, gensym_id);
-            }
+            // Emit const and define
+            emit2(cctx, OP_CONST, code_add_const(cctx->code, val));
+            emit2(cctx, OP_DEFINE, gensym_id);
         }
     }
 }
