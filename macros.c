@@ -181,30 +181,6 @@ static unsigned find_ellipsis_binding(unsigned var, unsigned bindings)
     return cons_match;
 }
 
-// Find an ellipsis-bound pattern variable inside a template (recursive)
-// Returns the binding if found, 0 otherwise
-static unsigned find_ellipsis_var_in_template(unsigned tmpl, unsigned bindings)
-{
-    if (!tmpl)
-        return 0;
-
-    if (IS_ATOM(tmpl)) {
-        unsigned binding = find_ellipsis_binding(tmpl, bindings);
-        if (binding && IS_PAIR(cdr(binding)))
-            return binding;
-        return 0;
-    }
-
-    if (IS_PAIR(tmpl)) {
-        unsigned result = find_ellipsis_var_in_template(car(tmpl), bindings);
-        if (result)
-            return result;
-        return find_ellipsis_var_in_template(cdr(tmpl), bindings);
-    }
-
-    return 0;
-}
-
 // Collect ALL ellipsis-bound variables from a template into a list
 // Returns list of bindings: ((var1 . values1) (var2 . values2) ...)
 static unsigned collect_ellipsis_vars(unsigned tmpl, unsigned bindings,
@@ -344,7 +320,7 @@ bool is_special_form(int64_t id)
            id == ctx.kw_quasiquote || id == ctx.kw_unquote ||
            id == ctx.kw_unquote_splicing || id == ctx.kw_else ||
            id == ctx.kw_ellipsis || id == ctx.kw_underscore ||
-           id == ctx.kw_let || id == ctx.kw_letrec;
+           id == ctx.kw_let || id == ctx.kw_letstar || id == ctx.kw_letrec;
 }
 
 // Check if identifier is in a list (used for free_ids collection)

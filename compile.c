@@ -273,6 +273,11 @@ static unsigned collect_template_free_vars(unsigned tmpl, unsigned pattern_vars,
     if (!tmpl)
         return collected;
 
+    GC_GUARD;
+    gc_protect(&tmpl);
+    gc_protect(&pattern_vars);
+    gc_protect(&collected);
+
     if (IS_ATOM(tmpl)) {
         int64_t id = CELL_ID(tmpl);
         // Skip if pattern variable, ellipsis, or already collected
@@ -302,9 +307,11 @@ static unsigned collect_template_free_vars(unsigned tmpl, unsigned pattern_vars,
     }
 
     if (CELL_TYPE(tmpl) == BT_VECTOR) {
-        vector_data *vec = GET_VECTOR_PTR(tmpl);
-        for (unsigned i = 0; i < vec->len; i++) {
-            collected = collect_template_free_vars(vec->data[i],
+        unsigned len = vector_len(tmpl);
+        for (unsigned i = 0; i < len; i++) {
+            // Refresh data pointer each iteration - GC may have moved tmpl
+            unsigned *data = vector_data_ptr(tmpl);
+            collected = collect_template_free_vars(data[i],
                                                    pattern_vars, collected, ellipsis);
         }
         return collected;
@@ -346,16 +353,17 @@ static unsigned rename_template_vars(unsigned tmpl, unsigned rename_map)
     }
 
     if (CELL_TYPE(tmpl) == BT_VECTOR) {
-        vector_data *vec = GET_VECTOR_PTR(tmpl);
+        unsigned len = vector_len(tmpl);
         gc_protect(&tmpl);
         gc_protect(&rename_map);
-        unsigned new_vec = make_vector(vec->len, 0);
+        unsigned new_vec = make_vector(len, 0);
         gc_protect(&new_vec);
         bool changed = false;
-        for (unsigned i = 0; i < vec->len; i++) {
-            unsigned old_elem = vec->data[i];
+        for (unsigned i = 0; i < len; i++) {
+            // Refresh data pointers each iteration - GC may have moved vectors
+            unsigned old_elem = vector_data_ptr(tmpl)[i];
             unsigned new_elem = rename_template_vars(old_elem, rename_map);
-            GET_VECTOR_PTR(new_vec)->data[i] = new_elem;
+            vector_data_ptr(new_vec)[i] = new_elem;
             if (new_elem != old_elem)
                 changed = true;
         }
@@ -372,6 +380,11 @@ static unsigned collect_pattern_vars(unsigned pattern, unsigned collected,
 {
     if (!pattern)
         return collected;
+
+    GC_GUARD;
+    gc_protect(&pattern);
+    gc_protect(&collected);
+    gc_protect(&literals);
 
     if (IS_ATOM(pattern)) {
         int64_t id = CELL_ID(pattern);
@@ -396,9 +409,11 @@ static unsigned collect_pattern_vars(unsigned pattern, unsigned collected,
     }
 
     if (CELL_TYPE(pattern) == BT_VECTOR) {
-        vector_data *vec = GET_VECTOR_PTR(pattern);
-        for (unsigned i = 0; i < vec->len; i++) {
-            collected = collect_pattern_vars(vec->data[i], collected,
+        unsigned len = vector_len(pattern);
+        for (unsigned i = 0; i < len; i++) {
+            // Refresh data pointer each iteration - GC may have moved pattern
+            unsigned *data = vector_data_ptr(pattern);
+            collected = collect_pattern_vars(data[i], collected,
                                              ellipsis, literals);
         }
         return collected;
