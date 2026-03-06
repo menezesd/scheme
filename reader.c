@@ -62,16 +62,6 @@ static void reset_datum_labels(void)
     // Keep the allocated buffer for reuse, just reset count
 }
 
-// Free datum labels - called during cleanup (currently unused, kept for future use)
-__attribute__((unused))
-static void free_datum_labels(void)
-{
-    free(datum_labels);
-    datum_labels = NULL;
-    datum_label_count = 0;
-    datum_label_cap = 0;
-}
-
 static int find_datum_label(int label)
 {
     for (int i = 0; i < datum_label_count; i++) {

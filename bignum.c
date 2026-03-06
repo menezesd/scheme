@@ -260,6 +260,10 @@ int bn_to_uint64(const bignum *a, uint64_t *out)
 // Simple digit-by-digit conversion for small numbers
 static char *bn_to_string_simple(const bignum *a, int base)
 {
+    // Check for potential overflow in size calculation
+    if (a->len > SIZE_MAX / LIMB_BITS) {
+        return NULL;  // Number too large to convert to string
+    }
     // Estimate size: log_base(2^(len*LIMB_BITS)) + sign + null
     size_t est_digits = (a->len * LIMB_BITS) / 3 + 3;
     char *buf = malloc(est_digits);

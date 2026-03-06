@@ -399,7 +399,22 @@ unsigned normalize_rational(int64_t num, int64_t denom)
         return TOK_ERROR;
     }
     // Handle signs - denominator always positive
+    // Use safe negation to avoid overflow when num or denom is INT64_MIN
     if (denom < 0) {
+        // If num is INT64_MIN, negating would overflow - use bignum path
+        if (num == INT64_MIN || denom == INT64_MIN) {
+            bignum *bn_num = bn_from_int(num);
+            bignum *bn_denom = bn_from_int(denom);
+            if (bn_sign(bn_denom) < 0) {
+                bn_neg_ip(bn_num);
+                bn_neg_ip(bn_denom);
+            }
+            GC_GUARD;
+            unsigned num_cell = store_integer(bn_num);
+            gc_protect(&num_cell);
+            unsigned denom_cell = store_integer(bn_denom);
+            return normalize_rational_cells(num_cell, denom_cell);
+        }
         num = -num;
         denom = -denom;
     }

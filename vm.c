@@ -78,9 +78,16 @@ void vm_init(vm_state *vm)
 
     vm->stack_cap = INITIAL_STACK_SIZE;
     vm->stack = malloc(vm->stack_cap * sizeof(unsigned));
+    if (!vm->stack) {
+        lisp_panic("vm_init: failed to allocate stack");
+    }
 
     vm->frames_cap = INITIAL_FRAMES_SIZE;
     vm->frames = malloc(vm->frames_cap * sizeof(vm_frame));
+    if (!vm->frames) {
+        free(vm->stack);
+        lisp_panic("vm_init: failed to allocate frames");
+    }
 
     vm->running = false;
     vm->error = false;
@@ -170,9 +177,14 @@ void vm_push(vm_state *vm, unsigned val)
             VM_ERROR(vm, "stack overflow");
             return;
         }
-        vm->stack_cap *= 2;
-        vm->stack = realloc(vm->stack, vm->stack_cap * sizeof(unsigned));
-        LISP_ASSERT_MSG(vm->stack != NULL, "vm_push: realloc failed");
+        unsigned new_cap = vm->stack_cap * 2;
+        unsigned *new_stack = realloc(vm->stack, new_cap * sizeof(unsigned));
+        if (!new_stack) {
+            VM_ERROR(vm, "stack reallocation failed");
+            return;
+        }
+        vm->stack = new_stack;
+        vm->stack_cap = new_cap;
     }
     LISP_ASSERT_FMT(vm->sp < vm->stack_cap,
                     "vm_push: sp=%u >= stack_cap=%u", vm->sp, vm->stack_cap);
@@ -210,9 +222,14 @@ static void push_frame(vm_state *vm, code_object *code, unsigned ip,
             VM_ERROR(vm, "call stack overflow");
             return;
         }
-        vm->frames_cap *= 2;
-        vm->frames = realloc(vm->frames, vm->frames_cap * sizeof(vm_frame));
-        LISP_ASSERT_MSG(vm->frames != NULL, "push_frame: realloc failed");
+        unsigned new_cap = vm->frames_cap * 2;
+        vm_frame *new_frames = realloc(vm->frames, new_cap * sizeof(vm_frame));
+        if (!new_frames) {
+            VM_ERROR(vm, "frame stack reallocation failed");
+            return;
+        }
+        vm->frames = new_frames;
+        vm->frames_cap = new_cap;
     }
     LISP_ASSERT_FMT(vm->fp < vm->frames_cap,
                     "push_frame: fp=%u >= frames_cap=%u", vm->fp, vm->frames_cap);
@@ -359,6 +376,10 @@ static void restore_continuation(vm_state *vm, unsigned cont_cell,
 // Forward declaration for vm_handle_apply
 static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail);
 
+// Maximum middle arguments for apply (proc arg1 ... argN list)
+// Most apply calls have few middle args; use heap allocation for more
+#define MAX_APPLY_MIDDLE_ARGS 64
+
 // Handle (apply proc arg1 ... args-list) - consolidated helper
 // Returns true if apply was handled, false on error
 static bool vm_handle_apply(vm_state *vm, unsigned argc, unsigned *argv,
@@ -374,8 +395,22 @@ static bool vm_handle_apply(vm_state *vm, unsigned argc, unsigned *argv,
 
     // Copy middle args before popping (they'll be overwritten)
     unsigned middle_count = (argc > 2) ? argc - 2 : 0;
-    unsigned middle_args[16]; // Should be enough for typical use
-    for (unsigned i = 0; i < middle_count && i < 16; i++) {
+
+    // Use stack allocation for small counts, heap for large
+    unsigned middle_args_stack[MAX_APPLY_MIDDLE_ARGS];
+    unsigned *middle_args = middle_args_stack;
+    unsigned *middle_args_heap = NULL;
+
+    if (middle_count > MAX_APPLY_MIDDLE_ARGS) {
+        middle_args_heap = malloc(middle_count * sizeof(unsigned));
+        if (!middle_args_heap) {
+            VM_ERROR(vm, "apply: out of memory for middle arguments");
+            return false;
+        }
+        middle_args = middle_args_heap;
+    }
+
+    for (unsigned i = 0; i < middle_count; i++) {
         middle_args[i] = argv[i + 1];
     }
 
@@ -389,9 +424,14 @@ static bool vm_handle_apply(vm_state *vm, unsigned argc, unsigned *argv,
 
     // Push middle args then append last list
     unsigned apply_argc = 0;
-    for (unsigned i = 0; i < middle_count && i < 16; i++) {
+    for (unsigned i = 0; i < middle_count; i++) {
         vm_push(vm, middle_args[i]);
         apply_argc++;
+    }
+
+    // Free heap allocation if used
+    if (middle_args_heap) {
+        free(middle_args_heap);
     }
 
     // Append the last list's elements

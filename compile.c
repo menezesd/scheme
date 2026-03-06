@@ -206,7 +206,16 @@ static bool is_foldable_primitive(int64_t prim_id)
 static compile_ctx *cctx_new(compile_ctx *parent, unsigned env)
 {
     compile_ctx *cctx = calloc(1, sizeof(compile_ctx));
+    if (!cctx) {
+        show_error("compile: out of memory allocating context");
+        return NULL;
+    }
     cctx->code = code_new();
+    if (!cctx->code) {
+        free(cctx);
+        show_error("compile: out of memory allocating code object");
+        return NULL;
+    }
     cctx->parent = parent;
     cctx->env = env;
     cctx->tail_position = false;
@@ -1149,27 +1158,42 @@ static compile_result compile_let(unsigned expr, compile_ctx *cctx)
     unsigned bindings = cadr(expr);
     unsigned body = cddr(expr);
 
-    // Compile all values first (in current environment)
+    // Count bindings
     unsigned count = 0;
+    FORLIST(b, bindings) { count++; }
+
+    // Compile all values first (in current environment)
     cctx->tail_position = false;
     FORLIST(b, bindings)
     {
         compile_expr_internal(cadr(car(b)), cctx);
-        count++;
     }
 
     // Push new environment frame
     emit(cctx, OP_PUSHENV);
 
+    // Dynamically allocate variable array
+    unsigned *vars = NULL;
+    if (count > 0) {
+        vars = malloc(count * sizeof(unsigned));
+        if (!vars) {
+            show_error("let: out of memory for bindings");
+            emit(cctx, OP_HALT);
+            return dynamic_result();
+        }
+    }
+
     // Collect variables
-    unsigned vars[256];
     unsigned i = 0;
     FORLIST(b, bindings) { vars[i++] = CELL_ID(car(car(b))); }
 
     // Define in reverse (pop from stack)
-    for (int j = count - 1; j >= 0; j--) {
+    for (int j = (int)count - 1; j >= 0; j--) {
         emit2(cctx, OP_DEFINE, vars[j]);
     }
+
+    // Free the variable array
+    free(vars);
 
     // Extend compile-time environment for body compilation
     unsigned saved_env = cctx->env;
@@ -1323,11 +1347,20 @@ static compile_result compile_and(unsigned expr, compile_ctx *cctx)
         return const_result(ctx.atom_true);
     }
 
+    // Count expressions
+    unsigned expr_count = 0;
+    FORLIST(a, args) { expr_count++; }
+
     bool tail = cctx->tail_position;
     unsigned saved_pos = cctx->code->code_len;
 
-    // Compile each expression with short-circuit folding
-    unsigned false_jumps[256];
+    // Dynamically allocate jump array
+    unsigned *false_jumps = malloc(expr_count * sizeof(unsigned));
+    if (!false_jumps) {
+        show_error("and: out of memory");
+        emit(cctx, OP_HALT);
+        return dynamic_result();
+    }
     unsigned jump_count = 0;
 
     while (args) {
@@ -1343,6 +1376,7 @@ static compile_result compile_and(unsigned expr, compile_ctx *cctx)
                 cctx->code->code_len = saved_pos;
                 emit2(cctx, OP_CONST,
                       code_add_const(cctx->code, ctx.atom_false));
+                free(false_jumps);
                 return const_result(ctx.atom_false);
             }
             // Constant truthy - can skip this expression if not last
@@ -1370,6 +1404,7 @@ static compile_result compile_and(unsigned expr, compile_ctx *cctx)
         patch_jump(cctx, false_jumps[i]);
     }
 
+    free(false_jumps);
     return dynamic_result();
 }
 
@@ -1384,11 +1419,20 @@ static compile_result compile_or(unsigned expr, compile_ctx *cctx)
         return const_result(ctx.atom_false);
     }
 
+    // Count expressions
+    unsigned expr_count = 0;
+    FORLIST(a, args) { expr_count++; }
+
     bool tail = cctx->tail_position;
     unsigned saved_pos = cctx->code->code_len;
 
-    // Compile each expression with short-circuit folding
-    unsigned true_jumps[256];
+    // Dynamically allocate jump array
+    unsigned *true_jumps = malloc(expr_count * sizeof(unsigned));
+    if (!true_jumps) {
+        show_error("or: out of memory");
+        emit(cctx, OP_HALT);
+        return dynamic_result();
+    }
     unsigned jump_count = 0;
 
     while (args) {
@@ -1403,6 +1447,7 @@ static compile_result compile_or(unsigned expr, compile_ctx *cctx)
                 // Constant truthy - short-circuit, rewind all bytecode
                 cctx->code->code_len = saved_pos;
                 emit2(cctx, OP_CONST, code_add_const(cctx->code, result.value));
+                free(true_jumps);
                 return const_result(result.value);
             }
             // Constant false - can skip this expression if not last
@@ -1430,6 +1475,7 @@ static compile_result compile_or(unsigned expr, compile_ctx *cctx)
         patch_jump(cctx, true_jumps[i]);
     }
 
+    free(true_jumps);
     return dynamic_result();
 }
 
@@ -1443,8 +1489,19 @@ static compile_result compile_cond(unsigned expr, compile_ctx *cctx)
         return const_result(0);
     }
 
+    // Count clauses
+    unsigned clause_count = 0;
+    FORLIST(c, clauses) { clause_count++; }
+
     bool tail = cctx->tail_position;
-    unsigned end_jumps[256];
+
+    // Dynamically allocate end jump array
+    unsigned *end_jumps = malloc(clause_count * sizeof(unsigned));
+    if (!end_jumps) {
+        show_error("cond: out of memory");
+        emit(cctx, OP_HALT);
+        return dynamic_result();
+    }
     unsigned end_count = 0;
     bool found_else = false;
 
@@ -1522,6 +1579,7 @@ static compile_result compile_cond(unsigned expr, compile_ctx *cctx)
         patch_jump(cctx, end_jumps[i]);
     }
 
+    free(end_jumps);
     return dynamic_result();
 }
 
@@ -2055,11 +2113,21 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
             // Push new environment frame
             emit(cctx, OP_PUSHENV);
 
+            // Dynamically allocate parameter ID array
+            unsigned *param_ids = NULL;
+            if (param_count > 0) {
+                param_ids = malloc(param_count * sizeof(unsigned));
+                if (!param_ids) {
+                    show_error("lambda: out of memory for parameters");
+                    emit(cctx, OP_HALT);
+                    return dynamic_result();
+                }
+            }
+
             // Collect parameter names (only if params is a list)
-            unsigned param_ids[256];
             unsigned i = 0;
             if (CELL_TYPE(lambda_params) == BT_CONS) {
-                for (unsigned p = lambda_params; p && i < 256; p = cdr(p)) {
+                for (unsigned p = lambda_params; p; p = cdr(p)) {
                     if (CELL_TYPE(p) == BT_ATOM)
                         break; // Stop at rest param
                     param_ids[i++] = CELL_ID(car(p));
@@ -2072,9 +2140,12 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
             }
 
             // Define fixed params in reverse order (pop from stack)
-            for (int j = param_count - 1; j >= 0; j--) {
+            for (int j = (int)param_count - 1; j >= 0; j--) {
                 emit2(cctx, OP_DEFINE, param_ids[j]);
             }
+
+            // Free the parameter ID array
+            free(param_ids);
 
             // Extend compile-time environment with params for body compilation
             unsigned saved_env = cctx->env;

@@ -172,7 +172,12 @@ unsigned setvar(int64_t var, unsigned aval, unsigned env)
         env = cdr(env);
     }
 
-    show_error("unbound variable: %s", ctx.atom_table[var]);
+    // Bounds check before accessing atom_table
+    if (var >= 0 && (unsigned)var < ctx.atom_table_cap && ctx.atom_table[var]) {
+        show_error("unbound variable: %s", ctx.atom_table[var]);
+    } else {
+        show_error("unbound variable: <invalid id %ld>", (long)var);
+    }
     return TOK_ERROR;
 }
 
@@ -243,7 +248,12 @@ unsigned lookup(int64_t var, unsigned env)
 {
     unsigned result = lookup_internal(var, env);
     if (result == TOK_ERROR) {
-        show_error("undefined variable: %s", ctx.atom_table[var]);
+        // Bounds check before accessing atom_table
+        if (var >= 0 && (unsigned)var < ctx.atom_table_cap && ctx.atom_table[var]) {
+            show_error("undefined variable: %s", ctx.atom_table[var]);
+        } else {
+            show_error("undefined variable: <invalid id %ld>", (long)var);
+        }
     }
     return result;
 }
