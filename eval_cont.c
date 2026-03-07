@@ -231,6 +231,11 @@ void handle_cont_let_vals(unsigned val, unsigned data, unsigned env,
     unsigned body = cdr(rest_and_body);
 
     unsigned v = list_last(vals);
+    if (!v) {
+        show_error("internal error: empty vals in let continuation");
+        tramp_error();
+        return;
+    }
     write_barrier(v, val); // v may be in old gen
     CELL_CAR(v) = val;
 

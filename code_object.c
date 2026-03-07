@@ -38,12 +38,33 @@ void code_register(code_object *code)
 code_object *code_new(void)
 {
     code_object *c = calloc(1, sizeof(code_object));
+    if (!c)
+        return NULL;
+
     c->code_cap = 64;
     c->code = malloc(c->code_cap * sizeof(unsigned));
+    if (!c->code) {
+        free(c);
+        return NULL;
+    }
+
     c->const_cap = 16;
     c->constants = malloc(c->const_cap * sizeof(unsigned));
+    if (!c->constants) {
+        free(c->code);
+        free(c);
+        return NULL;
+    }
+
     c->children_cap = 4;
     c->children = malloc(c->children_cap * sizeof(code_object *));
+    if (!c->children) {
+        free(c->constants);
+        free(c->code);
+        free(c);
+        return NULL;
+    }
+
     // Register with GC
     code_register(c);
     return c;

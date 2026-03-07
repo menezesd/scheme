@@ -272,6 +272,8 @@ static unsigned unwrap_protected(unsigned expr)
             return expr;
         }
 
+        // Protect expr across allocation - GC may move vectors
+        gc_protect(&expr);
         unsigned new_vec = make_vector(len, 0);
         gc_protect(&new_vec);
         for (unsigned i = 0; i < len; i++) {
@@ -280,6 +282,7 @@ static unsigned unwrap_protected(unsigned expr)
             unsigned *new_data = vector_data_ptr(new_vec);
             new_data[i] = unwrap_protected(data[i]);
         }
+        gc_unprotect(2);
         return new_vec;
     }
 
@@ -444,9 +447,13 @@ static unsigned rename_free_ids(unsigned tmpl, unsigned rename_map)
             // (set! var expr) -> (set! var renamed-expr)
             // (define var expr) -> (define var renamed-expr)
             if (head_id == ctx.kw_set || head_id == ctx.kw_define) {
+                // Validate that tmpl has at least (set!/define var)
+                if (!IS_PAIR(cdr(tmpl))) {
+                    return tmpl;  // Malformed, return as-is
+                }
                 unsigned var = cadr(tmpl);
                 unsigned expr = cddr(tmpl);
-                if (expr) {
+                if (expr && IS_PAIR(expr)) {
                     unsigned new_expr = rename_free_ids(car(expr), rename_map);
                     gc_protect(&new_expr);
                     return alloc_cons(head,
