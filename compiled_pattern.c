@@ -37,15 +37,32 @@ void pattern_register(compiled_pattern *pat)
 compiled_pattern *compiled_pattern_new(void)
 {
     compiled_pattern *pat = calloc(1, sizeof(compiled_pattern));
+    if (!pat)
+        return NULL;
 
     pat->code_cap = 32;
     pat->code = malloc(pat->code_cap * sizeof(pat_instruction));
+    if (!pat->code) {
+        free(pat);
+        return NULL;
+    }
 
     pat->const_cap = 8;
     pat->constants = malloc(pat->const_cap * sizeof(unsigned));
+    if (!pat->constants) {
+        free(pat->code);
+        free(pat);
+        return NULL;
+    }
 
     pat->var_cap = 8;
     pat->var_slots = malloc(pat->var_cap * sizeof(pat_var_slot));
+    if (!pat->var_slots) {
+        free(pat->constants);
+        free(pat->code);
+        free(pat);
+        return NULL;
+    }
 
     // Register with GC
     pattern_register(pat);
@@ -555,8 +572,8 @@ compiled_pattern *compile_pattern(unsigned pattern, unsigned literals,
 // Pattern Execution (Phase 3)
 // ============================================================================
 
-// Initialize match state
-static void init_match_state(pat_match_state *state, compiled_pattern *pat,
+// Initialize match state - returns false on allocation failure
+static bool init_match_state(pat_match_state *state, compiled_pattern *pat,
                              unsigned input)
 {
     memset(state, 0, sizeof(*state));
@@ -568,6 +585,8 @@ static void init_match_state(pat_match_state *state, compiled_pattern *pat,
     // Input stack
     state->input_cap = 32;
     state->input_stack = malloc(state->input_cap * sizeof(unsigned));
+    if (!state->input_stack)
+        return false;
     state->input_sp = 0;
 
     // Bindings
@@ -575,12 +594,27 @@ static void init_match_state(pat_match_state *state, compiled_pattern *pat,
         state->bindings = calloc(pat->var_count, sizeof(unsigned));
         state->ellipsis_lists = calloc(pat->var_count, sizeof(unsigned));
         state->ellipsis_tails = calloc(pat->var_count, sizeof(unsigned));
+        if (!state->bindings || !state->ellipsis_lists || !state->ellipsis_tails) {
+            free(state->input_stack);
+            free(state->bindings);
+            free(state->ellipsis_lists);
+            free(state->ellipsis_tails);
+            return false;
+        }
     }
 
     // Choice points
     state->choice_cap = 16;
     state->choices = malloc(state->choice_cap * sizeof(pat_choice_point));
+    if (!state->choices) {
+        free(state->input_stack);
+        free(state->bindings);
+        free(state->ellipsis_lists);
+        free(state->ellipsis_tails);
+        return false;
+    }
     state->choice_sp = 0;
+    return true;
 }
 
 // Cleanup match state
@@ -680,7 +714,10 @@ static unsigned build_bindings_alist(pat_match_state *state)
 unsigned execute_pattern(compiled_pattern *pat, unsigned input)
 {
     pat_match_state state;
-    init_match_state(&state, pat, input);
+    if (!init_match_state(&state, pat, input)) {
+        show_error("pattern match: out of memory");
+        return TOK_ERROR;
+    }
 
     // Protect input and state bindings from GC
     gc_protect(&input);
@@ -713,6 +750,12 @@ unsigned execute_pattern(compiled_pattern *pat, unsigned input)
             break;
 
         case PAT_INPUT_VECREF:
+            if (!IS_VECTOR(state.input) ||
+                instr->operand >= vector_len(state.input)) {
+                if (!backtrack(&state))
+                    failed = true;
+                break;
+            }
             push_input(&state, state.input);
             state.input = vector_data_ptr(state.input)[instr->operand];
             break;
@@ -843,6 +886,12 @@ unsigned execute_pattern(compiled_pattern *pat, unsigned input)
             unsigned pre_count = instr->operand & 0xFFFF;
             unsigned post_count = instr->operand >> 16;
             unsigned len = vector_len(state.input);
+            // Validate bounds to prevent underflow
+            if (pre_count + post_count > len) {
+                if (!backtrack(&state))
+                    failed = true;
+                break;
+            }
             state.vec_iter_vec = state.input;
             state.vec_iter_pre = pre_count;
             state.vec_iter_count = len - pre_count - post_count;
@@ -859,19 +908,38 @@ unsigned execute_pattern(compiled_pattern *pat, unsigned input)
             }
             break;
 
-        case PAT_INPUT_VEC_ITER:
+        case PAT_INPUT_VEC_ITER: {
             // Access current ellipsis iteration element
+            // idx is incremented before access, so ranges from 1 to vec_iter_count
+            unsigned idx = state.vec_iter_pre + state.vec_iter_idx - 1;
+            if (state.vec_iter_idx == 0 ||
+                idx >= vector_len(state.vec_iter_vec)) {
+                if (!backtrack(&state))
+                    failed = true;
+                break;
+            }
             push_input(&state, state.input);
-            state.input = vector_data_ptr(state.vec_iter_vec)
-                [state.vec_iter_pre + state.vec_iter_idx - 1];
+            state.input = vector_data_ptr(state.vec_iter_vec)[idx];
             break;
+        }
 
-        case PAT_INPUT_VECREF_END:
+        case PAT_INPUT_VECREF_END: {
             // Access element from end of vector (operand = offset from end)
+            if (!IS_VECTOR(state.input)) {
+                if (!backtrack(&state))
+                    failed = true;
+                break;
+            }
+            unsigned len = vector_len(state.input);
+            if (instr->operand >= len) {
+                if (!backtrack(&state))
+                    failed = true;
+                break;
+            }
             push_input(&state, state.input);
-            state.input = vector_data_ptr(state.input)
-                [vector_len(state.input) - 1 - instr->operand];
+            state.input = vector_data_ptr(state.input)[len - 1 - instr->operand];
             break;
+        }
 
         default:
             failed = true;

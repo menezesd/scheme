@@ -46,6 +46,7 @@ unsigned prim_append(unsigned argc, unsigned *argv)
     }
 
     unsigned last = argv[argc - 1];
+    gc_protect(&last);
     if (tail) {
         write_barrier(tail, last);
         CELL_CDR(tail) = last;

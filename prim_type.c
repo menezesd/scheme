@@ -63,10 +63,20 @@ unsigned apply_type_predicate(unsigned prim_id, unsigned argc,
         return (IS_FALSE(arg) || arg == ctx.atom_true) ? ctx.atom_true
                                                        : ctx.atom_false;
     case PLISTP: {
-        unsigned x = arg;
-        while (IS_PAIR(x))
-            x = cdr(x);
-        return IS_NIL(x) ? ctx.atom_true : ctx.atom_false;
+        // Use Floyd's cycle detection (tortoise and hare) to handle cycles
+        unsigned slow = arg;
+        unsigned fast = arg;
+        while (IS_PAIR(fast)) {
+            fast = cdr(fast);
+            if (!IS_PAIR(fast))
+                break;
+            fast = cdr(fast);
+            slow = cdr(slow);
+            // Cycle detected - not a proper list
+            if (slow == fast)
+                return ctx.atom_false;
+        }
+        return IS_NIL(fast) ? ctx.atom_true : ctx.atom_false;
     }
     default:
         return TOK_ERROR;
