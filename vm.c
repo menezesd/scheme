@@ -348,8 +348,14 @@ static void restore_continuation(vm_state *vm, unsigned cont_cell,
 
     // Restore stack (with return value on top)
     if (vm->stack_cap < cont->sp + 1) {
-        vm->stack_cap = cont->sp + 1;
-        vm->stack = realloc(vm->stack, vm->stack_cap * sizeof(unsigned));
+        unsigned new_cap = cont->sp + 1;
+        unsigned *new_stack = realloc(vm->stack, new_cap * sizeof(unsigned));
+        if (!new_stack) {
+            VM_ERROR(vm, "restore_continuation: stack realloc failed");
+            return;
+        }
+        vm->stack = new_stack;
+        vm->stack_cap = new_cap;
     }
     memcpy(vm->stack, cont->stack, cont->sp * sizeof(unsigned));
     vm->sp = cont->sp;
@@ -357,8 +363,14 @@ static void restore_continuation(vm_state *vm, unsigned cont_cell,
 
     // Restore frames
     if (vm->frames_cap < cont->fp) {
-        vm->frames_cap = cont->fp;
-        vm->frames = realloc(vm->frames, vm->frames_cap * sizeof(vm_frame));
+        unsigned new_cap = cont->fp;
+        vm_frame *new_frames = realloc(vm->frames, new_cap * sizeof(vm_frame));
+        if (!new_frames) {
+            VM_ERROR(vm, "restore_continuation: frames realloc failed");
+            return;
+        }
+        vm->frames = new_frames;
+        vm->frames_cap = new_cap;
     }
     memcpy(vm->frames, cont->frames, cont->fp * sizeof(vm_frame));
     vm->fp = cont->fp;

@@ -242,7 +242,7 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned argc,
             // Use repeated squaring with exact arithmetic
             // result = base^|exp|, then invert if exp < 0
             bool neg_exp = exp_val < 0;
-            uint64_t e = neg_exp ? (uint64_t)(-exp_val) : (uint64_t)exp_val;
+            uint64_t e = neg_exp ? -(uint64_t)exp_val : (uint64_t)exp_val;
 
             GC_GUARD;
             unsigned result = store(1);

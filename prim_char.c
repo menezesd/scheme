@@ -43,6 +43,10 @@ unsigned apply_char_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
             int64_t code;
             if (!expect_exact_int64(argv[0], &code, "integer->char"))
                 return TOK_ERROR;
+            if (code < 0 || code > 0x10FFFF) {
+                show_error("integer->char: code point out of range");
+                return TOK_ERROR;
+            }
             return make_char((int)code);
         }
     case PCHARUP:

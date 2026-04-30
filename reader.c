@@ -221,7 +221,7 @@ static unsigned read_character_literal(void)
         char buf[CHAR_NAME_BUF_SIZE];
         buf[0] = c;
         int i = 1;
-        int c2;
+        int c2 = EOF;
         while (i < CHAR_NAME_BUF_SIZE - 1 && isalpha(c2 = reader_getchar())) {
             buf[i++] = c2;
         }
@@ -229,14 +229,16 @@ static unsigned read_character_literal(void)
 
         if (i > 1) {
             // Multi-character name - look it up
-            reader_ungetc(c2);
+            if (c2 != EOF)
+                reader_ungetc(c2);
             int char_val = lookup_char_name(buf);
             if (char_val >= 0) {
                 return make_char(char_val);
             }
             // Unknown character name - just use first character
         } else {
-            reader_ungetc(c2);
+            if (c2 != EOF)
+                reader_ungetc(c2);
         }
     }
 

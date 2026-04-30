@@ -341,6 +341,8 @@ static char *bn_to_string_dc(const bignum *a, size_t num_digits)
     char *hi_str;
     if (bn_is_zero(hi)) {
         hi_str = malloc(1);
+        if (!hi_str)
+            return NULL;
         hi_str[0] = '\0';
     } else {
         hi_str = bn_to_string_dc(hi, hi_digits);
@@ -356,6 +358,11 @@ static char *bn_to_string_dc(const bignum *a, size_t num_digits)
     size_t pad = (lo_len < split) ? split - lo_len : 0;
 
     char *result = malloc(hi_len + pad + lo_len + 1);
+    if (!result) {
+        free(hi_str);
+        free(lo_str);
+        return NULL;
+    }
     memcpy(result, hi_str, hi_len);
     memset(result + hi_len, '0', pad);
     memcpy(result + hi_len + pad, lo_str, lo_len + 1);
@@ -373,6 +380,8 @@ char *bn_to_string(const bignum *a, int base)
 
     if (a->len == 0) {
         char *s = malloc(2);
+        if (!s)
+            return NULL;
         s[0] = '0';
         s[1] = '\0';
         return s;

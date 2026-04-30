@@ -90,8 +90,13 @@ void code_free(code_object *code)
 void code_emit(code_object *code, unsigned instr)
 {
     if (code->code_len >= code->code_cap) {
-        code->code_cap *= 2;
-        code->code = realloc(code->code, code->code_cap * sizeof(unsigned));
+        unsigned new_cap = code->code_cap * 2;
+        unsigned *new_code = realloc(code->code, new_cap * sizeof(unsigned));
+        if (!new_code) {
+            lisp_panic("code_emit: realloc failed");
+        }
+        code->code = new_code;
+        code->code_cap = new_cap;
     }
     code->code[code->code_len++] = instr;
 }
@@ -104,9 +109,13 @@ unsigned code_add_const(code_object *code, unsigned val)
             return i;
     }
     if (code->const_len >= code->const_cap) {
-        code->const_cap *= 2;
-        code->constants =
-            realloc(code->constants, code->const_cap * sizeof(unsigned));
+        unsigned new_cap = code->const_cap * 2;
+        unsigned *new_consts = realloc(code->constants, new_cap * sizeof(unsigned));
+        if (!new_consts) {
+            lisp_panic("code_add_const: realloc failed");
+        }
+        code->constants = new_consts;
+        code->const_cap = new_cap;
     }
     code->constants[code->const_len] = val;
     return code->const_len++;
@@ -115,9 +124,14 @@ unsigned code_add_const(code_object *code, unsigned val)
 unsigned code_add_child(code_object *code, code_object *child)
 {
     if (code->children_len >= code->children_cap) {
-        code->children_cap *= 2;
-        code->children =
-            realloc(code->children, code->children_cap * sizeof(code_object *));
+        unsigned new_cap = code->children_cap * 2;
+        code_object **new_children =
+            realloc(code->children, new_cap * sizeof(code_object *));
+        if (!new_children) {
+            lisp_panic("code_add_child: realloc failed");
+        }
+        code->children = new_children;
+        code->children_cap = new_cap;
     }
     code->children[code->children_len] = child;
     return code->children_len++;

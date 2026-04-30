@@ -1546,10 +1546,10 @@ static unsigned collect_to_old(unsigned x)
 
     case BT_STRING: {
         // Copy string cell to old gen
-        unsigned xx = ctx.hptr++;
         if (ctx.hptr >= ctx.nursery_start) {
             lisp_panic("old generation full during minor GC");
         }
+        unsigned xx = ctx.hptr++;
         CELL_TYPE(xx) = BT_STRING;
         CELL_ID(xx) = CELL_ID(x);
         CELL_TYPE(x) = BT_BROKENHEART;
@@ -1558,10 +1558,10 @@ static unsigned collect_to_old(unsigned x)
     }
 
     case BT_BIGNUM: {
-        unsigned xx = ctx.hptr++;
         if (ctx.hptr >= ctx.nursery_start) {
             lisp_panic("old generation full during minor GC");
         }
+        unsigned xx = ctx.hptr++;
         CELL_TYPE(xx) = BT_BIGNUM;
         CELL_ID(xx) = CELL_ID(x);
         CELL_TYPE(x) = BT_BROKENHEART;
@@ -1570,10 +1570,10 @@ static unsigned collect_to_old(unsigned x)
     }
 
     case BT_VECTOR: {
-        unsigned xx = ctx.hptr++;
         if (ctx.hptr >= ctx.nursery_start) {
             lisp_panic("old generation full during minor GC");
         }
+        unsigned xx = ctx.hptr++;
         CELL_TYPE(xx) = BT_VECTOR;
         CELL_PTR(xx) = CELL_PTR(x);
         CELL_TYPE(x) = BT_BROKENHEART;
@@ -1588,10 +1588,10 @@ static unsigned collect_to_old(unsigned x)
 
     case BT_STRINPORT:
     case BT_STROUTPORT: {
-        unsigned xx = ctx.hptr++;
         if (ctx.hptr >= ctx.nursery_start) {
             lisp_panic("old generation full during minor GC");
         }
+        unsigned xx = ctx.hptr++;
         CELL_TYPE(xx) = CELL_TYPE(x);
         CELL_PTR(xx) = CELL_PTR(x);
         CELL_TYPE(x) = BT_BROKENHEART;
@@ -1601,10 +1601,10 @@ static unsigned collect_to_old(unsigned x)
 
     case BT_VMCONT: {
         // VM continuation contains cell references that must be updated.
-        unsigned xx = ctx.hptr++;
         if (ctx.hptr >= ctx.nursery_start) {
             lisp_panic("old generation full during minor GC");
         }
+        unsigned xx = ctx.hptr++;
         CELL_TYPE(xx) = BT_VMCONT;
         CELL_PTR(xx) = CELL_PTR(x);
         CELL_TYPE(x) = BT_BROKENHEART;
@@ -1622,10 +1622,10 @@ static unsigned collect_to_old(unsigned x)
     }
 
     default: {
-        unsigned xx = ctx.hptr++;
         if (ctx.hptr >= ctx.nursery_start) {
             lisp_panic("old generation full during minor GC");
         }
+        unsigned xx = ctx.hptr++;
         ctx.cons_cells[xx] = ctx.cons_cells[x];
         CELL_TYPE(x) = BT_BROKENHEART;
         CELL_CAR(x) = xx;

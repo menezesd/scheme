@@ -1655,6 +1655,12 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
 
                 FORLIST(a, args)
                 {
+                    if (i >= 256) {
+                        all_const = false;
+                        compile_expr_internal(car(a), cctx);
+                        i++;
+                        continue;
+                    }
                     arg_results[i] = compile_expr_internal(car(a), cctx);
                     if (!arg_results[i].is_const)
                         all_const = false;
