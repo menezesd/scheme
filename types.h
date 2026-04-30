@@ -545,6 +545,32 @@ const char *reader_get_filename(void);
 #define FORLIST(node, list) for (unsigned node = (list); node; node = cdr(node))
 
 // ============================================================================
+// Fixnum Tagging (for unboxed integers on the VM stack)
+// ============================================================================
+//
+// Bit 31 of an unsigned value is used as a fixnum tag. Since the maximum
+// cell index is 2*SEMISPACE_SIZE (~33M, 25 bits), bit 31 is always zero
+// for valid cell indices. This lets us store small integers directly on
+// the VM stack without allocating heap cells.
+//
+// Encoding: MAKE_FIXNUM(v) = (v & 0x7FFFFFFF) | 0x80000000
+// Range: -2^30 to 2^30-1 (±1,073,741,824)
+
+#define FIXNUM_TAG     0x80000000u
+#define FIXNUM_MIN     (-1073741824)     // -(1 << 30)
+#define FIXNUM_MAX     1073741823        // (1 << 30) - 1
+#define IS_FIXNUM(v)   ((v) & FIXNUM_TAG)
+#define MAKE_FIXNUM(v) ((unsigned)((int32_t)(v) & 0x7FFFFFFF) | FIXNUM_TAG)
+#define FITS_FIXNUM(v) ((v) >= FIXNUM_MIN && (v) <= FIXNUM_MAX)
+
+// Extract signed integer from fixnum (portable sign extension from bit 30)
+static inline int32_t FIXNUM_VALUE(unsigned v)
+{
+    int32_t raw = (int32_t)(v & 0x7FFFFFFF);
+    return (raw ^ 0x40000000) - 0x40000000;
+}
+
+// ============================================================================
 // Cell Accessor Macros
 // ============================================================================
 

@@ -129,6 +129,19 @@ unsigned store_integer(bignum *bn);
 void free_bignum_cell(unsigned x);
 
 // ============================================================================
+// Fixnum Boxing
+// ============================================================================
+
+// Convert a fixnum-tagged value back to a heap cell. If already a cell index,
+// returns it unchanged. Used at VM boundaries where cell indices are required.
+static inline unsigned ensure_boxed(unsigned val)
+{
+    if (IS_FIXNUM(val))
+        return store((int64_t)FIXNUM_VALUE(val));
+    return val;
+}
+
+// ============================================================================
 // Type Constructors
 // ============================================================================
 

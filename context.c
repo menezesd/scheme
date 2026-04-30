@@ -1227,6 +1227,9 @@ unsigned collect(unsigned x)
     // Reserved cells (< HEAP_RESERVED) are permanent and never collected
     if (x < HEAP_RESERVED)
         return x;
+    // Fixnums are immediate values, not heap pointers
+    if (IS_FIXNUM(x))
+        return x;
 
     // Check if cell is already in the to-space (doesn't need collection)
     // During GC, we're copying FROM ctx.nmin side TO ctx.hptr side
@@ -1528,6 +1531,9 @@ static unsigned collect_to_old(unsigned x)
 {
     // Reserved cells don't need collection
     if (x < HEAP_RESERVED)
+        return x;
+    // Fixnums are immediate values, not heap pointers
+    if (IS_FIXNUM(x))
         return x;
     // Not in nursery (in old gen)
     if (x < ctx.nursery_start)
