@@ -1037,15 +1037,9 @@ static compile_result compile_lambda(unsigned expr, compile_ctx *cctx)
     lambda_cctx->code->arity = arity;
     lambda_cctx->code->has_rest = has_rest;
 
-    // Stack locals: disabled — RETURN sp restoration needs redesign
-    // The issue: RETURN uses frame.bp as restore_sp, but this value
-    // must be correct for BOTH locals and non-locals functions in
-    // mixed call chains. Currently the bp semantics differ between paths.
-    // Stack locals: disabled — needs stack layout redesign for recursive calls.
-    // The issue: RETURN_LOCALS restores sp=callee_bp, but intermediate results
-    // from the caller (pushed between caller's locals and callee's entry)
-    // get their positions confused. Needs callee to save/restore caller's sp
-    // in the frame, not just bp.
+    // Stack locals: keep params on VM stack for direct access (LOCAL_GET)
+    // instead of in environment frames. Only for fixed-arity functions where
+    // no parameter is captured by an inner closure.
     if (!has_rest && arity > 0 && arity <= 8) {
         bool can_use_locals = true;
         unsigned slot = 0;
@@ -1828,12 +1822,12 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
                     }
                     gc_unprotect(1);
 
-                    // Evaluate primitive at compile time
-                    // Redirect stderr to suppress error messages from failed folds
+                    // Evaluate primitive at compile time (suppress error output)
+                    static FILE *devnull = NULL;
+                    if (!devnull) devnull = fopen("/dev/null", "w");
                     FILE *saved_stderr = stderr;
-                    stderr = fopen("/dev/null", "w");
+                    if (devnull) stderr = devnull;
                     unsigned result = apply_primitive(prim_id, arg_vals);
-                    fclose(stderr);
                     stderr = saved_stderr;
                     ctx.last_error[0] = '\0';
                     if (result != TOK_ERROR) {

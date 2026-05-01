@@ -621,9 +621,7 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
         // For tail calls: if the CURRENT function uses locals, clean them up
         // by shifting args down to overwrite the old locals
         if (tail && vm->fp > 0 && vm->code->use_locals) {
-            unsigned old_locals_count = vm->code->arity;
-            // Args are at [sp-argc..sp-1], old locals at [bp..bp+old_count-1]
-            // Shift args down to bp position
+            // Shift new args down to overwrite old locals at bp
             for (unsigned i = 0; i < argc; i++)
                 vm->stack[vm->bp + i] = vm->stack[vm->sp - argc + i];
             vm->sp = vm->bp + argc;
