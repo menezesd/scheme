@@ -520,6 +520,11 @@ enum primitive_id {
     PWRITETOSTRING,
     // list-ref
     PLISTREF,
+    // Binary I/O
+    POPENBINARYINPUT,
+    PREADBYTEVEC,
+    // File system
+    PFILEEXISTS,
     PRIM_COUNT // Total number of primitives
 };
 

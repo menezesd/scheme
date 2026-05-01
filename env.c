@@ -534,6 +534,11 @@ static const struct {
     {"command-line", PCOMMANDLINE},
     {"write-to-string", PWRITETOSTRING},
     {"list-ref", PLISTREF},
+    // Binary I/O
+    {"open-binary-input-file", POPENBINARYINPUT},
+    {"read-bytevector", PREADBYTEVEC},
+    // File system
+    {"file-exists?", PFILEEXISTS},
 
     // Control
     {"apply", PAPPLY},

@@ -259,6 +259,10 @@ static unsigned eval_callback(unsigned expr, unsigned env)
 // Main Entry Point
 // ============================================================================
 
+// Store command line for (command-line) primitive
+int saved_argc = 0;
+char **saved_argv = NULL;
+
 static void print_usage(const char *prog)
 {
     fprintf(stderr, "Usage: %s [options] [file.scm]\n", prog);
@@ -270,6 +274,9 @@ static void print_usage(const char *prog)
 
 int main(int argc, char **argv)
 {
+    saved_argc = argc;
+    saved_argv = argv;
+
     // Parse command line options
     int file_arg = 0;
     for (int i = 1; i < argc; i++) {
@@ -279,6 +286,9 @@ int main(int argc, char **argv)
                    strcmp(argv[i], "-h") == 0) {
             print_usage(argv[0]);
             return 0;
+        } else if (strcmp(argv[i], "--") == 0) {
+            // Stop processing options; remaining args are for the script
+            break;
         } else if (argv[i][0] == '-') {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
             print_usage(argv[0]);

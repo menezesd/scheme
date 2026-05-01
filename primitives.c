@@ -23,6 +23,10 @@
 #include "prim_internal.h"
 #include <time.h>
 
+// Command line args (set by main.c, defaults for test binaries)
+int saved_argc __attribute__((weak)) = 0;
+char **saved_argv __attribute__((weak)) = NULL;
+
 // ============================================================================
 // Main Dispatch Function
 // ============================================================================
@@ -888,8 +892,18 @@ unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
     // ========================================================================
     case PCOMMANDLINE: {
         REQUIRE_ARGC(argc, 0, 0, "command-line");
-        // Return empty list (no args in embedded mode)
-        return alloc_cons(make_string_copy("vesper"), 0);
+        extern int saved_argc;
+        extern char **saved_argv;
+        unsigned result = 0;
+        gc_protect(&result);
+        for (int i = saved_argc - 1; i >= 0; i--) {
+            unsigned s = make_string_copy(saved_argv[i]);
+            gc_protect(&s);
+            result = alloc_cons(s, result);
+            gc_unprotect(1);
+        }
+        gc_unprotect(1);
+        return result;
     }
     case PWRITETOSTRING: {
         REQUIRE_ARGC(argc, 1, 1, "write-to-string");
@@ -919,6 +933,59 @@ unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
             show_error("list-ref: index out of bounds"); return TOK_ERROR;
         }
         return car(lst);
+    }
+
+    // ========================================================================
+    // Binary I/O
+    // ========================================================================
+    case POPENBINARYINPUT: {
+        REQUIRE_ARGC(argc, 1, 1, "open-binary-input-file");
+        CHECK_STRING(argv[0], "open-binary-input-file");
+        const char *fname = GET_STRING_PTR(argv[0]);
+        FILE *f = fopen(fname, "rb");
+        if (!f) {
+            show_error("open-binary-input-file: cannot open %s", fname);
+            return TOK_ERROR;
+        }
+        unsigned cell = alloc();
+        CELL_TYPE(cell) = BT_INPORT;
+        CELL_PTR(cell) = f;
+        return cell;
+    }
+    case PREADBYTEVEC: {
+        REQUIRE_ARGC(argc, 2, 2, "read-bytevector");
+        int64_t count;
+        if (!expect_nonneg_int64(argv[0], &count, "read-bytevector"))
+            return TOK_ERROR;
+        if (!IS_INPORT(argv[1])) {
+            show_error("read-bytevector: not an input port");
+            return TOK_ERROR;
+        }
+        FILE *f = GET_PORT_PTR(argv[1]);
+        uint8_t *buf = malloc((size_t)count);
+        if (!buf) { show_error("read-bytevector: out of memory"); return TOK_ERROR; }
+        size_t n = fread(buf, 1, (size_t)count, f);
+        if (n == 0) {
+            free(buf);
+            // Return eof-object
+            return atom_from_string("eof-object");
+        }
+        bytevec_data *bv = malloc(sizeof(bytevec_data) + n);
+        if (!bv) { free(buf); return TOK_ERROR; }
+        bv->len = (unsigned)n;
+        memcpy(bv->data, buf, n);
+        free(buf);
+        unsigned cell = alloc();
+        CELL_TYPE(cell) = BT_BYTEVEC;
+        CELL_PTR(cell) = bv;
+        return cell;
+    }
+    case PFILEEXISTS: {
+        REQUIRE_ARGC(argc, 1, 1, "file-exists?");
+        CHECK_STRING(argv[0], "file-exists?");
+        FILE *f = fopen(GET_STRING_PTR(argv[0]), "r");
+        if (f) { fclose(f); return ctx.atom_true; }
+        return ctx.atom_false;
     }
 
     default:
