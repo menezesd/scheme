@@ -1832,7 +1832,13 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
                     gc_unprotect(1);
 
                     // Evaluate primitive at compile time
+                    // Redirect stderr to suppress error messages from failed folds
+                    FILE *saved_stderr = stderr;
+                    stderr = fopen("/dev/null", "w");
                     unsigned result = apply_primitive(prim_id, arg_vals);
+                    fclose(stderr);
+                    stderr = saved_stderr;
+                    ctx.last_error[0] = '\0';
                     if (result != TOK_ERROR) {
                         // Success! Emit as constant
                         emit2(cctx, OP_CONST,
