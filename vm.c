@@ -615,25 +615,30 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
             return;
         }
 
+        // For tail calls: if the CURRENT function uses locals, clean them up
+        // by shifting args down to overwrite the old locals
+        if (tail && vm->fp > 0 && vm->code->use_locals) {
+            unsigned old_locals_count = vm->code->arity;
+            // Args are at [sp-argc..sp-1], old locals at [bp..bp+old_count-1]
+            // Shift args down to bp position
+            for (unsigned i = 0; i < argc; i++)
+                vm->stack[vm->bp + i] = vm->stack[vm->sp - argc + i];
+            vm->sp = vm->bp + argc;
+        }
+
         if (code->use_locals && !code->has_rest) {
             // Stack locals path: args stay on stack, no env frame needed
-            // Args are already on the stack at [sp-argc ... sp-1]
             unsigned new_bp = vm->sp - argc;
 
             if (tail && vm->fp > 0) {
-                // Tail call with locals: copy args to caller's bp area
-                // This reuses the same stack slots
-                if (new_bp != vm->bp) {
-                    for (unsigned i = 0; i < argc; i++)
-                        vm->stack[vm->bp + i] = vm->stack[new_bp + i];
-                    vm->sp = vm->bp + argc;
-                }
+                // Tail call to locals fn: args already at bp after shift above
+                vm->bp = new_bp;
                 vm->code = code;
                 vm->ip = 0;
                 vm->env = closure_env;
             } else {
-                // Regular call: push frame, set bp
-                push_frame(vm, vm->code, vm->ip, vm->bp, vm->env);
+                // Regular call: push frame
+                push_frame(vm, vm->code, vm->ip, new_bp, vm->env);
                 vm->bp = new_bp;
                 vm->code = code;
                 vm->ip = 0;
@@ -672,6 +677,9 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
             }
 
             if (tail && vm->fp > 0) {
+                // If caller used locals, those are still on the stack
+                // above the saved frame. They need to be cleaned up.
+                // (The frame.bp points to before the caller's locals)
                 vm->code = code;
                 vm->ip = 0;
                 vm->env = new_env;
@@ -941,6 +949,22 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             break;
         }
 
+        case OP_RETURN_LOCALS: {
+            vm->ip++; // skip operand (not needed — bp tracks locals)
+            unsigned val = vm_pop(vm);
+            if (vm->fp == 0) {
+                vm->sp = vm->bp; // remove locals
+                vm_push(vm, val);
+                vm->running = false;
+            } else {
+                unsigned callee_bp = vm->bp;
+                pop_frame(vm); // restores caller's bp
+                vm->sp = callee_bp; // remove callee's locals + any temps
+                vm_push(vm, val);
+            }
+            break;
+        }
+
         // Stack locals — direct access without environment lookup
         case OP_LOCAL_GET: {
             unsigned slot = vm->code->code[vm->ip++];
@@ -1013,13 +1037,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 vm_push(vm, val);
                 vm->running = false;
             } else {
-                // Save callee's bp before restoring caller's frame
-                unsigned callee_bp = vm->bp;
-                bool callee_had_locals = vm->code->use_locals;
                 pop_frame(vm); // restores code, ip, bp, env
-                // Clean up callee's locals from the stack
-                if (callee_had_locals && vm->sp > callee_bp)
-                    vm->sp = callee_bp;
                 vm_push(vm, val);
             }
             break;

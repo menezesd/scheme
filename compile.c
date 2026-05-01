@@ -1030,12 +1030,39 @@ static compile_result compile_lambda(unsigned expr, compile_ctx *cctx)
     lambda_cctx->code->arity = arity;
     lambda_cctx->code->has_rest = has_rest;
 
-    // Stack locals: disabled pending stack layout redesign
-    // TODO: enable after fixing RETURN sp restoration for mixed local/non-local calls
+    // Stack locals: disabled — RETURN sp restoration needs redesign
+    // The issue: RETURN uses frame.bp as restore_sp, but this value
+    // must be correct for BOTH locals and non-locals functions in
+    // mixed call chains. Currently the bp semantics differ between paths.
+    // Stack locals: disabled — needs stack layout redesign for recursive calls.
+    // The issue: RETURN_LOCALS restores sp=callee_bp, but intermediate results
+    // from the caller (pushed between caller's locals and callee's entry)
+    // get their positions confused. Needs callee to save/restore caller's sp
+    // in the frame, not just bp.
+    if (0 && !has_rest && arity > 0 && arity <= 8) {
+        bool can_use_locals = true;
+        unsigned slot = 0;
+        for (unsigned p = params; p && IS_PAIR(p); p = cdr(p), slot++) {
+            int64_t pid = CELL_ID(car(p));
+            if (captured_by_inner_lambda(body, pid)) {
+                can_use_locals = false;
+                break;
+            }
+            lambda_cctx->local_ids[slot] = pid;
+        }
+        if (can_use_locals) {
+            lambda_cctx->num_locals = (int)arity;
+            lambda_cctx->code->use_locals = true;
+        }
+    }
 
     // Compile body
     compile_begin(body, lambda_cctx);
-    emit(lambda_cctx, OP_RETURN);
+    if (lambda_cctx->code->use_locals) {
+        emit2(lambda_cctx, OP_RETURN_LOCALS, lambda_cctx->num_locals);
+    } else {
+        emit(lambda_cctx, OP_RETURN);
+    }
 
     // Add child code object
     unsigned child_idx = code_add_child(cctx->code, lambda_cctx->code);

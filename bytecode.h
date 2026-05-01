@@ -172,6 +172,9 @@ enum opcode {
     OP_LE_JUMPIFNOT,     // pop b,a, jump if !(a<=b)
     OP_GE_JUMPIFNOT,     // pop b,a, jump if !(a>=b)
 
+    // Return from function with stack locals (cleans up N local slots)
+    OP_RETURN_LOCALS, // RETURN_LOCALS n: pop val, remove n locals, push val
+
     // Stack locals — direct access to function parameters on the stack
     OP_LOCAL_GET,    // Push stack[bp + operand]: LOCAL_GET n
     OP_LOCAL_SET,    // stack[bp + operand] = pop, push old: LOCAL_SET n
