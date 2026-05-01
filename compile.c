@@ -70,9 +70,10 @@ static unsigned lookup_known_lambda(int64_t var_id, unsigned known_lambdas)
 // Forward declaration
 static bool contains_reference(unsigned expr, int64_t var_id);
 
-// Check if var_id is referenced inside any inner scope that creates
-// a closure (lambda, let, let*, letrec, define with lambda).
-// Conservative: if the variable appears inside ANY binding form, assume captured.
+// Check if var_id is captured by an inner closure. Since this runs on
+// unexpanded source, we must check let/let*/letrec too (they expand
+// to lambdas via macros). This is conservative: a let that doesn't
+// actually escape will still disable locals. But it's safe and correct.
 static bool captured_by_inner_lambda(unsigned expr, int64_t var_id)
 {
     if (!expr || !IS_PAIR(expr))
@@ -84,10 +85,25 @@ static bool captured_by_inner_lambda(unsigned expr, int64_t var_id)
     int64_t kw = CELL_ID(car(expr));
     if (kw == ctx.kw_quote)
         return false;
-    // Any of these forms may create closures that capture var_id
-    if (kw == ctx.kw_lambda || kw == ctx.kw_let || kw == ctx.kw_letstar ||
-        kw == ctx.kw_letrec) {
+    // lambda always captures
+    if (kw == ctx.kw_lambda)
         return contains_reference(cdr(expr), var_id);
+    // let/let*/letrec expand to lambdas — check the BODY for capture
+    // (the binding init expressions are evaluated in the outer scope,
+    // so references there don't count as capture)
+    if (kw == ctx.kw_let || kw == ctx.kw_letstar || kw == ctx.kw_letrec) {
+        // For (let bindings body...), body is cddr(expr)
+        // But named let (let name bindings body...) has body at cdddr
+        unsigned second = cadr(expr);
+        unsigned body_start;
+        if (IS_ATOM(second)) {
+            // Named let: (let name ((v i) ...) body...)
+            body_start = cdddr(expr);
+        } else {
+            // Regular: (let ((v i) ...) body...)
+            body_start = cddr(expr);
+        }
+        return contains_reference(body_start, var_id);
     }
     return captured_by_inner_lambda(car(expr), var_id) ||
            captured_by_inner_lambda(cdr(expr), var_id);
