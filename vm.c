@@ -2342,6 +2342,45 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             break;
         }
 
+        // Fused comparison + branch opcodes (LT, GT, LE, GE)
+        case OP_LT_JUMPIFNOT:
+        case OP_GT_JUMPIFNOT:
+        case OP_LE_JUMPIFNOT:
+        case OP_GE_JUMPIFNOT: {
+            unsigned fused_op = vm->code->code[vm->ip - 1]; // already consumed
+            unsigned target = vm->code->code[vm->ip++];
+            unsigned b = vm_pop(vm);
+            unsigned a = vm_pop(vm);
+            bool cond;
+            if (IS_FIXNUM(a) && IS_FIXNUM(b)) {
+                int32_t va = FIXNUM_VALUE(a), vb = FIXNUM_VALUE(b);
+                switch (fused_op) {
+                case OP_LT_JUMPIFNOT: cond = (va < vb); break;
+                case OP_GT_JUMPIFNOT: cond = (va > vb); break;
+                case OP_LE_JUMPIFNOT: cond = (va <= vb); break;
+                case OP_GE_JUMPIFNOT: cond = (va >= vb); break;
+                default: cond = false; break;
+                }
+            } else {
+                a = ensure_boxed(a);
+                gc_protect(&a);
+                b = ensure_boxed(b);
+                gc_unprotect(1);
+                unsigned result;
+                switch (fused_op) {
+                case OP_LT_JUMPIFNOT: result = binary_lt(a, b); break;
+                case OP_GT_JUMPIFNOT: result = binary_gt(a, b); break;
+                case OP_LE_JUMPIFNOT: result = binary_le(a, b); break;
+                case OP_GE_JUMPIFNOT: result = binary_ge(a, b); break;
+                default: result = ctx.atom_false; break;
+                }
+                cond = (result == ctx.atom_true);
+            }
+            if (!cond)
+                vm->ip = target;
+            break;
+        }
+
         // Superinstructions: fused LOOKUP + arithmetic
         case OP_LOOKUP_ADD1: {
             int64_t sym_id = vm->code->code[vm->ip];
