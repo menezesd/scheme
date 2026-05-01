@@ -2008,9 +2008,11 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             unsigned tail = 0;
             gc_protect(&result);
             gc_protect(&tail);
-            for (unsigned p = a; p != 0; p = cdr(p)) {
+            unsigned p = a;
+            gc_protect(&p);
+            for (; p != 0; p = cdr(p)) {
                 if (IS_FIXNUM(p) || !IS_PAIR(p)) {
-                    gc_unprotect(4);
+                    gc_unprotect(5);
                     vm->error = true;
                     vm->error_msg = "append: not a proper list";
                     vm->running = false;
@@ -2029,7 +2031,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 if (tail != 0) {
                     CELL_CDR(tail) = b;
                 }
-                gc_unprotect(4);
+                gc_unprotect(5); // p, tail, result, a, b
                 vm_push(vm, result == 0 ? b : result);
             }
             break;
@@ -2040,9 +2042,11 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             gc_protect(&list);
             unsigned result = 0;
             gc_protect(&result);
-            for (unsigned p = list; p != 0; p = cdr(p)) {
+            unsigned p = list;
+            gc_protect(&p);
+            for (; p != 0; p = cdr(p)) {
                 if (IS_FIXNUM(p) || !IS_PAIR(p)) {
-                    gc_unprotect(2);
+                    gc_unprotect(3);
                     vm->error = true;
                     vm->error_msg = "reverse: not a proper list";
                     vm->running = false;
@@ -2051,7 +2055,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 result = alloc_cons(car(p), result);
             }
             if (vm->running) {
-                gc_unprotect(2);
+                gc_unprotect(3);
                 vm_push(vm, result);
             }
             break;
