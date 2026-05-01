@@ -1896,6 +1896,24 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
                     }
                 }
 
+                // Emit specialized opcodes when constant folding didn't apply
+                if (argc == 2) {
+                    switch (prim_id) {
+                    case PPLUS: emit(cctx, OP_ADD); return dynamic_result();
+                    case PMINUS: emit(cctx, OP_SUB); return dynamic_result();
+                    case PTIMES: emit(cctx, OP_MUL); return dynamic_result();
+                    case PDIV: emit(cctx, OP_DIV); return dynamic_result();
+                    case PMOD: emit(cctx, OP_MOD); return dynamic_result();
+                    case PLT: emit(cctx, OP_LT); return dynamic_result();
+                    case PGT: emit(cctx, OP_GT); return dynamic_result();
+                    case PLEQ: emit(cctx, OP_LE); return dynamic_result();
+                    case PGEQ: emit(cctx, OP_GE); return dynamic_result();
+                    case PEQUAL: emit(cctx, OP_NUMEQ); return dynamic_result();
+                    case PCONS: emit(cctx, OP_CONS); return dynamic_result();
+                    case PEQ: emit(cctx, OP_EQ); return dynamic_result();
+                    default: break;
+                    }
+                }
                 emit3(cctx, OP_PRIM, prim_id, argc);
                 return dynamic_result();
             }
