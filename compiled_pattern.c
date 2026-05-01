@@ -335,11 +335,6 @@ static void compile_ellipsis(unsigned pattern, pattern_compile_ctx *pctx)
 
     pctx->ellipsis_depth++;
 
-    // First, pre-scan element pattern to collect variables so we know
-    // which variables need ELLIPSIS_LIST finalization.
-    // We do this by remembering the variable count before and after.
-    unsigned var_start = pctx->pattern->var_count;
-
     // Strategy: greedy with backtracking
     // Loop that tries rest first, on failure matches one element and retries.
 
@@ -381,16 +376,11 @@ static void compile_ellipsis(unsigned pattern, pattern_compile_ctx *pctx)
 
     pattern_emit(pctx->pattern, PAT_JUMP, loop_start);
 
-    // Emit ELLIPSIS_LIST for variables added during elem compilation
+    // Emit depth-based ELLIPSIS_LIST to finalize all vars at this depth
     unsigned success_pos = pattern_current_pos(pctx->pattern);
-    for (unsigned i = var_start; i < pctx->pattern->var_count; i++) {
-        if (pctx->pattern->var_slots[i].is_ellipsis &&
-            pctx->pattern->var_slots[i].depth == pctx->ellipsis_depth) {
-            pattern_emit(pctx->pattern, PAT_ELLIPSIS_LIST, i);
-        }
-    }
+    pattern_emit(pctx->pattern, PAT_ELLIPSIS_LIST, pctx->ellipsis_depth);
 
-    // Patch success jump to point here (after ELLIPSIS_LIST instructions)
+    // Patch success jump to point here (after ELLIPSIS_LIST instruction)
     pattern_patch(pctx->pattern, success_patch, success_pos);
 
     pctx->ellipsis_depth--;
@@ -470,7 +460,6 @@ static void compile_pattern_node(unsigned pattern, pattern_compile_ctx *pctx)
 
             // Setup ellipsis iteration
             pctx->ellipsis_depth++;
-            unsigned var_start = pctx->pattern->var_count;
 
             // Encode pre_count and post_count in single operand
             unsigned init_operand = pre_count | (post_count << 16);
@@ -499,13 +488,8 @@ static void compile_pattern_node(unsigned pattern, pattern_compile_ctx *pctx)
             unsigned done_label = pattern_current_pos(pctx->pattern);
             pattern_patch(pctx->pattern, done_patch, done_label);
 
-            // Emit ELLIPSIS_LIST for variables
-            for (unsigned i = var_start; i < pctx->pattern->var_count; i++) {
-                if (pctx->pattern->var_slots[i].is_ellipsis &&
-                    pctx->pattern->var_slots[i].depth == pctx->ellipsis_depth) {
-                    pattern_emit(pctx->pattern, PAT_ELLIPSIS_LIST, i);
-                }
-            }
+            // Emit depth-based ELLIPSIS_LIST for all vars at this depth
+            pattern_emit(pctx->pattern, PAT_ELLIPSIS_LIST, pctx->ellipsis_depth);
 
             pctx->ellipsis_depth--;
 
@@ -594,11 +578,17 @@ static bool init_match_state(pat_match_state *state, compiled_pattern *pat,
         state->bindings = calloc(pat->var_count, sizeof(unsigned));
         state->ellipsis_lists = calloc(pat->var_count, sizeof(unsigned));
         state->ellipsis_tails = calloc(pat->var_count, sizeof(unsigned));
-        if (!state->bindings || !state->ellipsis_lists || !state->ellipsis_tails) {
+        state->inner_lists = calloc(pat->var_count, sizeof(unsigned));
+        state->inner_tails = calloc(pat->var_count, sizeof(unsigned));
+        if (!state->bindings || !state->ellipsis_lists ||
+            !state->ellipsis_tails || !state->inner_lists ||
+            !state->inner_tails) {
             free(state->input_stack);
             free(state->bindings);
             free(state->ellipsis_lists);
             free(state->ellipsis_tails);
+            free(state->inner_lists);
+            free(state->inner_tails);
             return false;
         }
     }
@@ -624,6 +614,8 @@ static void cleanup_match_state(pat_match_state *state)
     free(state->bindings);
     free(state->ellipsis_lists);
     free(state->ellipsis_tails);
+    free(state->inner_lists);
+    free(state->inner_tails);
     free(state->choices);
 }
 
@@ -836,33 +828,63 @@ unsigned execute_pattern(compiled_pattern *pat, unsigned input)
             break;
 
         case PAT_ELLIPSIS_ACCUM: {
-            // Append current bindings to ellipsis lists
-            // Only accumulate variables at the current depth (operand)
+            // Append current bindings to ellipsis lists at the given depth.
+            // Accumulate vars with depth >= operand so nested ellipsis
+            // variables (e.g., step in ((var init step ...) ...)) are
+            // captured by the outer ellipsis too.
             unsigned depth = instr->operand;
+            // Select accumulator arrays by depth
+            unsigned *lists = (depth <= 1) ? state.ellipsis_lists
+                                           : state.inner_lists;
+            unsigned *tails = (depth <= 1) ? state.ellipsis_tails
+                                           : state.inner_tails;
             for (unsigned i = 0; i < pat->var_count; i++) {
                 if (pat->var_slots[i].is_ellipsis &&
-                    pat->var_slots[i].depth == depth && state.bindings[i]) {
+                    pat->var_slots[i].depth >= depth && state.bindings[i]) {
                     unsigned val = state.bindings[i];
                     gc_protect(&val);
                     unsigned new_cell = alloc_cons(val, 0);
                     gc_unprotect(1);
 
-                    if (state.ellipsis_tails[i]) {
-                        CELL_CDR(state.ellipsis_tails[i]) = new_cell;
+                    if (tails[i]) {
+                        CELL_CDR(tails[i]) = new_cell;
                     } else {
-                        state.ellipsis_lists[i] = new_cell;
+                        lists[i] = new_cell;
                     }
-                    state.ellipsis_tails[i] = new_cell;
+                    tails[i] = new_cell;
                 }
             }
             break;
         }
 
-        case PAT_ELLIPSIS_LIST:
-            // Ellipsis list is complete for this variable
-            // Clear the binding so it won't be re-accumulated by outer loops
-            state.bindings[instr->operand] = 0;
+        case PAT_ELLIPSIS_LIST: {
+            // Finalize ellipsis accumulation at given depth.
+            // operand = depth level being finalized.
+            unsigned depth = instr->operand;
+            if (depth >= 2) {
+                // Inner ellipsis: finalize inner_lists into bindings
+                // so the outer ACCUM can pick them up.
+                for (unsigned i = 0; i < pat->var_count; i++) {
+                    if (pat->var_slots[i].is_ellipsis &&
+                        pat->var_slots[i].depth >= depth) {
+                        state.bindings[i] = state.inner_lists[i];
+                        state.inner_lists[i] = 0;
+                        state.inner_tails[i] = 0;
+                    }
+                }
+            } else {
+                // Outermost ellipsis: clear bindings for all ellipsis vars
+                // (ellipsis_lists already has the final result for
+                //  build_bindings_alist to read)
+                for (unsigned i = 0; i < pat->var_count; i++) {
+                    if (pat->var_slots[i].is_ellipsis &&
+                        pat->var_slots[i].depth >= 1) {
+                        state.bindings[i] = 0;
+                    }
+                }
+            }
             break;
+        }
 
         case PAT_JUMP:
             state.ip = instr->operand;

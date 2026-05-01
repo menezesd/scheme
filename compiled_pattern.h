@@ -152,8 +152,12 @@ typedef struct {
     unsigned *bindings;      // Current binding for each variable
 
     // Ellipsis accumulation (per-variable list of matched values)
+    // Depth 1 (outermost ellipsis) — also the final result read by build_bindings
     unsigned *ellipsis_lists;    // Head of list for each ellipsis var
     unsigned *ellipsis_tails;    // Tail pointer for efficient append
+    // Depth 2 (inner ellipsis) — temporary, finalized into bindings[]
+    unsigned *inner_lists;
+    unsigned *inner_tails;
 
     // Backtracking
     pat_choice_point *choices;
