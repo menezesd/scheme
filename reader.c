@@ -418,6 +418,11 @@ unsigned read_token(void)
                     c = reader_getchar();
                 }
                 reader_ungetc(c);
+                if (sb.len == 0) {
+                    sb_free(&sb);
+                    show_error("invalid hex literal: #x");
+                    return TOK_ERROR;
+                }
                 int64_t val = (int64_t)strtoll(sb.data, NULL, 16);
                 sb_free(&sb);
                 return store(neg ? -val : val);
@@ -434,6 +439,11 @@ unsigned read_token(void)
                     c = reader_getchar();
                 }
                 reader_ungetc(c);
+                if (sb.len == 0) {
+                    sb_free(&sb);
+                    show_error("invalid octal literal: #o");
+                    return TOK_ERROR;
+                }
                 int64_t val = (int64_t)strtoll(sb.data, NULL, 8);
                 sb_free(&sb);
                 return store(neg ? -val : val);
@@ -450,6 +460,11 @@ unsigned read_token(void)
                     c = reader_getchar();
                 }
                 reader_ungetc(c);
+                if (sb.len == 0) {
+                    sb_free(&sb);
+                    show_error("invalid binary literal: #b");
+                    return TOK_ERROR;
+                }
                 int64_t val = (int64_t)strtoll(sb.data, NULL, 2);
                 sb_free(&sb);
                 return store(neg ? -val : val);
@@ -465,6 +480,10 @@ unsigned read_token(void)
                         unsigned count = 0;
                         for (unsigned p = list; p && IS_PAIR(p); p = cdr(p))
                             count++;
+                        if (count > 1024 * 1024) {
+                            show_error("bytevector literal too large");
+                            return TOK_ERROR;
+                        }
                         bytevec_data *bv = malloc(sizeof(bytevec_data) + count);
                         if (!bv) return TOK_ERROR;
                         bv->len = count;

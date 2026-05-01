@@ -62,6 +62,29 @@
 (define (bit-set? bit-num val)
   (not (= 0 (bitwise-and val (arithmetic-shift 1 bit-num)))))
 
+;; MIT Scheme compatibility aliases
+(define random random-integer)
+
+;; R7RS binary I/O
+(define (write-u8 byte . opt-port)
+  (let ((port (if (pair? opt-port) (car opt-port) (current-output-port))))
+    (if (bytevector-output-port? port)
+        (vector-set! port 1 (cons (bytevector byte) (vector-ref port 1)))
+        (write-char (integer->char byte) port))))
+
+(define (read-u8 . opt-port)
+  (let ((port (if (pair? opt-port) (car opt-port) (current-input-port))))
+    (if (bytevector-input-port? port)
+        (let* ((bv (vector-ref port 1))
+               (pos (vector-ref port 2)))
+          (if (>= pos (bytevector-length bv))
+              (eof-object)
+              (begin
+                (vector-set! port 2 (+ pos 1))
+                (bytevector-u8-ref bv pos))))
+        (let ((ch (read-char port)))
+          (if (eof-object? ch) ch (char->integer ch))))))
+
 ;;; ============================================================================
 ;;; Binary I/O helpers
 ;;; ============================================================================
@@ -71,6 +94,59 @@
     (let ((result (proc port)))
       (close-input-port port)
       result)))
+
+;;; ============================================================================
+;;; Bytevector ports (in-memory I/O using bytevectors)
+;;; ============================================================================
+
+;; Bytevector output port: vector #(tag chunks)
+(define (open-output-bytevector)
+  (vector 'bvout '()))
+
+(define (bytevector-output-port? x)
+  (and (vector? x) (> (vector-length x) 0) (eq? (vector-ref x 0) 'bvout)))
+
+(define (get-output-bytevector port)
+  (apply bytevector-append (reverse (vector-ref port 1))))
+
+;; Bytevector input port: vector #(tag bv pos)
+(define (open-input-bytevector bv)
+  (vector 'bvin bv 0))
+
+(define (bytevector-input-port? x)
+  (and (vector? x) (> (vector-length x) 0) (eq? (vector-ref x 0) 'bvin)))
+
+;; write-bytevector: write all or part of a bytevector to a port
+(define (write-bytevector bv . args)
+  (let* ((port (if (pair? args) (car args) (current-output-port)))
+         (rest (if (pair? args) (cdr args) '()))
+         (start (if (pair? rest) (car rest) 0))
+         (rest2 (if (pair? rest) (cdr rest) '()))
+         (end (if (pair? rest2) (car rest2) (bytevector-length bv))))
+    (if (bytevector-output-port? port)
+        ;; Accumulate chunk
+        (vector-set! port 1 (cons (bytevector-copy bv start end) (vector-ref port 1)))
+        ;; File port: write bytes
+        (let loop ((i start))
+          (when (< i end)
+            (write-char (integer->char (bytevector-u8-ref bv i)) port)
+            (loop (+ i 1)))))))
+
+;; Wrap read-bytevector to support bytevector input ports
+(let ((prim-read-bytevector read-bytevector))
+  (set! read-bytevector
+    (lambda (k port)
+      (if (bytevector-input-port? port)
+          (let* ((bv (vector-ref port 1))
+                 (pos (vector-ref port 2))
+                 (available (- (bytevector-length bv) pos)))
+            (if (<= available 0)
+                (eof-object)
+                (let* ((n (min k available))
+                       (result (bytevector-copy bv pos (+ pos n))))
+                  (vector-set! port 2 (+ pos n))
+                  result)))
+          (prim-read-bytevector k port)))))
 
 ;;; ============================================================================
 ;;; When/Unless macros (R7RS)
