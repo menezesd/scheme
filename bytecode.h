@@ -163,6 +163,8 @@ enum opcode {
     // Superinstructions (fused opcode sequences)
     OP_LOOKUP_ADD1,  // Lookup + add1: LOOKUP_ADD1 sym depth offset
     OP_LOOKUP_SUB1,  // Lookup + sub1: LOOKUP_SUB1 sym depth offset
+
+    OP_COUNT // Number of opcodes (must be last)
 };
 
 // ============================================================================
@@ -312,6 +314,12 @@ typedef struct compile_ctx {
     unsigned env;               // Compile-time environment (for macros)
     bool tail_position;         // True if compiling in tail position
     unsigned known_lambdas;     // Alist of (var-id . lambda-expr) for inlining
+    // Loop optimization: when inside a letrec-bound lambda, track the loop
+    // variable so recursive tail calls can be compiled as SET+JUMP
+    int64_t loop_var_id;        // Symbol ID of loop variable (-1 if none)
+    unsigned loop_params;       // Parameter list (cell index) for SET generation
+    unsigned loop_arity;        // Number of fixed parameters
+    unsigned env_depth;         // Number of PUSHENV frames since lambda entry
 } compile_ctx;
 
 // ============================================================================

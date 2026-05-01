@@ -219,6 +219,7 @@ static compile_ctx *cctx_new(compile_ctx *parent, unsigned env)
     cctx->parent = parent;
     cctx->env = env;
     cctx->tail_position = false;
+    cctx->loop_var_id = -1;
     // Inherit known_lambdas from parent (they're still in scope)
     cctx->known_lambdas = parent ? parent->known_lambdas : 0;
     // Protect env and known_lambdas so they're updated if GC runs
@@ -264,6 +265,20 @@ static void emit4(compile_ctx *cctx, unsigned op, unsigned arg1, unsigned arg2,
 }
 
 #define IC_UNCACHED 0xFFFFFFFF
+
+// Track env frame depth for loop optimization safety
+static void emit_pushenv(compile_ctx *cctx)
+{
+    code_emit(cctx->code, OP_PUSHENV);
+    cctx->env_depth++;
+}
+
+static void emit_popenv(compile_ctx *cctx)
+{
+    code_emit(cctx->code, OP_POPENV);
+    if (cctx->env_depth > 0)
+        cctx->env_depth--;
+}
 
 // Emit a jump instruction, return position to patch
 static unsigned emit_jump(compile_ctx *cctx, unsigned op)
@@ -751,7 +766,7 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
                 }
 
                 // Push a new runtime frame for the body
-                emit(cctx, OP_PUSHENV);
+                emit_pushenv(cctx);
 
                 // Emit gensym bindings: look up original var, define gensym
                 // This happens at let-syntax entry, BEFORE any inner scopes
@@ -791,7 +806,7 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
                 compile_begin(body, &new_cctx);
 
                 // Pop the runtime frame
-                emit(cctx, OP_POPENV);
+                emit_popenv(cctx);
                 return dynamic_result();
             }
 
@@ -955,6 +970,15 @@ static compile_result compile_lambda(unsigned expr, compile_ctx *cctx)
     // Create new compilation context for lambda body with shadowed params
     compile_ctx *lambda_cctx = cctx_new(cctx, lambda_env);
     lambda_cctx->tail_position = true;
+
+    // Inherit loop info from parent (for letrec-bound lambdas)
+    if (cctx->loop_var_id >= 0) {
+        lambda_cctx->loop_var_id = cctx->loop_var_id;
+        lambda_cctx->loop_params = cctx->loop_params;
+        lambda_cctx->loop_arity = cctx->loop_arity;
+        // Clear parent's loop info so it doesn't leak to other children
+        cctx->loop_var_id = -1;
+    }
 
     // Count parameters
     unsigned arity = 0;
@@ -1181,7 +1205,7 @@ static compile_result compile_let(unsigned expr, compile_ctx *cctx)
     }
 
     // Push new environment frame
-    emit(cctx, OP_PUSHENV);
+    emit_pushenv(cctx);
 
     // Dynamically allocate variable array
     unsigned *vars = NULL;
@@ -1244,7 +1268,7 @@ static compile_result compile_let(unsigned expr, compile_ctx *cctx)
     cctx->known_lambdas = saved_known;
 
     // Pop environment frame
-    emit(cctx, OP_POPENV);
+    emit_popenv(cctx);
 
     // let introduces bindings, so result is dynamic even if body is constant
     (void)result;
@@ -1258,7 +1282,7 @@ static compile_result compile_letstar(unsigned expr, compile_ctx *cctx)
     unsigned body = cddr(expr);
 
     // Push new environment frame
-    emit(cctx, OP_PUSHENV);
+    emit_pushenv(cctx);
 
     // Save original compile-time environment
     unsigned saved_env = cctx->env;
@@ -1287,7 +1311,7 @@ static compile_result compile_letstar(unsigned expr, compile_ctx *cctx)
     cctx->env = saved_env;
 
     // Pop environment frame
-    emit(cctx, OP_POPENV);
+    emit_popenv(cctx);
 
     return dynamic_result();
 }
@@ -1303,7 +1327,7 @@ static compile_result compile_letrec(unsigned expr, compile_ctx *cctx)
     FORLIST(b, bindings) { binding_count++; }
 
     // Push new environment frame
-    emit(cctx, OP_PUSHENV);
+    emit_pushenv(cctx);
 
     // First pass: define all variables with undefined values
     FORLIST(b, bindings)
@@ -1324,8 +1348,34 @@ static compile_result compile_letrec(unsigned expr, compile_ctx *cctx)
     // Save tail position from enclosing context
     bool tail = cctx->tail_position;
 
+    // Detect loop pattern: single binding of form (loop (lambda (params) body))
+    // Pass loop info to the lambda compiler so recursive tail calls become SET+JUMP
+    int64_t loop_var = -1;
+    unsigned loop_params = 0;
+    unsigned loop_arity = 0;
+    if (binding_count == 1) {
+        unsigned binding = car(car(bindings));
+        unsigned val_expr = cadr(car(bindings));
+        if (IS_ATOM(binding) && IS_PAIR(val_expr) && IS_ATOM(car(val_expr)) &&
+            CELL_ID(car(val_expr)) == ctx.kw_lambda &&
+            !is_keyword_shadowed(ctx.kw_lambda, cctx->env)) {
+            loop_var = CELL_ID(binding);
+            loop_params = cadr(val_expr);
+            // Count arity
+            for (unsigned p = loop_params; p && IS_PAIR(p); p = cdr(p))
+                loop_arity++;
+        }
+    }
+
     // Second pass: compile values and set variables
     cctx->tail_position = false;
+    // Temporarily set loop info so compile_lambda can pick it up
+    int64_t saved_loop_var = cctx->loop_var_id;
+    unsigned saved_loop_params = cctx->loop_params;
+    unsigned saved_loop_arity = cctx->loop_arity;
+    cctx->loop_var_id = loop_var;
+    cctx->loop_params = loop_params;
+    cctx->loop_arity = loop_arity;
     FORLIST(b, bindings)
     {
         unsigned binding = car(b);
@@ -1333,6 +1383,9 @@ static compile_result compile_letrec(unsigned expr, compile_ctx *cctx)
         emit2(cctx, OP_SET, CELL_ID(car(binding)));
         emit(cctx, OP_POP); // Discard set! result
     }
+    cctx->loop_var_id = saved_loop_var;
+    cctx->loop_params = saved_loop_params;
+    cctx->loop_arity = saved_loop_arity;
 
     // End letrec initialization - continuations after this won't restore values
     emit(cctx, OP_LETREC_DONE);
@@ -1345,7 +1398,7 @@ static compile_result compile_letrec(unsigned expr, compile_ctx *cctx)
     cctx->env = saved_env;
 
     // Pop environment frame
-    emit(cctx, OP_POPENV);
+    emit_popenv(cctx);
 
     return dynamic_result();
 }
@@ -2017,6 +2070,41 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
     }
 
     // ========================================================================
+    // Loop Optimization: recursive tail call to letrec-bound lambda
+    // ========================================================================
+    // Compile as SET+JUMP(0) instead of TAILCALL, avoiding closure lookup,
+    // arg list building, and environment frame allocation.
+    if (IS_ATOM(fn_expr) && cctx->tail_position &&
+        cctx->loop_var_id >= 0 &&
+        CELL_ID(fn_expr) == cctx->loop_var_id &&
+        cctx->env_depth == 0) {
+        // Only safe when not inside nested let/begin frames (env_depth == 0)
+        // because JUMP 0 would skip their POPENV instructions
+        unsigned argc = list_length(args);
+        if (argc == cctx->loop_arity) {
+            // Compile all arguments first (before any SET)
+            cctx->tail_position = false;
+            FORLIST(a, args) { compile_expr_internal(car(a), cctx); }
+            cctx->tail_position = true;
+
+            // SET each parameter in reverse order (stack is LIFO)
+            unsigned param_ids[16];
+            unsigned pi = 0;
+            for (unsigned p = cctx->loop_params;
+                 p && IS_PAIR(p) && pi < 16; p = cdr(p)) {
+                param_ids[pi++] = CELL_ID(car(p));
+            }
+            for (int j = (int)pi - 1; j >= 0; j--) {
+                emit2(cctx, OP_SET, param_ids[j]);
+                emit(cctx, OP_POP);
+            }
+            // Jump to start of this code object (ip = 0)
+            emit2(cctx, OP_JUMP, 0);
+            return dynamic_result();
+        }
+    }
+
+    // ========================================================================
     // Escape Analysis Inlining: (f args) where f is a known lambda
     // ========================================================================
     // If f is bound to a lambda in a let, we can inline it at the call site
@@ -2131,7 +2219,7 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
             }
 
             // Push new environment frame
-            emit(cctx, OP_PUSHENV);
+            emit_pushenv(cctx);
 
             // Dynamically allocate parameter ID array
             unsigned *param_ids = NULL;
@@ -2242,7 +2330,7 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
             cctx->known_lambdas = saved_known;
 
             // Pop environment frame
-            emit(cctx, OP_POPENV);
+            emit_popenv(cctx);
 
             return dynamic_result();
         }
