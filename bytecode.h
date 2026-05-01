@@ -164,6 +164,10 @@ enum opcode {
     OP_LOOKUP_ADD1,  // Lookup + add1: LOOKUP_ADD1 sym depth offset
     OP_LOOKUP_SUB1,  // Lookup + sub1: LOOKUP_SUB1 sym depth offset
 
+    // Fused opcodes for reduced dispatch
+    OP_SET_VOID,      // Set variable, discard old value: SET_VOID sym_id
+    OP_NUMEQ_JUMPIFNOT, // Numeric equal + branch: pop b,a, jump if a!=b
+
     OP_COUNT // Number of opcodes (must be last)
 };
 

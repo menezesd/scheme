@@ -884,6 +884,20 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             break;
         }
 
+        case OP_SET_VOID: {
+            // SET + POP fused: set variable, discard old value (no push)
+            int64_t sym_id = vm->code->code[vm->ip++];
+            unsigned val = vm_pop(vm);
+            val = ensure_boxed(val);
+            unsigned result = setvar(sym_id, val, vm->env);
+            if (result == TOK_ERROR) {
+                vm->error = true;
+                vm->error_msg = "unbound variable in set!";
+                vm->running = false;
+            }
+            break;
+        }
+
         case OP_CLOSURE: {
             unsigned child_idx = vm->code->code[vm->ip++];
             code_object *child = vm->code->children[child_idx];
@@ -2283,6 +2297,35 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 break;
             }
             vm_push(vm, odd ? ctx.atom_true : ctx.atom_false);
+            break;
+        }
+
+        // Fused compare-and-branch
+        case OP_NUMEQ_JUMPIFNOT: {
+            unsigned target = vm->code->code[vm->ip++];
+            unsigned b = vm_pop(vm);
+            unsigned a = vm_pop(vm);
+            bool eq;
+            if (IS_FIXNUM(a) && IS_FIXNUM(b)) {
+                eq = (a == b);
+            } else if (IS_FIXNUM(a) || IS_FIXNUM(b)) {
+                a = ensure_boxed(a);
+                gc_protect(&a);
+                b = ensure_boxed(b);
+                gc_unprotect(1);
+                eq = (IS_NUM(a) && IS_NUM(b) && CELL_ID(a) == CELL_ID(b));
+            } else if (IS_NUM(a) && IS_NUM(b)) {
+                eq = (CELL_ID(a) == CELL_ID(b));
+            } else {
+                a = ensure_boxed(a);
+                gc_protect(&a);
+                b = ensure_boxed(b);
+                gc_unprotect(1);
+                unsigned result = binary_numeq(a, b);
+                eq = (result == ctx.atom_true);
+            }
+            if (!eq)
+                vm->ip = target;
             break;
         }
 

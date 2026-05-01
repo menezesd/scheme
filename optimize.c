@@ -28,9 +28,11 @@ unsigned instruction_size(unsigned op)
     case OP_LOOKUP_ADD1:
     case OP_LOOKUP_SUB1:
         return 4; // opcode + sym_id + cached_depth + cached_offset
+    case OP_NUMEQ_JUMPIFNOT:
     case OP_CONST:
     case OP_DEFINE:
     case OP_SET:
+    case OP_SET_VOID:
     case OP_CLOSURE:
     case OP_CALL:
     case OP_TAILCALL:
@@ -102,7 +104,8 @@ static void cse_pass(code_object *code)
         unsigned size = instruction_size(op);
         if (op == OP_JUMP || op == OP_JUMPIF || op == OP_JUMPIFNOT ||
             op == OP_JUMPIFNULL || op == OP_JUMPIFNOTNULL ||
-            op == OP_JUMPIFZERO || op == OP_JUMPIFNOTZERO) {
+            op == OP_JUMPIFZERO || op == OP_JUMPIFNOTZERO ||
+                op == OP_NUMEQ_JUMPIFNOT) {
             unsigned target = c[i + 1];
             if (target <= len)
                 is_jump_target[target] = true;
@@ -212,6 +215,18 @@ static void cse_pass(code_object *code)
             }
         }
 
+        // Fuse: NUMEQ, JUMPIFNOT target -> NUMEQ_JUMPIFNOT target
+        // (Done in CSE pass because it changes instruction sizes)
+        if (op == OP_NUMEQ && i + 1 < len && c[i + 1] == OP_JUMPIFNOT &&
+            !is_jump_target[i + 1]) {
+            new_code[write++] = OP_NUMEQ_JUMPIFNOT;
+            new_code[write++] = c[i + 2]; // jump target
+            offset_map[i + 1] = write;
+            offset_map[i + 2] = write;
+            i += 3; // skip NUMEQ(1) + JUMPIFNOT(1) + target(1)
+            continue;
+        }
+
         // Copy instruction unchanged
         for (unsigned j = 0; j < size && i + j < len; j++) {
             new_code[write++] = c[i + j];
@@ -228,7 +243,8 @@ static void cse_pass(code_object *code)
 
             if (op == OP_JUMP || op == OP_JUMPIF || op == OP_JUMPIFNOT ||
                 op == OP_JUMPIFNULL || op == OP_JUMPIFNOTNULL ||
-                op == OP_JUMPIFZERO || op == OP_JUMPIFNOTZERO) {
+                op == OP_JUMPIFZERO || op == OP_JUMPIFNOTZERO ||
+                op == OP_NUMEQ_JUMPIFNOT) {
                 unsigned old_target = new_code[j + 1];
                 // Find the new target using offset map
                 // Search for the closest mapped position
@@ -276,7 +292,8 @@ void peephole_optimize(code_object *code)
         unsigned size = instruction_size(op);
         if (op == OP_JUMP || op == OP_JUMPIF || op == OP_JUMPIFNOT ||
             op == OP_JUMPIFNULL || op == OP_JUMPIFNOTNULL ||
-            op == OP_JUMPIFZERO || op == OP_JUMPIFNOTZERO) {
+            op == OP_JUMPIFZERO || op == OP_JUMPIFNOTZERO ||
+                op == OP_NUMEQ_JUMPIFNOT) {
             unsigned target = c[i + 1];
             if (target <= len)
                 is_jump_target[target] = true;
@@ -447,6 +464,18 @@ void peephole_optimize(code_object *code)
             continue;
         }
 
+        // Fuse: SET sym, POP -> SET_VOID sym (common in loop variable updates)
+        if (op == OP_SET && i + 2 < len && c[i + 2] == OP_POP &&
+            !is_jump_target[i + 2]) {
+            c[i] = OP_SET_VOID;
+            remove[i + 2] = true;
+            i += 2;
+            continue;
+        }
+
+        // Fuse: NUMEQ, JUMPIFNOT target -> NUMEQ_JUMPIFNOT target
+        // Handled in CSE pass (not peephole) since it changes instruction sizes
+
         // Superinstruction: LOOKUP sym d o, ADD1 -> LOOKUP_ADD1 sym d o
         if (op == OP_LOOKUP && i + 4 < len && c[i + 4] == OP_ADD1 &&
             !is_jump_target[i + 4]) {
@@ -609,7 +638,8 @@ void peephole_optimize(code_object *code)
         // Thread any jump instruction
         if (op == OP_JUMP || op == OP_JUMPIF || op == OP_JUMPIFNOT ||
             op == OP_JUMPIFNULL || op == OP_JUMPIFNOTNULL ||
-            op == OP_JUMPIFZERO || op == OP_JUMPIFNOTZERO) {
+            op == OP_JUMPIFZERO || op == OP_JUMPIFNOTZERO ||
+                op == OP_NUMEQ_JUMPIFNOT) {
 
             unsigned target = c[i + 1];
             unsigned visited_count = 0;
@@ -657,7 +687,8 @@ void peephole_optimize(code_object *code)
         // Handle operands, fixing jump targets
         if (op == OP_JUMP || op == OP_JUMPIF || op == OP_JUMPIFNOT ||
             op == OP_JUMPIFNULL || op == OP_JUMPIFNOTNULL ||
-            op == OP_JUMPIFZERO || op == OP_JUMPIFNOTZERO) {
+            op == OP_JUMPIFZERO || op == OP_JUMPIFNOTZERO ||
+                op == OP_NUMEQ_JUMPIFNOT) {
             unsigned old_target = c[read + 1];
             unsigned new_target =
                 (old_target < len) ? offset_map[old_target] : final_len;
@@ -777,6 +808,8 @@ static const char *opcode_names[] = {
     [OP_ODD] = "ODD",
     [OP_LOOKUP_ADD1] = "LOOKUP_ADD1",
     [OP_LOOKUP_SUB1] = "LOOKUP_SUB1",
+    [OP_SET_VOID] = "SET_VOID",
+    [OP_NUMEQ_JUMPIFNOT] = "NUMEQ_JUMPIFNOT",
 };
 
 void disassemble(code_object *code, const char *name)
@@ -832,6 +865,7 @@ void disassemble(code_object *code, const char *name)
             break;
         case OP_DEFINE:
         case OP_SET:
+        case OP_SET_VOID:
         case OP_DEFSYNTAX:
             printf(" %s", ctx.atom_table[code->code[ip++]]);
             break;
@@ -848,6 +882,7 @@ void disassemble(code_object *code, const char *name)
         case OP_JUMPIFNOTNULL:
         case OP_JUMPIFZERO:
         case OP_JUMPIFNOTZERO:
+        case OP_NUMEQ_JUMPIFNOT:
             printf(" -> %u", code->code[ip++]);
             break;
         case OP_PRIM:
