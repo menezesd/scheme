@@ -1046,8 +1046,7 @@ static compile_result compile_lambda(unsigned expr, compile_ctx *cctx)
     // from the caller (pushed between caller's locals and callee's entry)
     // get their positions confused. Needs callee to save/restore caller's sp
     // in the frame, not just bp.
-    // Stack locals disabled pending investigation of compose-through-map bug
-    if (0 && !has_rest && arity > 0 && arity <= 8) {
+    if (!has_rest && arity > 0 && arity <= 8) {
         bool can_use_locals = true;
         unsigned slot = 0;
         for (unsigned p = params; p && IS_PAIR(p); p = cdr(p), slot++) {
@@ -2441,9 +2440,28 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
                 }
             }
 
-            // Compile body in tail position
+            // Compile body — IIFE params shadow any same-named stack locals
+            int saved_num_locals = cctx->num_locals;
+            int64_t saved_local_ids[8];
+            if (saved_num_locals > 0)
+                memcpy(saved_local_ids, cctx->local_ids,
+                       sizeof(int64_t) * saved_num_locals);
+            // Remove locals that are shadowed by IIFE params
+            if (cctx->num_locals > 0 && CELL_TYPE(lambda_params) == BT_CONS) {
+                for (unsigned p = lambda_params; p && IS_PAIR(p); p = cdr(p)) {
+                    int64_t pid = CELL_ID(car(p));
+                    for (int k = 0; k < cctx->num_locals; k++) {
+                        if (cctx->local_ids[k] == pid)
+                            cctx->local_ids[k] = -1; // disable this slot
+                    }
+                }
+            }
             cctx->tail_position = tail;
             compile_begin(lambda_body, cctx);
+            cctx->num_locals = saved_num_locals;
+            if (saved_num_locals > 0)
+                memcpy(cctx->local_ids, saved_local_ids,
+                       sizeof(int64_t) * saved_num_locals);
 
             // Restore compile-time environment and known_lambdas
             cctx->env = saved_env;

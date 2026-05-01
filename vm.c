@@ -957,14 +957,13 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             vm->ip++; // skip operand
             unsigned val = vm_pop(vm);
             if (vm->fp == 0) {
-                vm->sp = vm->bp; // remove locals
+                vm->sp = vm->bp;
                 vm_push(vm, val);
                 vm->running = false;
             } else {
-                // Restore sp to the saved value from frame (sp before args)
                 unsigned restore_sp = vm->frames[vm->fp - 1].sp;
-                pop_frame(vm); // restores caller's bp and env
-                vm->sp = restore_sp; // remove callee's locals precisely
+                pop_frame(vm);
+                vm->sp = restore_sp;
                 vm_push(vm, val);
             }
             break;
