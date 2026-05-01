@@ -278,7 +278,7 @@ static inline unsigned vm_peek(vm_state *vm, unsigned depth)
 // ============================================================================
 
 static void push_frame(vm_state *vm, code_object *code, unsigned ip,
-                       unsigned bp, unsigned env)
+                       unsigned bp, unsigned restore_sp, unsigned env)
 {
     LISP_ASSERT_MSG(code != NULL, "push_frame: null code object");
     if (vm->fp >= vm->frames_cap) {
@@ -300,6 +300,7 @@ static void push_frame(vm_state *vm, code_object *code, unsigned ip,
     vm->frames[vm->fp].code = code;
     vm->frames[vm->fp].ip = ip;
     vm->frames[vm->fp].bp = bp;
+    vm->frames[vm->fp].sp = restore_sp;
     vm->frames[vm->fp].env = env;
     vm->fp++;
 }
@@ -638,7 +639,8 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
                 vm->env = closure_env;
             } else {
                 // Regular call: push frame
-                push_frame(vm, vm->code, vm->ip, new_bp, vm->env);
+                // Save new_bp as restore_sp so RETURN_LOCALS restores correctly
+                push_frame(vm, vm->code, vm->ip, vm->bp, new_bp, vm->env);
                 vm->bp = new_bp;
                 vm->code = code;
                 vm->ip = 0;
@@ -684,7 +686,7 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
                 vm->ip = 0;
                 vm->env = new_env;
             } else {
-                push_frame(vm, vm->code, vm->ip, vm->sp, vm->env);
+                push_frame(vm, vm->code, vm->ip, vm->bp, vm->sp, vm->env);
                 vm->code = code;
                 vm->ip = 0;
                 vm->env = new_env;
@@ -950,16 +952,17 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
         }
 
         case OP_RETURN_LOCALS: {
-            vm->ip++; // skip operand (not needed — bp tracks locals)
+            vm->ip++; // skip operand
             unsigned val = vm_pop(vm);
             if (vm->fp == 0) {
                 vm->sp = vm->bp; // remove locals
                 vm_push(vm, val);
                 vm->running = false;
             } else {
-                unsigned callee_bp = vm->bp;
-                pop_frame(vm); // restores caller's bp
-                vm->sp = callee_bp; // remove callee's locals + any temps
+                // Restore sp to the saved value from frame (sp before args)
+                unsigned restore_sp = vm->frames[vm->fp - 1].sp;
+                pop_frame(vm); // restores caller's bp and env
+                vm->sp = restore_sp; // remove callee's locals precisely
                 vm_push(vm, val);
             }
             break;

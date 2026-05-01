@@ -70,17 +70,24 @@ static unsigned lookup_known_lambda(int64_t var_id, unsigned known_lambdas)
 // Forward declaration
 static bool contains_reference(unsigned expr, int64_t var_id);
 
-// Check if var_id is referenced inside any inner lambda in expr
-// (i.e., would be "captured" by a closure)
+// Check if var_id is referenced inside any inner scope that creates
+// a closure (lambda, let, let*, letrec, define with lambda).
+// Conservative: if the variable appears inside ANY binding form, assume captured.
 static bool captured_by_inner_lambda(unsigned expr, int64_t var_id)
 {
     if (!expr || !IS_PAIR(expr))
         return false;
-    if (IS_ATOM(car(expr)) && CELL_ID(car(expr)) == ctx.kw_quote)
+    if (!IS_ATOM(car(expr)))
+        return captured_by_inner_lambda(car(expr), var_id) ||
+               captured_by_inner_lambda(cdr(expr), var_id);
+
+    int64_t kw = CELL_ID(car(expr));
+    if (kw == ctx.kw_quote)
         return false;
-    if (IS_ATOM(car(expr)) && CELL_ID(car(expr)) == ctx.kw_lambda) {
-        // This IS an inner lambda. Check if var_id appears in it
-        return contains_reference(expr, var_id);
+    // Any of these forms may create closures that capture var_id
+    if (kw == ctx.kw_lambda || kw == ctx.kw_let || kw == ctx.kw_letstar ||
+        kw == ctx.kw_letrec) {
+        return contains_reference(cdr(expr), var_id);
     }
     return captured_by_inner_lambda(car(expr), var_id) ||
            captured_by_inner_lambda(cdr(expr), var_id);
@@ -1039,6 +1046,9 @@ static compile_result compile_lambda(unsigned expr, compile_ctx *cctx)
     // from the caller (pushed between caller's locals and callee's entry)
     // get their positions confused. Needs callee to save/restore caller's sp
     // in the frame, not just bp.
+    // Stack locals disabled: LOOKUP of captured variables finds wrong binding
+    // when the caller uses locals (env doesn't include locals frame).
+    // Needs env to include locals for captured variable lookup.
     if (0 && !has_rest && arity > 0 && arity <= 8) {
         bool can_use_locals = true;
         unsigned slot = 0;

@@ -269,7 +269,8 @@ extern code_object *code_object_registry;
 typedef struct {
     code_object *code; // Code being executed
     unsigned ip;       // Return address (instruction pointer)
-    unsigned bp;       // Base pointer (stack position before args)
+    unsigned bp;       // Base pointer for stack locals
+    unsigned sp;       // Stack pointer to restore on return
     unsigned env;      // Environment to restore
 } vm_frame;
 
