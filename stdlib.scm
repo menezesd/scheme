@@ -32,6 +32,30 @@
       val))))
 
 ;;; ============================================================================
+;;; MIT Scheme compatibility functions
+;;; ============================================================================
+
+;; string-search-forward: find first occurrence of pattern in text
+;; Returns index or #f
+(define (string-search-forward pattern text . opt-start)
+  (let ((start (if (null? opt-start) 0 (car opt-start)))
+        (plen (string-length pattern))
+        (tlen (string-length text)))
+    (let loop ((i start))
+      (cond ((> (+ i plen) tlen) #f)
+            ((string=? pattern (substring text i (+ i plen))) i)
+            (else (loop (+ i 1)))))))
+
+;; string-search-backward: find last occurrence of pattern in text
+(define (string-search-backward pattern text . opt-end)
+  (let ((plen (string-length pattern))
+        (end (if (null? opt-end) (string-length text) (car opt-end))))
+    (let loop ((i (- end plen)))
+      (cond ((< i 0) #f)
+            ((string=? pattern (substring text i (+ i plen))) i)
+            (else (loop (- i 1)))))))
+
+;;; ============================================================================
 ;;; Bitwise helpers (MIT Scheme compatibility)
 ;;; ============================================================================
 

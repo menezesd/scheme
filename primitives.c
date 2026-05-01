@@ -690,28 +690,43 @@ unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
     // Bitwise operations
     // ========================================================================
     case PBITWISEAND: {
-        REQUIRE_ARGC(argc, 2, 2, "bitwise-and");
-        int64_t a, b;
-        if (!expect_exact_int64(argv[0], &a, "bitwise-and") ||
-            !expect_exact_int64(argv[1], &b, "bitwise-and"))
+        REQUIRE_ARGC(argc, 1, 999, "bitwise-and");
+        int64_t result;
+        if (!expect_exact_int64(argv[0], &result, "bitwise-and"))
             return TOK_ERROR;
-        return store(a & b);
+        for (unsigned i = 1; i < argc; i++) {
+            int64_t b;
+            if (!expect_exact_int64(argv[i], &b, "bitwise-and"))
+                return TOK_ERROR;
+            result &= b;
+        }
+        return store(result);
     }
     case PBITWISEIOR: {
-        REQUIRE_ARGC(argc, 2, 2, "bitwise-ior");
-        int64_t a, b;
-        if (!expect_exact_int64(argv[0], &a, "bitwise-ior") ||
-            !expect_exact_int64(argv[1], &b, "bitwise-ior"))
+        REQUIRE_ARGC(argc, 1, 999, "bitwise-ior");
+        int64_t result;
+        if (!expect_exact_int64(argv[0], &result, "bitwise-ior"))
             return TOK_ERROR;
-        return store(a | b);
+        for (unsigned i = 1; i < argc; i++) {
+            int64_t b;
+            if (!expect_exact_int64(argv[i], &b, "bitwise-ior"))
+                return TOK_ERROR;
+            result |= b;
+        }
+        return store(result);
     }
     case PBITWISEXOR: {
-        REQUIRE_ARGC(argc, 2, 2, "bitwise-xor");
-        int64_t a, b;
-        if (!expect_exact_int64(argv[0], &a, "bitwise-xor") ||
-            !expect_exact_int64(argv[1], &b, "bitwise-xor"))
+        REQUIRE_ARGC(argc, 1, 999, "bitwise-xor");
+        int64_t result;
+        if (!expect_exact_int64(argv[0], &result, "bitwise-xor"))
             return TOK_ERROR;
-        return store(a ^ b);
+        for (unsigned i = 1; i < argc; i++) {
+            int64_t b;
+            if (!expect_exact_int64(argv[i], &b, "bitwise-xor"))
+                return TOK_ERROR;
+            result ^= b;
+        }
+        return store(result);
     }
     case PBITWISENOT: {
         REQUIRE_ARGC(argc, 1, 1, "bitwise-not");
