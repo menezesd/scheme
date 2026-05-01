@@ -512,6 +512,29 @@ static const struct {
     // Process control
     {"exit", PEXIT},
 
+    // Bitwise operations
+    {"bitwise-and", PBITWISEAND},
+    {"bitwise-ior", PBITWISEIOR},
+    {"bitwise-not", PBITWISENOT},
+    {"bitwise-xor", PBITWISEXOR},
+    {"arithmetic-shift", PARITHSHIFT},
+
+    // Bytevector operations
+    {"make-bytevector", PMAKEBYTEVEC},
+    {"bytevector-u8-ref", PBYTEVECREF},
+    {"bytevector-u8-set!", PBYTEVECSET},
+    {"bytevector-length", PBYTEVECLEN},
+    {"bytevector-copy", PBYTEVECCOPY},
+    {"bytevector-copy!", PBYTEVECCOPYTO},
+    {"bytevector-append", PBYTEVECAPPEND},
+    {"bytevector", PBYTEVEC},
+    {"bytevector?", PBYTEVECUP},
+
+    // Misc
+    {"command-line", PCOMMANDLINE},
+    {"write-to-string", PWRITETOSTRING},
+    {"list-ref", PLISTREF},
+
     // Control
     {"apply", PAPPLY},
     {"call/cc", PCALLCC},

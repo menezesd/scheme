@@ -378,6 +378,81 @@ unsigned read_token(void)
                 return ctx.atom_true;
             } else if (c == 'f' || c == 'F') {
                 return ctx.atom_false;
+            } else if (c == 'x' || c == 'X') {
+                // Hexadecimal literal: #xFF
+                string_buffer sb;
+                sb_init(&sb);
+                bool neg = false;
+                c = reader_getchar();
+                if (c == '-') { neg = true; c = reader_getchar(); }
+                else if (c == '+') { c = reader_getchar(); }
+                while (isxdigit(c)) {
+                    sb_append(&sb, c);
+                    c = reader_getchar();
+                }
+                reader_ungetc(c);
+                int64_t val = (int64_t)strtoll(sb.data, NULL, 16);
+                sb_free(&sb);
+                return store(neg ? -val : val);
+            } else if (c == 'o' || c == 'O') {
+                // Octal literal: #o77
+                string_buffer sb;
+                sb_init(&sb);
+                bool neg = false;
+                c = reader_getchar();
+                if (c == '-') { neg = true; c = reader_getchar(); }
+                else if (c == '+') { c = reader_getchar(); }
+                while (c >= '0' && c <= '7') {
+                    sb_append(&sb, c);
+                    c = reader_getchar();
+                }
+                reader_ungetc(c);
+                int64_t val = (int64_t)strtoll(sb.data, NULL, 8);
+                sb_free(&sb);
+                return store(neg ? -val : val);
+            } else if (c == 'b' || c == 'B') {
+                // Binary literal: #b1010
+                string_buffer sb;
+                sb_init(&sb);
+                bool neg = false;
+                c = reader_getchar();
+                if (c == '-') { neg = true; c = reader_getchar(); }
+                else if (c == '+') { c = reader_getchar(); }
+                while (c == '0' || c == '1') {
+                    sb_append(&sb, c);
+                    c = reader_getchar();
+                }
+                reader_ungetc(c);
+                int64_t val = (int64_t)strtoll(sb.data, NULL, 2);
+                sb_free(&sb);
+                return store(neg ? -val : val);
+            } else if (c == 'u') {
+                // Bytevector literal: #u8(...)
+                c = reader_getchar();
+                if (c == '8') {
+                    c = reader_getchar();
+                    if (c == '(') {
+                        // Read bytes by reading a list then converting
+                        reader_ungetc(c); // put back '('
+                        unsigned list = read_obj(); // read (b1 b2 ...)
+                        unsigned count = 0;
+                        for (unsigned p = list; p && IS_PAIR(p); p = cdr(p))
+                            count++;
+                        bytevec_data *bv = malloc(sizeof(bytevec_data) + count);
+                        if (!bv) return TOK_ERROR;
+                        bv->len = count;
+                        unsigned i = 0;
+                        for (unsigned p = list; p && IS_PAIR(p); p = cdr(p))
+                            bv->data[i++] = (uint8_t)(CELL_ID(car(p)) & 0xFF);
+                        unsigned cell = alloc();
+                        CELL_TYPE(cell) = BT_BYTEVEC;
+                        CELL_PTR(cell) = bv;
+                        return cell;
+                    }
+                    reader_ungetc(c);
+                }
+                show_error("unknown # syntax: #u%c", c);
+                return TOK_ERROR;
             } else if (isdigit(c)) {
                 // Datum label: #n= or #n#
                 int label = c - '0';

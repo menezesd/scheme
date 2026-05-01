@@ -1251,19 +1251,12 @@ unsigned collect(unsigned x)
     case BT_FREE:
         return 0;
 
-    case BT_STRING: {
-        // String GC Invariant: String data (malloc'd) is shared between old and
-        // new cells during collection. The pointer is simply copied to the new
-        // cell. After collection completes, the old region is swept and any
-        // BT_STRING cells there have their data freed. This is safe because:
-        //   1. If the string was reachable: it was copied to new space and the
-        //      old cell is now BT_BROKENHEART (not BT_STRING), so sweep skips
-        //      it
-        //   2. If the string was unreachable: it was never copied, so the old
-        //      cell still has BT_STRING type and sweep correctly frees the data
-        // Thus exactly one cell owns each string at any time.
+    case BT_STRING:
+    case BT_BYTEVEC: {
+        // Pointer-based types: share the malloc'd data between old and new cells.
+        // The old region is swept after collection, freeing unreachable data.
         unsigned xx = alloc();
-        CELL_TYPE(xx) = BT_STRING;
+        CELL_TYPE(xx) = CELL_TYPE(x);
         CELL_ID(xx) = CELL_ID(x);
         CELL_TYPE(x) = BT_BROKENHEART;
         CELL_CAR(x) = xx;
@@ -1446,10 +1439,9 @@ unsigned gc(unsigned root)
             if (vd)
                 free(vd);
             CELL_PTR(i) = NULL;
-        } else if (CELL_TYPE(i) == BT_STRING) {
-            char *str = (char *)CELL_PTR(i);
-            if (str)
-                free(str);
+        } else if (CELL_TYPE(i) == BT_STRING || CELL_TYPE(i) == BT_BYTEVEC) {
+            if (CELL_PTR(i))
+                free(CELL_PTR(i));
             CELL_PTR(i) = NULL;
         } else if (CELL_TYPE(i) == BT_STRINPORT ||
                    CELL_TYPE(i) == BT_STROUTPORT) {
@@ -1550,13 +1542,14 @@ static unsigned collect_to_old(unsigned x)
     case BT_FREE:
         return 0;
 
-    case BT_STRING: {
-        // Copy string cell to old gen
+    case BT_STRING:
+    case BT_BYTEVEC: {
+        // Copy pointer-based cell to old gen (share malloc'd data)
         if (ctx.hptr >= ctx.nursery_start) {
             lisp_panic("old generation full during minor GC");
         }
         unsigned xx = ctx.hptr++;
-        CELL_TYPE(xx) = BT_STRING;
+        CELL_TYPE(xx) = CELL_TYPE(x);
         CELL_ID(xx) = CELL_ID(x);
         CELL_TYPE(x) = BT_BROKENHEART;
         CELL_CAR(x) = xx;

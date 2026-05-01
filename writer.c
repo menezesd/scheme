@@ -60,6 +60,8 @@ const char *type_name(unsigned cell)
         return "character";
     case BT_VECTOR:
         return "vector";
+    case BT_BYTEVEC:
+        return "bytevector";
     case BT_CONS:
         return "pair";
     case BT_FUNCTION:
@@ -368,6 +370,16 @@ static void write_obj_fp(unsigned s, bool with_quotes, FILE *fp)
             if (i > 0)
                 fprintf(fp, " ");
             write_obj_fp(data[i], with_quotes, fp);
+        }
+        fprintf(fp, ")");
+        break;
+    }
+    case BT_BYTEVEC: {
+        bytevec_data *bv = (bytevec_data *)CELL_PTR(s);
+        fprintf(fp, "#u8(");
+        for (unsigned i = 0; i < bv->len; i++) {
+            if (i > 0) fprintf(fp, " ");
+            fprintf(fp, "%u", bv->data[i]);
         }
         fprintf(fp, ")");
         break;

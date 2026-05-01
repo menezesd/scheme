@@ -682,6 +682,245 @@ unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
                    "handled in apply_function");
         return TOK_ERROR;
 
+    // ========================================================================
+    // Bitwise operations
+    // ========================================================================
+    case PBITWISEAND: {
+        REQUIRE_ARGC(argc, 2, 2, "bitwise-and");
+        int64_t a, b;
+        if (!expect_exact_int64(argv[0], &a, "bitwise-and") ||
+            !expect_exact_int64(argv[1], &b, "bitwise-and"))
+            return TOK_ERROR;
+        return store(a & b);
+    }
+    case PBITWISEIOR: {
+        REQUIRE_ARGC(argc, 2, 2, "bitwise-ior");
+        int64_t a, b;
+        if (!expect_exact_int64(argv[0], &a, "bitwise-ior") ||
+            !expect_exact_int64(argv[1], &b, "bitwise-ior"))
+            return TOK_ERROR;
+        return store(a | b);
+    }
+    case PBITWISEXOR: {
+        REQUIRE_ARGC(argc, 2, 2, "bitwise-xor");
+        int64_t a, b;
+        if (!expect_exact_int64(argv[0], &a, "bitwise-xor") ||
+            !expect_exact_int64(argv[1], &b, "bitwise-xor"))
+            return TOK_ERROR;
+        return store(a ^ b);
+    }
+    case PBITWISENOT: {
+        REQUIRE_ARGC(argc, 1, 1, "bitwise-not");
+        int64_t a;
+        if (!expect_exact_int64(argv[0], &a, "bitwise-not"))
+            return TOK_ERROR;
+        return store(~a);
+    }
+    case PARITHSHIFT: {
+        REQUIRE_ARGC(argc, 2, 2, "arithmetic-shift");
+        int64_t val, count;
+        if (!expect_exact_int64(argv[0], &val, "arithmetic-shift") ||
+            !expect_exact_int64(argv[1], &count, "arithmetic-shift"))
+            return TOK_ERROR;
+        if (count >= 0) {
+            if (count >= 63) return store(0);
+            return store(val << count);
+        } else {
+            count = -count;
+            if (count >= 63) return store(val < 0 ? -1 : 0);
+            return store(val >> count);
+        }
+    }
+
+    // ========================================================================
+    // Bytevector operations
+    // ========================================================================
+    case PMAKEBYTEVEC: {
+        REQUIRE_ARGC(argc, 1, 2, "make-bytevector");
+        int64_t len;
+        if (!expect_nonneg_int64(argv[0], &len, "make-bytevector"))
+            return TOK_ERROR;
+        uint8_t fill = 0;
+        if (argc > 1) {
+            int64_t f;
+            if (!expect_exact_int64(argv[1], &f, "make-bytevector"))
+                return TOK_ERROR;
+            fill = (uint8_t)(f & 0xFF);
+        }
+        bytevec_data *bv = malloc(sizeof(bytevec_data) + (size_t)len);
+        if (!bv) { show_error("make-bytevector: out of memory"); return TOK_ERROR; }
+        bv->len = (unsigned)len;
+        memset(bv->data, fill, (size_t)len);
+        unsigned cell = alloc();
+        CELL_TYPE(cell) = BT_BYTEVEC;
+        CELL_PTR(cell) = bv;
+        return cell;
+    }
+    case PBYTEVECREF: {
+        REQUIRE_ARGC(argc, 2, 2, "bytevector-u8-ref");
+        if (CELL_TYPE(argv[0]) != BT_BYTEVEC) {
+            show_error("bytevector-u8-ref: not a bytevector"); return TOK_ERROR;
+        }
+        bytevec_data *bv = (bytevec_data *)CELL_PTR(argv[0]);
+        int64_t idx;
+        if (!expect_nonneg_int64(argv[1], &idx, "bytevector-u8-ref"))
+            return TOK_ERROR;
+        if ((unsigned)idx >= bv->len) {
+            show_error("bytevector-u8-ref: index out of bounds"); return TOK_ERROR;
+        }
+        return store(bv->data[idx]);
+    }
+    case PBYTEVECSET: {
+        REQUIRE_ARGC(argc, 3, 3, "bytevector-u8-set!");
+        if (CELL_TYPE(argv[0]) != BT_BYTEVEC) {
+            show_error("bytevector-u8-set!: not a bytevector"); return TOK_ERROR;
+        }
+        bytevec_data *bv = (bytevec_data *)CELL_PTR(argv[0]);
+        int64_t idx, val;
+        if (!expect_nonneg_int64(argv[1], &idx, "bytevector-u8-set!") ||
+            !expect_exact_int64(argv[2], &val, "bytevector-u8-set!"))
+            return TOK_ERROR;
+        if ((unsigned)idx >= bv->len) {
+            show_error("bytevector-u8-set!: index out of bounds"); return TOK_ERROR;
+        }
+        bv->data[idx] = (uint8_t)(val & 0xFF);
+        return 0;
+    }
+    case PBYTEVECLEN: {
+        REQUIRE_ARGC(argc, 1, 1, "bytevector-length");
+        if (CELL_TYPE(argv[0]) != BT_BYTEVEC) {
+            show_error("bytevector-length: not a bytevector"); return TOK_ERROR;
+        }
+        return store(((bytevec_data *)CELL_PTR(argv[0]))->len);
+    }
+    case PBYTEVECUP: {
+        REQUIRE_ARGC(argc, 1, 1, "bytevector?");
+        return (argv[0] && CELL_TYPE(argv[0]) == BT_BYTEVEC)
+                   ? ctx.atom_true : ctx.atom_false;
+    }
+    case PBYTEVEC: {
+        // (bytevector b1 b2 ...) — construct from byte values
+        bytevec_data *bv = malloc(sizeof(bytevec_data) + argc);
+        if (!bv) { show_error("bytevector: out of memory"); return TOK_ERROR; }
+        bv->len = argc;
+        for (unsigned i = 0; i < argc; i++) {
+            int64_t val;
+            if (!expect_exact_int64(argv[i], &val, "bytevector"))
+                { free(bv); return TOK_ERROR; }
+            bv->data[i] = (uint8_t)(val & 0xFF);
+        }
+        unsigned cell = alloc();
+        CELL_TYPE(cell) = BT_BYTEVEC;
+        CELL_PTR(cell) = bv;
+        return cell;
+    }
+    case PBYTEVECCOPY: {
+        REQUIRE_ARGC(argc, 1, 3, "bytevector-copy");
+        if (CELL_TYPE(argv[0]) != BT_BYTEVEC) {
+            show_error("bytevector-copy: not a bytevector"); return TOK_ERROR;
+        }
+        bytevec_data *src = (bytevec_data *)CELL_PTR(argv[0]);
+        int64_t start = 0, end = src->len;
+        if (argc > 1 && !expect_nonneg_int64(argv[1], &start, "bytevector-copy"))
+            return TOK_ERROR;
+        if (argc > 2 && !expect_nonneg_int64(argv[2], &end, "bytevector-copy"))
+            return TOK_ERROR;
+        if (start > end || (unsigned)end > src->len) {
+            show_error("bytevector-copy: invalid range"); return TOK_ERROR;
+        }
+        unsigned len = (unsigned)(end - start);
+        bytevec_data *bv = malloc(sizeof(bytevec_data) + len);
+        if (!bv) { show_error("bytevector-copy: out of memory"); return TOK_ERROR; }
+        bv->len = len;
+        memcpy(bv->data, src->data + start, len);
+        unsigned cell = alloc();
+        CELL_TYPE(cell) = BT_BYTEVEC;
+        CELL_PTR(cell) = bv;
+        return cell;
+    }
+    case PBYTEVECCOPYTO: {
+        REQUIRE_ARGC(argc, 3, 5, "bytevector-copy!");
+        if (CELL_TYPE(argv[0]) != BT_BYTEVEC || CELL_TYPE(argv[2]) != BT_BYTEVEC) {
+            show_error("bytevector-copy!: not a bytevector"); return TOK_ERROR;
+        }
+        bytevec_data *dst = (bytevec_data *)CELL_PTR(argv[0]);
+        bytevec_data *src = (bytevec_data *)CELL_PTR(argv[2]);
+        int64_t at, start = 0, end = src->len;
+        if (!expect_nonneg_int64(argv[1], &at, "bytevector-copy!"))
+            return TOK_ERROR;
+        if (argc > 3 && !expect_nonneg_int64(argv[3], &start, "bytevector-copy!"))
+            return TOK_ERROR;
+        if (argc > 4 && !expect_nonneg_int64(argv[4], &end, "bytevector-copy!"))
+            return TOK_ERROR;
+        unsigned len = (unsigned)(end - start);
+        if ((unsigned)at + len > dst->len || (unsigned)end > src->len) {
+            show_error("bytevector-copy!: out of bounds"); return TOK_ERROR;
+        }
+        memmove(dst->data + at, src->data + start, len);
+        return 0;
+    }
+    case PBYTEVECAPPEND: {
+        // (bytevector-append bv1 bv2 ...)
+        unsigned total = 0;
+        for (unsigned i = 0; i < argc; i++) {
+            if (CELL_TYPE(argv[i]) != BT_BYTEVEC) {
+                show_error("bytevector-append: not a bytevector"); return TOK_ERROR;
+            }
+            total += ((bytevec_data *)CELL_PTR(argv[i]))->len;
+        }
+        bytevec_data *bv = malloc(sizeof(bytevec_data) + total);
+        if (!bv) { show_error("bytevector-append: out of memory"); return TOK_ERROR; }
+        bv->len = total;
+        unsigned pos = 0;
+        for (unsigned i = 0; i < argc; i++) {
+            bytevec_data *src = (bytevec_data *)CELL_PTR(argv[i]);
+            memcpy(bv->data + pos, src->data, src->len);
+            pos += src->len;
+        }
+        unsigned cell = alloc();
+        CELL_TYPE(cell) = BT_BYTEVEC;
+        CELL_PTR(cell) = bv;
+        return cell;
+    }
+
+    // ========================================================================
+    // Misc: command-line, write-to-string, list-ref
+    // ========================================================================
+    case PCOMMANDLINE: {
+        REQUIRE_ARGC(argc, 0, 0, "command-line");
+        // Return empty list (no args in embedded mode)
+        return alloc_cons(make_string_copy("vesper"), 0);
+    }
+    case PWRITETOSTRING: {
+        REQUIRE_ARGC(argc, 1, 1, "write-to-string");
+        char *buf = NULL;
+        size_t buf_len = 0;
+        FILE *mem = open_memstream(&buf, &buf_len);
+        if (!mem) { show_error("write-to-string: out of memory"); return TOK_ERROR; }
+        write_obj_port(argv[0], mem);
+        fclose(mem);
+        unsigned result = make_string_copy(buf);
+        free(buf);
+        return result;
+    }
+    case PLISTREF: {
+        REQUIRE_ARGC(argc, 2, 2, "list-ref");
+        int64_t idx;
+        if (!expect_nonneg_int64(argv[1], &idx, "list-ref"))
+            return TOK_ERROR;
+        unsigned lst = argv[0];
+        for (int64_t i = 0; i < idx; i++) {
+            if (!IS_PAIR(lst)) {
+                show_error("list-ref: index out of bounds"); return TOK_ERROR;
+            }
+            lst = cdr(lst);
+        }
+        if (!IS_PAIR(lst)) {
+            show_error("list-ref: index out of bounds"); return TOK_ERROR;
+        }
+        return car(lst);
+    }
+
     default:
         show_error("unknown primitive: %u", prim_id);
         return TOK_ERROR;

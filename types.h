@@ -77,6 +77,7 @@ enum lisp_type {
     BT_CLOSURE = 100,   // VM closure (bytecode)
     BT_VMCONT = 101,    // VM continuation (distinct from CPS BT_CONT)
     BT_COMPILED_PATTERN = 102, // Compiled pattern: ptr = compiled_pattern*
+    BT_BYTEVEC = 103,          // Bytevector: ptr = bytevec_data*
     BT_BROKENHEART = -1 // GC forwarding pointer: car = new location
 };
 
@@ -185,6 +186,12 @@ typedef struct {
     unsigned len;
     unsigned data[]; // Flexible array member
 } vector_data;
+
+// Bytevector data structure (stored in ptr field)
+typedef struct {
+    unsigned len;
+    uint8_t data[]; // Flexible array member
+} bytevec_data;
 
 // String port structure (for string I/O with fast appending)
 typedef struct {
@@ -491,6 +498,28 @@ enum primitive_id {
     PRANDOMSEED,
     // Process control
     PEXIT,
+    // Bitwise operations
+    PBITWISEAND,
+    PBITWISEIOR,
+    PBITWISENOT,
+    PBITWISEXOR,
+    PARITHSHIFT,
+    // Bytevector operations
+    PMAKEBYTEVEC,
+    PBYTEVECREF,
+    PBYTEVECSET,
+    PBYTEVECLEN,
+    PBYTEVECCOPY,
+    PBYTEVECCOPYTO,
+    PBYTEVECAPPEND,
+    PBYTEVEC,
+    PBYTEVECUP,
+    // Command line
+    PCOMMANDLINE,
+    // write-to-string
+    PWRITETOSTRING,
+    // list-ref
+    PLISTREF,
     PRIM_COUNT // Total number of primitives
 };
 
