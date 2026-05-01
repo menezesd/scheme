@@ -219,15 +219,33 @@ static void load_stdlib(unsigned *env)
 static unsigned load_callback(const char *filename, unsigned *env_ptr)
 {
     FILE *f = fopen(filename, "r");
+    // Try with .scm extension if not found
+    char *with_ext = NULL;
+    if (!f) {
+        size_t len = strlen(filename);
+        // Only add .scm if file doesn't already end with .scm
+        if (len < 4 || strcmp(filename + len - 4, ".scm") != 0) {
+            with_ext = malloc(len + 5);
+            if (with_ext) {
+                memcpy(with_ext, filename, len);
+                memcpy(with_ext + len, ".scm", 5);
+                f = fopen(with_ext, "r");
+                if (f) filename = with_ext; // use for error reporting
+            }
+        }
+    }
     if (!f) {
         show_error("load: cannot open file: %s", filename);
+        free(with_ext);
         return TOK_ERROR;
     }
     if (!load_from_port(f, env_ptr, true, filename)) {
         fclose(f);
+        free(with_ext);
         return TOK_ERROR;
     }
     fclose(f);
+    free(with_ext);
     return 0; // Return nil on success (like the CPS evaluator)
 }
 

@@ -46,6 +46,52 @@
      (if (not test) (begin body ...)))))
 
 ;;; ============================================================================
+;;; Guard (R7RS exception handling)
+;;; ============================================================================
+
+;; Simple exception system using continuations
+(define *current-exception-handler*
+  (lambda (exn)
+    (display "Unhandled exception: ")
+    (display exn)
+    (newline)
+    (exit 1)))
+
+(define (with-exception-handler handler thunk)
+  (let ((old-handler *current-exception-handler*))
+    (dynamic-wind
+      (lambda () (set! *current-exception-handler* handler))
+      thunk
+      (lambda () (set! *current-exception-handler* old-handler)))))
+
+(define (raise obj)
+  (*current-exception-handler* obj))
+
+(define (raise-continuable obj)
+  (*current-exception-handler* obj))
+
+(define-syntax guard
+  (syntax-rules ()
+    ((guard (var clause ...) body ...)
+     (call/cc
+       (lambda (guard-exit)
+         (with-exception-handler
+           (lambda (var)
+             (guard-exit
+               (guard-aux var clause ...)))
+           (lambda ()
+             body ...)))))))
+
+(define-syntax guard-aux
+  (syntax-rules (else)
+    ((guard-aux var (else result ...))
+     (begin result ...))
+    ((guard-aux var (test result ...))
+     (if test (begin result ...) (raise var)))
+    ((guard-aux var (test result ...) clause ...)
+     (if test (begin result ...) (guard-aux var clause ...)))))
+
+;;; ============================================================================
 ;;; Case and Do macros
 ;;; ============================================================================
 

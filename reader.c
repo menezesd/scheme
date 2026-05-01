@@ -262,23 +262,50 @@ static unsigned read_string_literal(void)
         if (c == '\\') {
             c = reader_getchar();
             switch (c) {
-            case 'n':
-                c = '\n';
+            case 'n': c = '\n'; break;
+            case 't': c = '\t'; break;
+            case 'r': c = '\r'; break;
+            case '\\': c = '\\'; break;
+            case '"': c = '"'; break;
+            case 'a': c = '\a'; break;
+            case 'b': c = '\b'; break;
+            case 'e': c = 27; break; // ESC
+            case 'x': {
+                // Hex escape: \xNN
+                int hi = reader_getchar();
+                int lo = reader_getchar();
+                int val = 0;
+                if (isxdigit(hi) && isxdigit(lo)) {
+                    val = (hi <= '9' ? hi - '0' : (hi | 32) - 'a' + 10) * 16 +
+                          (lo <= '9' ? lo - '0' : (lo | 32) - 'a' + 10);
+                } else {
+                    show_warning("invalid hex escape: \\x%c%c", hi, lo);
+                    reader_ungetc(lo);
+                    reader_ungetc(hi);
+                }
+                c = val;
                 break;
-            case 't':
-                c = '\t';
-                break;
-            case 'r':
-                c = '\r';
-                break;
-            case '\\':
-                c = '\\';
-                break;
-            case '"':
-                c = '"';
-                break;
+            }
             default:
-                show_warning("unknown escape sequence: \\%c", c);
+                if (c >= '0' && c <= '7') {
+                    // Octal escape: \NNN (1-3 digits)
+                    int val = c - '0';
+                    c = reader_getchar();
+                    if (c >= '0' && c <= '7') {
+                        val = val * 8 + (c - '0');
+                        c = reader_getchar();
+                        if (c >= '0' && c <= '7') {
+                            val = val * 8 + (c - '0');
+                        } else {
+                            reader_ungetc(c);
+                        }
+                    } else {
+                        reader_ungetc(c);
+                    }
+                    c = val;
+                } else {
+                    show_warning("unknown escape sequence: \\%c", c);
+                }
             }
         }
         sb_append(&sb, c);
