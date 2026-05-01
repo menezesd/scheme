@@ -614,26 +614,39 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
             return;
         }
 
-        // Protect closure_env from GC during argument building
+        // Build environment frame directly from stack values.
+        // For fixed-arity closures, skip arg list + bind_params entirely.
         gc_protect(&closure_env);
-
-        // Build argument list in correct order by iterating stack in reverse
-        unsigned args = 0;
-        for (int i = (int)argc - 1; i >= 0; i--) {
-            args = alloc_cons(vm->stack[vm->sp - argc + i], args);
-        }
-
-        vm->sp -= argc;
-
-        // Get params from constant pool and bind
-        gc_protect(&args);
         unsigned params = code->constants[code->params];
         gc_protect(&params);
-        unsigned frame = bind_params(params, args);
-        gc_unprotect(2); // params, args
-        gc_protect(&frame);
-        unsigned new_env = alloc_cons(frame, closure_env);
-        gc_unprotect(2); // frame, closure_env
+        unsigned new_env;
+
+        if (!code->has_rest) {
+            // Fast path: build (params . vals) frame directly from stack
+            unsigned vals = 0;
+            gc_protect(&vals);
+            for (int i = (int)argc - 1; i >= 0; i--) {
+                vals = alloc_cons(vm->stack[vm->sp - argc + i], vals);
+            }
+            vm->sp -= argc;
+            unsigned frame = alloc_cons(params, vals);
+            gc_protect(&frame);
+            new_env = alloc_cons(frame, closure_env);
+            gc_unprotect(4); // frame, vals, params, closure_env
+        } else {
+            // Rest parameter path: use bind_params for variadics
+            unsigned args = 0;
+            for (int i = (int)argc - 1; i >= 0; i--) {
+                args = alloc_cons(vm->stack[vm->sp - argc + i], args);
+            }
+            vm->sp -= argc;
+            gc_protect(&args);
+            unsigned frame = bind_params(params, args);
+            gc_unprotect(1); // args
+            gc_protect(&frame);
+            new_env = alloc_cons(frame, closure_env);
+            gc_unprotect(3); // frame, params, closure_env
+        }
 
         if (tail && vm->fp > 0) {
             // Tail call: reuse current frame
