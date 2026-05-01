@@ -1784,8 +1784,11 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             a = ensure_boxed(a);
             gc_protect(&a);
             b = ensure_boxed(b);
+            // Build bottom-up to avoid unspecified evaluation order
+            unsigned tail = alloc_cons(b, 0);
+            unsigned result = alloc_cons(a, tail);
             gc_unprotect(1);
-            vm_push(vm, alloc_cons(a, alloc_cons(b, 0)));
+            vm_push(vm, result);
             break;
         }
 
@@ -1798,8 +1801,11 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             b = ensure_boxed(b);
             gc_protect(&b);
             c = ensure_boxed(c);
+            unsigned t2 = alloc_cons(c, 0);
+            unsigned t1 = alloc_cons(b, t2);
+            unsigned result = alloc_cons(a, t1);
             gc_unprotect(2);
-            vm_push(vm, alloc_cons(a, alloc_cons(b, alloc_cons(c, 0))));
+            vm_push(vm, result);
             break;
         }
 
@@ -2416,7 +2422,10 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                                            : store(r));
             } else {
                 n = ensure_boxed(n);
-                unsigned argv[2] = {n, store(1)};
+                gc_protect(&n);
+                unsigned one = store(1);
+                gc_unprotect(1);
+                unsigned argv[2] = {n, one};
                 unsigned result = prim_plus(2, argv);
                 vm_push(vm, result);
             }
@@ -2447,7 +2456,10 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                                            : store(r));
             } else {
                 n = ensure_boxed(n);
-                unsigned argv[2] = {n, store(1)};
+                gc_protect(&n);
+                unsigned one = store(1);
+                gc_unprotect(1);
+                unsigned argv[2] = {n, one};
                 unsigned result = prim_minus(2, argv);
                 vm_push(vm, result);
             }
