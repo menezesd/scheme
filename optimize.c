@@ -29,7 +29,9 @@ unsigned instruction_size(unsigned op)
     case OP_LOOKUP_SUB1:
         return 4; // opcode + sym_id + cached_depth + cached_offset
     case OP_NUMEQ_JUMPIFNOT:
+    case OP_NUMEQ_INT_JUMPIFNOT:
     case OP_LT_JUMPIFNOT:
+    case OP_LT_INT_JUMPIFNOT:
     case OP_GT_JUMPIFNOT:
     case OP_LE_JUMPIFNOT:
     case OP_GE_JUMPIFNOT:
@@ -111,7 +113,8 @@ static void cse_pass(code_object *code)
             op == OP_JUMPIFZERO || op == OP_JUMPIFNOTZERO ||
                 op == OP_NUMEQ_JUMPIFNOT || op == OP_LT_JUMPIFNOT ||
                 op == OP_GT_JUMPIFNOT || op == OP_LE_JUMPIFNOT ||
-                op == OP_GE_JUMPIFNOT) {
+                op == OP_GE_JUMPIFNOT ||
+                op == OP_NUMEQ_INT_JUMPIFNOT || op == OP_LT_INT_JUMPIFNOT) {
             unsigned target = c[i + 1];
             if (target <= len)
                 is_jump_target[target] = true;
@@ -262,7 +265,8 @@ static void cse_pass(code_object *code)
                 op == OP_JUMPIFZERO || op == OP_JUMPIFNOTZERO ||
                 op == OP_NUMEQ_JUMPIFNOT || op == OP_LT_JUMPIFNOT ||
                 op == OP_GT_JUMPIFNOT || op == OP_LE_JUMPIFNOT ||
-                op == OP_GE_JUMPIFNOT) {
+                op == OP_GE_JUMPIFNOT ||
+                op == OP_NUMEQ_INT_JUMPIFNOT || op == OP_LT_INT_JUMPIFNOT) {
                 unsigned old_target = new_code[j + 1];
                 // Find the new target using offset map
                 // Search for the closest mapped position
@@ -313,7 +317,8 @@ void peephole_optimize(code_object *code)
             op == OP_JUMPIFZERO || op == OP_JUMPIFNOTZERO ||
                 op == OP_NUMEQ_JUMPIFNOT || op == OP_LT_JUMPIFNOT ||
                 op == OP_GT_JUMPIFNOT || op == OP_LE_JUMPIFNOT ||
-                op == OP_GE_JUMPIFNOT) {
+                op == OP_GE_JUMPIFNOT ||
+                op == OP_NUMEQ_INT_JUMPIFNOT || op == OP_LT_INT_JUMPIFNOT) {
             unsigned target = c[i + 1];
             if (target <= len)
                 is_jump_target[target] = true;
@@ -661,7 +666,8 @@ void peephole_optimize(code_object *code)
             op == OP_JUMPIFZERO || op == OP_JUMPIFNOTZERO ||
                 op == OP_NUMEQ_JUMPIFNOT || op == OP_LT_JUMPIFNOT ||
                 op == OP_GT_JUMPIFNOT || op == OP_LE_JUMPIFNOT ||
-                op == OP_GE_JUMPIFNOT) {
+                op == OP_GE_JUMPIFNOT ||
+                op == OP_NUMEQ_INT_JUMPIFNOT || op == OP_LT_INT_JUMPIFNOT) {
 
             unsigned target = c[i + 1];
             unsigned visited_count = 0;
@@ -712,7 +718,8 @@ void peephole_optimize(code_object *code)
             op == OP_JUMPIFZERO || op == OP_JUMPIFNOTZERO ||
                 op == OP_NUMEQ_JUMPIFNOT || op == OP_LT_JUMPIFNOT ||
                 op == OP_GT_JUMPIFNOT || op == OP_LE_JUMPIFNOT ||
-                op == OP_GE_JUMPIFNOT) {
+                op == OP_GE_JUMPIFNOT ||
+                op == OP_NUMEQ_INT_JUMPIFNOT || op == OP_LT_INT_JUMPIFNOT) {
             unsigned old_target = c[read + 1];
             unsigned new_target =
                 (old_target < len) ? offset_map[old_target] : final_len;

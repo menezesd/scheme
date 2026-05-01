@@ -1534,6 +1534,8 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 int64_t sum = (int64_t)FIXNUM_VALUE(a) + (int64_t)FIXNUM_VALUE(b);
                 vm_push(vm, FITS_FIXNUM(sum) ? MAKE_FIXNUM((int32_t)sum)
                                              : store(sum));
+                // Quicken: next time, skip type checks
+                vm->code->code[vm->ip - 1] = OP_ADD_INT;
                 break;
             }
             a = ensure_boxed(a);
@@ -1554,6 +1556,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 int64_t diff = (int64_t)FIXNUM_VALUE(a) - (int64_t)FIXNUM_VALUE(b);
                 vm_push(vm, FITS_FIXNUM(diff) ? MAKE_FIXNUM((int32_t)diff)
                                               : store(diff));
+                vm->code->code[vm->ip - 1] = OP_SUB_INT;
                 break;
             }
             a = ensure_boxed(a);
@@ -1574,6 +1577,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 int64_t prod = (int64_t)FIXNUM_VALUE(a) * (int64_t)FIXNUM_VALUE(b);
                 vm_push(vm, FITS_FIXNUM(prod) ? MAKE_FIXNUM((int32_t)prod)
                                               : store(prod));
+                vm->code->code[vm->ip - 1] = OP_MUL_INT;
                 break;
             }
             a = ensure_boxed(a);
@@ -2333,6 +2337,84 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             break;
         }
 
+        // Quickened (type-specialized) arithmetic — assume fixnum operands
+        case OP_ADD_INT: {
+            unsigned b = vm_pop(vm);
+            unsigned a = vm_pop(vm);
+            if (__builtin_expect(IS_FIXNUM(a) && IS_FIXNUM(b), 1)) {
+                int64_t sum = (int64_t)FIXNUM_VALUE(a) + (int64_t)FIXNUM_VALUE(b);
+                vm_push(vm, FITS_FIXNUM(sum) ? MAKE_FIXNUM((int32_t)sum)
+                                             : store(sum));
+            } else {
+                // Deopt: rewrite back to generic and re-execute
+                vm->code->code[vm->ip - 1] = OP_ADD;
+                vm_push(vm, a); vm_push(vm, b); vm->ip--;
+                continue;
+            }
+            break;
+        }
+        case OP_SUB_INT: {
+            unsigned b = vm_pop(vm);
+            unsigned a = vm_pop(vm);
+            if (__builtin_expect(IS_FIXNUM(a) && IS_FIXNUM(b), 1)) {
+                int64_t diff = (int64_t)FIXNUM_VALUE(a) - (int64_t)FIXNUM_VALUE(b);
+                vm_push(vm, FITS_FIXNUM(diff) ? MAKE_FIXNUM((int32_t)diff)
+                                              : store(diff));
+            } else {
+                vm->code->code[vm->ip - 1] = OP_SUB;
+                vm_push(vm, a); vm_push(vm, b); vm->ip--;
+                continue;
+            }
+            break;
+        }
+        case OP_MUL_INT: {
+            unsigned b = vm_pop(vm);
+            unsigned a = vm_pop(vm);
+            if (__builtin_expect(IS_FIXNUM(a) && IS_FIXNUM(b), 1)) {
+                int64_t prod = (int64_t)FIXNUM_VALUE(a) * (int64_t)FIXNUM_VALUE(b);
+                vm_push(vm, FITS_FIXNUM(prod) ? MAKE_FIXNUM((int32_t)prod)
+                                              : store(prod));
+            } else {
+                vm->code->code[vm->ip - 1] = OP_MUL;
+                vm_push(vm, a); vm_push(vm, b); vm->ip--;
+                continue;
+            }
+            break;
+        }
+
+        // Quickened compare+branch — assume fixnum operands
+        case OP_LT_INT_JUMPIFNOT: {
+            unsigned target = vm->code->code[vm->ip++];
+            unsigned b = vm_pop(vm);
+            unsigned a = vm_pop(vm);
+            if (__builtin_expect(IS_FIXNUM(a) && IS_FIXNUM(b), 1)) {
+                if (!(FIXNUM_VALUE(a) < FIXNUM_VALUE(b)))
+                    vm->ip = target;
+            } else {
+                // Deopt: rewrite and re-execute
+                vm->code->code[vm->ip - 2] = OP_LT_JUMPIFNOT;
+                vm_push(vm, a); vm_push(vm, b);
+                vm->ip -= 2;
+                continue;
+            }
+            break;
+        }
+        case OP_NUMEQ_INT_JUMPIFNOT: {
+            unsigned target = vm->code->code[vm->ip++];
+            unsigned b = vm_pop(vm);
+            unsigned a = vm_pop(vm);
+            if (__builtin_expect(IS_FIXNUM(a) && IS_FIXNUM(b), 1)) {
+                if (a != b)
+                    vm->ip = target;
+            } else {
+                vm->code->code[vm->ip - 2] = OP_NUMEQ_JUMPIFNOT;
+                vm_push(vm, a); vm_push(vm, b);
+                vm->ip -= 2;
+                continue;
+            }
+            break;
+        }
+
         // Fused compare-and-branch
         case OP_NUMEQ_JUMPIFNOT: {
             unsigned target = vm->code->code[vm->ip++];
@@ -2341,6 +2423,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             bool eq;
             if (IS_FIXNUM(a) && IS_FIXNUM(b)) {
                 eq = (a == b);
+                vm->code->code[vm->ip - 2] = OP_NUMEQ_INT_JUMPIFNOT;
             } else if (IS_FIXNUM(a) || IS_FIXNUM(b)) {
                 a = ensure_boxed(a);
                 gc_protect(&a);
@@ -2375,7 +2458,8 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             if (IS_FIXNUM(a) && IS_FIXNUM(b)) {
                 int32_t va = FIXNUM_VALUE(a), vb = FIXNUM_VALUE(b);
                 switch (fused_op) {
-                case OP_LT_JUMPIFNOT: cond = (va < vb); break;
+                case OP_LT_JUMPIFNOT: cond = (va < vb);
+                    vm->code->code[vm->ip - 2] = OP_LT_INT_JUMPIFNOT; break;
                 case OP_GT_JUMPIFNOT: cond = (va > vb); break;
                 case OP_LE_JUMPIFNOT: cond = (va <= vb); break;
                 case OP_GE_JUMPIFNOT: cond = (va >= vb); break;

@@ -172,6 +172,13 @@ enum opcode {
     OP_LE_JUMPIFNOT,     // pop b,a, jump if !(a<=b)
     OP_GE_JUMPIFNOT,     // pop b,a, jump if !(a>=b)
 
+    // Quickened (type-specialized) opcodes — assume fixnum operands
+    OP_ADD_INT,   // Fixnum add: skip type checks, deopt on non-fixnum
+    OP_SUB_INT,   // Fixnum sub
+    OP_MUL_INT,   // Fixnum mul
+    OP_LT_INT_JUMPIFNOT,  // Fixnum compare+branch
+    OP_NUMEQ_INT_JUMPIFNOT,
+
     OP_COUNT // Number of opcodes (must be last)
 };
 
