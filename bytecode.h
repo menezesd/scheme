@@ -172,6 +172,16 @@ enum opcode {
     OP_LE_JUMPIFNOT,     // pop b,a, jump if !(a<=b)
     OP_GE_JUMPIFNOT,     // pop b,a, jump if !(a>=b)
 
+    // Stack locals — direct access to function parameters on the stack
+    OP_LOCAL_GET,    // Push stack[bp + operand]: LOCAL_GET n
+    OP_LOCAL_SET,    // stack[bp + operand] = pop, push old: LOCAL_SET n
+    OP_LOCAL_SET_VOID, // stack[bp + operand] = pop: LOCAL_SET_VOID n
+    // Fast register-like access to first 4 locals (single-word opcodes)
+    OP_LOCAL_GET0,   // Push stack[bp + 0]
+    OP_LOCAL_GET1,   // Push stack[bp + 1]
+    OP_LOCAL_GET2,   // Push stack[bp + 2]
+    OP_LOCAL_GET3,   // Push stack[bp + 3]
+
     // Quickened (type-specialized) opcodes — assume fixnum operands
     OP_ADD_INT,   // Fixnum add: skip type checks, deopt on non-fixnum
     OP_SUB_INT,   // Fixnum sub
@@ -210,6 +220,7 @@ typedef struct code_object {
     unsigned arity;    // Number of required parameters
     bool has_rest;     // True if has rest parameter
     unsigned rest_idx; // Index of rest parameter (if has_rest)
+    bool use_locals;   // True if params are stack locals (not in env)
 
     // Source info for debugging
     const char *name;     // Function name (if known)
@@ -305,6 +316,7 @@ typedef struct {
     code_object *code; // Current code object
     unsigned ip;       // Instruction pointer
     unsigned env;      // Current environment
+    unsigned bp;       // Base pointer for stack locals
 
     // Letrec initialization tracking
     unsigned letrec_frame;   // Frame being initialized (0 if none)
@@ -329,6 +341,10 @@ typedef struct compile_ctx {
     unsigned env;               // Compile-time environment (for macros)
     bool tail_position;         // True if compiling in tail position
     unsigned known_lambdas;     // Alist of (var-id . lambda-expr) for inlining
+    // Stack locals: map param symbol IDs to stack slots
+    int num_locals;                // Number of stack locals (-1 = not using locals)
+    int64_t local_ids[8];          // Symbol IDs for locals[0..num_locals-1]
+
     // Loop optimization: when inside a letrec-bound lambda, track the loop
     // variable so recursive tail calls can be compiled as SET+JUMP
     int64_t loop_var_id;        // Symbol ID of loop variable (-1 if none)

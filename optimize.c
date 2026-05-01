@@ -35,6 +35,9 @@ unsigned instruction_size(unsigned op)
     case OP_GT_JUMPIFNOT:
     case OP_LE_JUMPIFNOT:
     case OP_GE_JUMPIFNOT:
+    case OP_LOCAL_GET:
+    case OP_LOCAL_SET:
+    case OP_LOCAL_SET_VOID:
     case OP_CONST:
     case OP_DEFINE:
     case OP_SET:

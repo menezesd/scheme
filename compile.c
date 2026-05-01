@@ -67,6 +67,25 @@ static unsigned lookup_known_lambda(int64_t var_id, unsigned known_lambdas)
     return 0;
 }
 
+// Forward declaration
+static bool contains_reference(unsigned expr, int64_t var_id);
+
+// Check if var_id is referenced inside any inner lambda in expr
+// (i.e., would be "captured" by a closure)
+static bool captured_by_inner_lambda(unsigned expr, int64_t var_id)
+{
+    if (!expr || !IS_PAIR(expr))
+        return false;
+    if (IS_ATOM(car(expr)) && CELL_ID(car(expr)) == ctx.kw_quote)
+        return false;
+    if (IS_ATOM(car(expr)) && CELL_ID(car(expr)) == ctx.kw_lambda) {
+        // This IS an inner lambda. Check if var_id appears in it
+        return contains_reference(expr, var_id);
+    }
+    return captured_by_inner_lambda(car(expr), var_id) ||
+           captured_by_inner_lambda(cdr(expr), var_id);
+}
+
 // Check if expr contains a reference to var_id (for detecting self-reference)
 static bool contains_reference(unsigned expr, int64_t var_id)
 {
@@ -220,6 +239,7 @@ static compile_ctx *cctx_new(compile_ctx *parent, unsigned env)
     cctx->env = env;
     cctx->tail_position = false;
     cctx->loop_var_id = -1;
+    cctx->num_locals = -1;
     // Inherit known_lambdas from parent (they're still in scope)
     cctx->known_lambdas = parent ? parent->known_lambdas : 0;
     // Protect env and known_lambdas so they're updated if GC runs
@@ -504,8 +524,21 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
         return const_result(expr);
 
     case BT_ATOM: {
-        // Variable reference - not constant
-        emit4(cctx, OP_LOOKUP, CELL_ID(expr), IC_UNCACHED, IC_UNCACHED);
+        // Check if this variable is a stack local
+        int64_t var_id = CELL_ID(expr);
+        if (cctx->num_locals > 0) {
+            for (int i = 0; i < cctx->num_locals; i++) {
+                if (cctx->local_ids[i] == var_id) {
+                    if (i < 4)
+                        emit(cctx, OP_LOCAL_GET0 + i);
+                    else
+                        emit2(cctx, OP_LOCAL_GET, i);
+                    return dynamic_result();
+                }
+            }
+        }
+        // Fall back to environment lookup
+        emit4(cctx, OP_LOOKUP, var_id, IC_UNCACHED, IC_UNCACHED);
         return dynamic_result();
     }
 
@@ -996,6 +1029,9 @@ static compile_result compile_lambda(unsigned expr, compile_ctx *cctx)
     lambda_cctx->code->params = code_add_const(lambda_cctx->code, params);
     lambda_cctx->code->arity = arity;
     lambda_cctx->code->has_rest = has_rest;
+
+    // Stack locals: disabled pending stack layout redesign
+    // TODO: enable after fixing RETURN sp restoration for mixed local/non-local calls
 
     // Compile body
     compile_begin(body, lambda_cctx);
@@ -1692,7 +1728,18 @@ static compile_result compile_set(unsigned expr, compile_ctx *cctx)
 
     cctx->tail_position = false;
     compile_expr_internal(val_expr, cctx);
-    emit2(cctx, OP_SET, CELL_ID(var));
+
+    // Use LOCAL_SET if variable is a stack local
+    int64_t var_id = CELL_ID(var);
+    if (cctx->num_locals > 0) {
+        for (int i = 0; i < cctx->num_locals; i++) {
+            if (cctx->local_ids[i] == var_id) {
+                emit2(cctx, OP_LOCAL_SET, i);
+                return dynamic_result();
+            }
+        }
+    }
+    emit2(cctx, OP_SET, var_id);
 
     return dynamic_result();
 }
@@ -2106,6 +2153,7 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
             cctx->tail_position = true;
 
             // SET each parameter in reverse order (stack is LIFO)
+            // Use LOCAL_SET_VOID if params are stack locals
             unsigned param_ids[16];
             unsigned pi = 0;
             for (unsigned p = cctx->loop_params;
@@ -2113,8 +2161,21 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
                 param_ids[pi++] = CELL_ID(car(p));
             }
             for (int j = (int)pi - 1; j >= 0; j--) {
-                emit2(cctx, OP_SET, param_ids[j]);
-                emit(cctx, OP_POP);
+                int local_slot = -1;
+                if (cctx->num_locals > 0) {
+                    for (int k = 0; k < cctx->num_locals; k++) {
+                        if (cctx->local_ids[k] == (int64_t)param_ids[j]) {
+                            local_slot = k;
+                            break;
+                        }
+                    }
+                }
+                if (local_slot >= 0) {
+                    emit2(cctx, OP_LOCAL_SET_VOID, local_slot);
+                } else {
+                    emit2(cctx, OP_SET, param_ids[j]);
+                    emit(cctx, OP_POP);
+                }
             }
             // Jump to start of this code object (ip = 0)
             emit2(cctx, OP_JUMP, 0);

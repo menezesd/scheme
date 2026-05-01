@@ -313,6 +313,7 @@ static inline void pop_frame(vm_state *vm)
     vm->fp--;
     vm->code = vm->frames[vm->fp].code;
     vm->ip = vm->frames[vm->fp].ip;
+    vm->bp = vm->frames[vm->fp].bp;
     vm->env = vm->frames[vm->fp].env;
 }
 
@@ -614,53 +615,72 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
             return;
         }
 
-        // Build environment frame directly from stack values.
-        // For fixed-arity closures, skip arg list + bind_params entirely.
-        gc_protect(&closure_env);
-        unsigned params = code->constants[code->params];
-        gc_protect(&params);
-        unsigned new_env;
+        if (code->use_locals && !code->has_rest) {
+            // Stack locals path: args stay on stack, no env frame needed
+            // Args are already on the stack at [sp-argc ... sp-1]
+            unsigned new_bp = vm->sp - argc;
 
-        if (!code->has_rest) {
-            // Fast path: build (params . vals) frame directly from stack
-            unsigned vals = 0;
-            gc_protect(&vals);
-            for (int i = (int)argc - 1; i >= 0; i--) {
-                vals = alloc_cons(vm->stack[vm->sp - argc + i], vals);
+            if (tail && vm->fp > 0) {
+                // Tail call with locals: copy args to caller's bp area
+                // This reuses the same stack slots
+                if (new_bp != vm->bp) {
+                    for (unsigned i = 0; i < argc; i++)
+                        vm->stack[vm->bp + i] = vm->stack[new_bp + i];
+                    vm->sp = vm->bp + argc;
+                }
+                vm->code = code;
+                vm->ip = 0;
+                vm->env = closure_env;
+            } else {
+                // Regular call: push frame, set bp
+                push_frame(vm, vm->code, vm->ip, vm->bp, vm->env);
+                vm->bp = new_bp;
+                vm->code = code;
+                vm->ip = 0;
+                vm->env = closure_env;
             }
-            vm->sp -= argc;
-            unsigned frame = alloc_cons(params, vals);
-            gc_protect(&frame);
-            new_env = alloc_cons(frame, closure_env);
-            gc_unprotect(4); // frame, vals, params, closure_env
         } else {
-            // Rest parameter path: use bind_params for variadics
-            unsigned args = 0;
-            for (int i = (int)argc - 1; i >= 0; i--) {
-                args = alloc_cons(vm->stack[vm->sp - argc + i], args);
+            // Environment frame path (original): build frame from stack values
+            gc_protect(&closure_env);
+            unsigned params = code->constants[code->params];
+            gc_protect(&params);
+            unsigned new_env;
+
+            if (!code->has_rest) {
+                unsigned vals = 0;
+                gc_protect(&vals);
+                for (int i = (int)argc - 1; i >= 0; i--) {
+                    vals = alloc_cons(vm->stack[vm->sp - argc + i], vals);
+                }
+                vm->sp -= argc;
+                unsigned frame = alloc_cons(params, vals);
+                gc_protect(&frame);
+                new_env = alloc_cons(frame, closure_env);
+                gc_unprotect(4);
+            } else {
+                unsigned args = 0;
+                for (int i = (int)argc - 1; i >= 0; i--) {
+                    args = alloc_cons(vm->stack[vm->sp - argc + i], args);
+                }
+                vm->sp -= argc;
+                gc_protect(&args);
+                unsigned frame = bind_params(params, args);
+                gc_unprotect(1);
+                gc_protect(&frame);
+                new_env = alloc_cons(frame, closure_env);
+                gc_unprotect(3);
             }
-            vm->sp -= argc;
-            gc_protect(&args);
-            unsigned frame = bind_params(params, args);
-            gc_unprotect(1); // args
-            gc_protect(&frame);
-            new_env = alloc_cons(frame, closure_env);
-            gc_unprotect(3); // frame, params, closure_env
-        }
 
-        if (tail && vm->fp > 0) {
-            // Tail call: reuse current frame
-            vm->code = code;
-            vm->ip = 0;
-            vm->env = new_env;
-        } else {
-            // Regular call: push new frame
-            push_frame(vm, vm->code, vm->ip, vm->sp, vm->env);
-
-            // Set new execution state
-            vm->code = code;
-            vm->ip = 0;
-            vm->env = new_env;
+            if (tail && vm->fp > 0) {
+                vm->code = code;
+                vm->ip = 0;
+                vm->env = new_env;
+            } else {
+                push_frame(vm, vm->code, vm->ip, vm->sp, vm->env);
+                vm->code = code;
+                vm->ip = 0;
+                vm->env = new_env;
+            }
         }
         return;
     }
@@ -921,6 +941,38 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             break;
         }
 
+        // Stack locals — direct access without environment lookup
+        case OP_LOCAL_GET: {
+            unsigned slot = vm->code->code[vm->ip++];
+            vm_push(vm, vm->stack[vm->bp + slot]);
+            break;
+        }
+        case OP_LOCAL_GET0:
+            vm_push(vm, vm->stack[vm->bp]);
+            break;
+        case OP_LOCAL_GET1:
+            vm_push(vm, vm->stack[vm->bp + 1]);
+            break;
+        case OP_LOCAL_GET2:
+            vm_push(vm, vm->stack[vm->bp + 2]);
+            break;
+        case OP_LOCAL_GET3:
+            vm_push(vm, vm->stack[vm->bp + 3]);
+            break;
+        case OP_LOCAL_SET: {
+            unsigned slot = vm->code->code[vm->ip++];
+            unsigned val = vm_pop(vm);
+            unsigned old = vm->stack[vm->bp + slot];
+            vm->stack[vm->bp + slot] = val;
+            vm_push(vm, old);
+            break;
+        }
+        case OP_LOCAL_SET_VOID: {
+            unsigned slot = vm->code->code[vm->ip++];
+            vm->stack[vm->bp + slot] = vm_pop(vm);
+            break;
+        }
+
         case OP_CLOSURE: {
             unsigned child_idx = vm->code->code[vm->ip++];
             code_object *child = vm->code->children[child_idx];
@@ -961,7 +1013,13 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 vm_push(vm, val);
                 vm->running = false;
             } else {
-                pop_frame(vm);
+                // Save callee's bp before restoring caller's frame
+                unsigned callee_bp = vm->bp;
+                bool callee_had_locals = vm->code->use_locals;
+                pop_frame(vm); // restores code, ip, bp, env
+                // Clean up callee's locals from the stack
+                if (callee_had_locals && vm->sp > callee_bp)
+                    vm->sp = callee_bp;
                 vm_push(vm, val);
             }
             break;
