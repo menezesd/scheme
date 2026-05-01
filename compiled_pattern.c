@@ -687,6 +687,15 @@ static unsigned build_bindings_alist(pat_match_state *state)
 
         if (state->pattern->var_slots[i].is_ellipsis) {
             value = state->ellipsis_lists[i];
+            // Convert CELL_ATOM_TRUE sentinels (empty inner ellipsis)
+            // back to nil in the binding list
+            if (state->pattern->var_slots[i].depth >= 2 && value) {
+                // Walk the list and replace #t with ()
+                for (unsigned p = value; p && IS_PAIR(p); p = cdr(p)) {
+                    if (car(p) == CELL_ATOM_TRUE)
+                        CELL_CAR(p) = 0; // nil = empty list
+                }
+            }
         } else {
             value = state->bindings[i];
         }
@@ -864,10 +873,14 @@ unsigned execute_pattern(compiled_pattern *pat, unsigned input)
             if (depth >= 2) {
                 // Inner ellipsis: finalize inner_lists into bindings
                 // so the outer ACCUM can pick them up.
+                // Use CELL_ATOM_TRUE as sentinel for "matched but empty"
+                // (distinguishes from 0 = "never matched")
                 for (unsigned i = 0; i < pat->var_count; i++) {
                     if (pat->var_slots[i].is_ellipsis &&
                         pat->var_slots[i].depth >= depth) {
-                        state.bindings[i] = state.inner_lists[i];
+                        state.bindings[i] = state.inner_lists[i]
+                            ? state.inner_lists[i]
+                            : CELL_ATOM_TRUE; // sentinel for empty
                         state.inner_lists[i] = 0;
                         state.inner_tails[i] = 0;
                     }

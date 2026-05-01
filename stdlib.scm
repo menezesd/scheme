@@ -226,42 +226,9 @@
          (case key clause ...)))))
 
 ; do - iteration (uses nested ellipsis)
-; do - iteration
-; Uses nested ellipsis for the all-step case, with explicit patterns
-; for vars without step expressions (empty inner ellipsis workaround)
+; do - iteration (uses nested ellipsis for any number of variables)
 (define-syntax do
   (syntax-rules ()
-    ; 1 var with step
-    ((do ((v1 i1 s1)) (test expr ...) command ...)
-     (letrec ((loop (lambda (v1)
-                      (if test (begin #f expr ...)
-                          (begin command ... (loop s1))))))
-       (loop i1)))
-    ; 2 vars, both with step
-    ((do ((v1 i1 s1) (v2 i2 s2)) (test expr ...) command ...)
-     (letrec ((loop (lambda (v1 v2)
-                      (if test (begin #f expr ...)
-                          (begin command ... (loop s1 s2))))))
-       (loop i1 i2)))
-    ; 2 vars, first without step
-    ((do ((v1 i1) (v2 i2 s2)) (test expr ...) command ...)
-     (letrec ((loop (lambda (v1 v2)
-                      (if test (begin #f expr ...)
-                          (begin command ... (loop v1 s2))))))
-       (loop i1 i2)))
-    ; 2 vars, second without step
-    ((do ((v1 i1 s1) (v2 i2)) (test expr ...) command ...)
-     (letrec ((loop (lambda (v1 v2)
-                      (if test (begin #f expr ...)
-                          (begin command ... (loop s1 v2))))))
-       (loop i1 i2)))
-    ; 3 vars, all with step
-    ((do ((v1 i1 s1) (v2 i2 s2) (v3 i3 s3)) (test expr ...) command ...)
-     (letrec ((loop (lambda (v1 v2 v3)
-                      (if test (begin #f expr ...)
-                          (begin command ... (loop s1 s2 s3))))))
-       (loop i1 i2 i3)))
-    ; General case with nested ellipsis (all vars must have step)
     ((do ((var init step ...) ...)
          (test expr ...)
        command ...)
