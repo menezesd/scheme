@@ -39,8 +39,8 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         int port_index = (argc == 2) ? 1 : -1;
         int ptype = extract_port_argv(argv, port_index, PORT_OUTPUT, &fport,
                                       &sport, "display");
-        if (ptype < 0)
-            return TOK_ERROR;
+        if (ptype == -1) return TOK_ERROR;
+        if (ptype == -2) return 0; // silently discard (nil port)
         if (ptype == 1) {
             // String port: use open_memstream to capture output
             char *buf = NULL;
@@ -80,8 +80,8 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         int port_index = (argc == 2) ? 1 : -1;
         int ptype = extract_port_argv(argv, port_index, PORT_OUTPUT, &fport,
                                       &sport, "write");
-        if (ptype < 0)
-            return TOK_ERROR;
+        if (ptype == -1) return TOK_ERROR;
+        if (ptype == -2) return 0;
         if (ptype == 1) {
             // String port: use open_memstream to capture output
             char *buf = NULL;
@@ -150,8 +150,8 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         int port_index = (argc == 1) ? 0 : -1;
         int ptype = extract_port_argv(argv, port_index, PORT_INPUT, &fport,
                                       &sport, "read");
-        if (ptype < 0)
-            return TOK_ERROR;
+        if (ptype == -1) return TOK_ERROR;
+        if (ptype == -2) return 0;
         if (ptype == 1) {
             // String port: use fmemopen on remaining content
             size_t remaining = sport->len - sport->pos;
@@ -178,8 +178,8 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         int port_index = (argc == 1) ? 0 : -1;
         int ptype = extract_port_argv(argv, port_index, PORT_INPUT, &fport,
                                       &sport, "read-char");
-        if (ptype < 0)
-            return TOK_ERROR;
+        if (ptype == -1) return TOK_ERROR;
+        if (ptype == -2) return 0;
         int c;
         if (ptype == 1) {
             c = strport_getc(sport);
@@ -197,8 +197,8 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         int port_index = (argc == 1) ? 0 : -1;
         int ptype = extract_port_argv(argv, port_index, PORT_INPUT, &fport,
                                       &sport, "peek-char");
-        if (ptype < 0)
-            return TOK_ERROR;
+        if (ptype == -1) return TOK_ERROR;
+        if (ptype == -2) return 0;
         int c;
         if (ptype == 1) {
             c = strport_peekc(sport);
@@ -220,8 +220,8 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         int port_index = (argc == 2) ? 1 : -1;
         int ptype = extract_port_argv(argv, port_index, PORT_OUTPUT, &fport,
                                       &sport, "write-char");
-        if (ptype < 0)
-            return TOK_ERROR;
+        if (ptype == -1) return TOK_ERROR;
+        if (ptype == -2) return 0;
         if (ptype == 1) {
             strport_putc(sport, c);
         } else {
@@ -245,8 +245,8 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         int port_index = (argc == 1) ? 0 : -1;
         int ptype = extract_port_argv(argv, port_index, PORT_INPUT, &fport,
                                       &sport, "char-ready?");
-        if (ptype < 0)
-            return TOK_ERROR;
+        if (ptype == -1) return TOK_ERROR;
+        if (ptype == -2) return 0;
 
         if (ptype == 1) {
             // String port: ready if there are characters remaining
@@ -272,8 +272,8 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         int port_index = (argc == 1) ? 0 : -1;
         int ptype = extract_port_argv(argv, port_index, PORT_INPUT, &fport,
                                       &sport, "read-line");
-        if (ptype < 0)
-            return TOK_ERROR;
+        if (ptype == -1) return TOK_ERROR;
+        if (ptype == -2) return 0;
 
         // Build line in temporary buffer
         size_t cap = 128;

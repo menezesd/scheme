@@ -24,10 +24,14 @@ unsigned apply_port_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         return p;
     }
     case POPENOUTPUT: {
-        REQUIRE_ARGC(argc, 1, 1, "open-output-file");
+        REQUIRE_ARGC(argc, 1, 2, "open-output-file");
         CHECK_STRING(argv[0], "open-output-file");
         char *filename = GET_STRING_PTR(argv[0]);
-        FILE *f = fopen(filename, "w");
+        const char *mode = "w";
+        if (argc > 1 && IS_ATOM(argv[1]) &&
+            strcmp(ctx.atom_table[CELL_ID(argv[1])], "append") == 0)
+            mode = "a";
+        FILE *f = fopen(filename, mode);
         if (!f) {
             show_error("open-output-file: cannot open %s", filename);
             return TOK_ERROR;
@@ -194,6 +198,8 @@ unsigned apply_port_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
                 fflush(GET_PORT_PTR(port));
             } else if (IS_STROUTPORT(port)) {
                 // String port - nothing to flush
+            } else if (port == 0) {
+                // Nil port (e.g., closed transcript) - silently ignore
             } else {
                 show_error("flush-output-port: not an output port, got %s",
                            type_name(port));

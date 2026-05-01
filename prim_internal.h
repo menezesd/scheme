@@ -854,6 +854,9 @@ static inline int extract_port_argv(unsigned *argv, int port_index,
 
     unsigned p = argv[port_index];
 
+    // Tolerate nil/empty-list ports (e.g., closed transcript) by silently skipping
+    if (p == 0) return -2;
+
     bool is_strport = (dir == PORT_INPUT) ? IS_STRINPORT(p) : IS_STROUTPORT(p);
     if (is_strport) {
         *strport_out = GET_STRPORT_PTR(p);

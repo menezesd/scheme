@@ -811,7 +811,12 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 continue;
             }
             vm->error = true;
-            vm->error_msg = "undefined variable";
+            if (sym_id >= 0 && (unsigned)sym_id < ctx.atom_table_cap &&
+                ctx.atom_table[sym_id])
+                show_error("undefined variable: %s", ctx.atom_table[sym_id]);
+            else
+                show_error("undefined variable: <id %ld>", (long)sym_id);
+            vm->error_msg = ctx.last_error;
             vm->running = false;
             break;
         }
@@ -854,7 +859,12 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             unsigned val = ic_lookup(sym_id, vm->env, cache_slot);
             if (val == TOK_ERROR) {
                 vm->error = true;
-                vm->error_msg = "undefined variable";
+                if (sym_id >= 0 && (unsigned)sym_id < ctx.atom_table_cap &&
+                    ctx.atom_table[sym_id])
+                    show_error("undefined variable: %s",
+                               ctx.atom_table[sym_id]);
+                vm->error_msg = ctx.last_error[0] ? ctx.last_error
+                                                   : "undefined variable";
                 vm->running = false;
                 break;
             }
@@ -2387,8 +2397,14 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             unsigned *cache_slot = &vm->code->code[vm->ip + 1];
             vm->ip += 3;
             unsigned n = ic_lookup(sym_id, vm->env, cache_slot);
-            if (n == TOK_ERROR)
-                VM_ERROR_BREAK(vm, "undefined variable");
+            if (n == TOK_ERROR) {
+                if (sym_id >= 0 && (unsigned)sym_id < ctx.atom_table_cap &&
+                    ctx.atom_table[sym_id])
+                    show_error("undefined variable: %s",
+                               ctx.atom_table[sym_id]);
+                VM_ERROR_BREAK(vm, ctx.last_error[0] ? ctx.last_error
+                                                     : "undefined variable");
+            }
             if (IS_FIXNUM(n)) {
                 int32_t val = FIXNUM_VALUE(n);
                 vm_push(vm, val < FIXNUM_MAX ? MAKE_FIXNUM(val + 1)
@@ -2412,8 +2428,14 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             unsigned *cache_slot = &vm->code->code[vm->ip + 1];
             vm->ip += 3;
             unsigned n = ic_lookup(sym_id, vm->env, cache_slot);
-            if (n == TOK_ERROR)
-                VM_ERROR_BREAK(vm, "undefined variable");
+            if (n == TOK_ERROR) {
+                if (sym_id >= 0 && (unsigned)sym_id < ctx.atom_table_cap &&
+                    ctx.atom_table[sym_id])
+                    show_error("undefined variable: %s",
+                               ctx.atom_table[sym_id]);
+                VM_ERROR_BREAK(vm, ctx.last_error[0] ? ctx.last_error
+                                                     : "undefined variable");
+            }
             if (IS_FIXNUM(n)) {
                 int32_t val = FIXNUM_VALUE(n);
                 vm_push(vm, val > FIXNUM_MIN ? MAKE_FIXNUM(val - 1)
