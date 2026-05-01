@@ -534,8 +534,11 @@ static void vm_box_stack_args(vm_state *vm, unsigned argc)
 
 static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
 {
-    // Ensure all arguments are boxed cell indices before binding
+    // Ensure all arguments are boxed cell indices before binding.
+    // Protect fn across boxing since store() can trigger GC.
+    gc_protect(&fn);
     vm_box_stack_args(vm, argc);
+    gc_unprotect(1);
     if (IS_BUILTIN(fn)) {
         int64_t prim_id = CELL_ID(fn);
 
@@ -1709,7 +1712,9 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             unsigned val = vm_pop(vm);
             unsigned pair = vm_pop(vm);
             VM_CHECK_PAIR(vm, pair, "set-car!: not a pair");
+            gc_protect(&pair);
             val = ensure_boxed(val);
+            gc_unprotect(1);
             write_barrier(pair, val);
             CELL_CAR(pair) = val;
             vm_push(vm, val);
@@ -1720,7 +1725,9 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             unsigned val = vm_pop(vm);
             unsigned pair = vm_pop(vm);
             VM_CHECK_PAIR(vm, pair, "set-cdr!: not a pair");
+            gc_protect(&pair);
             val = ensure_boxed(val);
+            gc_unprotect(1);
             write_barrier(pair, val);
             CELL_CDR(pair) = val;
             vm_push(vm, val);
@@ -2011,7 +2018,9 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             unsigned list = vm_pop(vm);
             unsigned obj = vm_pop(vm);
             // Box obj for comparison (list elements are always boxed)
+            gc_protect(&list);
             obj = ensure_boxed(obj);
+            gc_unprotect(1);
             unsigned result = ctx.atom_false;
             for (unsigned p = list; p != 0; p = cdr(p)) {
                 if (IS_FIXNUM(p) || !IS_PAIR(p)) {

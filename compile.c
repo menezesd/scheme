@@ -1321,6 +1321,9 @@ static compile_result compile_letrec(unsigned expr, compile_ctx *cctx)
     unsigned saved_env = cctx->env;
     cctx->env = extend_compile_env(cctx->env, bindings);
 
+    // Save tail position from enclosing context
+    bool tail = cctx->tail_position;
+
     // Second pass: compile values and set variables
     cctx->tail_position = false;
     FORLIST(b, bindings)
@@ -1334,8 +1337,8 @@ static compile_result compile_letrec(unsigned expr, compile_ctx *cctx)
     // End letrec initialization - continuations after this won't restore values
     emit(cctx, OP_LETREC_DONE);
 
-    // Compile body in tail position
-    cctx->tail_position = true;
+    // Compile body with correct tail position from enclosing context
+    cctx->tail_position = tail;
     compile_begin(body, cctx);
 
     // Restore compile-time environment

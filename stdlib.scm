@@ -48,26 +48,34 @@
          (begin result ...)
          (case key clause ...)))))
 
-; do - iteration
+; do - iteration (explicit patterns to avoid nested ellipsis)
 (define-syntax do
   (syntax-rules ()
-    ((do ((var init step ...) ...)
-         (test expr ...)
-       command ...)
-     (letrec ((loop
-               (lambda (var ...)
-                 (if test
-                     (begin #f expr ...)
-                     (begin
-                       command ...
-                       (loop (do-step var step ...) ...))))))
-       (loop init ...)))
+    ; 1 variable
+    ((do ((v1 i1 s1)) (test expr ...) command ...)
+     (letrec ((loop (lambda (v1)
+                      (if test (begin #f expr ...)
+                          (begin command ... (loop s1))))))
+       (loop i1)))
+    ; 2 variables
+    ((do ((v1 i1 s1) (v2 i2 s2)) (test expr ...) command ...)
+     (letrec ((loop (lambda (v1 v2)
+                      (if test (begin #f expr ...)
+                          (begin command ... (loop s1 s2))))))
+       (loop i1 i2)))
+    ; 3 variables
+    ((do ((v1 i1 s1) (v2 i2 s2) (v3 i3 s3)) (test expr ...) command ...)
+     (letrec ((loop (lambda (v1 v2 v3)
+                      (if test (begin #f expr ...)
+                          (begin command ... (loop s1 s2 s3))))))
+       (loop i1 i2 i3)))
+    ; 4 variables
+    ((do ((v1 i1 s1) (v2 i2 s2) (v3 i3 s3) (v4 i4 s4)) (test expr ...) command ...)
+     (letrec ((loop (lambda (v1 v2 v3 v4)
+                      (if test (begin #f expr ...)
+                          (begin command ... (loop s1 s2 s3 s4))))))
+       (loop i1 i2 i3 i4)))
     ))
-
-(define-syntax do-step
-  (syntax-rules ()
-    ((do-step var) var)
-    ((do-step var step) step)))
 
 ;;; ============================================================================
 ;;; List accessors (compositions of car/cdr)
