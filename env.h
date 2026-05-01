@@ -62,6 +62,9 @@ unsigned lookup_silent(int64_t var, unsigned env);
 // Invalidate lookup cache (call after GC or major environment changes)
 void env_invalidate_cache(void);
 
+// Global inline cache epoch — bumped on define to invalidate bytecode ICs
+extern unsigned global_ic_epoch;
+
 // Bind parameters to arguments, supporting variadic (a b . rest) syntax
 unsigned bind_params(unsigned params, unsigned args);
 

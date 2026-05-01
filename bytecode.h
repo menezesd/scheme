@@ -159,6 +159,10 @@ enum opcode {
     OP_NEGATIVE, // Negative check: pop n, push (negative? n)
     OP_EVEN,    // Even check: pop n, push (even? n)
     OP_ODD,     // Odd check: pop n, push (odd? n)
+
+    // Superinstructions (fused opcode sequences)
+    OP_LOOKUP_ADD1,  // Lookup + add1: LOOKUP_ADD1 sym depth offset
+    OP_LOOKUP_SUB1,  // Lookup + sub1: LOOKUP_SUB1 sym depth offset
 };
 
 // ============================================================================
@@ -193,6 +197,9 @@ typedef struct code_object {
     // Source info for debugging
     const char *name;     // Function name (if known)
     unsigned source_line; // Source line number
+
+    // Inline cache epoch (for invalidation on define)
+    unsigned ic_epoch;
 
     // GC integration: linked list of all code objects
     struct code_object *gc_next;

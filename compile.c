@@ -254,6 +254,17 @@ static void emit3(compile_ctx *cctx, unsigned op, unsigned arg1, unsigned arg2)
     code_emit(cctx->code, arg2);
 }
 
+static void emit4(compile_ctx *cctx, unsigned op, unsigned arg1, unsigned arg2,
+                  unsigned arg3)
+{
+    code_emit(cctx->code, op);
+    code_emit(cctx->code, arg1);
+    code_emit(cctx->code, arg2);
+    code_emit(cctx->code, arg3);
+}
+
+#define IC_UNCACHED 0xFFFFFFFF
+
 // Emit a jump instruction, return position to patch
 static unsigned emit_jump(compile_ctx *cctx, unsigned op)
 {
@@ -479,7 +490,7 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
 
     case BT_ATOM: {
         // Variable reference - not constant
-        emit2(cctx, OP_LOOKUP, CELL_ID(expr));
+        emit4(cctx, OP_LOOKUP, CELL_ID(expr), IC_UNCACHED, IC_UNCACHED);
         return dynamic_result();
     }
 
@@ -751,7 +762,7 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
                     int64_t gensym_id = CELL_ID(gensym_atom);
                     int64_t var_id = CELL_ID(var_atom);
 
-                    emit2(cctx, OP_LOOKUP, var_id);
+                    emit4(cctx, OP_LOOKUP, var_id, IC_UNCACHED, IC_UNCACHED);
                     emit2(cctx, OP_DEFINE, gensym_id);
                 }
 

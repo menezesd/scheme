@@ -47,6 +47,9 @@ typedef struct {
 
 static lookup_cache_entry lookup_cache[LOOKUP_CACHE_SIZE];
 
+// Global inline cache epoch for bytecode IC invalidation
+unsigned global_ic_epoch = 0;
+
 // Invalidate all cache entries
 static inline void invalidate_lookup_cache(void)
 {
@@ -96,6 +99,7 @@ unsigned defvar(unsigned var, unsigned aval, unsigned env)
 {
     // Invalidate lookup cache - new binding may shadow outer variables
     invalidate_lookup_cache();
+    global_ic_epoch++;
 
     unsigned frame = car(env);
     int64_t vid = CELL_ID(var);

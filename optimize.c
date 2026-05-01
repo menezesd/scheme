@@ -24,8 +24,11 @@
 unsigned instruction_size(unsigned op)
 {
     switch (op) {
-    case OP_CONST:
     case OP_LOOKUP:
+    case OP_LOOKUP_ADD1:
+    case OP_LOOKUP_SUB1:
+        return 4; // opcode + sym_id + cached_depth + cached_offset
+    case OP_CONST:
     case OP_DEFINE:
     case OP_SET:
     case OP_CLOSURE:
@@ -136,16 +139,18 @@ static void cse_pass(code_object *code)
             continue;
         }
 
-        // Pattern: LOOKUP x, LOOKUP x -> LOOKUP x, DUP
-        if (op == OP_LOOKUP && i + 3 < len && c[i + 2] == OP_LOOKUP &&
-            c[i + 1] == c[i + 3] && !is_jump_target[i + 2]) {
-            // Emit LOOKUP x
+        // Pattern: LOOKUP x d o, LOOKUP x d2 o2 -> LOOKUP x d o, DUP
+        if (op == OP_LOOKUP && i + 7 < len && c[i + 4] == OP_LOOKUP &&
+            c[i + 1] == c[i + 5] && !is_jump_target[i + 4]) {
+            // Emit first LOOKUP x d o
             new_code[write++] = OP_LOOKUP;
             new_code[write++] = c[i + 1];
-            offset_map[i + 2] = write;
+            new_code[write++] = c[i + 2];
+            new_code[write++] = c[i + 3];
+            offset_map[i + 4] = write;
             // Emit DUP instead of second LOOKUP
             new_code[write++] = OP_DUP;
-            i += 4;
+            i += 8;
             continue;
         }
 
@@ -350,10 +355,11 @@ void peephole_optimize(code_object *code)
             continue;
         }
 
-        // Pattern: LOOKUP x, POP -> nothing (dead code)
-        if (op == OP_LOOKUP && i + 2 < len && c[i + 2] == OP_POP) {
-            remove[i] = remove[i + 1] = remove[i + 2] = true;
-            i += 3;
+        // Pattern: LOOKUP x d o, POP -> nothing (dead code)
+        if (op == OP_LOOKUP && i + 4 < len && c[i + 4] == OP_POP) {
+            remove[i] = remove[i + 1] = remove[i + 2] = remove[i + 3] =
+                remove[i + 4] = true;
+            i += 5;
             continue;
         }
 
@@ -438,6 +444,24 @@ void peephole_optimize(code_object *code)
             remove[i] = true;
             c[i + 1] = OP_JUMPIFZERO;
             i += 1;
+            continue;
+        }
+
+        // Superinstruction: LOOKUP sym d o, ADD1 -> LOOKUP_ADD1 sym d o
+        if (op == OP_LOOKUP && i + 4 < len && c[i + 4] == OP_ADD1 &&
+            !is_jump_target[i + 4]) {
+            c[i] = OP_LOOKUP_ADD1;
+            remove[i + 4] = true;
+            i += 4;
+            continue;
+        }
+
+        // Superinstruction: LOOKUP sym d o, SUB1 -> LOOKUP_SUB1 sym d o
+        if (op == OP_LOOKUP && i + 4 < len && c[i + 4] == OP_SUB1 &&
+            !is_jump_target[i + 4]) {
+            c[i] = OP_LOOKUP_SUB1;
+            remove[i + 4] = true;
+            i += 4;
             continue;
         }
 
@@ -751,6 +775,8 @@ static const char *opcode_names[] = {
     [OP_NEGATIVE] = "NEGATIVE",
     [OP_EVEN] = "EVEN",
     [OP_ODD] = "ODD",
+    [OP_LOOKUP_ADD1] = "LOOKUP_ADD1",
+    [OP_LOOKUP_SUB1] = "LOOKUP_SUB1",
 };
 
 void disassemble(code_object *code, const char *name)
@@ -795,6 +821,15 @@ void disassemble(code_object *code, const char *name)
             printf(" %u", code->code[ip++]);
             break;
         case OP_LOOKUP:
+        case OP_LOOKUP_ADD1:
+        case OP_LOOKUP_SUB1:
+            printf(" %s", ctx.atom_table[code->code[ip++]]);
+            if (code->code[ip] != 0xFFFFFFFF)
+                printf(" [d=%u o=%u]", code->code[ip], code->code[ip + 1]);
+            else
+                printf(" [uncached]");
+            ip += 2;
+            break;
         case OP_DEFINE:
         case OP_SET:
         case OP_DEFSYNTAX:

@@ -28,6 +28,8 @@
 // VM Constants
 // ============================================================================
 
+#define IC_UNCACHED 0xFFFFFFFF
+
 #define INITIAL_STACK_SIZE 1024
 #define INITIAL_FRAMES_SIZE 256
 #define MAX_STACK_SIZE (1024 * 1024)
@@ -60,6 +62,68 @@
         if (IS_FIXNUM(val) || CELL_TYPE(val) != (expected_type))               \
             VM_ERROR_BREAK(vm, msg);                                           \
     } while (0)
+
+// ============================================================================
+// Inline Cached Lookup
+// ============================================================================
+
+// Perform a variable lookup with inline cache. On cache hit (depth/offset are
+// valid and verified), walks depth frames and offset values — O(depth+offset).
+// On miss, does a full lookup and fills the cache in the bytecode.
+static inline unsigned ic_lookup(int64_t sym_id, unsigned env,
+                                 unsigned *cache_slot)
+{
+    unsigned cached_depth = cache_slot[0];
+    unsigned cached_offset = cache_slot[1];
+
+    if (cached_depth != IC_UNCACHED) {
+        // Try cached path: walk depth frames, offset values, verify sym_id
+        unsigned e = env;
+        for (unsigned d = 0; d < cached_depth && e; d++)
+            e = cdr(e);
+        if (e) {
+            unsigned frame = car(e);
+            unsigned vars = car(frame);
+            unsigned vals = cdr(frame);
+            for (unsigned o = 0; o < cached_offset && vars; o++) {
+                vars = cdr(vars);
+                vals = cdr(vals);
+            }
+            if (vars && vals) {
+                int64_t var_id = (CELL_TYPE(vars) == BT_ATOM)
+                                     ? CELL_ID(vars)
+                                     : CELL_ID(car(vars));
+                if (var_id == sym_id)
+                    return car(vals); // Verified hit
+            }
+        }
+        // Cache stale — fall through to full lookup
+    }
+
+    // Full lookup and fill cache
+    unsigned depth = 0;
+    for (unsigned e = env; e; e = cdr(e), depth++) {
+        unsigned frame = car(e);
+        unsigned vars = car(frame);
+        unsigned vals = cdr(frame);
+        unsigned offset = 0;
+        for (; vars; vars = cdr(vars), vals = cdr(vals), offset++) {
+            bool match = false;
+            if (CELL_TYPE(vars) == BT_ATOM) {
+                match = (CELL_ID(vars) == sym_id);
+                if (!match) break;
+            } else {
+                match = (CELL_ID(car(vars)) == sym_id);
+            }
+            if (match) {
+                cache_slot[0] = depth;
+                cache_slot[1] = offset;
+                return car(vals);
+            }
+        }
+    }
+    return TOK_ERROR;
+}
 
 // Global VM state for GC integration
 // When the VM is running, this points to the active VM state
@@ -712,8 +776,10 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
         }
 
         if (op == OP_LOOKUP) {
-            int64_t sym_id = vm->code->code[vm->ip++];
-            unsigned val = lookup(sym_id, vm->env);
+            int64_t sym_id = vm->code->code[vm->ip];
+            unsigned *cache_slot = &vm->code->code[vm->ip + 1];
+            vm->ip += 3;
+            unsigned val = ic_lookup(sym_id, vm->env, cache_slot);
             if (__builtin_expect(val != TOK_ERROR, 1)) {
                 // Eagerly unbox small integers to fixnum tags
                 if (CELL_TYPE(val) == BT_NUM) {
@@ -766,8 +832,10 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
 
         case OP_LOOKUP: {
             // Fallback (shouldn't reach here normally - fast path above)
-            int64_t sym_id = vm->code->code[vm->ip++];
-            unsigned val = lookup(sym_id, vm->env);
+            int64_t sym_id = vm->code->code[vm->ip];
+            unsigned *cache_slot = &vm->code->code[vm->ip + 1];
+            vm->ip += 3;
+            unsigned val = ic_lookup(sym_id, vm->env, cache_slot);
             if (val == TOK_ERROR) {
                 vm->error = true;
                 vm->error_msg = "undefined variable";
@@ -2206,6 +2274,57 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 break;
             }
             vm_push(vm, odd ? ctx.atom_true : ctx.atom_false);
+            break;
+        }
+
+        // Superinstructions: fused LOOKUP + arithmetic
+        case OP_LOOKUP_ADD1: {
+            int64_t sym_id = vm->code->code[vm->ip];
+            unsigned *cache_slot = &vm->code->code[vm->ip + 1];
+            vm->ip += 3;
+            unsigned n = ic_lookup(sym_id, vm->env, cache_slot);
+            if (n == TOK_ERROR)
+                VM_ERROR_BREAK(vm, "undefined variable");
+            if (IS_FIXNUM(n)) {
+                int32_t val = FIXNUM_VALUE(n);
+                vm_push(vm, val < FIXNUM_MAX ? MAKE_FIXNUM(val + 1)
+                                             : store((int64_t)val + 1));
+            } else if (CELL_TYPE(n) == BT_NUM) {
+                int64_t val = CELL_ID(n);
+                int64_t r = val + 1;
+                vm_push(vm, FITS_FIXNUM(r) ? MAKE_FIXNUM((int32_t)r)
+                                           : store(r));
+            } else {
+                n = ensure_boxed(n);
+                unsigned argv[2] = {n, store(1)};
+                unsigned result = prim_plus(2, argv);
+                vm_push(vm, result);
+            }
+            break;
+        }
+
+        case OP_LOOKUP_SUB1: {
+            int64_t sym_id = vm->code->code[vm->ip];
+            unsigned *cache_slot = &vm->code->code[vm->ip + 1];
+            vm->ip += 3;
+            unsigned n = ic_lookup(sym_id, vm->env, cache_slot);
+            if (n == TOK_ERROR)
+                VM_ERROR_BREAK(vm, "undefined variable");
+            if (IS_FIXNUM(n)) {
+                int32_t val = FIXNUM_VALUE(n);
+                vm_push(vm, val > FIXNUM_MIN ? MAKE_FIXNUM(val - 1)
+                                             : store((int64_t)val - 1));
+            } else if (CELL_TYPE(n) == BT_NUM) {
+                int64_t val = CELL_ID(n);
+                int64_t r = val - 1;
+                vm_push(vm, FITS_FIXNUM(r) ? MAKE_FIXNUM((int32_t)r)
+                                           : store(r));
+            } else {
+                n = ensure_boxed(n);
+                unsigned argv[2] = {n, store(1)};
+                unsigned result = prim_minus(2, argv);
+                vm_push(vm, result);
+            }
             break;
         }
 
