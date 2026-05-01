@@ -291,6 +291,7 @@ typedef struct {
     code_object *code; // Current code object
     unsigned ip;       // Instruction pointer
     unsigned env;      // Current environment (cell index)
+    unsigned bp;       // Base pointer for stack locals
 
     // Letrec support: save/restore binding values for proper continuation behavior
     unsigned *letrec_saved;    // Saved values of letrec bindings (NULL if none)

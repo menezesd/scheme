@@ -1046,9 +1046,7 @@ static compile_result compile_lambda(unsigned expr, compile_ctx *cctx)
     // from the caller (pushed between caller's locals and callee's entry)
     // get their positions confused. Needs callee to save/restore caller's sp
     // in the frame, not just bp.
-    // Stack locals disabled: LOOKUP of captured variables finds wrong binding
-    // when the caller uses locals (env doesn't include locals frame).
-    // Needs env to include locals for captured variable lookup.
+    // Stack locals disabled pending investigation of compose-through-map bug
     if (0 && !has_rest && arity > 0 && arity <= 8) {
         bool can_use_locals = true;
         unsigned slot = 0;

@@ -360,6 +360,7 @@ static unsigned capture_continuation(vm_state *vm)
     cont->code = vm->code;
     cont->ip = vm->ip;
     cont->env = vm->env;
+    cont->bp = vm->bp;
 
     // Save letrec values if we're in letrec initialization
     if (letrec_count > 0) {
@@ -445,6 +446,7 @@ static void restore_continuation(vm_state *vm, unsigned cont_cell,
     vm->code = cont->code;
     vm->ip = cont->ip;
     vm->env = cont->env;
+    vm->bp = cont->bp;
 }
 
 // ============================================================================
