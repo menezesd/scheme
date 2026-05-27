@@ -3,11 +3,14 @@
 
 # Binaries
 lisp
+vesper
+vesper-debug
 test_bignum
 test_reader
 test_context
 test_macros
 test_eval
+test_pattern
 
 # IDE/editor
 .vscode/

@@ -258,6 +258,32 @@ TEST(read_empty_vector)
     PASS();
 }
 
+TEST(read_bytevector)
+{
+    unsigned x = read_from_string("#u8(0 127 255)");
+    ASSERT(CELL_TYPE(x) == BT_BYTEVEC);
+    bytevec_data *bv = (bytevec_data *)CELL_PTR(x);
+    ASSERT_EQ(bv->len, 3);
+    ASSERT_EQ(bv->data[0], 0);
+    ASSERT_EQ(bv->data[1], 127);
+    ASSERT_EQ(bv->data[2], 255);
+    PASS();
+}
+
+TEST(read_bytevector_rejects_out_of_range)
+{
+    unsigned x = read_from_string("#u8(256)");
+    ASSERT(x == TOK_ERROR);
+    PASS();
+}
+
+TEST(read_bytevector_rejects_non_integer)
+{
+    unsigned x = read_from_string("#u8(foo)");
+    ASSERT(x == TOK_ERROR);
+    PASS();
+}
+
 // ============================================================================
 // Reader Tests - Quotes
 // ============================================================================
@@ -384,6 +410,9 @@ int main(void)
     // Vectors
     RUN_TEST(read_vector);
     RUN_TEST(read_empty_vector);
+    RUN_TEST(read_bytevector);
+    RUN_TEST(read_bytevector_rejects_out_of_range);
+    RUN_TEST(read_bytevector_rejects_non_integer);
 
     // Quotes
     RUN_TEST(read_quote);

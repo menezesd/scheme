@@ -637,17 +637,21 @@ unsigned make_char(int c)
 
 unsigned make_vector(unsigned len, unsigned fill)
 {
+    GC_GUARD;
+    gc_protect(&fill);
+
     vector_data *vd = malloc(sizeof(vector_data) + len * sizeof(unsigned));
     if (!vd) {
         lisp_panic("failed to allocate vector");
     }
     vd->len = len;
-    for (unsigned i = 0; i < len; i++) {
-        vd->data[i] = fill;
-    }
+
     unsigned p = alloc();
     CELL_TYPE(p) = BT_VECTOR;
     CELL_PTR(p) = vd;
+    for (unsigned i = 0; i < len; i++) {
+        vd->data[i] = fill;
+    }
     return p;
 }
 
@@ -1079,9 +1083,11 @@ unsigned atom_from_string(const char *s)
     not_rational:
 
         // Try parsing as floating-point
-        double dval = strtod(s, &endptr);
-        if ((size_t)(endptr - s) == n) {
-            return store_inexact(dval);
+        {
+            double dval = strtod(s, &endptr);
+            if ((size_t)(endptr - s) == n) {
+                return store_inexact(dval);
+            }
         }
     }
 
@@ -1361,14 +1367,9 @@ unsigned gc(unsigned root)
     }
     ctx.nursery_ptr = ctx.nursery_start;
 
-    // Copy initial root to new space (skip reserved cells)
-    if (root >= HEAP_RESERVED) {
-        unsigned x = alloc();
-        ctx.cons_cells[x] = ctx.cons_cells[root];
-        CELL_TYPE(root) = BT_BROKENHEART;
-        CELL_CAR(root) = x;
-        root = x;
-    }
+    // Copy initial root to new space using the same type-aware path as all
+    // other roots. Direct roots may be pointer-bearing cells such as vectors.
+    root = collect(root);
 
     // Collect trampoline state (global evaluator state)
     tramp.expr = collect(tramp.expr);
@@ -1383,6 +1384,7 @@ unsigned gc(unsigned root)
             *shadow_stack[i] = collect(*shadow_stack[i]);
         }
     }
+    gc_update_active_pattern_state();
 
     // Update VM roots if VM is active
     gc_update_vm_roots(get_active_vm());
@@ -1515,11 +1517,8 @@ void write_barrier(unsigned target, unsigned value)
 // Minor GC (Nursery Collection)
 // ============================================================================
 
-// Forward declare collect for reuse (for generational GC when enabled)
-static unsigned collect_to_old(unsigned x);
-
 // Collect a nursery cell to old generation
-static unsigned collect_to_old(unsigned x)
+unsigned collect_to_old(unsigned x)
 {
     // Reserved cells don't need collection
     if (x < HEAP_RESERVED)
@@ -1653,6 +1652,7 @@ unsigned minor_gc(unsigned root)
             *shadow_stack[i] = collect_to_old(*shadow_stack[i]);
         }
     }
+    minor_gc_update_active_pattern_state();
 
     // Update VM roots if VM is active
     {
@@ -1677,6 +1677,7 @@ unsigned minor_gc(unsigned root)
             code->constants[i] = collect_to_old(code->constants[i]);
         }
     }
+    minor_gc_update_all_patterns();
 
     // Scan dirty cards in old generation for nursery pointers
     // Skip if generational GC is disabled (no card table)

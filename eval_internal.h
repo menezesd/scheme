@@ -156,7 +156,7 @@ static inline unsigned make_syntax_transformer(unsigned transformer_form,
             compiled_rules = new_node;
             compiled_tail = new_node;
         } else {
-            CELL_CDR(compiled_tail) = new_node;
+            cell_set_cdr(compiled_tail, new_node);
             compiled_tail = new_node;
         }
     }

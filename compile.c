@@ -441,7 +441,7 @@ static unsigned rename_template_vars(unsigned tmpl, unsigned rename_map)
             // Refresh data pointers each iteration - GC may have moved vectors
             unsigned old_elem = vector_data_ptr(tmpl)[i];
             unsigned new_elem = rename_template_vars(old_elem, rename_map);
-            vector_data_ptr(new_vec)[i] = new_elem;
+            vector_set_elem(new_vec, i, new_elem);
             if (new_elem != old_elem)
                 changed = true;
         }
@@ -785,7 +785,7 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
                                 renamed_rules = new_cell;
                                 renamed_tail = new_cell;
                             } else {
-                                CELL_CDR(renamed_tail) = new_cell;
+                                cell_set_cdr(renamed_tail, new_cell);
                                 renamed_tail = new_cell;
                             }
                         }
@@ -817,8 +817,8 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
                 } else {
                     // Update letrec-syntax frame
                     unsigned frame = car(new_env);
-                    CELL_CAR(frame) = frame_vars;
-                    CELL_CDR(frame) = frame_vals;
+                    cell_set_car(frame, frame_vars);
+                    cell_set_cdr(frame, frame_vals);
                 }
 
                 // Push a new runtime frame for the body
@@ -1008,8 +1008,8 @@ static compile_result compile_lambda(unsigned expr, compile_ctx *cctx)
                 vars = vc;
                 vals = ac;
             } else {
-                CELL_CDR(vars_tail) = vc;
-                CELL_CDR(vals_tail) = ac;
+                cell_set_cdr(vars_tail, vc);
+                cell_set_cdr(vals_tail, ac);
             }
             vars_tail = vc;
             vals_tail = ac;
@@ -2695,5 +2695,4 @@ code_object *compile_toplevel(unsigned expr, unsigned env)
     cctx_free(cctx);
     return result;
 }
-
 

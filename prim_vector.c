@@ -52,8 +52,7 @@ unsigned apply_vector_primitive(unsigned prim_id, unsigned argc,
             return TOK_ERROR;
         CHECK_VECTOR_BOUNDS(idx, vec, "vector-set!");
         unsigned val = argv[2];
-        write_barrier(vec, val); // Generational GC write barrier
-        vector_data_ptr(vec)[idx] = val;
+        vector_set_elem(vec, (unsigned)idx, val);
         return val;
     }
     case PVECLEN: {
@@ -69,11 +68,9 @@ unsigned apply_vector_primitive(unsigned prim_id, unsigned argc,
         if (!IS_VECTOR(vec))
             ERROR_RETURN("vector-fill!: not a vector");
         unsigned fill = argv[1];
-        write_barrier(vec, fill); // Generational GC write barrier
         unsigned len = vector_len(vec);
-        unsigned *data = vector_data_ptr(vec);
         for (unsigned i = 0; i < len; i++)
-            data[i] = fill;
+            vector_set_elem(vec, i, fill);
         return 0;
     }
     case PLIST2VEC: {

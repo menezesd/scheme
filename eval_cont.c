@@ -236,8 +236,7 @@ void handle_cont_let_vals(unsigned val, unsigned data, unsigned env,
         tramp_error();
         return;
     }
-    write_barrier(v, val); // v may be in old gen
-    CELL_CAR(v) = val;
+    cell_set_car(v, val);
 
     if (!rest_bindings) {
         // Protect body and next across extend_env which allocates
@@ -266,13 +265,11 @@ void handle_cont_let_vals(unsigned val, unsigned data, unsigned env,
 
         vt = list_last(new_vars);
         unsigned new_vc = alloc_cons(car(bind), 0);
-        write_barrier(vt, new_vc); // vt may be in old gen
-        CELL_CDR(vt) = new_vc;
+        cell_set_cdr(vt, new_vc);
 
         // v is already list_last(vals), which equals list_last(new_vals)
         unsigned new_valc = alloc_cons(0, 0);
-        write_barrier(v, new_valc);
-        CELL_CDR(v) = new_valc;
+        cell_set_cdr(v, new_valc);
 
         unsigned next_val_expr = cadr(bind);
         gc_protect(&next_val_expr);
@@ -360,13 +357,11 @@ void handle_cont_letrec_init(unsigned val, unsigned data, unsigned env,
     unsigned v = all_vals;
     unsigned s = saved;
     for (; v && v != vals_ptr && s; v = cdr(v), s = cdr(s)) {
-        write_barrier(v, car(s));
-        CELL_CAR(v) = car(s);
+        cell_set_car(v, car(s));
     }
 
     // Store the new value
-    write_barrier(vals_ptr, val);
-    CELL_CAR(vals_ptr) = val;
+    cell_set_car(vals_ptr, val);
 
     unsigned rest = cdr(bindings);
     if (!rest) {

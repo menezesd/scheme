@@ -280,6 +280,28 @@ void trigger_gc(void);
 // to a nursery value. This adds the cell to the remembered set.
 void write_barrier(unsigned target, unsigned value);
 
+// Collect a nursery cell to old generation. Used by root providers during minor
+// GC; callers outside the collector should normally use gc()/minor_gc().
+unsigned collect_to_old(unsigned x);
+
+static inline void cell_set_car(unsigned cell, unsigned value)
+{
+    write_barrier(cell, value);
+    CELL_CAR(cell) = value;
+}
+
+static inline void cell_set_cdr(unsigned cell, unsigned value)
+{
+    write_barrier(cell, value);
+    CELL_CDR(cell) = value;
+}
+
+static inline void vector_set_elem(unsigned vec, unsigned idx, unsigned value)
+{
+    write_barrier(vec, value);
+    vector_data_ptr(vec)[idx] = value;
+}
+
 // Check if a cell is in the nursery
 static inline bool is_in_nursery(unsigned x)
 {

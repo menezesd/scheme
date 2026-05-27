@@ -23,6 +23,7 @@
 // ============================================================================
 
 compiled_pattern *compiled_pattern_registry = NULL;
+static pat_match_state *active_match_state = NULL;
 
 void pattern_register(compiled_pattern *pat)
 {
@@ -87,8 +88,13 @@ void compiled_pattern_free(compiled_pattern *pat)
 void pattern_emit(compiled_pattern *pat, unsigned opcode, unsigned operand)
 {
     if (pat->code_len >= pat->code_cap) {
-        pat->code_cap *= 2;
-        pat->code = realloc(pat->code, pat->code_cap * sizeof(pat_instruction));
+        unsigned new_cap = pat->code_cap * 2;
+        pat_instruction *new_code =
+            realloc(pat->code, new_cap * sizeof(pat_instruction));
+        if (!new_code)
+            lisp_panic("pattern_emit: realloc failed");
+        pat->code = new_code;
+        pat->code_cap = new_cap;
     }
     pat->code[pat->code_len].opcode = opcode;
     pat->code[pat->code_len].operand = operand;
@@ -118,9 +124,13 @@ unsigned pattern_add_constant(compiled_pattern *pat, unsigned value)
     }
 
     if (pat->const_len >= pat->const_cap) {
-        pat->const_cap *= 2;
-        pat->constants = realloc(pat->constants,
-                                 pat->const_cap * sizeof(unsigned));
+        unsigned new_cap = pat->const_cap * 2;
+        unsigned *new_constants =
+            realloc(pat->constants, new_cap * sizeof(unsigned));
+        if (!new_constants)
+            lisp_panic("pattern_add_constant: realloc failed");
+        pat->constants = new_constants;
+        pat->const_cap = new_cap;
     }
     pat->constants[pat->const_len] = value;
     return pat->const_len++;
@@ -146,9 +156,13 @@ unsigned pattern_add_var(compiled_pattern *pat, unsigned atom, bool is_ellipsis,
     }
 
     if (pat->var_count >= pat->var_cap) {
-        pat->var_cap *= 2;
-        pat->var_slots = realloc(pat->var_slots,
-                                 pat->var_cap * sizeof(pat_var_slot));
+        unsigned new_cap = pat->var_cap * 2;
+        pat_var_slot *new_slots =
+            realloc(pat->var_slots, new_cap * sizeof(pat_var_slot));
+        if (!new_slots)
+            lisp_panic("pattern_add_var: realloc failed");
+        pat->var_slots = new_slots;
+        pat->var_cap = new_cap;
     }
 
     pat->var_slots[pat->var_count].atom = atom;
@@ -170,20 +184,71 @@ int pattern_find_var(compiled_pattern *pat, unsigned atom)
 // GC Integration
 // ============================================================================
 
-// Update constants during GC (called before scan phase)
-void gc_update_all_patterns(void)
+static void update_all_patterns(unsigned (*update)(unsigned))
 {
     for (compiled_pattern *pat = compiled_pattern_registry; pat;
          pat = pat->gc_next) {
         // Update constants
         for (unsigned i = 0; i < pat->const_len; i++) {
-            pat->constants[i] = collect(pat->constants[i]);
+            pat->constants[i] = update(pat->constants[i]);
         }
         // Update variable atoms
         for (unsigned i = 0; i < pat->var_count; i++) {
-            pat->var_slots[i].atom = collect(pat->var_slots[i].atom);
+            pat->var_slots[i].atom = update(pat->var_slots[i].atom);
         }
     }
+}
+
+// Update constants during major GC (called before scan phase)
+void gc_update_all_patterns(void)
+{
+    update_all_patterns(collect);
+}
+
+void minor_gc_update_all_patterns(void)
+{
+    update_all_patterns(collect_to_old);
+}
+
+static void update_match_state_roots(pat_match_state *state,
+                                     unsigned (*update)(unsigned))
+{
+    if (!state)
+        return;
+
+    state->input = update(state->input);
+    state->vec_iter_vec = update(state->vec_iter_vec);
+
+    for (unsigned i = 0; i < state->input_sp; i++) {
+        state->input_stack[i] = update(state->input_stack[i]);
+    }
+    for (unsigned i = 0; i < state->choice_sp; i++) {
+        state->choices[i].input = update(state->choices[i].input);
+    }
+
+    unsigned n = state->pattern ? state->pattern->var_count : 0;
+    for (unsigned i = 0; i < n; i++) {
+        if (state->bindings)
+            state->bindings[i] = update(state->bindings[i]);
+        if (state->ellipsis_lists)
+            state->ellipsis_lists[i] = update(state->ellipsis_lists[i]);
+        if (state->ellipsis_tails)
+            state->ellipsis_tails[i] = update(state->ellipsis_tails[i]);
+        if (state->inner_lists)
+            state->inner_lists[i] = update(state->inner_lists[i]);
+        if (state->inner_tails)
+            state->inner_tails[i] = update(state->inner_tails[i]);
+    }
+}
+
+void gc_update_active_pattern_state(void)
+{
+    update_match_state_roots(active_match_state, collect);
+}
+
+void minor_gc_update_active_pattern_state(void)
+{
+    update_match_state_roots(active_match_state, collect_to_old);
 }
 
 // Mark a pattern as reachable
@@ -603,6 +668,8 @@ static bool init_match_state(pat_match_state *state, compiled_pattern *pat,
         free(state->bindings);
         free(state->ellipsis_lists);
         free(state->ellipsis_tails);
+        free(state->inner_lists);
+        free(state->inner_tails);
         return false;
     }
     state->choice_sp = 0;
@@ -625,9 +692,13 @@ static void cleanup_match_state(pat_match_state *state)
 static void push_input(pat_match_state *state, unsigned input)
 {
     if (state->input_sp >= state->input_cap) {
-        state->input_cap *= 2;
-        state->input_stack = realloc(state->input_stack,
-                                     state->input_cap * sizeof(unsigned));
+        unsigned new_cap = state->input_cap * 2;
+        unsigned *new_stack =
+            realloc(state->input_stack, new_cap * sizeof(unsigned));
+        if (!new_stack)
+            lisp_panic("pattern input stack: realloc failed");
+        state->input_stack = new_stack;
+        state->input_cap = new_cap;
     }
     state->input_stack[state->input_sp++] = input;
 }
@@ -645,9 +716,13 @@ static unsigned pop_input(pat_match_state *state)
 static void push_choice(pat_match_state *state, unsigned retry_ip)
 {
     if (state->choice_sp >= state->choice_cap) {
-        state->choice_cap *= 2;
-        state->choices = realloc(state->choices,
-                                 state->choice_cap * sizeof(pat_choice_point));
+        unsigned new_cap = state->choice_cap * 2;
+        pat_choice_point *new_choices =
+            realloc(state->choices, new_cap * sizeof(pat_choice_point));
+        if (!new_choices)
+            lisp_panic("pattern choice stack: realloc failed");
+        state->choices = new_choices;
+        state->choice_cap = new_cap;
     }
     pat_choice_point *cp = &state->choices[state->choice_sp++];
     cp->input = state->input;
@@ -695,7 +770,7 @@ static unsigned build_bindings_alist(pat_match_state *state)
                 // Walk the list and replace #t with ()
                 for (unsigned p = value; p && IS_PAIR(p); p = cdr(p)) {
                     if (car(p) == CELL_ATOM_TRUE)
-                        CELL_CAR(p) = 0; // nil = empty list
+                        cell_set_car(p, 0); // nil = empty list
                 }
             }
         } else {
@@ -725,6 +800,8 @@ unsigned execute_pattern(compiled_pattern *pat, unsigned input)
     // Protect input and state bindings from GC
     gc_protect(&input);
     gc_protect(&state.input);
+    pat_match_state *prev_active_match_state = active_match_state;
+    active_match_state = &state;
 
     bool matched = false;
     bool failed = false;
@@ -858,7 +935,7 @@ unsigned execute_pattern(compiled_pattern *pat, unsigned input)
                     gc_unprotect(1);
 
                     if (tails[i]) {
-                        CELL_CDR(tails[i]) = new_cell;
+                        cell_set_cdr(tails[i], new_cell);
                     } else {
                         lists[i] = new_cell;
                     }
@@ -988,10 +1065,12 @@ unsigned execute_pattern(compiled_pattern *pat, unsigned input)
 
     if (matched) {
         unsigned result = build_bindings_alist(&state);
+        active_match_state = prev_active_match_state;
         cleanup_match_state(&state);
         return result;
     }
 
+    active_match_state = prev_active_match_state;
     cleanup_match_state(&state);
     return TOK_ERROR;
 }

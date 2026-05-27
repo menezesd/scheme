@@ -10,12 +10,18 @@ SRCS = main.c context.c reader.c writer.c env.c primitives.c macros.c eval.c big
        prim_char.c prim_vector.c prim_math.c prim_io.c prim_port.c prim_numtower.c \
        eval_forms.c eval_cont.c compile.c code_object.c optimize.c vm.c compiled_pattern.c
 OBJS = $(SRCS:.c=.o)
+DEBUG_OBJS = $(SRCS:.c=.debug.o)
 HEADERS = types.h context.h reader.h writer.h env.h primitives.h macros.h eval.h bignum.h \
           prim_internal.h eval_internal.h bytecode.h compile_internal.h compiled_pattern.h
 GENERATED = stdlib_data.h
 
 # Target executable
 TARGET = vesper
+DEBUG_TARGET = vesper-debug
+DEBUG_CFLAGS = -Wall -Wextra -Wshadow -Wstrict-prototypes -std=c11 -g -O0 \
+               -DDEBUG -DDEBUG_GC -fsanitize=address,undefined \
+               -fno-omit-frame-pointer
+DEBUG_LDFLAGS = $(LDFLAGS) -fsanitize=address,undefined
 
 .PHONY: all clean distclean debug test test-c test-prop test-all
 
@@ -67,10 +73,13 @@ compiled_pattern.o: compiled_pattern.c compiled_pattern.h context.h types.h
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-debug: CFLAGS = -Wall -Wextra -Wshadow -Wstrict-prototypes -std=c11 -g -O0 -DDEBUG -DDEBUG_GC \
-               -fsanitize=address,undefined -fno-omit-frame-pointer
-debug: LDFLAGS += -fsanitize=address,undefined
-debug: clean $(TARGET)
+%.debug.o: %.c $(HEADERS) stdlib_data.h
+	$(CC) $(DEBUG_CFLAGS) -c $< -o $@
+
+$(DEBUG_TARGET): $(DEBUG_OBJS)
+	$(CC) $(DEBUG_CFLAGS) -o $@ $(DEBUG_OBJS) $(DEBUG_LDFLAGS)
+
+debug: $(DEBUG_TARGET)
 
 distclean: clean
 	rm -f $(GENERATED)
@@ -122,7 +131,7 @@ test-prop: $(TARGET)
 test-all: test test-c test-prop
 
 clean:
-	rm -f $(OBJS) $(TARGET) $(TEST_BINS)
+	rm -f $(OBJS) $(DEBUG_OBJS) $(TARGET) $(DEBUG_TARGET) $(TEST_BINS)
 
 # Format code (requires clang-format)
 format:

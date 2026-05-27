@@ -202,6 +202,9 @@ unsigned execute_pattern(compiled_pattern *pat, unsigned input);
 // GC integration
 void pattern_register(compiled_pattern *pat);
 void gc_update_all_patterns(void);
+void minor_gc_update_all_patterns(void);
+void gc_update_active_pattern_state(void);
+void minor_gc_update_active_pattern_state(void);
 void gc_sweep_patterns(void);
 void gc_mark_pattern(compiled_pattern *pat);
 

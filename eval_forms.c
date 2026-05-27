@@ -399,10 +399,8 @@ bool handle_letrec(unsigned id, unsigned env, unsigned cont)
             vars = vc;
             vals = vlc;
         } else {
-            write_barrier(vars_tail, vc); // GC may have promoted vars_tail
-            write_barrier(vals_tail, vlc);
-            CELL_CDR(vars_tail) = vc;
-            CELL_CDR(vals_tail) = vlc;
+            cell_set_cdr(vars_tail, vc);
+            cell_set_cdr(vals_tail, vlc);
         }
         vars_tail = vc;
         vals_tail = vlc;

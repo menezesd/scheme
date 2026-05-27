@@ -108,16 +108,16 @@ unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
         unsigned arg1 = argv[0];
         CHECK_PAIR(arg1, "set-car!");
         unsigned arg2 = argv[1];
-        write_barrier(arg1, arg2); // Generational GC write barrier
-        return CELL_CAR(arg1) = arg2;
+        cell_set_car(arg1, arg2);
+        return arg2;
     }
     case PSETCDR: {
         REQUIRE_ARGC(argc, 2, 2, "set-cdr!");
         unsigned arg1 = argv[0];
         CHECK_PAIR(arg1, "set-cdr!");
         unsigned arg2 = argv[1];
-        write_barrier(arg1, arg2); // Generational GC write barrier
-        return CELL_CDR(arg1) = arg2;
+        cell_set_cdr(arg1, arg2);
+        return arg2;
     }
     case PLIST:
         if (argc == 0)

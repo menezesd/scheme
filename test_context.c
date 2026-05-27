@@ -431,6 +431,20 @@ TEST(gc_preserves_vector)
     PASS();
 }
 
+TEST(gc_preserves_direct_vector_root)
+{
+    unsigned v = make_vector(3, store(42));
+    unsigned preserved = gc(v);
+    ASSERT(CELL_TYPE(preserved) == BT_VECTOR);
+    ASSERT_EQ(vector_len(preserved), 3);
+    for (unsigned i = 0; i < vector_len(preserved); i++) {
+        unsigned elem = vector_data_ptr(preserved)[i];
+        ASSERT(CELL_TYPE(elem) == BT_NUM);
+        ASSERT_EQ(CELL_ID(elem), 42);
+    }
+    PASS();
+}
+
 TEST(gc_stress_many_allocations)
 {
     // Allocate a long list of numbers
@@ -588,6 +602,7 @@ int main(void)
     RUN_TEST(gc_preserves_root);
     RUN_TEST(gc_preserves_list);
     RUN_TEST(gc_preserves_vector);
+    RUN_TEST(gc_preserves_direct_vector_root);
     RUN_TEST(gc_stress_many_allocations);
     RUN_TEST(gc_stress_deep_nesting);
     RUN_TEST(gc_stress_multiple_collections);

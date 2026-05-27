@@ -478,18 +478,30 @@ unsigned read_token(void)
                         reader_ungetc(c); // put back '('
                         unsigned list = read_obj(); // read (b1 b2 ...)
                         unsigned count = 0;
-                        for (unsigned p = list; p && IS_PAIR(p); p = cdr(p))
+                        for (unsigned p = list; p; p = cdr(p)) {
+                            if (!IS_PAIR(p)) {
+                                show_error("bytevector literal: improper list");
+                                return TOK_ERROR;
+                            }
+                            unsigned byte = car(p);
+                            if (!IS_NUM(byte) || CELL_ID(byte) < 0 ||
+                                CELL_ID(byte) > 255) {
+                                show_error("bytevector literal: byte out of range");
+                                return TOK_ERROR;
+                            }
                             count++;
+                        }
                         if (count > 1024 * 1024) {
                             show_error("bytevector literal too large");
                             return TOK_ERROR;
                         }
                         bytevec_data *bv = malloc(sizeof(bytevec_data) + count);
-                        if (!bv) return TOK_ERROR;
+                        if (!bv)
+                            return TOK_ERROR;
                         bv->len = count;
                         unsigned i = 0;
                         for (unsigned p = list; p && IS_PAIR(p); p = cdr(p))
-                            bv->data[i++] = (uint8_t)(CELL_ID(car(p)) & 0xFF);
+                            bv->data[i++] = (uint8_t)CELL_ID(car(p));
                         unsigned cell = alloc();
                         CELL_TYPE(cell) = BT_BYTEVEC;
                         CELL_PTR(cell) = bv;
@@ -533,12 +545,8 @@ unsigned read_token(void)
                         return TOK_ERROR;
                     // Copy datum content into placeholder
                     if (IS_PAIR(datum)) {
-                        write_barrier(
-                            placeholder,
-                            car(datum)); // placeholder may be in old gen
-                        write_barrier(placeholder, cdr(datum));
-                        CELL_CAR(placeholder) = car(datum);
-                        CELL_CDR(placeholder) = cdr(datum);
+                        cell_set_car(placeholder, car(datum));
+                        cell_set_cdr(placeholder, cdr(datum));
                     } else {
                         // For non-pairs, copy the cell content
                         ctx.cons_cells[placeholder] = ctx.cons_cells[datum];

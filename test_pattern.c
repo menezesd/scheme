@@ -39,6 +39,17 @@ static unsigned list3(unsigned a, unsigned b, unsigned c)
     return result;
 }
 
+static unsigned binding_value(unsigned bindings, const char *name)
+{
+    int64_t id = intern(name);
+    for (unsigned p = bindings; p; p = cdr(p)) {
+        unsigned binding = car(p);
+        if (CELL_ID(car(binding)) == id)
+            return cdr(binding);
+    }
+    return TOK_ERROR;
+}
+
 // ============================================================================
 // Compilation Tests
 // ============================================================================
@@ -286,6 +297,41 @@ TEST(execute_ellipsis_empty)
     PASS();
 }
 
+TEST(execute_ellipsis_with_tail_binding)
+{
+    // Pattern: (x ... y), input: (1 2 3)
+    unsigned x = atom("x");
+    unsigned y = atom("y");
+    unsigned ellipsis = atom("...");
+    gc_protect(&x);
+    gc_protect(&y);
+    gc_protect(&ellipsis);
+    unsigned pat = alloc_cons(y, 0);
+    pat = alloc_cons(ellipsis, pat);
+    pat = alloc_cons(x, pat);
+    gc_unprotect(3);
+
+    compiled_pattern *cpat = compile_pattern(pat, 0, ctx.kw_ellipsis);
+    ASSERT(cpat->var_count == 2);
+    ASSERT(!cpat->var_slots[0].is_ellipsis); // y is post-ellipsis tail
+    ASSERT(cpat->var_slots[1].is_ellipsis);  // x is repeated
+
+    unsigned input = list3(store(1), store(2), store(3));
+    unsigned bindings = execute_pattern(cpat, input);
+    ASSERT(bindings != TOK_ERROR);
+
+    unsigned y_value = binding_value(bindings, "y");
+    ASSERT(IS_NUM(y_value));
+    ASSERT_EQ(CELL_ID(y_value), 3);
+
+    unsigned x_values = binding_value(bindings, "x");
+    ASSERT(IS_PAIR(x_values));
+    ASSERT_EQ(CELL_ID(car(x_values)), 1);
+    ASSERT_EQ(CELL_ID(cadr(x_values)), 2);
+    ASSERT(cddr(x_values) == 0);
+    PASS();
+}
+
 // ============================================================================
 // Vector Tests
 // ============================================================================
@@ -487,6 +533,7 @@ int main(void)
     RUN_TEST(execute_literal);
     RUN_TEST(execute_ellipsis_simple);
     RUN_TEST(execute_ellipsis_empty);
+    RUN_TEST(execute_ellipsis_with_tail_binding);
 
     // Vector tests
     printf("\nVector:\n");

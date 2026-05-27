@@ -1259,9 +1259,7 @@ unsigned syntax_expand(unsigned tmpl, unsigned bindings, unsigned mark,
             unsigned rest_expanded =
                 syntax_expand(rest_tmpl, bindings, mark, ellipsis_id);
             if (result) {
-                write_barrier(result_tail,
-                              rest_expanded); // result_tail may be in old gen
-                CELL_CDR(result_tail) = rest_expanded;
+                cell_set_cdr(result_tail, rest_expanded);
                 gc_unprotect(4); // result_tail, result, bindings, tmpl
                 return result;
             }

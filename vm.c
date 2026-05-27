@@ -408,8 +408,7 @@ static void restore_continuation(vm_state *vm, unsigned cont_cell,
         // Restore the saved values to the frame
         for (unsigned i = 0; i < cont->letrec_saved_len && vals;
              i++, vals = cdr(vals)) {
-            write_barrier(vals, cont->letrec_saved[i]);
-            CELL_CAR(vals) = cont->letrec_saved[i];
+            cell_set_car(vals, cont->letrec_saved[i]);
         }
     }
 
@@ -1405,7 +1404,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                     compiled_rules = new_node;
                     compiled_tail = new_node;
                 } else {
-                    CELL_CDR(compiled_tail) = new_node;
+                    cell_set_cdr(compiled_tail, new_node);
                     compiled_tail = new_node;
                 }
             }
@@ -1834,8 +1833,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             gc_protect(&pair);
             val = ensure_boxed(val);
             gc_unprotect(1);
-            write_barrier(pair, val);
-            CELL_CAR(pair) = val;
+            cell_set_car(pair, val);
             vm_push(vm, val);
             break;
         }
@@ -1847,8 +1845,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             gc_protect(&pair);
             val = ensure_boxed(val);
             gc_unprotect(1);
-            write_barrier(pair, val);
-            CELL_CDR(pair) = val;
+            cell_set_cdr(pair, val);
             vm_push(vm, val);
             break;
         }
@@ -2105,13 +2102,13 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                     result = new_cell;
                     tail = new_cell;
                 } else {
-                    CELL_CDR(tail) = new_cell;
+                    cell_set_cdr(tail, new_cell);
                     tail = new_cell;
                 }
             }
             if (vm->running) {
                 if (tail != 0) {
-                    CELL_CDR(tail) = b;
+                    cell_set_cdr(tail, b);
                 }
                 gc_unprotect(5); // p, tail, result, a, b
                 vm_push(vm, result == 0 ? b : result);
@@ -2213,8 +2210,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 VM_ERROR_BREAK(vm, "vector-set!: index out of bounds");
             }
             val = ensure_boxed(val);
-            write_barrier(vec, val);
-            vd->data[i] = val;
+            vector_set_elem(vec, (unsigned)i, val);
             vm_push(vm, val);
             break;
         }

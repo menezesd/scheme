@@ -109,8 +109,7 @@ unsigned defvar(unsigned var, unsigned aval, unsigned env)
     for (; vars; vars = cdr(vars), vals = cdr(vals)) {
         if (CELL_TYPE(vars) == BT_ATOM) {
             if (CELL_ID(vars) == vid) {
-                write_barrier(vals, aval); // Generational GC
-                CELL_CAR(vals) = aval;
+                cell_set_car(vals, aval);
                 return var;
             } else {
                 break;
@@ -118,8 +117,7 @@ unsigned defvar(unsigned var, unsigned aval, unsigned env)
         }
 
         if (CELL_ID(car(vars)) == vid) {
-            write_barrier(vals, aval); // Generational GC
-            CELL_CAR(vals) = aval;
+            cell_set_car(vals, aval);
             return var;
         }
     }
@@ -139,10 +137,8 @@ unsigned defvar(unsigned var, unsigned aval, unsigned env)
         gc_protect(&new_vars);
         new_vals = alloc_cons(aval, vals);
     }
-    write_barrier(frame, new_vars); // Generational GC
-    write_barrier(frame, new_vals);
-    CELL_CAR(frame) = new_vars;
-    CELL_CDR(frame) = new_vals;
+    cell_set_car(frame, new_vars);
+    cell_set_cdr(frame, new_vals);
     return var;
 }
 
@@ -157,8 +153,7 @@ unsigned setvar(int64_t var, unsigned aval, unsigned env)
             if (CELL_TYPE(vars) == BT_ATOM) {
                 if (CELL_ID(vars) == var) {
                     unsigned oid = car(vals);
-                    write_barrier(vals, aval); // Generational GC
-                    CELL_CAR(vals) = aval;
+                    cell_set_car(vals, aval);
                     return oid;
                 } else {
                     break;
@@ -166,8 +161,7 @@ unsigned setvar(int64_t var, unsigned aval, unsigned env)
             }
             if (CELL_ID(car(vars)) == var) {
                 unsigned oid = car(vals);
-                write_barrier(vals, aval); // Generational GC
-                CELL_CAR(vals) = aval;
+                cell_set_car(vals, aval);
                 return oid;
             }
             vars = cdr(vars);
@@ -304,10 +298,8 @@ unsigned bind_params(unsigned params, unsigned args)
             vars = vc;
             vals = ac;
         } else {
-            write_barrier(vars_tail, vc); // GC may have promoted vars_tail
-            write_barrier(vals_tail, ac);
-            CELL_CDR(vars_tail) = vc;
-            CELL_CDR(vals_tail) = ac;
+            cell_set_cdr(vars_tail, vc);
+            cell_set_cdr(vals_tail, ac);
         }
         vars_tail = vc;
         vals_tail = ac;
@@ -325,10 +317,8 @@ unsigned bind_params(unsigned params, unsigned args)
             vars = vc;
             vals = ac;
         } else {
-            write_barrier(vars_tail, vc); // GC may have promoted vars_tail
-            write_barrier(vals_tail, ac);
-            CELL_CDR(vars_tail) = vc;
-            CELL_CDR(vals_tail) = ac;
+            cell_set_cdr(vars_tail, vc);
+            cell_set_cdr(vals_tail, ac);
         }
     }
 
