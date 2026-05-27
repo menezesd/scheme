@@ -5,6 +5,22 @@
 
 #include "prim_internal.h"
 
+static bool require_number(unsigned x, const char *name)
+{
+    if (is_numeric(x))
+        return true;
+    show_error("%s: not a number", name);
+    return false;
+}
+
+static bool require_real(unsigned x, const char *name)
+{
+    if (is_numeric(x) && !IS_COMPLEX(x))
+        return true;
+    show_error("%s: not a real number", name);
+    return false;
+}
+
 /**
  * Convert an inexact real number to an exact rational.
  * Uses IEEE754 representation: value = mantissa * 2^exponent
@@ -81,7 +97,8 @@ static unsigned prim_inexact_to_exact(unsigned x)
         if (denom_exp == 0) {
             return store(num);
         } else if (denom_exp <= 62) {
-            int64_t denom = 1LL << denom_exp;
+            uint64_t denom_u = UINT64_C(1) << (unsigned)denom_exp;
+            int64_t denom = (int64_t)denom_u;
             return normalize_rational(num, denom);
         } else {
             // Large denominator - use bignums
@@ -109,6 +126,12 @@ unsigned apply_numtower_primitive(unsigned prim_id, unsigned argc,
     case PNUMERATOR: {
         REQUIRE_ARGC(argc, 1, 1, "numerator");
         unsigned x = argv[0];
+        if (IS_FIXNUM(x))
+            return x;
+        if (!IS_CELL(x)) {
+            show_error("numerator: not a rational");
+            return TOK_ERROR;
+        }
         switch (CELL_TYPE(x)) {
         case BT_NUM:
         case BT_BIGNUM:
@@ -130,6 +153,12 @@ unsigned apply_numtower_primitive(unsigned prim_id, unsigned argc,
     case PDENOMINATOR: {
         REQUIRE_ARGC(argc, 1, 1, "denominator");
         unsigned x = argv[0];
+        if (IS_FIXNUM(x))
+            return store(1);
+        if (!IS_CELL(x)) {
+            show_error("denominator: not a rational");
+            return TOK_ERROR;
+        }
         switch (CELL_TYPE(x)) {
         case BT_NUM:
         case BT_BIGNUM:
@@ -152,13 +181,19 @@ unsigned apply_numtower_primitive(unsigned prim_id, unsigned argc,
         REQUIRE_ARGC(argc, 2, 2, "make-rectangular");
         unsigned real = argv[0];
         unsigned imag = argv[1];
+        if (!require_real(real, "make-rectangular") ||
+            !require_real(imag, "make-rectangular"))
+            return TOK_ERROR;
         // If imaginary part is zero, return just the real
-        if (to_double(imag) == 0.0)
+        if (is_zero_number(imag))
             return real;
         return store_complex(real, imag);
     }
     case PMAKEPOLAR: {
         REQUIRE_ARGC(argc, 2, 2, "make-polar");
+        if (!require_real(argv[0], "make-polar") ||
+            !require_real(argv[1], "make-polar"))
+            return TOK_ERROR;
         double mag = to_double(argv[0]);
         double ang = to_double(argv[1]);
         double real = mag * cos(ang);
@@ -170,7 +205,9 @@ unsigned apply_numtower_primitive(unsigned prim_id, unsigned argc,
     case PREALPART: {
         REQUIRE_ARGC(argc, 1, 1, "real-part");
         unsigned x = argv[0];
-        if (CELL_TYPE(x) == BT_COMPLEX) {
+        if (!require_number(x, "real-part"))
+            return TOK_ERROR;
+        if (IS_COMPLEX(x)) {
             return CELL_CAR(x);
         }
         return x; // Real numbers are their own real part
@@ -178,7 +215,9 @@ unsigned apply_numtower_primitive(unsigned prim_id, unsigned argc,
     case PIMAGPART: {
         REQUIRE_ARGC(argc, 1, 1, "imag-part");
         unsigned x = argv[0];
-        if (CELL_TYPE(x) == BT_COMPLEX) {
+        if (!require_number(x, "imag-part"))
+            return TOK_ERROR;
+        if (IS_COMPLEX(x)) {
             return CELL_CDR(x);
         }
         return store(0); // Real numbers have 0 imaginary part
@@ -186,15 +225,21 @@ unsigned apply_numtower_primitive(unsigned prim_id, unsigned argc,
     case PMAGNITUDE: {
         REQUIRE_ARGC(argc, 1, 1, "magnitude");
         unsigned x = argv[0];
-        if (CELL_TYPE(x) == BT_COMPLEX) {
+        if (!require_number(x, "magnitude"))
+            return TOK_ERROR;
+        if (IS_FIXNUM(x)) {
+            int32_t n = FIXNUM_VALUE(x);
+            return n < 0 ? store(-(int64_t)n) : store(n);
+        }
+        if (IS_COMPLEX(x)) {
             double real = to_double(CELL_CAR(x));
             double imag = to_double(CELL_CDR(x));
             return store_inexact(sqrt(real * real + imag * imag));
         }
         // For real numbers, magnitude is abs
-        if (CELL_TYPE(x) == BT_NUM)
+        if (IS_NUM(x))
             return CELL_ID(x) < 0 ? negate_number(x) : x;
-        if (CELL_TYPE(x) == BT_BIGNUM) {
+        if (IS_BIGNUM(x)) {
             bignum *bn = get_bignum(x);
             if (bn->sign) {
                 bignum *abs_bn = bn_neg(bn);
@@ -206,7 +251,7 @@ unsigned apply_numtower_primitive(unsigned prim_id, unsigned argc,
             }
             return x;
         }
-        if (CELL_TYPE(x) == BT_RATIONAL) {
+        if (IS_RATIONAL(x)) {
             unsigned num = CELL_CAR(x);
             if (!is_negative_number(num))
                 return x;
@@ -221,6 +266,8 @@ unsigned apply_numtower_primitive(unsigned prim_id, unsigned argc,
     }
     case PANGLE: {
         REQUIRE_ARGC(argc, 1, 1, "angle");
+        if (!require_number(argv[0], "angle"))
+            return TOK_ERROR;
         unsigned x = argv[0];
         double real, imag;
         get_complex_parts(x, &real, &imag);
@@ -229,7 +276,9 @@ unsigned apply_numtower_primitive(unsigned prim_id, unsigned argc,
     case PEXACT2INEXACT: {
         REQUIRE_ARGC(argc, 1, 1, "exact->inexact");
         unsigned x = argv[0];
-        if (CELL_TYPE(x) == BT_COMPLEX) {
+        if (!require_number(x, "exact->inexact"))
+            return TOK_ERROR;
+        if (IS_COMPLEX(x)) {
             return make_complex_inexact(to_double(CELL_CAR(x)),
                                         to_double(CELL_CDR(x)));
         }
@@ -238,12 +287,14 @@ unsigned apply_numtower_primitive(unsigned prim_id, unsigned argc,
     case PINEXACT2EXACT: {
         REQUIRE_ARGC(argc, 1, 1, "inexact->exact");
         unsigned x = argv[0];
+        if (!require_number(x, "inexact->exact"))
+            return TOK_ERROR;
 
         // Already exact? Return as-is
         if (is_exact(x))
             return x;
 
-        if (CELL_TYPE(x) == BT_COMPLEX) {
+        if (IS_COMPLEX(x)) {
             // Convert both parts to exact
             GC_GUARD;
             unsigned real_exact = prim_inexact_to_exact(CELL_CAR(x));
@@ -256,6 +307,9 @@ unsigned apply_numtower_primitive(unsigned prim_id, unsigned argc,
     }
     case PRATIONALIZE: {
         REQUIRE_ARGC(argc, 2, 2, "rationalize");
+        if (!require_real(argv[0], "rationalize") ||
+            !require_real(argv[1], "rationalize"))
+            return TOK_ERROR;
         // Find simplest rational within epsilon using continued fractions
         double x = to_double(argv[0]);
         double epsilon = fabs(to_double(argv[1]));
@@ -319,11 +373,13 @@ unsigned apply_numtower_primitive(unsigned prim_id, unsigned argc,
     case PFINITE: {
         REQUIRE_ARGC(argc, 1, 1, "finite?");
         unsigned x = argv[0];
-        if (CELL_TYPE(x) == BT_INEXACT) {
+        if (!is_numeric(x))
+            return ctx.atom_false;
+        if (IS_INEXACT(x)) {
             double d = to_double(x);
             return isfinite(d) ? ctx.atom_true : ctx.atom_false;
         }
-        if (CELL_TYPE(x) == BT_COMPLEX) {
+        if (IS_COMPLEX(x)) {
             double real = to_double(CELL_CAR(x));
             double imag = to_double(CELL_CDR(x));
             return (isfinite(real) && isfinite(imag)) ? ctx.atom_true
@@ -335,11 +391,13 @@ unsigned apply_numtower_primitive(unsigned prim_id, unsigned argc,
     case PINFINITE: {
         REQUIRE_ARGC(argc, 1, 1, "infinite?");
         unsigned x = argv[0];
-        if (CELL_TYPE(x) == BT_INEXACT) {
+        if (!is_numeric(x))
+            return ctx.atom_false;
+        if (IS_INEXACT(x)) {
             double d = to_double(x);
             return isinf(d) ? ctx.atom_true : ctx.atom_false;
         }
-        if (CELL_TYPE(x) == BT_COMPLEX) {
+        if (IS_COMPLEX(x)) {
             double real = to_double(CELL_CAR(x));
             double imag = to_double(CELL_CDR(x));
             return (isinf(real) || isinf(imag)) ? ctx.atom_true
@@ -351,11 +409,13 @@ unsigned apply_numtower_primitive(unsigned prim_id, unsigned argc,
     case PNAN: {
         REQUIRE_ARGC(argc, 1, 1, "nan?");
         unsigned x = argv[0];
-        if (CELL_TYPE(x) == BT_INEXACT) {
+        if (!is_numeric(x))
+            return ctx.atom_false;
+        if (IS_INEXACT(x)) {
             double d = to_double(x);
             return isnan(d) ? ctx.atom_true : ctx.atom_false;
         }
-        if (CELL_TYPE(x) == BT_COMPLEX) {
+        if (IS_COMPLEX(x)) {
             double real = to_double(CELL_CAR(x));
             double imag = to_double(CELL_CDR(x));
             return (isnan(real) || isnan(imag)) ? ctx.atom_true

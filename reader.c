@@ -42,6 +42,48 @@ static int reader_line = 1;
 static int reader_col = 0;
 static const char *reader_filename = "<stdin>";
 
+#define READER_PUSHBACK_CAP 16
+
+typedef struct {
+    int c;
+    int line_before;
+    int col_before;
+} reader_char_state;
+
+static reader_char_state reader_pushback[READER_PUSHBACK_CAP];
+static int reader_pushback_len = 0;
+static reader_char_state reader_history[READER_PUSHBACK_CAP];
+static int reader_history_len = 0;
+
+static FILE *saved_pushback_port = NULL;
+static long saved_pushback_pos = -1;
+static int saved_reader_line = 1;
+static int saved_reader_col = 0;
+static reader_char_state saved_pushback[READER_PUSHBACK_CAP];
+static int saved_pushback_len = 0;
+static reader_char_state saved_history[READER_PUSHBACK_CAP];
+static int saved_history_len = 0;
+
+static void reader_record_history(reader_char_state state)
+{
+    if (reader_history_len == READER_PUSHBACK_CAP) {
+        memmove(reader_history, reader_history + 1,
+                (READER_PUSHBACK_CAP - 1) * sizeof(reader_history[0]));
+        reader_history_len--;
+    }
+    reader_history[reader_history_len++] = state;
+}
+
+static void advance_position_for_char(int c, int *line, int *col)
+{
+    if (c == '\n') {
+        (*line)++;
+        *col = 0;
+    } else if (c != EOF) {
+        (*col)++;
+    }
+}
+
 // ============================================================================
 // Datum Labels (#n= and #n#)
 // ============================================================================
@@ -58,6 +100,7 @@ typedef struct {
 static datum_label_entry *datum_labels = NULL;
 static int datum_label_count = 0;
 static int datum_label_cap = 0;
+static int reader_obj_depth = 0;
 
 static void reset_datum_labels(void)
 {
@@ -101,16 +144,72 @@ static int add_datum_label(int label)
     return idx;
 }
 
+void reader_update_datum_labels(unsigned (*collector)(unsigned))
+{
+    if (reader_obj_depth == 0)
+        return;
+    for (int i = 0; i < datum_label_count; i++) {
+        if (datum_labels[i].defined)
+            datum_labels[i].value = collector(datum_labels[i].value);
+    }
+}
+
+static void resolve_datum_label_placeholder(unsigned placeholder,
+                                            unsigned datum)
+{
+    if (IS_PAIR(datum)) {
+        cell_set_car(placeholder, car(datum));
+        cell_set_cdr(placeholder, cdr(datum));
+        return;
+    }
+
+    enum lisp_type type = CELL_TYPE(datum);
+    CELL_TYPE(placeholder) = type;
+
+    if (type == BT_RATIONAL || type == BT_COMPLEX ||
+        type == BT_FUNCTION || type == BT_MACRO ||
+        type == BT_SYNTAX || type == BT_CONT) {
+        cell_set_car(placeholder, car(datum));
+        cell_set_cdr(placeholder, cdr(datum));
+        return;
+    }
+
+    CELL_ID(placeholder) = CELL_ID(datum);
+
+    if (type == BT_VECTOR) {
+        unsigned len = vector_len(placeholder);
+        for (unsigned i = 0; i < len; i++) {
+            unsigned elem = vector_data_ptr(placeholder)[i];
+            vector_set_elem(placeholder, i, elem);
+        }
+    }
+
+    if (datum >= HEAP_RESERVED) {
+        CELL_TYPE(datum) = BT_FREE;
+        CELL_ID(datum) = 0;
+    }
+}
+
 static int reader_getchar(void)
 {
-    FILE *fp = reader_port ? reader_port : stdin;
-    int c = fgetc(fp);
-    if (c == '\n') {
-        reader_line++;
-        reader_col = 0;
-    } else if (c != EOF) {
-        reader_col++;
+    reader_char_state state;
+    int c;
+    if (reader_pushback_len > 0) {
+        state = reader_pushback[--reader_pushback_len];
+        c = state.c;
+        reader_line = state.line_before;
+        reader_col = state.col_before;
+    } else {
+        FILE *fp = reader_port ? reader_port : stdin;
+        c = fgetc(fp);
+        state.c = c;
+        state.line_before = reader_line;
+        state.col_before = reader_col;
     }
+
+    advance_position_for_char(c, &reader_line, &reader_col);
+    if (c != EOF)
+        reader_record_history(state);
     return c;
 }
 
@@ -119,13 +218,20 @@ static void reader_ungetc(int c)
     if (c == EOF)
         return;
 
-    FILE *fp = reader_port ? reader_port : stdin;
-    if (c == '\n') {
-        reader_line--;
-    } else {
-        reader_col--;
+    if (reader_pushback_len >= READER_PUSHBACK_CAP ||
+        reader_history_len == 0) {
+        show_error("reader: pushback buffer overflow");
+        return;
     }
-    ungetc(c, fp);
+
+    reader_char_state state = reader_history[--reader_history_len];
+    if (state.c != c) {
+        show_error("reader: pushback order mismatch");
+        return;
+    }
+    reader_pushback[reader_pushback_len++] = state;
+    reader_line = state.line_before;
+    reader_col = state.col_before;
 }
 
 // Reset line tracking (call when switching input sources)
@@ -133,12 +239,31 @@ void reader_reset_position(void)
 {
     reader_line = 1;
     reader_col = 0;
+    reader_pushback_len = 0;
+    reader_history_len = 0;
+    saved_pushback_port = NULL;
+    saved_pushback_pos = -1;
+    saved_reader_line = 1;
+    saved_reader_col = 0;
+    saved_pushback_len = 0;
+    saved_history_len = 0;
 }
 
 // Get current reader position for error messages
-int reader_get_line(void) { return reader_line; }
-int reader_get_col(void) { return reader_col; }
-const char *reader_get_filename(void) { return reader_filename; }
+int reader_get_line(void)
+{
+    return reader_line;
+}
+
+int reader_get_col(void)
+{
+    return reader_col;
+}
+
+const char *reader_get_filename(void)
+{
+    return reader_filename;
+}
 void reader_set_filename(const char *name)
 {
     reader_filename = name ? name : "<stdin>";
@@ -219,6 +344,24 @@ static unsigned read_prefixed_integer(const char *digits, int base, bool neg)
     return store_integer(bn);
 }
 
+static bool read_byte_value(unsigned obj, uint8_t *out)
+{
+    int64_t val;
+    if (IS_FIXNUM(obj)) {
+        val = FIXNUM_VALUE(obj);
+    } else if (IS_NUM(obj)) {
+        val = CELL_ID(obj);
+    } else {
+        return false;
+    }
+
+    if (val < 0 || val > UINT8_MAX)
+        return false;
+
+    *out = (uint8_t)val;
+    return true;
+}
+
 // ============================================================================
 // Token Delimiter Check
 // ============================================================================
@@ -227,6 +370,20 @@ static inline bool is_delimiter(int c)
 {
     return isspace(c) || c == '(' || c == ')' || c == '"' || c == ';' ||
            c == EOF;
+}
+
+static bool reject_invalid_prefixed_tail(int c, const char *name)
+{
+    if (is_delimiter(c)) {
+        reader_ungetc(c);
+        return false;
+    }
+
+    while (!is_delimiter(c))
+        c = reader_getchar();
+    reader_ungetc(c);
+    show_error("invalid %s literal", name);
+    return true;
 }
 
 // ============================================================================
@@ -265,24 +422,30 @@ static unsigned read_character_literal(void)
         char buf[CHAR_NAME_BUF_SIZE];
         buf[0] = c;
         int i = 1;
-        int c2 = EOF;
-        while (i < CHAR_NAME_BUF_SIZE - 1 && isalpha(c2 = reader_getchar())) {
-            buf[i++] = c2;
+        bool too_long = false;
+        int c2 = reader_getchar();
+        while (!is_delimiter(c2)) {
+            if (i < CHAR_NAME_BUF_SIZE - 1) {
+                buf[i++] = c2;
+            } else {
+                too_long = true;
+            }
+            c2 = reader_getchar();
         }
         buf[i] = '\0';
+        reader_ungetc(c2);
 
         if (i > 1) {
-            // Multi-character name - look it up
-            if (c2 != EOF)
-                reader_ungetc(c2);
+            if (too_long) {
+                show_error("character name too long");
+                return TOK_ERROR;
+            }
             int char_val = lookup_char_name(buf);
             if (char_val >= 0) {
                 return make_char(char_val);
             }
-            // Unknown character name - just use first character
-        } else {
-            if (c2 != EOF)
-                reader_ungetc(c2);
+            show_error("unknown character name: %s", buf);
+            return TOK_ERROR;
         }
     }
 
@@ -393,17 +556,17 @@ unsigned read_token(void)
             while ((c = reader_getchar()) != '\n' && c != EOF)
                 ;
             if (c == EOF) {
-                if (reader_port == NULL)
+                if (reader_port == NULL && reader_obj_depth <= 1)
                     exit(0);
-                return atom_from_string("eof-object");
+                return TOK_EOF;
             }
             continue;
         }
 
         if (c == EOF) {
-            if (reader_port == NULL)
+            if (reader_port == NULL && reader_obj_depth <= 1)
                 exit(0);
-            return atom_from_string("eof-object");
+            return TOK_EOF;
         }
 
         switch (c) {
@@ -461,7 +624,10 @@ unsigned read_token(void)
                     sb_append(&sb, c);
                     c = reader_getchar();
                 }
-                reader_ungetc(c);
+                if (reject_invalid_prefixed_tail(c, "hex")) {
+                    sb_free(&sb);
+                    return TOK_ERROR;
+                }
                 if (sb.len == 0) {
                     sb_free(&sb);
                     show_error("invalid hex literal: #x");
@@ -482,7 +648,10 @@ unsigned read_token(void)
                     sb_append(&sb, c);
                     c = reader_getchar();
                 }
-                reader_ungetc(c);
+                if (reject_invalid_prefixed_tail(c, "octal")) {
+                    sb_free(&sb);
+                    return TOK_ERROR;
+                }
                 if (sb.len == 0) {
                     sb_free(&sb);
                     show_error("invalid octal literal: #o");
@@ -503,7 +672,10 @@ unsigned read_token(void)
                     sb_append(&sb, c);
                     c = reader_getchar();
                 }
-                reader_ungetc(c);
+                if (reject_invalid_prefixed_tail(c, "binary")) {
+                    sb_free(&sb);
+                    return TOK_ERROR;
+                }
                 if (sb.len == 0) {
                     sb_free(&sb);
                     show_error("invalid binary literal: #b");
@@ -515,12 +687,26 @@ unsigned read_token(void)
             } else if (c == 'u') {
                 // Bytevector literal: #u8(...)
                 c = reader_getchar();
+                if (c == EOF) {
+                    show_error("unexpected end of file after #u");
+                    return TOK_ERROR;
+                }
                 if (c == '8') {
                     c = reader_getchar();
+                    if (c == EOF) {
+                        show_error("unexpected end of file after #u8");
+                        return TOK_ERROR;
+                    }
                     if (c == '(') {
                         // Read bytes by reading a list then converting
                         reader_ungetc(c); // put back '('
                         unsigned list = read_obj(); // read (b1 b2 ...)
+                        if (list == TOK_ERROR)
+                            return TOK_ERROR;
+                        if (list == TOK_EOF) {
+                            show_error("unexpected end of file in bytevector literal");
+                            return TOK_ERROR;
+                        }
                         unsigned count = 0;
                         for (unsigned p = list; p; p = cdr(p)) {
                             if (!IS_PAIR(p)) {
@@ -528,8 +714,8 @@ unsigned read_token(void)
                                 return TOK_ERROR;
                             }
                             unsigned byte = car(p);
-                            if (!IS_NUM(byte) || CELL_ID(byte) < 0 ||
-                                CELL_ID(byte) > 255) {
+                            uint8_t byte_value;
+                            if (!read_byte_value(byte, &byte_value)) {
                                 show_error("bytevector literal: byte out of range");
                                 return TOK_ERROR;
                             }
@@ -540,12 +726,17 @@ unsigned read_token(void)
                             return TOK_ERROR;
                         }
                         bytevec_data *bv = malloc(sizeof(bytevec_data) + count);
-                        if (!bv)
+                        if (!bv) {
+                            show_error("bytevector literal: out of memory");
                             return TOK_ERROR;
+                        }
                         bv->len = count;
                         unsigned i = 0;
-                        for (unsigned p = list; p && IS_PAIR(p); p = cdr(p))
-                            bv->data[i++] = (uint8_t)CELL_ID(car(p));
+                        for (unsigned p = list; p && IS_PAIR(p); p = cdr(p)) {
+                            uint8_t byte_value;
+                            read_byte_value(car(p), &byte_value);
+                            bv->data[i++] = byte_value;
+                        }
                         unsigned cell = alloc();
                         CELL_TYPE(cell) = BT_BYTEVEC;
                         CELL_PTR(cell) = bv;
@@ -584,17 +775,21 @@ unsigned read_token(void)
                     datum_labels[idx].value = placeholder;
                     datum_labels[idx].defined = true;
                     // Read the datum
+                    GC_GUARD;
+                    gc_protect(&placeholder);
                     unsigned datum = read_obj();
+                    gc_protect(&datum);
                     if (datum == TOK_ERROR)
                         return TOK_ERROR;
-                    // Copy datum content into placeholder
-                    if (IS_PAIR(datum)) {
-                        cell_set_car(placeholder, car(datum));
-                        cell_set_cdr(placeholder, cdr(datum));
-                    } else {
-                        // For non-pairs, copy the cell content
-                        ctx.cons_cells[placeholder] = ctx.cons_cells[datum];
+                    if (datum == TOK_EOF) {
+                        show_error("unexpected end of file after datum label");
+                        return TOK_ERROR;
                     }
+                    if (!IS_CELL(datum)) {
+                        datum_labels[idx].value = datum;
+                        return datum;
+                    }
+                    resolve_datum_label_placeholder(placeholder, datum);
                     return placeholder;
                 } else if (c == '#') {
                     // Reference label: #n#
@@ -619,6 +814,7 @@ unsigned read_token(void)
             string_buffer sb;
             sb_init(&sb);
             bool is_number = isdigit(c) || c == '-' || c == '+';
+            bool delimiter_unread = false;
             sb_append(&sb, tolower(c));
 
             for (;;) {
@@ -635,6 +831,7 @@ unsigned read_token(void)
                         // End of number followed by dot (for dotted pairs)
                         reader_ungetc(c2);
                         reader_ungetc(c);
+                        delimiter_unread = true;
                         break;
                     }
                     reader_ungetc(c2);
@@ -647,7 +844,8 @@ unsigned read_token(void)
                 // The . as dotted-pair marker is handled in the switch above
                 sb_append(&sb, tolower(c));
             }
-            reader_ungetc(c);
+            if (!delimiter_unread)
+                reader_ungetc(c);
             unsigned res = atom_from_string(sb.data);
             sb_free(&sb);
             return res;
@@ -674,6 +872,10 @@ unsigned read_vector(void)
             break;
         if (elem == TOK_ERROR)
             return TOK_ERROR;
+        if (elem == TOK_EOF) {
+            show_error("unexpected end of file in vector");
+            return TOK_ERROR;
+        }
         if (elem == TOK_DOT) {
             show_error("dot not allowed in vector literal");
             return TOK_ERROR;
@@ -684,13 +886,15 @@ unsigned read_vector(void)
     }
 
     unsigned vec = make_vector(count, 0);
+    if (vec == TOK_ERROR)
+        return TOK_ERROR;
     unsigned *data = vector_data_ptr(vec);
     unsigned i = 0;
     FORLIST(l, head) { data[i++] = car(l); }
     return vec;
 }
 
-unsigned read_obj(void)
+static unsigned read_obj_inner(void)
 {
     unsigned tok = read_token();
     switch (tok) {
@@ -709,6 +913,9 @@ unsigned read_obj(void)
             return tok;
         case TOK_ERROR:
             return tok;
+        case TOK_EOF:
+            show_error("unexpected end of file after quote");
+            return TOK_ERROR;
         default: {
             GC_GUARD;
             gc_protect(&tok);
@@ -719,6 +926,10 @@ unsigned read_obj(void)
         }
     case TOK_QUASIQUOTE:
         tok = read_obj();
+        if (tok == TOK_EOF) {
+            show_error("unexpected end of file after quasiquote");
+            return TOK_ERROR;
+        }
         if (tok == TOK_CLOSE || tok == TOK_DOT || tok == TOK_ERROR) {
             show_warning("ignoring quasiquote before special token");
             return tok;
@@ -732,6 +943,10 @@ unsigned read_obj(void)
         }
     case TOK_UNQUOTE:
         tok = read_obj();
+        if (tok == TOK_EOF) {
+            show_error("unexpected end of file after unquote");
+            return TOK_ERROR;
+        }
         if (tok == TOK_CLOSE || tok == TOK_DOT || tok == TOK_ERROR) {
             show_warning("ignoring unquote before special token");
             return tok;
@@ -745,6 +960,10 @@ unsigned read_obj(void)
         }
     case TOK_UNQUOTE_SPLICING:
         tok = read_obj();
+        if (tok == TOK_EOF) {
+            show_error("unexpected end of file after unquote-splicing");
+            return TOK_ERROR;
+        }
         if (tok == TOK_CLOSE || tok == TOK_DOT || tok == TOK_ERROR) {
             show_warning("ignoring unquote-splicing before special token");
             return tok;
@@ -759,6 +978,17 @@ unsigned read_obj(void)
     default:
         return tok;
     }
+}
+
+unsigned read_obj(void)
+{
+    bool outermost = reader_obj_depth == 0;
+    reader_obj_depth++;
+    unsigned result = read_obj_inner();
+    reader_obj_depth--;
+    if (outermost && result == TOK_EOF)
+        return atom_from_string("eof-object");
+    return result;
 }
 
 unsigned read_list(void)
@@ -781,6 +1011,9 @@ unsigned read_list(void)
         case TOK_CLOSE:
             show_error("a dot must be followed by an object");
             return TOK_ERROR;
+        case TOK_EOF:
+            show_error("unexpected end of file after dot");
+            return TOK_ERROR;
         }
         st = read_list();
         if (st == TOK_ERROR)
@@ -791,27 +1024,127 @@ unsigned read_list(void)
         }
         return sh;
     default:
+        if (sh == TOK_EOF) {
+            show_error("unexpected end of file in list");
+            return TOK_ERROR;
+        }
         st = read_list();
         if (st == TOK_ERROR)
             return TOK_ERROR;
+        gc_protect(&st);
         return alloc_cons(sh, st);
     }
 }
 
-void reader_reset_labels(void) { reset_datum_labels(); }
+void reader_reset_labels(void)
+{
+    reset_datum_labels();
+    reader_pushback_len = 0;
+    reader_history_len = 0;
+}
 
 unsigned read_obj_port(FILE *port)
 {
     FILE *old_port = reader_port;
     int old_line = reader_line;
     int old_col = reader_col;
+    reader_char_state old_pushback[READER_PUSHBACK_CAP];
+    reader_char_state old_history[READER_PUSHBACK_CAP];
+    int old_pushback_len = reader_pushback_len;
+    int old_history_len = reader_history_len;
+    memcpy(old_pushback, reader_pushback, sizeof(old_pushback));
+    memcpy(old_history, reader_history, sizeof(old_history));
+
     reader_port = port;
-    reader_line = 1;
-    reader_col = 0;
+    long port_pos = ftell(port);
+    if (saved_pushback_port == port &&
+        (port_pos < 0 || port_pos == saved_pushback_pos)) {
+        reader_line = saved_reader_line;
+        reader_col = saved_reader_col;
+        memcpy(reader_pushback, saved_pushback, sizeof(reader_pushback));
+        memcpy(reader_history, saved_history, sizeof(reader_history));
+        reader_pushback_len = saved_pushback_len;
+        reader_history_len = saved_history_len;
+    } else {
+        reader_line = 1;
+        reader_col = 0;
+        reader_pushback_len = 0;
+        reader_history_len = 0;
+    }
     reset_datum_labels();
     unsigned result = read_obj();
+    if (ferror(port)) {
+        show_error("read: input error");
+        result = TOK_ERROR;
+    }
+    saved_pushback_port = port;
+    saved_pushback_pos = ftell(port);
+    saved_reader_line = reader_line;
+    saved_reader_col = reader_col;
+    memcpy(saved_pushback, reader_pushback, sizeof(saved_pushback));
+    memcpy(saved_history, reader_history, sizeof(saved_history));
+    saved_pushback_len = reader_pushback_len;
+    saved_history_len = reader_history_len;
+
     reader_port = old_port;
     reader_line = old_line;
     reader_col = old_col;
+    memcpy(reader_pushback, old_pushback, sizeof(reader_pushback));
+    memcpy(reader_history, old_history, sizeof(reader_history));
+    reader_pushback_len = old_pushback_len;
+    reader_history_len = old_history_len;
     return result;
+}
+
+size_t reader_port_pending_bytes(FILE *port)
+{
+    if (reader_port == port)
+        return (size_t)reader_pushback_len;
+    if (saved_pushback_port == port)
+        return (size_t)saved_pushback_len;
+    return 0;
+}
+
+int reader_port_getc(FILE *port)
+{
+    if (reader_port == port && reader_pushback_len > 0) {
+        int c = reader_pushback[--reader_pushback_len].c;
+        advance_position_for_char(c, &reader_line, &reader_col);
+        return c;
+    }
+    if (saved_pushback_port == port && saved_pushback_len > 0) {
+        int c = saved_pushback[--saved_pushback_len].c;
+        advance_position_for_char(c, &saved_reader_line, &saved_reader_col);
+        return c;
+    }
+    return fgetc(port);
+}
+
+int reader_port_peekc(FILE *port)
+{
+    if (reader_port == port && reader_pushback_len > 0)
+        return reader_pushback[reader_pushback_len - 1].c;
+    if (saved_pushback_port == port && saved_pushback_len > 0)
+        return saved_pushback[saved_pushback_len - 1].c;
+
+    int c = fgetc(port);
+    if (c != EOF && ungetc(c, port) == EOF)
+        return EOF;
+    return c;
+}
+
+void reader_forget_port(FILE *port)
+{
+    if (saved_pushback_port == port) {
+        saved_pushback_port = NULL;
+        saved_pushback_pos = -1;
+        saved_reader_line = 1;
+        saved_reader_col = 0;
+        saved_pushback_len = 0;
+        saved_history_len = 0;
+    }
+    if (reader_port == port) {
+        reader_pushback_len = 0;
+        reader_history_len = 0;
+    }
 }

@@ -28,9 +28,9 @@ unsigned apply_port_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         CHECK_STRING(argv[0], "open-output-file");
         char *filename = GET_STRING_PTR(argv[0]);
         const char *mode = "w";
-        if (argc > 1 && IS_ATOM(argv[1]) &&
-            strcmp(ctx.atom_table[CELL_ID(argv[1])], "append") == 0)
-            mode = "a";
+        if (argc > 1) {
+            mode = IS_FALSE(argv[1]) ? "w" : "a";
+        }
         FILE *f = fopen(filename, mode);
         if (!f) {
             show_error("open-output-file: cannot open %s", filename);
@@ -48,21 +48,37 @@ unsigned apply_port_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         REQUIRE_ARGC(argc, 1, 1, name);
         unsigned port = argv[0];
         // Handle string ports
-        if (IS_STRINPORT(port) || IS_STROUTPORT(port)) {
+        if (prim_id == PCLOSEINPUT && IS_STRINPORT(port)) {
             string_port *sp = GET_STRPORT_PTR(port);
             if (sp)
                 strport_free(sp);
             CELL_ID(port) = 0;
             return 0;
         }
-        if (!IS_INPORT(port) && !IS_OUTPORT(port)) {
-            show_error("%s: not a port", name);
+        if (prim_id == PCLOSEOUTPUT && IS_STROUTPORT(port)) {
+            string_port *sp = GET_STRPORT_PTR(port);
+            if (sp)
+                strport_free(sp);
+            CELL_ID(port) = 0;
+            return 0;
+        }
+        if ((prim_id == PCLOSEINPUT && !IS_INPORT(port)) ||
+            (prim_id == PCLOSEOUTPUT && !IS_OUTPORT(port))) {
+            show_error("%s: not an %s port", name,
+                       prim_id == PCLOSEINPUT ? "input" : "output");
             return TOK_ERROR;
         }
         FILE *f = GET_PORT_PTR(port);
+        bool close_failed = false;
+        if (f)
+            reader_forget_port(f);
         if (f && f != stdin && f != stdout)
-            fclose(f);
+            close_failed = fclose(f) != 0;
         CELL_ID(port) = 0;
+        if (close_failed) {
+            show_error("%s: close failed", name);
+            return TOK_ERROR;
+        }
         return 0;
     }
     case PINPUTPORTP: {
@@ -75,7 +91,7 @@ unsigned apply_port_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
     }
     case PCURRENTINPUT: {
         REQUIRE_ARGC(argc, 0, 0, "current-input-port");
-        // Return string port if active, otherwise wrap FILE*
+        // Return rooted current port cell if active, otherwise wrap FILE*.
         if (ctx.current_input_cell != 0) {
             return ctx.current_input_cell;
         }
@@ -86,7 +102,7 @@ unsigned apply_port_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
     }
     case PCURRENTOUTPUT: {
         REQUIRE_ARGC(argc, 0, 0, "current-output-port");
-        // Return string port if active, otherwise wrap FILE*
+        // Return rooted current port cell if active, otherwise wrap FILE*.
         if (ctx.current_output_cell != 0) {
             return ctx.current_output_cell;
         }
@@ -161,10 +177,18 @@ unsigned apply_port_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         REQUIRE_ARGC(argc, 1, 1, "set-current-input-port!");
         unsigned port = argv[0];
         if (IS_INPORT(port)) {
+            if (!GET_PORT_PTR(port)) {
+                show_error("set-current-input-port!: port is closed");
+                return TOK_ERROR;
+            }
             ctx.current_input = GET_PORT_PTR(port);
-            ctx.current_input_cell = 0; // Use FILE*
+            ctx.current_input_cell = port;
         } else if (IS_STRINPORT(port)) {
-            ctx.current_input_cell = port; // Use string port cell
+            if (!GET_STRPORT_PTR(port)) {
+                show_error("set-current-input-port!: port is closed");
+                return TOK_ERROR;
+            }
+            ctx.current_input_cell = port;
         } else {
             show_error("set-current-input-port!: not an input port, got %s",
                        type_name(port));
@@ -176,10 +200,18 @@ unsigned apply_port_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         REQUIRE_ARGC(argc, 1, 1, "set-current-output-port!");
         unsigned port = argv[0];
         if (IS_OUTPORT(port)) {
+            if (!GET_PORT_PTR(port)) {
+                show_error("set-current-output-port!: port is closed");
+                return TOK_ERROR;
+            }
             ctx.current_output = GET_PORT_PTR(port);
-            ctx.current_output_cell = 0; // Use FILE*
+            ctx.current_output_cell = port;
         } else if (IS_STROUTPORT(port)) {
-            ctx.current_output_cell = port; // Use string port cell
+            if (!GET_STRPORT_PTR(port)) {
+                show_error("set-current-output-port!: port is closed");
+                return TOK_ERROR;
+            }
+            ctx.current_output_cell = port;
         } else {
             show_error("set-current-output-port!: not an output port, got %s",
                        type_name(port));
@@ -189,21 +221,34 @@ unsigned apply_port_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
     }
     case PFLUSHOUTPUT: {
         REQUIRE_ARGC(argc, 0, 1, "flush-output-port");
+        FILE *fport;
+        string_port *sport;
         if (argc == 0) {
-            // Flush current output port
-            if (ctx.current_output_cell != 0) {
-                // String port - nothing to flush
-            } else {
-                fflush(ctx.current_output);
+            int ptype = extract_port_argv(argv, -1, PORT_OUTPUT, &fport,
+                                          &sport, "flush-output-port");
+            if (ptype == -1) return TOK_ERROR;
+            if (ptype == 0 && fflush(fport) != 0) {
+                show_error("flush-output-port: flush failed");
+                return TOK_ERROR;
             }
         } else {
             unsigned port = argv[0];
             if (IS_OUTPORT(port)) {
-                fflush(GET_PORT_PTR(port));
+                fport = GET_PORT_PTR(port);
+                if (!fport) {
+                    show_error("flush-output-port: port is closed");
+                    return TOK_ERROR;
+                }
+                if (fflush(fport) != 0) {
+                    show_error("flush-output-port: flush failed");
+                    return TOK_ERROR;
+                }
             } else if (IS_STROUTPORT(port)) {
-                // String port - nothing to flush
-            } else if (port == 0) {
-                // Nil port (e.g., closed transcript) - silently ignore
+                sport = GET_STRPORT_PTR(port);
+                if (!sport) {
+                    show_error("flush-output-port: port is closed");
+                    return TOK_ERROR;
+                }
             } else {
                 show_error("flush-output-port: not an output port, got %s",
                            type_name(port));

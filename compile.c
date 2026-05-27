@@ -18,8 +18,10 @@
 #include "eval.h"
 #include "eval_internal.h"
 #include "macros.h"
+#include "prim_internal.h"
 #include "primitives.h"
 #include "writer.h"
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -38,6 +40,9 @@ static void *malloc_array(unsigned count, size_t elem_size)
 // Forward declaration for helper
 static void emit_gensym_definitions(compile_ctx *cctx, unsigned old_gensym,
                                     unsigned new_gensym);
+static void emit2(compile_ctx *cctx, unsigned op, unsigned arg);
+static void emit3(compile_ctx *cctx, unsigned op, unsigned arg1,
+                  unsigned arg2);
 
 
 // ============================================================================
@@ -60,12 +65,21 @@ static inline compile_result dynamic_result(void)
     return (compile_result){false, 0};
 }
 
+static compile_result emit_syntax_error(compile_ctx *cctx, const char *message)
+{
+    unsigned msg = make_string_copy(message);
+    gc_protect(&msg);
+    emit2(cctx, OP_CONST, code_add_const(cctx->code, msg));
+    emit3(cctx, OP_PRIM, PERROR, 1);
+    gc_unprotect(1);
+    return dynamic_result();
+}
+
 // Look up a variable in the known_lambdas alist
 // Returns the lambda expression if found, 0 otherwise
 static unsigned lookup_known_lambda(int64_t var_id, unsigned known_lambdas)
 {
-    FORLIST(entry, known_lambdas)
-    {
+    FORLIST(entry, known_lambdas) {
         unsigned pair = car(entry);
         if (IS_PAIR(pair) && IS_ATOM(car(pair)) &&
             CELL_ID(car(pair)) == var_id) {
@@ -82,13 +96,13 @@ static bool contains_reference(unsigned expr, int64_t var_id);
 // unexpanded source, we must check let/let*/letrec too (they expand
 // to lambdas via macros). This is conservative: a let that doesn't
 // actually escape will still disable locals. But it's safe and correct.
-static bool captured_by_inner_lambda(unsigned expr, int64_t var_id)
+static bool captured_by_inner_lambda(unsigned expr, int64_t var_id, unsigned env)
 {
     if (!expr || !IS_PAIR(expr))
         return false;
     if (!IS_ATOM(car(expr)))
-        return captured_by_inner_lambda(car(expr), var_id) ||
-               captured_by_inner_lambda(cdr(expr), var_id);
+        return captured_by_inner_lambda(car(expr), var_id, env) ||
+               captured_by_inner_lambda(cdr(expr), var_id, env);
 
     int64_t kw = CELL_ID(car(expr));
     if (kw == ctx.kw_quote)
@@ -113,8 +127,11 @@ static bool captured_by_inner_lambda(unsigned expr, int64_t var_id)
         }
         return contains_reference(body_start, var_id);
     }
-    return captured_by_inner_lambda(car(expr), var_id) ||
-           captured_by_inner_lambda(cdr(expr), var_id);
+    unsigned binding = lookup_silent(kw, env);
+    if (binding != TOK_ERROR && IS_SYNTAX(binding))
+        return contains_reference(expr, var_id);
+    return captured_by_inner_lambda(car(expr), var_id, env) ||
+           captured_by_inner_lambda(cdr(expr), var_id, env);
 }
 
 // Check if expr contains a reference to var_id (for detecting self-reference)
@@ -135,11 +152,11 @@ static bool contains_reference(unsigned expr, int64_t var_id)
     if (IS_ATOM(car(expr)) && CELL_ID(car(expr)) == ctx.kw_lambda) {
         unsigned params = cadr(expr);
         // Check if var_id is in params
-        if (CELL_TYPE(params) == BT_ATOM && CELL_ID(params) == var_id)
+        if (IS_ATOM(params) && CELL_ID(params) == var_id)
             return false; // Shadowed by rest param
         if (IS_PAIR(params)) {
             for (unsigned p = params; p; p = cdr(p)) {
-                if (CELL_TYPE(p) == BT_ATOM && CELL_ID(p) == var_id)
+                if (IS_ATOM(p) && CELL_ID(p) == var_id)
                     return false; // Shadowed by rest param
                 if (IS_PAIR(p) && IS_ATOM(car(p)) && CELL_ID(car(p)) == var_id)
                     return false; // Shadowed by regular param
@@ -214,15 +231,12 @@ static bool is_foldable_primitive(int64_t prim_id)
     case PEQ:
     case PEQUAL:
     case PEQUALP:
-    // String operations (pure ones)
+    // String operations that return immutable/immediate values. Operations
+    // that allocate mutable strings or lists are not foldable because a folded
+    // constant would be reused across calls to compiled lambdas.
     case PSTRLEN:
     case PSTRREF:
-    case PSUBSTR:
-    case PSTRAPP:
-    case PSTR2LIST:
-    case PLIST2STR:
     case PSTR2SYM:
-    case PSYM2STR:
     // Char operations
     case PCHARCODE:
     case PCODECHAR:
@@ -291,7 +305,10 @@ static void cctx_free(compile_ctx *cctx)
 // Helper: Emit with operand
 // ============================================================================
 
-static void emit(compile_ctx *cctx, unsigned op) { code_emit(cctx->code, op); }
+static void emit(compile_ctx *cctx, unsigned op)
+{
+    code_emit(cctx->code, op);
+}
 
 static void emit2(compile_ctx *cctx, unsigned op, unsigned arg)
 {
@@ -392,7 +409,7 @@ static unsigned collect_template_free_vars(unsigned tmpl, unsigned pattern_vars,
         return collect_template_free_vars(cdr(tmpl), pattern_vars, collected, ellipsis);
     }
 
-    if (CELL_TYPE(tmpl) == BT_VECTOR) {
+    if (IS_VECTOR(tmpl)) {
         unsigned len = vector_len(tmpl);
         for (unsigned i = 0; i < len; i++) {
             // Refresh data pointer each iteration - GC may have moved tmpl
@@ -430,28 +447,50 @@ static unsigned rename_template_vars(unsigned tmpl, unsigned rename_map)
         gc_protect(&tmpl);
         gc_protect(&rename_map);
         unsigned new_car = rename_template_vars(car(tmpl), rename_map);
+        if (new_car == TOK_ERROR) {
+            gc_unprotect(2);
+            return TOK_ERROR;
+        }
         gc_protect(&new_car);
         unsigned new_cdr = rename_template_vars(cdr(tmpl), rename_map);
-        gc_unprotect(3);
-        if (new_car == car(tmpl) && new_cdr == cdr(tmpl))
+        if (new_cdr == TOK_ERROR) {
+            gc_unprotect(3);
+            return TOK_ERROR;
+        }
+        gc_protect(&new_cdr);
+        if (new_car == car(tmpl) && new_cdr == cdr(tmpl)) {
+            gc_unprotect(4);
             return tmpl;
-        return alloc_cons(new_car, new_cdr);
+        }
+        unsigned result = alloc_cons(new_car, new_cdr);
+        gc_unprotect(4);
+        return result;
     }
 
-    if (CELL_TYPE(tmpl) == BT_VECTOR) {
+    if (IS_VECTOR(tmpl)) {
         unsigned len = vector_len(tmpl);
         gc_protect(&tmpl);
         gc_protect(&rename_map);
         unsigned new_vec = make_vector(len, 0);
+        if (new_vec == TOK_ERROR) {
+            gc_unprotect(2);
+            return TOK_ERROR;
+        }
         gc_protect(&new_vec);
         bool changed = false;
         for (unsigned i = 0; i < len; i++) {
             // Refresh data pointers each iteration - GC may have moved vectors
             unsigned old_elem = vector_data_ptr(tmpl)[i];
+            gc_protect(&old_elem);
             unsigned new_elem = rename_template_vars(old_elem, rename_map);
+            if (new_elem == TOK_ERROR) {
+                gc_unprotect(4);
+                return TOK_ERROR;
+            }
             vector_set_elem(new_vec, i, new_elem);
             if (new_elem != old_elem)
                 changed = true;
+            gc_unprotect(1);
         }
         gc_unprotect(3);
         return changed ? new_vec : tmpl;
@@ -494,7 +533,7 @@ static unsigned collect_pattern_vars(unsigned pattern, unsigned collected,
         return collect_pattern_vars(cdr(pattern), collected, ellipsis, literals);
     }
 
-    if (CELL_TYPE(pattern) == BT_VECTOR) {
+    if (IS_VECTOR(pattern)) {
         unsigned len = vector_len(pattern);
         for (unsigned i = 0; i < len; i++) {
             // Refresh data pointer each iteration - GC may have moved pattern
@@ -540,6 +579,18 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
         emit2(cctx, OP_CONST, code_add_const(cctx->code, 0));
         return const_result(0);
     }
+    if (IS_FIXNUM(expr)) {
+        emit2(cctx, OP_CONST, code_add_const(cctx->code, expr));
+        return const_result(expr);
+    }
+    if (!IS_CELL(expr)) {
+        show_error("compile: invalid expression");
+        emit(cctx, OP_HALT);
+        return dynamic_result();
+    }
+
+    GC_GUARD;
+    gc_protect(&expr);
 
     switch (CELL_TYPE(expr)) {
     case BT_NUM:
@@ -582,6 +633,8 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
 
             // quote can be shadowed by local bindings (R5RS allows this)
             if (kw == ctx.kw_quote && !is_keyword_shadowed(kw, cctx->env)) {
+                if (!syntax_arity_checked(expr, 1, 1, "quote"))
+                    return emit_syntax_error(cctx, "quote: invalid syntax");
                 unsigned val = cadr(expr);
                 emit2(cctx, OP_CONST, code_add_const(cctx->code, val));
                 return const_result(val);
@@ -630,8 +683,18 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
                 return compile_quasiquote(expr, cctx);
             if (kw == ctx.kw_define_syntax) {
                 // (define-syntax name transformer)
+                if (!syntax_arity_checked(expr, 2, 2, "define-syntax"))
+                    return emit_syntax_error(cctx,
+                                             "define-syntax: invalid syntax");
                 unsigned name = cadr(expr);
                 unsigned transformer_form = caddr(expr);
+                if (!IS_ATOM(name) ||
+                    !syntax_rules_valid(
+                        transformer_form,
+                        syntax_default_ellipsis_id(cctx->env),
+                        "define-syntax"))
+                    return emit_syntax_error(cctx,
+                                             "define-syntax: invalid syntax");
                 emit2(cctx, OP_CONST,
                       code_add_const(cctx->code, transformer_form));
                 emit2(cctx, OP_DEFSYNTAX, CELL_ID(name));
@@ -642,8 +705,18 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
             if (kw == ctx.kw_let_syntax || kw == ctx.kw_letrec_syntax) {
                 // (let-syntax ((name transformer) ...) body ...)
                 // (letrec-syntax ((name transformer) ...) body ...)
+                const char *form_name = kw == ctx.kw_let_syntax
+                                            ? "let-syntax"
+                                            : "letrec-syntax";
+                if (!syntax_arity_checked(expr, 2, UINT_MAX, form_name))
+                    return emit_syntax_error(
+                        cctx, "syntax binding: invalid syntax");
                 unsigned bindings = cadr(expr);
                 unsigned body = cddr(expr);
+                if (!binding_list_valid(bindings, form_name) ||
+                    !list_length_checked(body, NULL, form_name))
+                    return emit_syntax_error(
+                        cctx, "syntax binding: invalid syntax");
 
                 // If no bindings, just compile body in current env
                 if (!bindings) {
@@ -669,24 +742,36 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
                 // First pass: create frame with placeholder values for letrec-syntax
                 if (kw == ctx.kw_letrec_syntax) {
                     unsigned frame = alloc_cons(0, 0);
+                    gc_protect(&frame);
                     new_env = alloc_cons(frame, cctx->env);
+                    gc_unprotect(1);
                 }
 
-                int64_t ellipsis_id = ctx.kw_ellipsis;
-
                 // First pass: collect all free variables from all templates
-                for (unsigned b = bindings; b; b = cdr(b)) {
+                unsigned b = bindings;
+                gc_protect(&b);
+                while (b) {
                     unsigned binding = car(b);
                     unsigned transformer_form = cadr(binding);
 
-                    if (!IS_PAIR(transformer_form) ||
-                        !IS_KEYWORD(car(transformer_form), ctx.kw_syntax_rules))
-                        continue;
+                    int64_t default_ellipsis_id =
+                        kw == ctx.kw_let_syntax
+                            ? syntax_default_ellipsis_id(cctx->env)
+                            : syntax_default_ellipsis_id(new_env);
+                    if (!syntax_rules_valid(transformer_form,
+                                            default_ellipsis_id, form_name))
+                        return emit_syntax_error(
+                            cctx, "syntax binding: invalid syntax");
 
-                    unsigned literals = cadr(transformer_form);
-                    unsigned rules = cddr(transformer_form);
+                    int64_t ellipsis_id = 0;
+                    unsigned literals = 0;
+                    unsigned rules = 0;
+                    syntax_rules_parts(transformer_form, default_ellipsis_id,
+                                       &ellipsis_id, &literals, &rules);
 
-                    for (unsigned r = rules; r; r = cdr(r)) {
+                    unsigned r = rules;
+                    gc_protect(&r);
+                    while (r) {
                         unsigned rule = car(r);
                         unsigned pattern = car(rule);
                         unsigned tmpl = cadr(rule);
@@ -703,11 +788,14 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
                         // Collect free variables from template
                         unsigned free_vars = collect_template_free_vars(
                             tmpl, pattern_vars, 0, ellipsis_id);
-                        gc_unprotect(1);
+                        gc_protect(&free_vars);
 
                         // For each free var, create gensym if bound in outer scope
-                        for (unsigned fv = free_vars; fv; fv = cdr(fv)) {
+                        unsigned fv = free_vars;
+                        gc_protect(&fv);
+                        while (fv) {
                             unsigned var_atom = car(fv);
+                            gc_protect(&var_atom);
                             int64_t var_id = CELL_ID(var_atom);
 
                             // Check if already in rename_map
@@ -719,7 +807,7 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
                                 }
                             }
                             if (already_mapped)
-                                continue;
+                                goto next_free_var;
 
                             // Check if bound in outer scope (compile-time env)
                             unsigned val = lookup_silent(var_id, cctx->env);
@@ -733,32 +821,49 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
 
                                 // Add to rename map: (var_atom . gensym_atom)
                                 unsigned entry = alloc_cons(var_atom, gensym_atom);
+                                gc_protect(&entry);
                                 rename_map = alloc_cons(entry, rename_map);
+                                gc_unprotect(1);
 
                                 // Record for runtime binding: (gensym_id . var_id)
                                 unsigned bind_entry = alloc_cons(gensym_atom, var_atom);
+                                gc_protect(&bind_entry);
                                 gensym_bindings = alloc_cons(bind_entry, gensym_bindings);
+                                gc_unprotect(1);
 
                                 gc_unprotect(1);
                             }
+next_free_var:
+                            gc_unprotect(1);
+                            fv = cdr(fv);
                         }
+                        gc_unprotect(1);
+                        gc_unprotect(2);
+                        r = cdr(r);
                     }
+                    gc_unprotect(1);
+                    b = cdr(b);
                 }
+                gc_unprotect(1);
 
                 // Second pass: create transformers with renamed templates
-                for (unsigned b = bindings; b; b = cdr(b)) {
+                b = bindings;
+                gc_protect(&b);
+                while (b) {
                     unsigned binding = car(b);
                     unsigned name = car(binding);
                     unsigned transformer_form = cadr(binding);
+                    gc_protect(&name);
 
                     // Check it's a syntax-rules form
-                    if (!IS_PAIR(transformer_form) ||
-                        !IS_KEYWORD(car(transformer_form), ctx.kw_syntax_rules)) {
-                        show_error("%s: expected syntax-rules",
-                                   kw == ctx.kw_let_syntax ? "let-syntax"
-                                                           : "letrec-syntax");
-                        emit(cctx, OP_HALT);
-                        return dynamic_result();
+                    int64_t default_ellipsis_id =
+                        kw == ctx.kw_let_syntax
+                            ? syntax_default_ellipsis_id(cctx->env)
+                            : syntax_default_ellipsis_id(new_env);
+                    if (!syntax_rules_valid(transformer_form,
+                                            default_ellipsis_id, form_name)) {
+                        return emit_syntax_error(cctx,
+                                                 "syntax binding: invalid syntax");
                     }
 
                     // Rename free vars in templates
@@ -768,8 +873,12 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
                         gc_protect(&renamed_form);
 
                         // Rebuild syntax-rules with renamed templates
-                        unsigned literals = cadr(transformer_form);
-                        unsigned rules = cddr(transformer_form);
+                        int64_t ellipsis_id = 0;
+                        unsigned literals = 0;
+                        unsigned rules = 0;
+                        syntax_rules_parts(transformer_form,
+                                           default_ellipsis_id,
+                                           &ellipsis_id, &literals, &rules);
                         gc_protect(&literals);
                         gc_protect(&rules);
 
@@ -778,12 +887,19 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
                         unsigned renamed_tail = 0;
                         gc_protect(&renamed_tail);
 
-                        for (unsigned r = rules; r; r = cdr(r)) {
+                        unsigned r = rules;
+                        gc_protect(&r);
+                        while (r) {
                             unsigned rule = car(r);
                             unsigned pattern = car(rule);
                             unsigned tmpl = cadr(rule);
 
+                            gc_protect(&pattern);
                             unsigned renamed_tmpl = rename_template_vars(tmpl, rename_map);
+                            if (renamed_tmpl == TOK_ERROR) {
+                                emit(cctx, OP_HALT);
+                                return dynamic_result();
+                            }
                             gc_protect(&renamed_tmpl);
                             unsigned new_rule_tail = alloc_cons(renamed_tmpl, 0);
                             gc_protect(&new_rule_tail);
@@ -791,7 +907,7 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
                             gc_protect(&new_rule);
 
                             unsigned new_cell = alloc_cons(new_rule, 0);
-                            gc_unprotect(3);
+                            gc_unprotect(4);
                             if (!renamed_rules) {
                                 renamed_rules = new_cell;
                                 renamed_tail = new_cell;
@@ -799,33 +915,58 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
                                 cell_set_cdr(renamed_tail, new_cell);
                                 renamed_tail = new_cell;
                             }
+                            r = cdr(r);
                         }
+                        gc_unprotect(1);
 
                         unsigned sr_atom = car(transformer_form);
-                        unsigned sr_tail = alloc_cons(literals, renamed_rules);
+                        unsigned second = cadr(transformer_form);
+                        gc_protect(&sr_atom);
+                        gc_protect(&second);
+                        unsigned sr_tail = 0;
                         gc_protect(&sr_tail);
+                        if (IS_ATOM(second)) {
+                            unsigned rules_tail =
+                                alloc_cons(literals, renamed_rules);
+                            gc_protect(&rules_tail);
+                            sr_tail = alloc_cons(second, rules_tail);
+                            gc_unprotect(1);
+                        } else {
+                            sr_tail = alloc_cons(literals, renamed_rules);
+                        }
                         renamed_form = alloc_cons(sr_atom, sr_tail);
-                        gc_unprotect(7);
+                        gc_unprotect(9);
                     }
 
-                    // Create syntax transformer with renamed form
-                    // Use empty closure_env since free vars are pre-renamed
-                    unsigned transformer = make_syntax_transformer(renamed_form, 0);
+                    // Free vars are pre-renamed, but the default ellipsis
+                    // decision still belongs to the transformer definition
+                    // environment.
+                    unsigned transformer =
+                        make_syntax_transformer_with_default_ellipsis(
+                            renamed_form, 0, default_ellipsis_id);
+                    if (transformer == TOK_ERROR) {
+                        emit(cctx, OP_HALT);
+                        return dynamic_result();
+                    }
 
                     // Add to frame
-                    gc_protect(&name);
                     gc_protect(&transformer);
                     unsigned vc = alloc_cons(name, frame_vars);
+                    gc_protect(&vc);
                     unsigned ac = alloc_cons(transformer, frame_vals);
-                    gc_unprotect(2);
+                    gc_unprotect(3);
                     frame_vars = vc;
                     frame_vals = ac;
+                    b = cdr(b);
                 }
+                gc_unprotect(1);
 
                 // Create frame if let-syntax (letrec-syntax already has frame)
                 if (kw == ctx.kw_let_syntax) {
                     unsigned frame = alloc_cons(frame_vars, frame_vals);
+                    gc_protect(&frame);
                     new_env = alloc_cons(frame, cctx->env);
+                    gc_unprotect(1);
                 } else {
                     // Update letrec-syntax frame
                     unsigned frame = car(new_env);
@@ -855,23 +996,31 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
                     gc_protect(&gensym_frame_vars);
                     gc_protect(&gensym_frame_vals);
 
-                    for (unsigned gb = gensym_bindings; gb; gb = cdr(gb)) {
+                    unsigned gb = gensym_bindings;
+                    gc_protect(&gb);
+                    while (gb) {
                         unsigned entry = car(gb);
                         unsigned gensym_atom = car(entry);
                         // Use a placeholder value - actual value is set at runtime
                         gensym_frame_vars = alloc_cons(gensym_atom, gensym_frame_vars);
                         gensym_frame_vals = alloc_cons(gensym_atom, gensym_frame_vals);
+                        gb = cdr(gb);
                     }
+                    gc_unprotect(1);
 
                     unsigned gensym_frame = alloc_cons(gensym_frame_vars, gensym_frame_vals);
+                    gc_protect(&gensym_frame);
                     new_env = alloc_cons(gensym_frame, new_env);
-                    gc_unprotect(2);
+                    gc_unprotect(3);
                 }
 
                 // Compile body with new compile-time environment
                 compile_ctx new_cctx = *cctx;
                 new_cctx.env = new_env;
+                gc_protect(&new_cctx.env);
+                gc_protect(&new_cctx.known_lambdas);
                 compile_begin(body, &new_cctx);
+                gc_unprotect(2);
 
                 // Pop the runtime frame
                 emit_popenv(cctx);
@@ -893,12 +1042,22 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
                     return compile_expr_internal(expanded, cctx);
                 }
                 if (IS_MACRO(mac)) {
+                    GC_GUARD;
                     unsigned params = car(mac);
                     unsigned mbody = car(cdr(mac));
                     unsigned menv = cdr(cdr(mac));
+                    gc_protect(&mbody);
+                    gc_protect(&menv);
                     unsigned frame = bind_params(params, cdr(expr));
+                    if (frame == TOK_ERROR) {
+                        emit(cctx, OP_HALT);
+                        return dynamic_result();
+                    }
+                    gc_protect(&frame);
                     unsigned new_env = alloc_cons(frame, menv);
+                    gc_protect(&new_env);
                     unsigned expanded = eval_cps(mbody, new_env);
+                    gc_protect(&expanded);
                     if (expanded == TOK_ERROR) {
                         show_error("macro expansion failed");
                         emit(cctx, OP_HALT);
@@ -927,6 +1086,12 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
 // (if test then else)
 static compile_result compile_if(unsigned expr, compile_ctx *cctx)
 {
+    GC_GUARD;
+    gc_protect(&expr);
+
+    if (!syntax_arity_checked(expr, 2, 3, "if"))
+        return emit_syntax_error(cctx, "if: invalid syntax");
+
     bool tail = cctx->tail_position;
     unsigned saved_pos = cctx->code->code_len;
 
@@ -978,20 +1143,23 @@ static compile_result compile_if(unsigned expr, compile_ctx *cctx)
 
     patch_jump(cctx, end_jump);
 
-    // Result is constant only if both branches are constant with same value
-    // (rare case, but handles things like (if x 1 1))
-    if (then_result.is_const && else_result.is_const &&
-        then_result.value == else_result.value) {
-        return then_result;
-    }
+    (void)then_result;
+    (void)else_result;
     return dynamic_result();
 }
 
 // (lambda params body...)
 static compile_result compile_lambda(unsigned expr, compile_ctx *cctx)
 {
-    unsigned params = cadr(expr);
-    unsigned body = cddr(expr);
+    GC_GUARD;
+    unsigned rest = cdr(expr);
+    if (!IS_PAIR(rest))
+        return emit_syntax_error(cctx, "lambda: expected formals and body");
+    unsigned params = car(rest);
+    unsigned body = cdr(rest);
+    if (!body || !list_length_checked(body, NULL, "lambda") ||
+        !lambda_params_valid(params))
+        return emit_syntax_error(cctx, "lambda: invalid syntax");
 
     // Create compile-time environment that shadows lambda parameters
     // This prevents the compiler from inlining builtins that are shadowed
@@ -999,12 +1167,12 @@ static compile_result compile_lambda(unsigned expr, compile_ctx *cctx)
     // call the exit primitive)
     unsigned lambda_env = cctx->env;
 
+    gc_protect(&params);
+    gc_protect(&body);
+    gc_protect(&lambda_env);
+
     // Build a dummy frame with parameters as vars, all bound to 0
     {
-        GC_GUARD;
-        gc_protect(&lambda_env);
-        gc_protect(&params);
-        gc_protect(&body);
         unsigned vars = 0, vals = 0;
         gc_protect(&vars);
         gc_protect(&vals);
@@ -1014,7 +1182,9 @@ static compile_result compile_lambda(unsigned expr, compile_ctx *cctx)
 
         for (unsigned p = params; p; p = IS_PAIR(p) ? cdr(p) : 0) {
             unsigned var = IS_PAIR(p) ? car(p) : p;
+            gc_protect(&var);
             unsigned vc = alloc_cons(var, 0);
+            gc_protect(&vc);
             unsigned ac = alloc_cons(0, 0); // dummy value
             if (!vars) {
                 vars = vc;
@@ -1025,18 +1195,24 @@ static compile_result compile_lambda(unsigned expr, compile_ctx *cctx)
             }
             vars_tail = vc;
             vals_tail = ac;
+            gc_unprotect(2);
             if (!IS_PAIR(p))
                 break; // rest param
         }
 
         if (vars) {
             unsigned frame = alloc_cons(vars, vals);
+            gc_protect(&frame);
             lambda_env = alloc_cons(frame, lambda_env);
         }
     }
 
     // Create new compilation context for lambda body with shadowed params
     compile_ctx *lambda_cctx = cctx_new(cctx, lambda_env);
+    if (!lambda_cctx) {
+        emit(cctx, OP_HALT);
+        return dynamic_result();
+    }
     lambda_cctx->tail_position = true;
 
     // Inherit loop info from parent (for letrec-bound lambdas)
@@ -1052,7 +1228,7 @@ static compile_result compile_lambda(unsigned expr, compile_ctx *cctx)
     unsigned arity = 0;
     bool has_rest = false;
     for (unsigned p = params; p; p = cdr(p)) {
-        if (CELL_TYPE(p) == BT_ATOM) {
+        if (IS_ATOM(p)) {
             // Rest parameter
             has_rest = true;
             break;
@@ -1073,7 +1249,7 @@ static compile_result compile_lambda(unsigned expr, compile_ctx *cctx)
         unsigned slot = 0;
         for (unsigned p = params; p && IS_PAIR(p); p = cdr(p), slot++) {
             int64_t pid = CELL_ID(car(p));
-            if (captured_by_inner_lambda(body, pid)) {
+            if (captured_by_inner_lambda(body, pid, lambda_env)) {
                 can_use_locals = false;
                 break;
             }
@@ -1132,6 +1308,7 @@ static unsigned scan_internal_defines(unsigned body, unsigned env)
     unsigned names = 0;
     gc_protect(&names);
     gc_protect(&body);
+    gc_protect(&env);
 
     while (body) {
         unsigned expr = car(body);
@@ -1140,8 +1317,10 @@ static unsigned scan_internal_defines(unsigned body, unsigned env)
         // Check for direct define
         unsigned name = is_internal_define(expr);
         if (name) {
+            gc_protect(&name);
             unsigned cell = alloc_cons(name, names);
             names = cell;
+            gc_unprotect(1);
             body = cdr(body);
             gc_unprotect(1);
             continue;
@@ -1156,8 +1335,10 @@ static unsigned scan_internal_defines(unsigned body, unsigned env)
                 unsigned inner = car(begin_body);
                 unsigned inner_name = is_internal_define(inner);
                 if (inner_name) {
+                    gc_protect(&inner_name);
                     unsigned cell = alloc_cons(inner_name, names);
                     names = cell;
+                    gc_unprotect(1);
                     begin_body = cdr(begin_body);
                 } else {
                     break; // Non-define in begin, stop scanning begin
@@ -1176,7 +1357,7 @@ static unsigned scan_internal_defines(unsigned body, unsigned env)
         break;
     }
 
-    gc_unprotect(2);
+    gc_unprotect(3);
     return names;
 }
 
@@ -1192,8 +1373,7 @@ static unsigned extend_compile_env_with_names(unsigned env, unsigned names)
     gc_protect(&env);
     gc_protect(&names);
 
-    FORLIST(n, names)
-    {
+    FORLIST(n, names) {
         unsigned var = car(n);
         gc_protect(&var);
         unsigned vc = alloc_cons(var, frame_vars);
@@ -1204,14 +1384,18 @@ static unsigned extend_compile_env_with_names(unsigned env, unsigned names)
     }
 
     unsigned frame = alloc_cons(frame_vars, frame_vals);
+    gc_protect(&frame);
     unsigned new_env = alloc_cons(frame, env);
-    gc_unprotect(4);
+    gc_unprotect(5);
     return new_env;
 }
 
 // Compile sequence of expressions
 static compile_result compile_begin(unsigned exprs, compile_ctx *cctx)
 {
+    if (!list_length_checked(exprs, NULL, "begin"))
+        return emit_syntax_error(cctx, "begin: invalid syntax");
+
     if (!exprs) {
         emit2(cctx, OP_CONST, code_add_const(cctx->code, 0)); // unspecified
         return const_result(0);
@@ -1219,18 +1403,20 @@ static compile_result compile_begin(unsigned exprs, compile_ctx *cctx)
 
     // Scan for internal defines and extend compile-time environment
     // This ensures defines shadow any macros from enclosing scopes
+    GC_GUARD;
     gc_protect(&exprs);
     unsigned internal_defs = scan_internal_defines(exprs, cctx->env);
     gc_protect(&internal_defs);
 
     unsigned saved_env = cctx->env;
+    gc_protect(&saved_env);
     if (internal_defs) {
         cctx->env = extend_compile_env_with_names(cctx->env, internal_defs);
     }
-    gc_unprotect(2);
 
     bool tail = cctx->tail_position;
     compile_result result = dynamic_result();
+    bool had_prior_expr = false;
 
     while (exprs) {
         bool is_last = !cdr(exprs);
@@ -1240,6 +1426,7 @@ static compile_result compile_begin(unsigned exprs, compile_ctx *cctx)
 
         if (!is_last) {
             emit(cctx, OP_POP); // Discard non-final values
+            had_prior_expr = true;
         }
 
         exprs = cdr(exprs);
@@ -1248,7 +1435,10 @@ static compile_result compile_begin(unsigned exprs, compile_ctx *cctx)
     // Restore compile-time environment
     cctx->env = saved_env;
 
-    return result;
+    // A multi-expression begin may contain effects before the final value.
+    // Reporting the final value as a constant lets outer folds erase those
+    // effects by rewinding emitted bytecode.
+    return had_prior_expr ? dynamic_result() : result;
 }
 
 // Helper to extend compile-time environment with variable bindings
@@ -1262,8 +1452,7 @@ static unsigned extend_compile_env(unsigned env, unsigned bindings)
     gc_protect(&env);
     gc_protect(&bindings);
 
-    FORLIST(b, bindings)
-    {
+    FORLIST(b, bindings) {
         unsigned var = car(car(b));
         gc_protect(&var);
         unsigned vc = alloc_cons(var, frame_vars);
@@ -1274,16 +1463,27 @@ static unsigned extend_compile_env(unsigned env, unsigned bindings)
     }
 
     unsigned frame = alloc_cons(frame_vars, frame_vals);
+    gc_protect(&frame);
     unsigned new_env = alloc_cons(frame, env);
-    gc_unprotect(4);
+    gc_unprotect(5);
     return new_env;
 }
 
 // (let ((var val) ...) body...)
 static compile_result compile_let(unsigned expr, compile_ctx *cctx)
 {
+    if (!syntax_arity_checked(expr, 2, UINT_MAX, "let"))
+        return emit_syntax_error(cctx, "let: invalid syntax");
+
     unsigned bindings = cadr(expr);
     unsigned body = cddr(expr);
+    if (!binding_list_valid(bindings, "let") ||
+        !list_length_checked(body, NULL, "let"))
+        return emit_syntax_error(cctx, "let: invalid syntax");
+
+    GC_GUARD;
+    gc_protect(&bindings);
+    gc_protect(&body);
 
     // Count bindings
     unsigned count = 0;
@@ -1291,10 +1491,13 @@ static compile_result compile_let(unsigned expr, compile_ctx *cctx)
 
     // Compile all values first (in current environment)
     cctx->tail_position = false;
-    FORLIST(b, bindings)
-    {
-        compile_expr_internal(cadr(car(b)), cctx);
+    unsigned bind_cursor = bindings;
+    gc_protect(&bind_cursor);
+    while (bind_cursor) {
+        compile_expr_internal(cadr(car(bind_cursor)), cctx);
+        bind_cursor = cdr(bind_cursor);
     }
+    gc_unprotect(1);
 
     // Push new environment frame
     emit_pushenv(cctx);
@@ -1324,14 +1527,15 @@ static compile_result compile_let(unsigned expr, compile_ctx *cctx)
 
     // Extend compile-time environment for body compilation
     unsigned saved_env = cctx->env;
+    gc_protect(&saved_env);
     cctx->env = extend_compile_env(cctx->env, bindings);
 
     // Track lambda bindings for escape analysis inlining
     // Save and extend known_lambdas for bindings of form (var (lambda ...))
     // Only track non-self-referential lambdas (self-ref needs letrec semantics)
     unsigned saved_known = cctx->known_lambdas;
-    FORLIST(b, bindings)
-    {
+    gc_protect(&saved_known);
+    FORLIST(b, bindings) {
         unsigned binding = car(b);
         unsigned var = car(binding);
         unsigned val_expr = cadr(binding);
@@ -1346,7 +1550,9 @@ static compile_result compile_let(unsigned expr, compile_ctx *cctx)
             if (!contains_reference(lambda_body, CELL_ID(var))) {
                 // Add (var . lambda-expr) to known_lambdas
                 unsigned pair = alloc_cons(var, val_expr);
+                gc_protect(&pair);
                 cctx->known_lambdas = alloc_cons(pair, cctx->known_lambdas);
+                gc_unprotect(1);
             }
         }
     }
@@ -1370,21 +1576,32 @@ static compile_result compile_let(unsigned expr, compile_ctx *cctx)
 // (let* ((var val) ...) body...)
 static compile_result compile_letstar(unsigned expr, compile_ctx *cctx)
 {
+    if (!syntax_arity_checked(expr, 2, UINT_MAX, "let*"))
+        return emit_syntax_error(cctx, "let*: invalid syntax");
+
     unsigned bindings = cadr(expr);
     unsigned body = cddr(expr);
+    if (!binding_list_valid(bindings, "let*") ||
+        !list_length_checked(body, NULL, "let*"))
+        return emit_syntax_error(cctx, "let*: invalid syntax");
+
+    GC_GUARD;
+    gc_protect(&bindings);
+    gc_protect(&body);
 
     // Push new environment frame
     emit_pushenv(cctx);
 
     // Save original compile-time environment
     unsigned saved_env = cctx->env;
+    gc_protect(&saved_env);
 
     // Compile and define each binding sequentially
     // Each binding extends the compile-time environment for subsequent bindings
     cctx->tail_position = false;
-    FORLIST(b, bindings)
-    {
+    FORLIST(b, bindings) {
         unsigned binding = car(b);
+        gc_protect(&binding);
         compile_expr_internal(cadr(binding), cctx);
         emit2(cctx, OP_DEFINE, CELL_ID(car(binding)));
 
@@ -1392,7 +1609,7 @@ static compile_result compile_letstar(unsigned expr, compile_ctx *cctx)
         unsigned single_binding = alloc_cons(binding, 0);
         gc_protect(&single_binding);
         cctx->env = extend_compile_env(cctx->env, single_binding);
-        gc_unprotect(1);
+        gc_unprotect(2);
     }
 
     // Compile body in tail position (with all bindings visible)
@@ -1411,8 +1628,18 @@ static compile_result compile_letstar(unsigned expr, compile_ctx *cctx)
 // (letrec ((var val) ...) body...)
 static compile_result compile_letrec(unsigned expr, compile_ctx *cctx)
 {
+    if (!syntax_arity_checked(expr, 2, UINT_MAX, "letrec"))
+        return emit_syntax_error(cctx, "letrec: invalid syntax");
+
     unsigned bindings = cadr(expr);
     unsigned body = cddr(expr);
+    if (!binding_list_valid(bindings, "letrec") ||
+        !list_length_checked(body, NULL, "letrec"))
+        return emit_syntax_error(cctx, "letrec: invalid syntax");
+
+    GC_GUARD;
+    gc_protect(&bindings);
+    gc_protect(&body);
 
     // Count bindings
     unsigned binding_count = 0;
@@ -1422,8 +1649,7 @@ static compile_result compile_letrec(unsigned expr, compile_ctx *cctx)
     emit_pushenv(cctx);
 
     // First pass: define all variables with undefined values
-    FORLIST(b, bindings)
-    {
+    FORLIST(b, bindings) {
         unsigned binding = car(b);
         emit2(cctx, OP_CONST, code_add_const(cctx->code, 0));
         emit2(cctx, OP_DEFINE, CELL_ID(car(binding)));
@@ -1435,6 +1661,7 @@ static compile_result compile_letrec(unsigned expr, compile_ctx *cctx)
     // Extend compile-time environment with all bindings
     // (letrec bindings are mutually recursive, all visible during value compilation)
     unsigned saved_env = cctx->env;
+    gc_protect(&saved_env);
     cctx->env = extend_compile_env(cctx->env, bindings);
 
     // Save tail position from enclosing context
@@ -1465,15 +1692,18 @@ static compile_result compile_letrec(unsigned expr, compile_ctx *cctx)
     int64_t saved_loop_var = cctx->loop_var_id;
     unsigned saved_loop_params = cctx->loop_params;
     unsigned saved_loop_arity = cctx->loop_arity;
+    gc_protect(&saved_loop_params);
     cctx->loop_var_id = loop_var;
     cctx->loop_params = loop_params;
+    gc_protect(&cctx->loop_params);
     cctx->loop_arity = loop_arity;
-    FORLIST(b, bindings)
-    {
+    FORLIST(b, bindings) {
         unsigned binding = car(b);
+        gc_protect(&binding);
         compile_expr_internal(cadr(binding), cctx);
         emit2(cctx, OP_SET, CELL_ID(car(binding)));
         emit(cctx, OP_POP); // Discard set! result
+        gc_unprotect(1);
     }
     cctx->loop_var_id = saved_loop_var;
     cctx->loop_params = saved_loop_params;
@@ -1499,6 +1729,11 @@ static compile_result compile_letrec(unsigned expr, compile_ctx *cctx)
 static compile_result compile_and(unsigned expr, compile_ctx *cctx)
 {
     unsigned args = cdr(expr);
+    if (!list_length_checked(args, NULL, "and"))
+        return emit_syntax_error(cctx, "and: invalid syntax");
+
+    GC_GUARD;
+    gc_protect(&args);
 
     if (!args) {
         // (and) => #t
@@ -1531,12 +1766,17 @@ static compile_result compile_and(unsigned expr, compile_ctx *cctx)
 
         if (result.is_const) {
             if (IS_FALSE(result.value)) {
-                // Constant false - short-circuit, rewind all bytecode
-                cctx->code->code_len = saved_pos;
-                emit2(cctx, OP_CONST,
-                      code_add_const(cctx->code, ctx.atom_false));
-                free(false_jumps);
-                return const_result(ctx.atom_false);
+                // Constant false short-circuits the rest. If no prior runtime
+                // tests were emitted, the whole form is constant; otherwise
+                // keep the already-emitted code so its effects still happen.
+                if (jump_count == 0) {
+                    cctx->code->code_len = saved_pos;
+                    emit2(cctx, OP_CONST,
+                          code_add_const(cctx->code, ctx.atom_false));
+                    free(false_jumps);
+                    return const_result(ctx.atom_false);
+                }
+                break;
             }
             // Constant truthy - can skip this expression if not last
             if (!is_last) {
@@ -1571,6 +1811,11 @@ static compile_result compile_and(unsigned expr, compile_ctx *cctx)
 static compile_result compile_or(unsigned expr, compile_ctx *cctx)
 {
     unsigned args = cdr(expr);
+    if (!list_length_checked(args, NULL, "or"))
+        return emit_syntax_error(cctx, "or: invalid syntax");
+
+    GC_GUARD;
+    gc_protect(&args);
 
     if (!args) {
         // (or) => #f
@@ -1603,11 +1848,17 @@ static compile_result compile_or(unsigned expr, compile_ctx *cctx)
 
         if (result.is_const) {
             if (IS_TRUTHY(result.value)) {
-                // Constant truthy - short-circuit, rewind all bytecode
-                cctx->code->code_len = saved_pos;
-                emit2(cctx, OP_CONST, code_add_const(cctx->code, result.value));
-                free(true_jumps);
-                return const_result(result.value);
+                // Constant truthy short-circuits the rest. If prior runtime
+                // tests exist, preserve them because they may have effects or
+                // produce the returned truthy value.
+                if (jump_count == 0) {
+                    cctx->code->code_len = saved_pos;
+                    emit2(cctx, OP_CONST,
+                          code_add_const(cctx->code, result.value));
+                    free(true_jumps);
+                    return const_result(result.value);
+                }
+                break;
             }
             // Constant false - can skip this expression if not last
             if (!is_last) {
@@ -1642,6 +1893,11 @@ static compile_result compile_or(unsigned expr, compile_ctx *cctx)
 static compile_result compile_cond(unsigned expr, compile_ctx *cctx)
 {
     unsigned clauses = cdr(expr);
+    if (!cond_clauses_valid(clauses, "cond"))
+        return emit_syntax_error(cctx, "cond: invalid syntax");
+
+    GC_GUARD;
+    gc_protect(&clauses);
 
     if (!clauses) {
         emit2(cctx, OP_CONST, code_add_const(cctx->code, 0)); // unspecified
@@ -1666,8 +1922,11 @@ static compile_result compile_cond(unsigned expr, compile_ctx *cctx)
 
     while (clauses) {
         unsigned clause = car(clauses);
+        gc_protect(&clause);
         unsigned test = car(clause);
         unsigned conseq = cdr(clause);
+        gc_protect(&test);
+        gc_protect(&conseq);
 
         // Check for else clause
         if (IS_KEYWORD(test, ctx.kw_else)) {
@@ -1679,6 +1938,7 @@ static compile_result compile_cond(unsigned expr, compile_ctx *cctx)
                       code_add_const(cctx->code, ctx.atom_true));
             }
             found_else = true;
+            gc_unprotect(3);
             break;
         }
 
@@ -1704,7 +1964,9 @@ static compile_result compile_cond(unsigned expr, compile_ctx *cctx)
             // (test => receiver) syntax
             // Stack has: test-value (from DUP)
             unsigned receiver_expr = cadr(conseq);
+            gc_protect(&receiver_expr);
             compile_expr_internal(receiver_expr, cctx);
+            gc_unprotect(1);
             // Stack has: test-value receiver
             // CALL pops fn first, then args - already in correct order
             emit2(cctx, OP_CALL, 1);
@@ -1726,6 +1988,7 @@ static compile_result compile_cond(unsigned expr, compile_ctx *cctx)
         }
 
         clauses = cdr(clauses);
+        gc_unprotect(3);
     }
 
     // If no else clause was found, emit unspecified for fall-through
@@ -1745,6 +2008,9 @@ static compile_result compile_cond(unsigned expr, compile_ctx *cctx)
 // (define var expr) or (define (name params...) body...)
 static compile_result compile_define(unsigned expr, compile_ctx *cctx)
 {
+    if (!syntax_arity_checked(expr, 2, UINT_MAX, "define"))
+        return emit_syntax_error(cctx, "define: invalid syntax");
+
     unsigned second = cadr(expr);
 
     if (IS_PAIR(second)) {
@@ -1752,9 +2018,16 @@ static compile_result compile_define(unsigned expr, compile_ctx *cctx)
         unsigned name = car(second);
         unsigned params = cdr(second);
         unsigned body = cddr(expr);
+        if (!IS_ATOM(name) || !body ||
+            !list_length_checked(body, NULL, "define") ||
+            !lambda_params_valid(params))
+            return emit_syntax_error(cctx, "define: invalid syntax");
 
         // Build lambda expression
         GC_GUARD;
+        gc_protect(&name);
+        gc_protect(&params);
+        gc_protect(&body);
         unsigned lambda_atom = atom_from_string("lambda");
         gc_protect(&lambda_atom);
         unsigned lambda_args = alloc_cons(params, body);
@@ -1769,7 +2042,12 @@ static compile_result compile_define(unsigned expr, compile_ctx *cctx)
         // Return the name
         emit2(cctx, OP_CONST, code_add_const(cctx->code, name));
     } else {
+        if (!IS_ATOM(second) || cdddr(expr))
+            return emit_syntax_error(cctx, "define: invalid syntax");
+
         // (define var expr)
+        GC_GUARD;
+        gc_protect(&second);
         cctx->tail_position = false;
         compile_expr_internal(caddr(expr), cctx);
         emit2(cctx, OP_DEFINE, CELL_ID(second));
@@ -1784,8 +2062,17 @@ static compile_result compile_define(unsigned expr, compile_ctx *cctx)
 // (set! var expr)
 static compile_result compile_set(unsigned expr, compile_ctx *cctx)
 {
+    if (!syntax_arity_checked(expr, 2, 2, "set!"))
+        return emit_syntax_error(cctx, "set!: invalid syntax");
+
     unsigned var = cadr(expr);
     unsigned val_expr = caddr(expr);
+    if (!IS_ATOM(var))
+        return emit_syntax_error(cctx, "set!: expected variable");
+
+    GC_GUARD;
+    gc_protect(&var);
+    gc_protect(&val_expr);
 
     cctx->tail_position = false;
     compile_expr_internal(val_expr, cctx);
@@ -1811,6 +2098,18 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
     unsigned fn_expr = car(expr);
     unsigned args = cdr(expr);
 
+    GC_GUARD;
+    gc_protect(&fn_expr);
+    gc_protect(&args);
+
+    if (!list_length_checked(args, NULL, "application")) {
+        unsigned msg = make_string_copy("malformed application");
+        gc_protect(&msg);
+        emit2(cctx, OP_CONST, code_add_const(cctx->code, msg));
+        emit3(cctx, OP_PRIM, PERROR, 1);
+        return dynamic_result();
+    }
+
     // Check for primitive inlining (silent lookup - ok if not found)
     if (IS_ATOM(fn_expr)) {
         unsigned fn = lookup_silent(CELL_ID(fn_expr), cctx->env);
@@ -1824,22 +2123,30 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
                 cctx->tail_position = false;
 
                 // Compile all arguments, tracking which are constant
-                compile_result arg_results[256];
+                compile_result arg_results[256] = {0};
                 unsigned i = 0;
+                unsigned protected_arg_count = 0;
                 bool all_const = true;
 
-                FORLIST(a, args)
-                {
+                unsigned a = args;
+                gc_protect(&a);
+                while (a) {
                     if (i >= 256) {
                         all_const = false;
                         compile_expr_internal(car(a), cctx);
                         i++;
+                        a = cdr(a);
                         continue;
                     }
                     arg_results[i] = compile_expr_internal(car(a), cctx);
+                    if (arg_results[i].is_const) {
+                        gc_protect(&arg_results[i].value);
+                        protected_arg_count++;
+                    }
                     if (!arg_results[i].is_const)
                         all_const = false;
                     i++;
+                    a = cdr(a);
                 }
 
                 if (all_const) {
@@ -1853,15 +2160,17 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
                         arg_vals = alloc_cons(arg_results[argc - 1 - j].value,
                                               arg_vals);
                     }
-                    gc_unprotect(1);
 
                     // Evaluate primitive at compile time (suppress error output)
                     static FILE *devnull = NULL;
                     if (!devnull) devnull = fopen("/dev/null", "w");
                     FILE *saved_stderr = stderr;
-                    if (devnull) stderr = devnull;
+                    if (devnull)
+                        stderr = devnull;
                     unsigned result = apply_primitive(prim_id, arg_vals);
                     stderr = saved_stderr;
+                    gc_unprotect(1);
+                    gc_unprotect((int)protected_arg_count + 1);
                     ctx.last_error[0] = '\0';
                     if (result != TOK_ERROR) {
                         // Success! Emit as constant
@@ -1871,7 +2180,15 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
                     }
                     // If folding failed (e.g., division by zero), re-compile
                     // normally
-                    FORLIST(a, args) { compile_expr_internal(car(a), cctx); }
+                    a = args;
+                    gc_protect(&a);
+                    while (a) {
+                        compile_expr_internal(car(a), cctx);
+                        a = cdr(a);
+                    }
+                    gc_unprotect(1);
+                } else {
+                    gc_unprotect((int)protected_arg_count + 1);
                 }
 
                 // Arguments already compiled, emit the operation
@@ -1911,11 +2228,11 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
                     bool arg0_const = arg_results[0].is_const;
                     bool arg1_const = arg_results[1].is_const;
                     int64_t val0 =
-                        arg0_const && CELL_TYPE(arg_results[0].value) == BT_NUM
+                        arg0_const && IS_NUM(arg_results[0].value)
                             ? CELL_ID(arg_results[0].value)
                             : -999;
                     int64_t val1 =
-                        arg1_const && CELL_TYPE(arg_results[1].value) == BT_NUM
+                        arg1_const && IS_NUM(arg_results[1].value)
                             ? CELL_ID(arg_results[1].value)
                             : -999;
 
@@ -1981,33 +2298,6 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
                         }
                     }
 
-                    // (* x 0) or (* 0 x) -> 0
-                    // (* x 1) or (* 1 x) -> x (identity)
-                    if (prim_id == PTIMES) {
-                        if ((arg0_const && val0 == 0) ||
-                            (arg1_const && val1 == 0)) {
-                            cctx->code->code_len = saved_pos;
-                            emit2(cctx, OP_CONST,
-                                  code_add_const(cctx->code, store(0)));
-                            return const_result(store(0));
-                        }
-                        if (arg1_const && val1 == 1) {
-                            cctx->code->code_len = saved_pos;
-                            return compile_expr_internal(car(args), cctx);
-                        }
-                        if (arg0_const && val0 == 1) {
-                            cctx->code->code_len = saved_pos;
-                            return compile_expr_internal(cadr(args), cctx);
-                        }
-                    }
-
-                    // (/ x 1) -> x (identity)
-                    if (prim_id == PDIV) {
-                        if (arg1_const && val1 == 1) {
-                            cctx->code->code_len = saved_pos;
-                            return compile_expr_internal(car(args), cctx);
-                        }
-                    }
                 }
 
                 // Emit specialized opcodes when constant folding didn't apply
@@ -2034,6 +2324,24 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
 
             // Non-foldable primitive - compile normally
             cctx->tail_position = false;
+
+            // call/cc captures the VM continuation, so it cannot go through the
+            // normal primitive call path.
+            if (prim_id == PCALLCC) {
+                unsigned a = args;
+                gc_protect(&a);
+                while (a) {
+                    compile_expr_internal(car(a), cctx);
+                    a = cdr(a);
+                }
+                gc_unprotect(1);
+                if (argc == 1) {
+                    emit(cctx, OP_CALLCC);
+                } else {
+                    emit3(cctx, OP_PRIM, prim_id, argc);
+                }
+                return dynamic_result();
+            }
 
             if (argc == 1) {
                 compile_expr_internal(car(args), cctx);
@@ -2182,13 +2490,13 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
             }
 
             // Compile arguments for general case
-            FORLIST(a, args) { compile_expr_internal(car(a), cctx); }
-
-            // Special handling for call/cc
-            if (prim_id == PCALLCC) {
-                emit(cctx, OP_CALLCC);
-                return dynamic_result();
+            unsigned a = args;
+            gc_protect(&a);
+            while (a) {
+                compile_expr_internal(car(a), cctx);
+                a = cdr(a);
             }
+            gc_unprotect(1);
 
             // Special handling for apply - use OP_PRIM to handle variable args
             if (prim_id == PAPPLY) {
@@ -2216,7 +2524,13 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
         if (argc == cctx->loop_arity && cctx->loop_arity <= 16) {
             // Compile all arguments first (before any SET)
             cctx->tail_position = false;
-            FORLIST(a, args) { compile_expr_internal(car(a), cctx); }
+            unsigned a = args;
+            gc_protect(&a);
+            while (a) {
+                compile_expr_internal(car(a), cctx);
+                a = cdr(a);
+            }
+            gc_unprotect(1);
             cctx->tail_position = true;
 
             // SET each parameter in reverse order (stack is LIFO)
@@ -2258,23 +2572,34 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
         int64_t var_id = CELL_ID(fn_expr);
         unsigned lambda_expr = lookup_known_lambda(var_id, cctx->known_lambdas);
         if (lambda_expr) {
+            GC_GUARD;
             // Found a known lambda - construct ((lambda ...) args) and recurse
             // to use the existing lambda inlining code.
             // Remove this binding from known_lambdas to prevent infinite
             // recursion if the lambda calls itself (recursive functions).
             unsigned saved_known = cctx->known_lambdas;
+            gc_protect(&saved_known);
+            gc_protect(&lambda_expr);
+            gc_protect(&args);
             unsigned new_known = 0;
-            FORLIST(entry, cctx->known_lambdas)
-            {
+            gc_protect(&new_known);
+            unsigned entry = cctx->known_lambdas;
+            gc_protect(&entry);
+            while (entry) {
                 unsigned pair = car(entry);
+                gc_protect(&pair);
                 if (!IS_PAIR(pair) || !IS_ATOM(car(pair)) ||
                     CELL_ID(car(pair)) != var_id) {
                     new_known = alloc_cons(pair, new_known);
                 }
+                gc_unprotect(1);
+                entry = cdr(entry);
             }
+            gc_unprotect(1);
             cctx->known_lambdas = new_known;
 
             unsigned inlined_call = alloc_cons(lambda_expr, args);
+            gc_protect(&inlined_call);
             compile_result result = compile_call(inlined_call, cctx);
 
             cctx->known_lambdas = saved_known;
@@ -2301,7 +2626,7 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
         bool has_rest = false;
         unsigned rest_param = 0;
 
-        if (CELL_TYPE(lambda_params) == BT_ATOM) {
+        if (IS_ATOM(lambda_params)) {
             // Case 1: (lambda args body) - entire params is the rest param
             has_rest = true;
             rest_param = lambda_params;
@@ -2309,7 +2634,7 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
         } else {
             // Case 2: (lambda (x y ...) body) or (lambda (x y . rest) body)
             for (unsigned p = lambda_params; p; p = cdr(p)) {
-                if (CELL_TYPE(p) == BT_ATOM) {
+                if (IS_ATOM(p)) {
                     // Found rest param at end of dotted list
                     has_rest = true;
                     rest_param = p;
@@ -2333,6 +2658,7 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
 
             // Compile fixed arguments first
             unsigned args_remaining = args;
+            gc_protect(&args_remaining);
             for (unsigned i = 0; i < param_count; i++) {
                 compile_expr_internal(car(args_remaining), cctx);
                 args_remaining = cdr(args_remaining);
@@ -2348,10 +2674,13 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
                     // Compile rest args and build list
                     // Stack after compiling: [arg1 arg2 arg3]
                     // We want (arg1 arg2 arg3) = (cons arg1 (cons arg2 (cons arg3 '())))
-                    FORLIST(a, args_remaining)
-                    {
+                    unsigned a = args_remaining;
+                    gc_protect(&a);
+                    while (a) {
                         compile_expr_internal(car(a), cctx);
+                        a = cdr(a);
                     }
+                    gc_unprotect(1);
                     // Push nil: [arg1 arg2 arg3 nil]
                     emit2(cctx, OP_CONST, code_add_const(cctx->code, 0));
                     // CONS takes car from second-top, cdr from top
@@ -2363,6 +2692,7 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
                     }
                 }
             }
+            gc_unprotect(1);
 
             // Push new environment frame
             emit_pushenv(cctx);
@@ -2380,12 +2710,17 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
 
             // Collect parameter names (only if params is a list)
             unsigned i = 0;
-            if (CELL_TYPE(lambda_params) == BT_CONS) {
-                for (unsigned p = lambda_params; p; p = cdr(p)) {
-                    if (CELL_TYPE(p) == BT_ATOM)
+            if (param_count > 0 && IS_PAIR(lambda_params)) {
+                for (unsigned p = lambda_params; p && i < param_count;
+                     p = cdr(p)) {
+                    if (IS_ATOM(p))
                         break; // Stop at rest param
                     param_ids[i++] = CELL_ID(car(p));
                 }
+            }
+            if (i != param_count) {
+                free(param_ids);
+                return emit_syntax_error(cctx, "lambda: invalid syntax");
             }
 
             // Define rest param first (it's on top of stack)
@@ -2394,15 +2729,19 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
             }
 
             // Define fixed params in reverse order (pop from stack)
-            for (int j = (int)param_count - 1; j >= 0; j--) {
-                emit2(cctx, OP_DEFINE, param_ids[j]);
+            if (param_ids) {
+                for (int j = (int)param_count - 1; j >= 0; j--) {
+                    emit2(cctx, OP_DEFINE, param_ids[j]);
+                }
             }
 
             // Free the parameter ID array
             free(param_ids);
 
+            GC_GUARD;
             // Extend compile-time environment with params for body compilation
             unsigned saved_env = cctx->env;
+            gc_protect(&saved_env);
             {
                 GC_GUARD;
                 gc_protect(&lambda_params);
@@ -2413,9 +2752,9 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
                 gc_protect(&frame_vals);
 
                 // Add fixed params (only if lambda_params is a list)
-                if (CELL_TYPE(lambda_params) == BT_CONS) {
+                if (IS_PAIR(lambda_params)) {
                     for (unsigned p = lambda_params; p; p = cdr(p)) {
-                        if (CELL_TYPE(p) == BT_ATOM)
+                        if (IS_ATOM(p))
                             break;
                         unsigned var = car(p);
                         gc_protect(&var);
@@ -2436,6 +2775,7 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
                 }
 
                 unsigned frame = alloc_cons(frame_vars, frame_vals);
+                gc_protect(&frame);
                 cctx->env = alloc_cons(frame, cctx->env);
             }
 
@@ -2443,11 +2783,13 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
             // When ((lambda (var) body) (lambda ...)) is inlined, we can inline
             // calls to var within body if the lambda doesn't self-reference var
             unsigned saved_known = cctx->known_lambdas;
+            gc_protect(&saved_known);
             {
                 unsigned a = args;
-                if (CELL_TYPE(lambda_params) == BT_CONS) {
+                gc_protect(&a);
+                if (IS_PAIR(lambda_params)) {
                     for (unsigned p = lambda_params; p && a; p = cdr(p)) {
-                        if (CELL_TYPE(p) == BT_ATOM)
+                        if (IS_ATOM(p))
                             break;
                         unsigned var = car(p);
                         unsigned val_expr = car(a);
@@ -2458,13 +2800,16 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
                             unsigned arg_body = cddr(val_expr);
                             if (!contains_reference(arg_body, CELL_ID(var))) {
                                 unsigned pair = alloc_cons(var, val_expr);
+                                gc_protect(&pair);
                                 cctx->known_lambdas =
                                     alloc_cons(pair, cctx->known_lambdas);
+                                gc_unprotect(1);
                             }
                         }
                         a = cdr(a);
                     }
                 }
+                gc_unprotect(1);
             }
 
             // Compile body — IIFE params shadow any same-named stack locals
@@ -2474,7 +2819,7 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
                 memcpy(saved_local_ids, cctx->local_ids,
                        sizeof(int64_t) * saved_num_locals);
             // Remove locals that are shadowed by IIFE params
-            if (cctx->num_locals > 0 && CELL_TYPE(lambda_params) == BT_CONS) {
+            if (cctx->num_locals > 0 && IS_PAIR(lambda_params)) {
                 for (unsigned p = lambda_params; p && IS_PAIR(p); p = cdr(p)) {
                     int64_t pid = CELL_ID(car(p));
                     for (int k = 0; k < cctx->num_locals; k++) {
@@ -2507,11 +2852,14 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
 
     // Compile arguments first (left to right)
     cctx->tail_position = false;
-    FORLIST(a, args)
-    {
+    unsigned a = args;
+    gc_protect(&a);
+    while (a) {
         compile_expr_internal(car(a), cctx);
         argc++;
+        a = cdr(a);
     }
+    gc_unprotect(1);
 
     // Compile function expression
     compile_expr_internal(fn_expr, cctx);
@@ -2529,6 +2877,15 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
 // Check if quasiquote contains unquote or unquote-splicing
 static bool qq_has_unquote(unsigned x, int depth)
 {
+    if (IS_VECTOR(x)) {
+        unsigned len = vector_len(x);
+        for (unsigned i = 0; i < len; i++) {
+            if (qq_has_unquote(vector_data_ptr(x)[i], depth))
+                return true;
+        }
+        return false;
+    }
+
     if (!IS_PAIR(x))
         return false;
 
@@ -2550,16 +2907,28 @@ static bool qq_has_unquote(unsigned x, int depth)
         return qq_has_unquote(cadr(x), depth - 1);
 
     // Check all elements of list
-    for (unsigned l = x; IS_PAIR(l); l = cdr(l)) {
+    unsigned l = x;
+    for (; IS_PAIR(l); l = cdr(l)) {
         if (qq_has_unquote(car(l), depth))
             return true;
     }
+    if (l && qq_has_unquote(l, depth))
+        return true;
     return false;
 }
 
 // Compile quasiquote recursively - generates runtime code
 static void compile_qq_rec(unsigned x, compile_ctx *cctx, int depth)
 {
+    if (IS_VECTOR(x)) {
+        unsigned len = vector_len(x);
+        for (unsigned i = 0; i < len; i++) {
+            compile_qq_rec(vector_data_ptr(x)[i], cctx, depth);
+        }
+        emit3(cctx, OP_PRIM, PVECTOR, len);
+        return;
+    }
+
     if (!IS_PAIR(x)) {
         // Non-pair: just quote it
         emit2(cctx, OP_CONST, code_add_const(cctx->code, x));
@@ -2663,6 +3032,9 @@ static void compile_qq_rec(unsigned x, compile_ctx *cctx, int depth)
 // Quasiquote expansion
 static compile_result compile_quasiquote(unsigned expr, compile_ctx *cctx)
 {
+    if (!syntax_arity_checked(expr, 1, 1, "quasiquote"))
+        return emit_syntax_error(cctx, "quasiquote: invalid syntax");
+
     unsigned tmpl = cadr(expr);
 
     // Check if quasiquote has any unquotes that need runtime evaluation
@@ -2702,6 +3074,8 @@ void compile_sequence(unsigned exprs, compile_ctx *cctx, bool tail)
 code_object *compile_toplevel(unsigned expr, unsigned env)
 {
     compile_ctx *cctx = cctx_new(NULL, env);
+    if (!cctx)
+        return NULL;
     cctx->tail_position = false;
 
     compile_expr_internal(expr, cctx);

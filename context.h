@@ -40,15 +40,50 @@
 // Cell Accessors
 // ============================================================================
 
-static inline unsigned car(unsigned id) { return ctx.cons_cells[id].car; }
-static inline unsigned cdr(unsigned id) { return ctx.cons_cells[id].cdr; }
-static inline unsigned caar(unsigned id) { return car(car(id)); }
-static inline unsigned cdar(unsigned id) { return cdr(car(id)); }
-static inline unsigned cadr(unsigned id) { return car(cdr(id)); }
-static inline unsigned cddr(unsigned id) { return cdr(cdr(id)); }
-static inline unsigned caddr(unsigned id) { return car(cdr(cdr(id))); }
-static inline unsigned cdddr(unsigned id) { return cdr(cdr(cdr(id))); }
-static inline unsigned cadddr(unsigned id) { return car(cdr(cdr(cdr(id)))); }
+static inline unsigned car(unsigned id)
+{
+    return ctx.cons_cells[id].car;
+}
+
+static inline unsigned cdr(unsigned id)
+{
+    return ctx.cons_cells[id].cdr;
+}
+
+static inline unsigned caar(unsigned id)
+{
+    return car(car(id));
+}
+
+static inline unsigned cdar(unsigned id)
+{
+    return cdr(car(id));
+}
+
+static inline unsigned cadr(unsigned id)
+{
+    return car(cdr(id));
+}
+
+static inline unsigned cddr(unsigned id)
+{
+    return cdr(cdr(id));
+}
+
+static inline unsigned caddr(unsigned id)
+{
+    return car(cdr(cdr(id)));
+}
+
+static inline unsigned cdddr(unsigned id)
+{
+    return cdr(cdr(cdr(id)));
+}
+
+static inline unsigned cadddr(unsigned id)
+{
+    return car(cdr(cdr(cdr(id))));
+}
 
 // ============================================================================
 // Memory Allocation
@@ -175,9 +210,20 @@ static inline enum cont_type cont_type(unsigned k)
 {
     return (enum cont_type)caar(k);
 }
-static inline unsigned cont_data(unsigned k) { return cdar(k); }
-static inline unsigned cont_env(unsigned k) { return cadr(k); }
-static inline unsigned cont_next(unsigned k) { return cddr(k); }
+static inline unsigned cont_data(unsigned k)
+{
+    return cdar(k);
+}
+
+static inline unsigned cont_env(unsigned k)
+{
+    return cadr(k);
+}
+
+static inline unsigned cont_next(unsigned k)
+{
+    return cddr(k);
+}
 
 // Create HALT continuation
 unsigned make_halt_cont(void);
@@ -207,7 +253,10 @@ static inline void tramp_done(unsigned value)
     tramp.value = value;
 }
 
-static inline void tramp_error(void) { tramp.mode = TRAMP_ERROR; }
+static inline void tramp_error(void)
+{
+    tramp.mode = TRAMP_ERROR;
+}
 
 // ============================================================================
 // Atom/String Interning
@@ -231,6 +280,19 @@ unsigned list_length(unsigned lst);
 
 // Count list length for proper lists; returns false and reports error on improper
 bool list_length_checked(unsigned lst, unsigned *len_out, const char *name);
+
+// Validate proper-list arity for special forms.
+bool syntax_arity_checked(unsigned form, unsigned min_args, unsigned max_args,
+                          const char *name);
+
+// Validate lambda formal parameter syntax.
+bool lambda_params_valid(unsigned params);
+
+// Validate ((var expr) ...) binding syntax.
+bool binding_list_valid(unsigned bindings, const char *name);
+
+// Validate cond clause syntax.
+bool cond_clauses_valid(unsigned clauses, const char *name);
 
 // Find last cons cell in a proper list (returns 0 for empty list)
 static inline unsigned list_last(unsigned lst)
@@ -337,7 +399,10 @@ void gc_release(int mark);
 // ============================================================================
 
 // Cleanup function for __attribute__((cleanup))
-static inline void gc_release_ptr(int *mark) { gc_release(*mark); }
+static inline void gc_release_ptr(int *mark)
+{
+    gc_release(*mark);
+}
 
 // Helper macros for unique variable names
 #define GC_CONCAT_(a, b) a##b

@@ -37,6 +37,8 @@
 
 const char *type_name(unsigned cell)
 {
+    if (IS_FIXNUM(cell))
+        return "integer";
     if (cell == 0)
         return "()";
     switch (CELL_TYPE(cell)) {
@@ -88,6 +90,10 @@ const char *type_name(unsigned cell)
         return "bytecode-closure";
     case BT_VMCONT:
         return "vm-continuation";
+    case BT_COMPILED_PATTERN:
+        return "compiled-pattern";
+    case BT_BROKENHEART:
+        return "broken-heart";
     default:
         return "unknown";
     }
@@ -173,10 +179,19 @@ static visited_entry *insert_visited(unsigned cell)
     return NULL; // Table full
 }
 
+static bool is_bytecode_closure_object(unsigned s)
+{
+    return IS_PAIR(s) && IS_CELL(car(s)) && CELL_TYPE(car(s)) == BT_CLOSURE;
+}
+
 // First pass: mark all cells that are visited more than once
 static void mark_shared(unsigned s)
 {
     if (s == 0 || s == TOK_ERROR)
+        return;
+    if (IS_FIXNUM(s))
+        return;
+    if (is_bytecode_closure_object(s))
         return;
 
     // Only track cons cells and vectors (things that can have sharing)
@@ -211,6 +226,43 @@ static void mark_shared(unsigned s)
 
 // Forward declaration
 static void write_obj_fp(unsigned s, bool with_quotes, FILE *fp);
+
+static void write_escaped_string(FILE *fp, const char *s)
+{
+    fputc('"', fp);
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        switch (*p) {
+        case '"':
+            fputs("\\\"", fp);
+            break;
+        case '\\':
+            fputs("\\\\", fp);
+            break;
+        case '\n':
+            fputs("\\n", fp);
+            break;
+        case '\t':
+            fputs("\\t", fp);
+            break;
+        case '\r':
+            fputs("\\r", fp);
+            break;
+        case '\a':
+            fputs("\\a", fp);
+            break;
+        case '\b':
+            fputs("\\b", fp);
+            break;
+        default:
+            if (*p < 0x20 || *p == 0x7f)
+                fprintf(fp, "\\x%02x", *p);
+            else
+                fputc(*p, fp);
+            break;
+        }
+    }
+    fputc('"', fp);
+}
 
 static void write_list_tail_fp(unsigned st, bool with_quotes, FILE *fp)
 {
@@ -257,6 +309,14 @@ static void write_obj_fp(unsigned s, bool with_quotes, FILE *fp)
     }
     if (s == TOK_ERROR) {
         fprintf(fp, "[ERROR]");
+        return;
+    }
+    if (IS_FIXNUM(s)) {
+        fprintf(fp, "%" PRId64, (int64_t)FIXNUM_VALUE(s));
+        return;
+    }
+    if (is_bytecode_closure_object(s)) {
+        fprintf(fp, "[function]");
         return;
     }
 
@@ -336,7 +396,7 @@ static void write_obj_fp(unsigned s, bool with_quotes, FILE *fp)
     }
     case BT_STRING:
         if (with_quotes) {
-            fprintf(fp, "\"%s\"", GET_STRING_PTR(s));
+            write_escaped_string(fp, GET_STRING_PTR(s));
         } else {
             fprintf(fp, "%s", GET_STRING_PTR(s));
         }
@@ -416,6 +476,18 @@ static void write_obj_fp(unsigned s, bool with_quotes, FILE *fp)
         break;
     case BT_CONT:
         fprintf(fp, "[continuation]");
+        break;
+    case BT_VMCONT:
+        fprintf(fp, "[continuation]");
+        break;
+    case BT_CLOSURE:
+        fprintf(fp, "[bytecode-closure]");
+        break;
+    case BT_COMPILED_PATTERN:
+        fprintf(fp, "[compiled-pattern]");
+        break;
+    case BT_BROKENHEART:
+        fprintf(fp, "[broken-heart]");
         break;
     case BT_BUILTIN:
         fprintf(fp, "[builtin]");

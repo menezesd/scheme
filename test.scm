@@ -257,8 +257,70 @@
       (call-with-output-string (lambda (p) (display "test" p))))
 (test "call-with-input-string" #\a
       (call-with-input-string "abc" (lambda (p) (read-char p))))
+(test "with-output-to-string" "test"
+      (with-output-to-string (display "test")))
+(test "with-input-from-string" #\a
+      (with-input-from-string "abc" (read-char)))
+(test "with-output-to-string restores on continuation escape" "after"
+      (let ((old (current-output-port))
+            (p (open-output-string))
+            (escape #f))
+        (set-current-output-port! p)
+        (call/cc
+          (lambda (k)
+            (set! escape k)
+            (with-output-to-string (escape #t))))
+        (display "after")
+        (set-current-output-port! old)
+        (get-output-string p)))
+(test "with-input-from-string restores on continuation escape" #\z
+      (let ((old (current-input-port))
+            (p (open-input-string "z"))
+            (escape #f))
+        (set-current-input-port! p)
+        (let ((result
+               (begin
+                 (call/cc
+                   (lambda (k)
+                     (set! escape k)
+                     (with-input-from-string "abc" (escape #t))))
+                 (read-char))))
+          (set-current-input-port! old)
+          result)))
 (test "string-port?" #t (string-port? (open-output-string)))
 (test "string-port? file" #f (string-port? (current-output-port)))
+
+;;; ============================================================================
+;;; File Port Dynamic Extents
+;;; ============================================================================
+
+(section "File Port Dynamic Extents")
+
+(test "call-with-output-file closes on continuation escape" #\x
+      (begin
+        (call/cc
+          (lambda (k)
+            (call-with-output-file
+              "/tmp/vesper-call-with-output-escape-test.txt"
+              (lambda (p)
+                (display "x" p)
+                (k #t)))))
+        (call-with-input-file
+          "/tmp/vesper-call-with-output-escape-test.txt"
+          (lambda (p) (read-char p)))))
+
+(test "with-output-to-file restores on continuation escape" "after"
+      (let ((old (current-output-port))
+            (p (open-output-string)))
+        (set-current-output-port! p)
+        (call/cc
+          (lambda (k)
+            (with-output-to-file
+              "/tmp/vesper-with-output-escape-test.txt"
+              (lambda () (k #t)))))
+        (display "after")
+        (set-current-output-port! old)
+        (get-output-string p)))
 
 ;;; ============================================================================
 ;;; Case and Do

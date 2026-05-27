@@ -18,7 +18,7 @@ unsigned apply_type_predicate(unsigned prim_id, unsigned argc,
     case PNUMBERP:
         return is_numeric(arg) ? ctx.atom_true : ctx.atom_false;
     case PINTEGERP: {
-        if (IS_NUM(arg) || IS_BIGNUM(arg))
+        if (IS_FIXNUM(arg) || IS_NUM(arg) || IS_BIGNUM(arg))
             return ctx.atom_true;
         if (IS_INEXACT(arg)) {
             double d = to_double(arg);
@@ -33,21 +33,25 @@ unsigned apply_type_predicate(unsigned prim_id, unsigned argc,
         return ctx.atom_false;
     }
     case PEXACTP:
-        return is_exact(arg) ? ctx.atom_true : ctx.atom_false;
+        return (is_numeric(arg) && is_exact(arg)) ? ctx.atom_true
+                                                  : ctx.atom_false;
     case PINEXACTP:
         return (is_numeric(arg) && !is_exact(arg)) ? ctx.atom_true
                                                    : ctx.atom_false;
     case PCOMPLEXP:
         return is_numeric(arg) ? ctx.atom_true : ctx.atom_false;
     case PRATIONALP:
-        return (IS_NUM(arg) || IS_BIGNUM(arg) || IS_RATIONAL(arg))
+        return (IS_FIXNUM(arg) || IS_NUM(arg) || IS_BIGNUM(arg) ||
+                IS_RATIONAL(arg))
                    ? ctx.atom_true
                    : ctx.atom_false;
     case PPROCP:
         // Check for bytecode closures: cons cell with BT_CLOSURE marker in car
-        if (IS_PAIR(arg) && CELL_TYPE(car(arg)) == BT_CLOSURE)
+        if (IS_PAIR(arg) && IS_CELL(car(arg)) &&
+            CELL_TYPE(car(arg)) == BT_CLOSURE)
             return ctx.atom_true;
-        return (IS_FUNCTION(arg) || IS_BUILTIN(arg) || IS_CONT(arg))
+        return (IS_FUNCTION(arg) || IS_BUILTIN(arg) || IS_CONT(arg) ||
+                (IS_CELL(arg) && CELL_TYPE(arg) == BT_VMCONT))
                    ? ctx.atom_true
                    : ctx.atom_false;
     case PCONSP:

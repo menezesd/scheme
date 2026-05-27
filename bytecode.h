@@ -177,7 +177,7 @@ enum opcode {
 
     // Stack locals — direct access to function parameters on the stack
     OP_LOCAL_GET,    // Push stack[bp + operand]: LOCAL_GET n
-    OP_LOCAL_SET,    // stack[bp + operand] = pop, push old: LOCAL_SET n
+    OP_LOCAL_SET,    // stack[bp + operand] = pop, push assigned value
     OP_LOCAL_SET_VOID, // stack[bp + operand] = pop: LOCAL_SET_VOID n
     // Fast register-like access to first 4 locals (single-word opcodes)
     OP_LOCAL_GET0,   // Push stack[bp + 0]

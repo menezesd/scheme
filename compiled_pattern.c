@@ -23,6 +23,8 @@
 static unsigned grow_capacity(unsigned cap, size_t elem_size,
                               const char *error_msg)
 {
+    if (cap == 0)
+        return 1;
     if (cap > UINT_MAX / 2) {
         lisp_panic(error_msg);
     }
@@ -118,6 +120,16 @@ void compiled_pattern_free(compiled_pattern *pat)
     if (!pat)
         return;
     pattern_unregister(pat);
+    free(pat->code);
+    free(pat->constants);
+    free(pat->var_slots);
+    free(pat);
+}
+
+static void compiled_pattern_destroy_unregistered(compiled_pattern *pat)
+{
+    if (!pat)
+        return;
     free(pat->code);
     free(pat->constants);
     free(pat->var_slots);
@@ -334,6 +346,9 @@ void gc_sweep_patterns(void)
             }
         }
     }
+    if (active_match_state) {
+        gc_mark_pattern(active_match_state->pattern);
+    }
 
     // Sweep: remove unreachable patterns from registry
     compiled_pattern **prev = &compiled_pattern_registry;
@@ -343,7 +358,7 @@ void gc_sweep_patterns(void)
             // Unlink from registry
             *prev = pat->gc_next;
             // Free the pattern
-            compiled_pattern_free(pat);
+            compiled_pattern_destroy_unregistered(pat);
         } else {
             prev = &pat->gc_next;
         }
@@ -661,6 +676,8 @@ compiled_pattern *compile_pattern(unsigned pattern, unsigned literals,
         .ellipsis_id = ellipsis_id,
         .ellipsis_depth = 0,
     };
+    if (!pctx.pattern)
+        return NULL;
 
     compile_pattern_node(pattern, &pctx);
     pattern_emit(pctx.pattern, PAT_SUCCESS, 0);
@@ -843,6 +860,11 @@ static unsigned build_bindings_alist(pat_match_state *state)
 
 unsigned execute_pattern(compiled_pattern *pat, unsigned input)
 {
+    if (!pat) {
+        show_error("pattern match: invalid compiled pattern");
+        return TOK_ERROR;
+    }
+
     pat_match_state state;
     if (!init_match_state(&state, pat, input)) {
         show_error("pattern match: out of memory");

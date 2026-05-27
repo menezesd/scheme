@@ -1,12 +1,12 @@
 #define _POSIX_C_SOURCE 200809L
 #include "bytecode.h"
+#include "compiled_pattern.h"
 #include "context.h"
 #include "env.h"
 #include "eval.h"
 #include "reader.h"
 #include "types.h"
 #include "writer.h"
-#include <ctype.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -23,8 +23,8 @@ static bool use_bytecode = true;
 // Check if expression is the eof-object atom
 static bool is_eof_object(unsigned expr)
 {
-    return CELL_TYPE(expr) == BT_ATOM &&
-           strcmp(ctx.atom_table[CELL_ID(expr)], "eof-object") == 0;
+    return IS_ATOM(expr) && strcmp(ctx.atom_table[CELL_ID(expr)],
+                                   "eof-object") == 0;
 }
 
 // Track evaluation depth to only sweep code objects at top level
@@ -49,6 +49,7 @@ static unsigned eval_expr(unsigned expr, unsigned env)
         // (nested eval via callback must not sweep parent's code)
         if (eval_depth == 0) {
             gc_sweep_code_objects();
+            gc_sweep_patterns();
         }
         return result;
     } else {
@@ -63,6 +64,12 @@ static bool is_define_syntax(unsigned expr)
 {
     return IS_PAIR(expr) && IS_ATOM(car(expr)) &&
            CELL_ID(car(expr)) == ctx.kw_define_syntax;
+}
+
+static void restore_reader_context(const char *filename)
+{
+    reader_set_filename(filename);
+    reader_reset_position();
 }
 
 // Evaluate a batch of expressions as a begin form
@@ -98,16 +105,9 @@ static bool load_from_port(FILE *f, unsigned *env, bool warn_on_error,
     gc_protect(&all_tail);
 
     for (;;) {
-        int c;
-        while ((c = fgetc(f)) != EOF && isspace(c))
-            ;
-        if (c == EOF)
-            break;
-        ungetc(c, f);
-
         unsigned expr = read_obj_port(f);
         if (expr == TOK_ERROR) {
-            reader_set_filename(old_filename);
+            restore_reader_context(old_filename);
             return false;
         }
         if (is_eof_object(expr))
@@ -121,7 +121,7 @@ static bool load_from_port(FILE *f, unsigned *env, bool warn_on_error,
 
     if (!all_exprs) {
         *env = gc(*env);
-        reader_set_filename(old_filename);
+        restore_reader_context(old_filename);
         return true;
     }
 
@@ -147,7 +147,7 @@ static bool load_from_port(FILE *f, unsigned *env, bool warn_on_error,
             if (batch) {
                 unsigned result = eval_batch(batch, *env);
                 if (result == TOK_ERROR) {
-                    reader_set_filename(old_filename);
+                    restore_reader_context(old_filename);
                     if (warn_on_error)
                         fprintf(stderr, "Warning: error during load\n");
                     return false;
@@ -158,7 +158,7 @@ static bool load_from_port(FILE *f, unsigned *env, bool warn_on_error,
             unsigned result = eval_expr(expr, *env);
             gc_unprotect(1); // expr - per-iteration cleanup
             if (result == TOK_ERROR) {
-                reader_set_filename(old_filename);
+                restore_reader_context(old_filename);
                 if (warn_on_error)
                     fprintf(stderr, "Warning: error during load\n");
                 return false;
@@ -176,7 +176,7 @@ static bool load_from_port(FILE *f, unsigned *env, bool warn_on_error,
     if (batch) {
         unsigned result = eval_batch(batch, *env);
         if (result == TOK_ERROR) {
-            reader_set_filename(old_filename);
+            restore_reader_context(old_filename);
             if (warn_on_error)
                 fprintf(stderr, "Warning: error during load\n");
             return false;
@@ -184,7 +184,7 @@ static bool load_from_port(FILE *f, unsigned *env, bool warn_on_error,
     }
 
     *env = gc(*env);
-    reader_set_filename(old_filename);
+    restore_reader_context(old_filename);
     return true;
 }
 
@@ -197,8 +197,10 @@ static void load_stdlib(unsigned *env)
     // Try external file first (for development)
     FILE *f = fopen("./stdlib.scm", "r");
     if (f) {
-        load_from_port(f, env, false, "stdlib.scm");
-        fclose(f);
+        bool loaded = load_from_port(f, env, false, "stdlib.scm");
+        reader_forget_port(f);
+        if (fclose(f) != 0 || !loaded)
+            fprintf(stderr, "Warning: could not load external stdlib\n");
         return;
     }
 
@@ -208,8 +210,10 @@ static void load_stdlib(unsigned *env)
         fprintf(stderr, "Warning: could not load embedded stdlib\n");
         return;
     }
-    load_from_port(f, env, true, "<stdlib>");
-    fclose(f);
+    bool loaded = load_from_port(f, env, true, "<stdlib>");
+    reader_forget_port(f);
+    if (fclose(f) != 0 || !loaded)
+        fprintf(stderr, "Warning: could not load embedded stdlib\n");
 }
 
 // ============================================================================
@@ -231,12 +235,14 @@ static unsigned load_callback(const char *filename, unsigned *env_ptr)
                 return TOK_ERROR;
             }
             with_ext = malloc(len + 5);
-            if (with_ext) {
-                memcpy(with_ext, filename, len);
-                memcpy(with_ext + len, ".scm", 5);
-                f = fopen(with_ext, "r");
-                if (f) filename = with_ext; // use for error reporting
+            if (!with_ext) {
+                show_error("load: out of memory");
+                return TOK_ERROR;
             }
+            memcpy(with_ext, filename, len);
+            memcpy(with_ext + len, ".scm", 5);
+            f = fopen(with_ext, "r");
+            if (f) filename = with_ext; // use for error reporting
         }
     }
     if (!f) {
@@ -245,11 +251,18 @@ static unsigned load_callback(const char *filename, unsigned *env_ptr)
         return TOK_ERROR;
     }
     if (!load_from_port(f, env_ptr, true, filename)) {
-        fclose(f);
+        reader_forget_port(f);
+        if (fclose(f) != 0)
+            show_error("load: close failed");
         free(with_ext);
         return TOK_ERROR;
     }
-    fclose(f);
+    reader_forget_port(f);
+    if (fclose(f) != 0) {
+        show_error("load: close failed");
+        free(with_ext);
+        return TOK_ERROR;
+    }
     free(with_ext);
     return 0; // Return nil on success (like the CPS evaluator)
 }
@@ -335,9 +348,13 @@ int main(int argc, char **argv)
             fprintf(stderr, "Cannot open file: %s\n", argv[file_arg]);
             return 1;
         }
-        load_from_port(f, &env, false, argv[file_arg]);
-        fclose(f);
-        return 0;
+        bool loaded = load_from_port(f, &env, false, argv[file_arg]);
+        reader_forget_port(f);
+        if (fclose(f) != 0) {
+            fprintf(stderr, "Error closing file: %s\n", argv[file_arg]);
+            return 1;
+        }
+        return loaded ? 0 : 1;
     }
 
     // REPL with error recovery
@@ -356,6 +373,8 @@ int main(int argc, char **argv)
         reader_reset_labels();
         reader_reset_position(); // Reset line/col for each REPL input
         unsigned expr = read_obj();
+        if (expr == TOK_ERROR)
+            continue;
         unsigned x = eval_expr(expr, env);
         printf("\n;Value: ");
         write_obj(x);

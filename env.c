@@ -91,8 +91,11 @@ void env_invalidate_cache(void)
 
 unsigned empty_environment(void)
 {
+    GC_GUARD;
     unsigned frame = alloc_cons(0, 0);
-    return alloc_cons(frame, 0);
+    gc_protect(&frame);
+    unsigned env = alloc_cons(frame, 0);
+    return env;
 }
 
 unsigned defvar(unsigned var, unsigned aval, unsigned env)
@@ -282,12 +285,16 @@ unsigned bind_params(unsigned params, unsigned args)
     gc_protect(&vc);
     gc_protect(&ac);
 
-    while (params && CELL_TYPE(params) == BT_CONS) {
+    while (IS_PAIR(params)) {
+        if (!IS_PAIR(args)) {
+            show_error("procedure: too few arguments");
+            return TOK_ERROR;
+        }
         var = car(params);
-        val = args ? car(args) : 0;
+        val = car(args);
 
         // Validate var is an atom before using it
-        if (var && CELL_TYPE(var) != BT_ATOM) {
+        if (var && !IS_ATOM(var)) {
             lisp_panic("bind_params: var is not BT_ATOM");
         }
 
@@ -305,11 +312,11 @@ unsigned bind_params(unsigned params, unsigned args)
         vals_tail = ac;
 
         params = cdr(params);
-        args = args ? cdr(args) : 0;
+        args = cdr(args);
     }
 
     // Handle rest parameter (dotted notation)
-    if (params && CELL_TYPE(params) == BT_ATOM) {
+    if (IS_ATOM(params)) {
         vc = alloc_cons(params, 0);
         ac = alloc_cons(args, 0);
 
@@ -320,6 +327,9 @@ unsigned bind_params(unsigned params, unsigned args)
             cell_set_cdr(vars_tail, vc);
             cell_set_cdr(vals_tail, ac);
         }
+    } else if (args) {
+        show_error("procedure: too many arguments");
+        return TOK_ERROR;
     }
 
     return alloc_cons(vars, vals);
@@ -593,19 +603,27 @@ static const struct {
 
 unsigned default_environment(void)
 {
+    GC_GUARD;
     unsigned env = empty_environment();
+    gc_protect(&env);
 
     // Register all builtins from table
     for (int i = 0; builtins[i].name; i++) {
-        defvar(atom_from_string(builtins[i].name), mk_primop(builtins[i].prim),
-               env);
+        unsigned name = atom_from_string(builtins[i].name);
+        gc_protect(&name);
+        unsigned prim = mk_primop(builtins[i].prim);
+        gc_protect(&prim);
+        defvar(name, prim, env);
+        gc_unprotect(2);
     }
 
     // Register special atoms
     defvar(ctx.atom_true, ctx.atom_true, env);
     defvar(ctx.atom_false, ctx.atom_false, env);
     // Make 't' an alias for true
-    defvar(atom_from_string("t"), ctx.atom_true, env);
+    unsigned t = atom_from_string("t");
+    gc_protect(&t);
+    defvar(t, ctx.atom_true, env);
 
     return env;
 }

@@ -80,6 +80,9 @@ void handle_cont_define(unsigned val, unsigned data, unsigned env,
                         unsigned next)
 {
     GC_GUARD;
+    gc_protect(&val);
+    gc_protect(&data);
+    gc_protect(&env);
     gc_protect(&next);
     defvar(data, val, env);
     tramp_apply(data, next);
@@ -428,6 +431,10 @@ void handle_cont_eval_fn(unsigned val, unsigned data, unsigned env,
         unsigned frame = 0;
         gc_protect(&frame);
         frame = bind_params(params, arg_exprs);
+        if (frame == TOK_ERROR) {
+            tramp_error();
+            return;
+        }
         unsigned menv = alloc_cons(frame, macroenv);
         if (!cdr(mbody)) {
             unsigned first_expr = car(mbody);
@@ -455,7 +462,9 @@ void handle_cont_eval_fn(unsigned val, unsigned data, unsigned env,
         gc_protect(&fn);
         gc_protect(&arg_exprs);
         unsigned input = alloc_cons(0, arg_exprs);
+        gc_protect(&input);
         unsigned expanded = apply_syntax(fn, input, env);
+        gc_protect(&expanded);
         if (expanded == TOK_ERROR) {
             tramp_error();
             return;
@@ -568,8 +577,10 @@ void handle_cont_callwithvalues(unsigned val, unsigned data, unsigned env,
         consumer_args = CELL_CAR(val);
     } else {
         GC_GUARD;
-        // Single value - wrap in a list; protect consumer and next across alloc
+        // Single value - wrap in a list; protect call inputs across alloc
+        gc_protect(&val);
         gc_protect(&consumer);
+        gc_protect(&env);
         gc_protect(&next);
         consumer_args = alloc_cons(val, 0);
     }

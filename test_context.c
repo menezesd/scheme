@@ -3,8 +3,17 @@
 #include "bytecode.h"
 #include "context.h"
 #include "env.h"
+#include "prim_internal.h"
+#include "primitives.h"
+#include "reader.h"
 #include "test_framework.h"
 #include "types.h"
+#include "writer.h"
+#include <errno.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 
 // ============================================================================
 // Context Tests - Allocation
@@ -101,6 +110,65 @@ TEST(store_rational_to_integer)
     unsigned x = normalize_rational(6, 3);
     ASSERT(CELL_TYPE(x) == BT_NUM);
     ASSERT_EQ(CELL_ID(x), 2);
+    PASS();
+}
+
+TEST(numeric_helpers_accept_direct_fixnum)
+{
+    ASSERT(is_numeric(MAKE_FIXNUM(42)));
+    ASSERT(is_exact(MAKE_FIXNUM(-7)));
+    ASSERT(to_double(MAKE_FIXNUM(5)) == 5.0);
+    PASS();
+}
+
+TEST(numeric_helpers_reject_token_sentinels)
+{
+    ASSERT(!is_numeric(TOK_ERROR));
+    ASSERT(!is_exact(TOK_ERROR));
+    ASSERT(to_double(TOK_ERROR) == 0.0);
+    PASS();
+}
+
+TEST(store_complex_accepts_direct_fixnum_parts)
+{
+    unsigned real = MAKE_FIXNUM(3);
+    unsigned zero_imag = store_complex(real, MAKE_FIXNUM(0));
+    ASSERT(zero_imag == real);
+
+    unsigned complex = store_complex(real, MAKE_FIXNUM(4));
+    ASSERT(CELL_TYPE(complex) == BT_COMPLEX);
+    ASSERT(CELL_CAR(complex) == real);
+    ASSERT(CELL_CDR(complex) == MAKE_FIXNUM(4));
+    ASSERT(to_double(complex) == 3.0);
+    PASS();
+}
+
+TEST(numeric_sign_helpers_accept_direct_fixnum)
+{
+    ASSERT(is_negative_number(MAKE_FIXNUM(-3)));
+    ASSERT(!is_negative_number(MAKE_FIXNUM(3)));
+    ASSERT(negate_number(MAKE_FIXNUM(3)) == MAKE_FIXNUM(-3));
+    ASSERT(negate_number(MAKE_FIXNUM(-3)) == MAKE_FIXNUM(3));
+
+    unsigned min_negated = negate_number(MAKE_FIXNUM(FIXNUM_MIN));
+    ASSERT(CELL_TYPE(min_negated) == BT_NUM);
+    ASSERT_EQ(CELL_ID(min_negated), -(int64_t)FIXNUM_MIN);
+    ASSERT(!is_negative_number(TOK_ERROR));
+    ASSERT_EQ(negate_number(TOK_ERROR), TOK_ERROR);
+    PASS();
+}
+
+TEST(bignum_helpers_accept_direct_fixnum)
+{
+    bignum *bn = to_bignum(MAKE_FIXNUM(-42));
+    ASSERT(bn != NULL);
+    ASSERT_EQ(bn_sign(bn), -1);
+    ASSERT_EQ(bn->len, 1);
+    ASSERT_EQ(bn->limbs[0], 42);
+    bn_free(bn);
+
+    ASSERT(get_bignum(MAKE_FIXNUM(1)) == NULL);
+    ASSERT(to_bignum(TOK_ERROR) == NULL);
     PASS();
 }
 
@@ -209,6 +277,97 @@ TEST(vector_data_access)
     PASS();
 }
 
+TEST(writer_handles_direct_fixnum)
+{
+    char *buf = NULL;
+    size_t len = 0;
+    FILE *mem = open_memstream(&buf, &len);
+    ASSERT(mem != NULL);
+
+    write_obj_port(MAKE_FIXNUM(-42), mem);
+    fclose(mem);
+    ASSERT_STR_EQ(buf, "-42");
+    free(buf);
+    PASS();
+}
+
+TEST(writer_handles_vector_containing_direct_fixnum)
+{
+    unsigned v = make_vector(2, MAKE_FIXNUM(7));
+    char *buf = NULL;
+    size_t len = 0;
+    FILE *mem = open_memstream(&buf, &len);
+    ASSERT(mem != NULL);
+
+    write_obj_port(v, mem);
+    fclose(mem);
+    ASSERT_STR_EQ(buf, "#(7 7)");
+    free(buf);
+    PASS();
+}
+
+TEST(writer_handles_vm_continuation)
+{
+    unsigned cont = alloc();
+    CELL_TYPE(cont) = BT_VMCONT;
+    CELL_PTR(cont) = NULL;
+
+    char *buf = NULL;
+    size_t len = 0;
+    FILE *mem = open_memstream(&buf, &len);
+    ASSERT(mem != NULL);
+
+    write_obj_port(cont, mem);
+    fclose(mem);
+    ASSERT_STR_EQ(buf, "[continuation]");
+    free(buf);
+    PASS();
+}
+
+TEST(writer_handles_bytecode_closure_marker)
+{
+    unsigned marker = alloc();
+    CELL_TYPE(marker) = BT_CLOSURE;
+    CELL_PTR(marker) = NULL;
+
+    char *buf = NULL;
+    size_t len = 0;
+    FILE *mem = open_memstream(&buf, &len);
+    ASSERT(mem != NULL);
+
+    write_obj_port(marker, mem);
+    fclose(mem);
+    ASSERT_STR_EQ(buf, "[bytecode-closure]");
+    ASSERT_STR_EQ(type_name(marker), "bytecode-closure");
+    free(buf);
+    PASS();
+}
+
+TEST(string_port_write_failures_return_false)
+{
+    string_port *sp = strport_new();
+    ASSERT(sp != NULL);
+
+    sp->cap = SIZE_MAX / 2 + 1;
+    sp->len = sp->cap - 1;
+    ASSERT(!strport_putc(sp, 'x'));
+
+    sp->len = SIZE_MAX - 2;
+    ASSERT(!strport_puts(sp, "xx"));
+
+    sp->len = 0;
+    sp->cap = INITIAL_STRING_CAP;
+    sp->data[0] = '\0';
+    strport_free(sp);
+    PASS();
+}
+
+TEST(make_string_owned_rejects_null)
+{
+    ASSERT(make_string_owned(NULL) == TOK_ERROR);
+    PASS();
+}
+
 // ============================================================================
 // Context Tests - List Utilities
 // ============================================================================
@@ -216,6 +375,12 @@ TEST(vector_data_access)
 TEST(list_length_empty)
 {
     ASSERT_EQ(list_length(0), 0);
+    PASS();
+}
+
+TEST(list_length_non_pair_is_zero)
+{
+    ASSERT_EQ(list_length(MAKE_FIXNUM(42)), 0);
     PASS();
 }
 
@@ -248,6 +413,162 @@ TEST(deep_equal_numbers)
 {
     ASSERT(deep_equal(store(42), store(42)));
     ASSERT(!deep_equal(store(42), store(43)));
+    PASS();
+}
+
+TEST(deep_equal_fixnum_and_boxed_integer)
+{
+    ASSERT(deep_equal(MAKE_FIXNUM(42), store(42)));
+    ASSERT(deep_equal(store(-7), MAKE_FIXNUM(-7)));
+    ASSERT(!deep_equal(MAKE_FIXNUM(42), store(43)));
+    PASS();
+}
+
+TEST(deep_equal_rejects_token_sentinels)
+{
+    ASSERT(!deep_equal(MAKE_FIXNUM(42), TOK_ERROR));
+    ASSERT(!deep_equal(TOK_ERROR, store(42)));
+    PASS();
+}
+
+TEST(primitive_eq_handles_fixnum_and_boxed_integer)
+{
+    unsigned argv_same[2] = {MAKE_FIXNUM(42), store(42)};
+    unsigned argv_diff[2] = {MAKE_FIXNUM(42), store(43)};
+    unsigned argv_nil[2] = {MAKE_FIXNUM(42), 0};
+    ASSERT(apply_primitive_argv(PEQ, 2, argv_same) == ctx.atom_true);
+    ASSERT(apply_primitive_argv(PEQ, 2, argv_diff) == ctx.atom_false);
+    ASSERT(apply_primitive_argv(PEQ, 2, argv_nil) == ctx.atom_false);
+    PASS();
+}
+
+TEST(primitive_arithmetic_handles_direct_fixnums)
+{
+    unsigned plus_args[2] = {MAKE_FIXNUM(2), MAKE_FIXNUM(3)};
+    unsigned plus = apply_primitive_argv(PPLUS, 2, plus_args);
+    ASSERT(CELL_TYPE(plus) == BT_NUM);
+    ASSERT_EQ(CELL_ID(plus), 5);
+
+    unsigned minus_args[2] = {MAKE_FIXNUM(7), MAKE_FIXNUM(4)};
+    unsigned minus = apply_primitive_argv(PMINUS, 2, minus_args);
+    ASSERT(CELL_TYPE(minus) == BT_NUM);
+    ASSERT_EQ(CELL_ID(minus), 3);
+
+    unsigned times_args[2] = {MAKE_FIXNUM(6), MAKE_FIXNUM(7)};
+    unsigned times = apply_primitive_argv(PTIMES, 2, times_args);
+    ASSERT(CELL_TYPE(times) == BT_NUM);
+    ASSERT_EQ(CELL_ID(times), 42);
+
+    unsigned divide_args[2] = {MAKE_FIXNUM(21), MAKE_FIXNUM(7)};
+    unsigned divide = apply_primitive_argv(PDIV, 2, divide_args);
+    ASSERT(CELL_TYPE(divide) == BT_NUM);
+    ASSERT_EQ(CELL_ID(divide), 3);
+
+    unsigned abs_args[1] = {MAKE_FIXNUM(-8)};
+    unsigned abs_result = apply_primitive_argv(PABS, 1, abs_args);
+    ASSERT(CELL_TYPE(abs_result) == BT_NUM);
+    ASSERT_EQ(CELL_ID(abs_result), 8);
+
+    unsigned modulo_args[2] = {MAKE_FIXNUM(17), MAKE_FIXNUM(5)};
+    unsigned modulo = apply_primitive_argv(PMOD, 2, modulo_args);
+    ASSERT(CELL_TYPE(modulo) == BT_NUM);
+    ASSERT_EQ(CELL_ID(modulo), 2);
+
+    unsigned remainder_args[2] = {MAKE_FIXNUM(17), MAKE_FIXNUM(5)};
+    unsigned remainder = apply_primitive_argv(PREMAINDER, 2, remainder_args);
+    ASSERT(CELL_TYPE(remainder) == BT_NUM);
+    ASSERT_EQ(CELL_ID(remainder), 2);
+
+    unsigned quotient_args[2] = {MAKE_FIXNUM(17), MAKE_FIXNUM(5)};
+    unsigned quotient = apply_primitive_argv(PQUOTIENT, 2, quotient_args);
+    ASSERT(CELL_TYPE(quotient) == BT_NUM);
+    ASSERT_EQ(CELL_ID(quotient), 3);
+    PASS();
+}
+
+TEST(bytevector_primitives_reject_direct_fixnum)
+{
+    unsigned args[1] = {MAKE_FIXNUM(1)};
+    ASSERT(apply_primitive_argv(PBYTEVECUP, 1, args) == ctx.atom_false);
+    ASSERT(apply_primitive_argv(PBYTEVECLEN, 1, args) == TOK_ERROR);
+    ASSERT(apply_primitive_argv(PBYTEVECCOPY, 1, args) == TOK_ERROR);
+    ASSERT(apply_primitive_argv(PBYTEVECAPPEND, 1, args) == TOK_ERROR);
+    PASS();
+}
+
+TEST(numtower_primitives_handle_direct_fixnums)
+{
+    unsigned positive_arg[1] = {MAKE_FIXNUM(9)};
+    unsigned negative_arg[1] = {MAKE_FIXNUM(-9)};
+
+    ASSERT(apply_primitive_argv(PINTEGERP, 1, positive_arg) == ctx.atom_true);
+    ASSERT(apply_primitive_argv(PRATIONALP, 1, positive_arg) == ctx.atom_true);
+    ASSERT(apply_primitive_argv(PFINITE, 1, positive_arg) == ctx.atom_true);
+    ASSERT(apply_primitive_argv(PINFINITE, 1, positive_arg) ==
+           ctx.atom_false);
+    ASSERT(apply_primitive_argv(PNAN, 1, positive_arg) == ctx.atom_false);
+
+    unsigned numerator = apply_primitive_argv(PNUMERATOR, 1, positive_arg);
+    ASSERT(IS_FIXNUM(numerator));
+    ASSERT_EQ(FIXNUM_VALUE(numerator), 9);
+
+    unsigned denominator =
+        apply_primitive_argv(PDENOMINATOR, 1, positive_arg);
+    ASSERT(CELL_TYPE(denominator) == BT_NUM);
+    ASSERT_EQ(CELL_ID(denominator), 1);
+
+    unsigned magnitude = apply_primitive_argv(PMAGNITUDE, 1, negative_arg);
+    ASSERT(CELL_TYPE(magnitude) == BT_NUM);
+    ASSERT_EQ(CELL_ID(magnitude), 9);
+
+    unsigned real = apply_primitive_argv(PREALPART, 1, positive_arg);
+    ASSERT(IS_FIXNUM(real));
+    ASSERT_EQ(FIXNUM_VALUE(real), 9);
+
+    unsigned imag = apply_primitive_argv(PIMAGPART, 1, positive_arg);
+    ASSERT(CELL_TYPE(imag) == BT_NUM);
+    ASSERT_EQ(CELL_ID(imag), 0);
+
+    PASS();
+}
+
+TEST(math_primitives_handle_direct_fixnums)
+{
+    unsigned square_arg[1] = {MAKE_FIXNUM(9)};
+    unsigned negative_arg[1] = {MAKE_FIXNUM(-9)};
+    unsigned exponent_args[2] = {MAKE_FIXNUM(2), MAKE_FIXNUM(10)};
+
+    unsigned sqrt_result = apply_primitive_argv(PSQRT, 1, square_arg);
+    ASSERT(CELL_TYPE(sqrt_result) == BT_NUM);
+    ASSERT_EQ(CELL_ID(sqrt_result), 3);
+
+    unsigned expt_result = apply_primitive_argv(PEXPT, 2, exponent_args);
+    ASSERT(CELL_TYPE(expt_result) == BT_NUM);
+    ASSERT_EQ(CELL_ID(expt_result), 1024);
+
+    unsigned floor_result = apply_primitive_argv(PFLOOR, 1, negative_arg);
+    ASSERT(IS_FIXNUM(floor_result));
+    ASSERT_EQ(FIXNUM_VALUE(floor_result), -9);
+
+    ASSERT(apply_primitive_argv(PRANDOMSEED, 1, square_arg) ==
+           MAKE_FIXNUM(9));
+    PASS();
+}
+
+TEST(number_to_string_handles_direct_fixnum)
+{
+    unsigned args[1] = {MAKE_FIXNUM(-123)};
+    unsigned result = apply_primitive_argv(PNUM2STR, 1, args);
+    ASSERT(IS_STRING(result));
+    ASSERT_STR_EQ(GET_STRING_PTR(result), "-123");
+    PASS();
+}
+
+TEST(procedure_predicate_rejects_pair_with_fixnum_car)
+{
+    unsigned pair = alloc_cons(MAKE_FIXNUM(1), 0);
+    unsigned args[1] = {pair};
+    ASSERT(apply_primitive_argv(PPROCP, 1, args) == ctx.atom_false);
     PASS();
 }
 
@@ -314,6 +635,183 @@ TEST(code_free_unregisters_tree)
         ASSERT(code != parent);
         ASSERT(code != child);
     }
+    PASS();
+}
+
+static bool code_registry_contains(code_object *needle)
+{
+    for (code_object *code = code_object_registry; code; code = code->gc_next) {
+        if (code == needle)
+            return true;
+    }
+    return false;
+}
+
+TEST(code_sweep_marks_vm_continuation_code)
+{
+    code_object *code = code_new();
+    code_object *child = code_new();
+    code_object *frame_code = code_new();
+    ASSERT(code != NULL);
+    ASSERT(child != NULL);
+    ASSERT(frame_code != NULL);
+    code_add_child(code, child);
+
+    unsigned cont_cell = alloc();
+    size_t block_size = sizeof(vm_continuation) + sizeof(vm_frame);
+    vm_continuation *cont = calloc(1, block_size);
+    ASSERT(cont != NULL);
+    cont->code = code;
+    cont->fp = 1;
+    cont->frames = (vm_frame *)((char *)cont + sizeof(vm_continuation));
+    cont->frames[0].code = frame_code;
+    CELL_TYPE(cont_cell) = BT_VMCONT;
+    CELL_PTR(cont_cell) = cont;
+
+    gc_sweep_code_objects();
+    ASSERT(code_registry_contains(code));
+    ASSERT(code_registry_contains(child));
+    ASSERT(code_registry_contains(frame_code));
+
+    CELL_TYPE(cont_cell) = BT_FREE;
+    CELL_PTR(cont_cell) = NULL;
+    free(cont);
+    code_free(code);
+    code_free(frame_code);
+    PASS();
+}
+
+TEST(gc_updates_vm_continuation_letrec_roots)
+{
+    unsigned saved = alloc();
+    CELL_TYPE(saved) = BT_STRING;
+    CELL_PTR(saved) = strdup("saved");
+    ASSERT(CELL_PTR(saved) != NULL);
+
+    GC_GUARD;
+    gc_protect(&saved);
+    unsigned vals = alloc_cons(saved, 0);
+    gc_protect(&vals);
+    unsigned frame = alloc_cons(0, vals);
+    gc_protect(&frame);
+    unsigned letrec_frame = alloc_cons(frame, 0);
+    gc_protect(&letrec_frame);
+
+    unsigned cont_cell = alloc();
+    size_t block_size = sizeof(vm_continuation) + sizeof(unsigned);
+    vm_continuation *cont = calloc(1, block_size);
+    ASSERT(cont != NULL);
+    cont->letrec_frame = letrec_frame;
+    cont->letrec_saved_len = 1;
+    cont->letrec_saved =
+        (unsigned *)((char *)cont + sizeof(vm_continuation));
+    cont->letrec_saved[0] = saved;
+    CELL_TYPE(cont_cell) = BT_VMCONT;
+    CELL_PTR(cont_cell) = cont;
+
+    cont_cell = gc(cont_cell);
+    cont = (vm_continuation *)CELL_PTR(cont_cell);
+    ASSERT(CELL_TYPE(cont->letrec_frame) == BT_CONS);
+    ASSERT(CELL_TYPE(cont->letrec_saved[0]) == BT_STRING);
+    ASSERT_STR_EQ(GET_STRING_PTR(cont->letrec_saved[0]), "saved");
+    PASS();
+}
+
+TEST(vm_continuation_capture_copies_after_gc)
+{
+    code_object *code = code_new();
+    ASSERT(code != NULL);
+    code_emit(code, OP_PUSHCONT);
+    code_emit(code, OP_HALT);
+
+    unsigned env = empty_environment();
+    unsigned old_env = env;
+
+    if (ctx.card_table) {
+        unsigned nursery_end =
+            (ctx.mmin < SEMISPACE_SIZE) ? SEMISPACE_SIZE : 2 * SEMISPACE_SIZE;
+        ctx.nursery_ptr = nursery_end;
+    }
+
+    vm_state vm;
+    vm_init(&vm);
+    unsigned result = vm_run(&vm, code, env);
+    vm_free(&vm);
+
+    ASSERT(CELL_TYPE(result) == BT_VMCONT);
+    vm_continuation *cont = (vm_continuation *)CELL_PTR(result);
+    ASSERT(cont != NULL);
+    ASSERT(cont->env != old_env);
+    ASSERT(CELL_TYPE(cont->env) == BT_CONS);
+
+    free(cont);
+    CELL_TYPE(result) = BT_FREE;
+    CELL_PTR(result) = NULL;
+    code_free(code);
+    PASS();
+}
+
+TEST(gc_closes_unreachable_file_port)
+{
+    FILE *f = tmpfile();
+    ASSERT(f != NULL);
+    int fd = fileno(f);
+    ASSERT(fd >= 0);
+
+    unsigned port = alloc();
+    CELL_TYPE(port) = BT_INPORT;
+    CELL_PTR(port) = f;
+
+    gc(0);
+
+    errno = 0;
+    ASSERT(fcntl(fd, F_GETFD) == -1);
+    ASSERT(errno == EBADF);
+    PASS();
+}
+
+TEST(gc_forgets_unreachable_file_port_reader_state)
+{
+    FILE *f = fmemopen((void *)"12.\n", 4, "r");
+    ASSERT(f != NULL);
+
+    unsigned port = alloc();
+    CELL_TYPE(port) = BT_INPORT;
+    CELL_PTR(port) = f;
+
+    unsigned value = read_obj_port(f);
+    ASSERT(value != TOK_ERROR);
+    ASSERT(reader_port_pending_bytes(f) > 0);
+
+    gc(0);
+
+    ASSERT_EQ(reader_port_pending_bytes(f), 0);
+    PASS();
+}
+
+TEST(gc_preserves_current_file_port_until_replaced)
+{
+    FILE *f = tmpfile();
+    ASSERT(f != NULL);
+    int fd = fileno(f);
+    ASSERT(fd >= 0);
+
+    unsigned port = alloc();
+    CELL_TYPE(port) = BT_INPORT;
+    CELL_PTR(port) = f;
+    ctx.current_input = f;
+    ctx.current_input_cell = port;
+
+    gc(0);
+    ASSERT(fcntl(fd, F_GETFD) != -1);
+
+    ctx.current_input = stdin;
+    ctx.current_input_cell = 0;
+    gc(0);
+
+    errno = 0;
+    ASSERT(fcntl(fd, F_GETFD) == -1);
+    ASSERT(errno == EBADF);
     PASS();
 }
 
@@ -520,6 +1018,7 @@ TEST(gc_preserves_permanent_atoms)
     unsigned before_true = ctx.atom_true;
     unsigned before_quote = ctx.atom_quote;
     root = gc(root);
+    ASSERT(root != 0);
     ASSERT_EQ(ctx.atom_true, before_true);
     ASSERT_EQ(ctx.atom_quote, before_quote);
     ASSERT_EQ(ctx.atom_true, CELL_ATOM_TRUE);
@@ -534,6 +1033,7 @@ TEST(gc_heap_usage_percent)
     // After GC with minimal data, usage should decrease
     unsigned root = alloc_cons(store(1), 0);
     root = gc(root);
+    ASSERT(root != 0);
     int usage_after = heap_usage_percent();
     ASSERT(usage_after >= 0 && usage_after <= 100);
     PASS();
@@ -574,6 +1074,11 @@ int main(void)
     RUN_TEST(store_rational);
     RUN_TEST(store_rational_normalized);
     RUN_TEST(store_rational_to_integer);
+    RUN_TEST(numeric_helpers_accept_direct_fixnum);
+    RUN_TEST(numeric_helpers_reject_token_sentinels);
+    RUN_TEST(store_complex_accepts_direct_fixnum_parts);
+    RUN_TEST(numeric_sign_helpers_accept_direct_fixnum);
+    RUN_TEST(bignum_helpers_accept_direct_fixnum);
     RUN_TEST(store_bignum_test);
 
     // Interning
@@ -590,14 +1095,30 @@ int main(void)
     RUN_TEST(make_vector_empty);
     RUN_TEST(make_vector_with_fill);
     RUN_TEST(vector_data_access);
+    RUN_TEST(writer_handles_direct_fixnum);
+    RUN_TEST(writer_handles_vector_containing_direct_fixnum);
+    RUN_TEST(writer_handles_vm_continuation);
+    RUN_TEST(writer_handles_bytecode_closure_marker);
+    RUN_TEST(string_port_write_failures_return_false);
+    RUN_TEST(make_string_owned_rejects_null);
 
     // List utilities
     RUN_TEST(list_length_empty);
+    RUN_TEST(list_length_non_pair_is_zero);
     RUN_TEST(list_length_three);
     RUN_TEST(list_append_builds_list);
 
     // Deep equality
     RUN_TEST(deep_equal_numbers);
+    RUN_TEST(deep_equal_fixnum_and_boxed_integer);
+    RUN_TEST(deep_equal_rejects_token_sentinels);
+    RUN_TEST(primitive_eq_handles_fixnum_and_boxed_integer);
+    RUN_TEST(primitive_arithmetic_handles_direct_fixnums);
+    RUN_TEST(bytevector_primitives_reject_direct_fixnum);
+    RUN_TEST(numtower_primitives_handle_direct_fixnums);
+    RUN_TEST(math_primitives_handle_direct_fixnums);
+    RUN_TEST(number_to_string_handles_direct_fixnum);
+    RUN_TEST(procedure_predicate_rejects_pair_with_fixnum_car);
     RUN_TEST(deep_equal_atoms);
     RUN_TEST(deep_equal_lists);
     RUN_TEST(deep_equal_nested);
@@ -606,6 +1127,12 @@ int main(void)
     RUN_TEST(make_cont_test);
     RUN_TEST(make_halt_cont_test);
     RUN_TEST(code_free_unregisters_tree);
+    RUN_TEST(code_sweep_marks_vm_continuation_code);
+    RUN_TEST(gc_updates_vm_continuation_letrec_roots);
+    RUN_TEST(vm_continuation_capture_copies_after_gc);
+    RUN_TEST(gc_closes_unreachable_file_port);
+    RUN_TEST(gc_forgets_unreachable_file_port_reader_state);
+    RUN_TEST(gc_preserves_current_file_port_until_replaced);
 
     // Environment
     RUN_TEST(empty_environment_test);

@@ -21,11 +21,14 @@ unsigned apply_vector_primitive(unsigned prim_id, unsigned argc,
         }
         unsigned len = (unsigned)len64;
         unsigned fill = (argc == 2) ? argv[1] : 0;
-        return make_vector(len, fill);
+        unsigned vec = make_vector(len, fill);
+        return vec == TOK_ERROR ? TOK_ERROR : vec;
     }
     case PVECTOR: {
         unsigned len = argc;
         unsigned vec = make_vector(len, 0);
+        if (vec == TOK_ERROR)
+            return TOK_ERROR;
         unsigned *data = vector_data_ptr(vec);
         for (unsigned i = 0; i < len; i++)
             data[i] = argv[i];
@@ -79,14 +82,11 @@ unsigned apply_vector_primitive(unsigned prim_id, unsigned argc,
         unsigned lst = argv[0];
         gc_protect(&lst);
         unsigned len = 0;
-        for (unsigned it = lst; it; it = cdr(it)) {
-            if (!IS_PAIR(it)) {
-                show_error("list->vector: improper list");
-                return TOK_ERROR;
-            }
-            len++;
-        }
+        if (!list_length_checked(lst, &len, "list->vector"))
+            return TOK_ERROR;
         unsigned vec = make_vector(len, 0);
+        if (vec == TOK_ERROR)
+            return TOK_ERROR;
         unsigned *data = vector_data_ptr(vec);
         for (unsigned i = 0; lst; lst = cdr(lst), i++)
             data[i] = car(lst);
@@ -94,14 +94,20 @@ unsigned apply_vector_primitive(unsigned prim_id, unsigned argc,
     }
     case PVEC2LIST: {
         REQUIRE_ARGC(argc, 1, 1, "vector->list");
+        GC_GUARD;
         unsigned vec = argv[0];
+        gc_protect(&vec);
         if (!IS_VECTOR(vec))
             ERROR_RETURN("vector->list: not a vector");
         unsigned len = vector_len(vec);
-        unsigned *data = vector_data_ptr(vec);
         unsigned result = 0, tail = 0;
+        gc_protect(&result);
+        gc_protect(&tail);
         for (unsigned i = 0; i < len; i++) {
-            list_append(&result, &tail, data[i]);
+            unsigned elem = vector_data_ptr(vec)[i];
+            gc_protect(&elem);
+            list_append(&result, &tail, elem);
+            gc_unprotect(1);
         }
         return result;
     }

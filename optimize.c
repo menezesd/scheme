@@ -100,9 +100,16 @@ static bool get_small_int(code_object *code, unsigned const_idx, int64_t *val)
     if (const_idx >= code->const_len)
         return false;
     unsigned cell = code->constants[const_idx];
-    if (ctx.cons_cells[cell].type != BT_NUM)
+    if (IS_FIXNUM(cell)) {
+        *val = FIXNUM_VALUE(cell);
+        return true;
+    }
+    if (!IS_NUM(cell))
         return false;
-    *val = (int64_t)ctx.cons_cells[cell].id;
+    int64_t boxed = CELL_ID(cell);
+    if (boxed <= INT32_MIN || boxed >= INT32_MAX)
+        return false;
+    *val = boxed;
     return true;
 }
 
@@ -427,14 +434,6 @@ void peephole_optimize(code_object *code)
             continue;
         }
 
-        // Pattern: LOOKUP x d o, POP -> nothing (dead code)
-        if (op == OP_LOOKUP && i + 4 < len && c[i + 4] == OP_POP) {
-            remove[i] = remove[i + 1] = remove[i + 2] = remove[i + 3] =
-                remove[i + 4] = true;
-            i += 5;
-            continue;
-        }
-
         // Pattern: DUP, POP -> nothing
         if (op == OP_DUP && i + 1 < len && c[i + 1] == OP_POP) {
             remove[i] = remove[i + 1] = true;
@@ -444,13 +443,6 @@ void peephole_optimize(code_object *code)
 
         // Pattern: SWAP, SWAP -> nothing (identity)
         if (op == OP_SWAP && i + 1 < len && c[i + 1] == OP_SWAP) {
-            remove[i] = remove[i + 1] = true;
-            i += 2;
-            continue;
-        }
-
-        // Pattern: NOT, NOT -> nothing (double negation)
-        if (op == OP_NOT && i + 1 < len && c[i + 1] == OP_NOT) {
             remove[i] = remove[i + 1] = true;
             i += 2;
             continue;
@@ -546,20 +538,6 @@ void peephole_optimize(code_object *code)
             c[i] = OP_LOOKUP_SUB1;
             remove[i + 4] = true;
             i += 4;
-            continue;
-        }
-
-        // Pattern: ADD1, SUB1 -> nothing (identity)
-        if (op == OP_ADD1 && i + 1 < len && c[i + 1] == OP_SUB1) {
-            remove[i] = remove[i + 1] = true;
-            i += 2;
-            continue;
-        }
-
-        // Pattern: SUB1, ADD1 -> nothing (identity)
-        if (op == OP_SUB1 && i + 1 < len && c[i + 1] == OP_ADD1) {
-            remove[i] = remove[i + 1] = true;
-            i += 2;
             continue;
         }
 
@@ -666,14 +644,6 @@ void peephole_optimize(code_object *code)
             c[i] = OP_CADDR;
             remove[i + 1] = true;
             i += 1;
-            continue;
-        }
-
-        // Pattern: NEG, NEG -> nothing (double negation)
-        if (op == OP_NEG && i + 1 < len && c[i + 1] == OP_NEG &&
-            !is_jump_target[i + 1]) {
-            remove[i] = remove[i + 1] = true;
-            i += 2;
             continue;
         }
 

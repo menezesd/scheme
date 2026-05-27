@@ -27,6 +27,19 @@
             return TOK_ERROR;                                                  \
     } while (0)
 
+static inline bool exact_int64_value(unsigned x, int64_t *out)
+{
+    if (IS_FIXNUM(x)) {
+        *out = FIXNUM_VALUE(x);
+        return true;
+    }
+    if (IS_NUM(x)) {
+        *out = CELL_ID(x);
+        return true;
+    }
+    return false;
+}
+
 unsigned prim_plus(unsigned argc, unsigned *argv)
 {
     if (argc == 0)
@@ -36,9 +49,10 @@ unsigned prim_plus(unsigned argc, unsigned *argv)
     int64_t v = 0;
     for (unsigned i = 0; i < argc; i++) {
         unsigned x = argv[i];
-        if (!IS_NUM(x))
+        int64_t xi;
+        if (!exact_int64_value(x, &xi))
             goto slow_path;
-        if (__builtin_add_overflow(v, CELL_ID(x), &v))
+        if (__builtin_add_overflow(v, xi, &v))
             goto slow_path;
     }
     return store(v);
@@ -61,16 +75,20 @@ slow_path:;
 
         if (all_complex_exact) {
             GC_GUARD;
-            unsigned real_sum = store(0), imag_sum = store(0);
+            unsigned real_sum = store(0);
             gc_protect(&real_sum);
+            unsigned imag_sum = store(0);
             gc_protect(&imag_sum);
             for (unsigned i = 0; i < argc; i++) {
                 unsigned r, im;
                 get_complex_cells(argv[i], &r, &im);
+                gc_protect(&r);
+                gc_protect(&im);
                 real_sum = binary_add(real_sum, r);
                 RETURN_IF_ERROR(real_sum);
                 imag_sum = binary_add(imag_sum, im);
                 RETURN_IF_ERROR(imag_sum);
+                gc_unprotect(2);
             }
             return make_complex_exact(real_sum, imag_sum);
         }
@@ -92,12 +110,15 @@ slow_path:;
     }
     case NUM_RATIONAL: {
         GC_GUARD;
-        unsigned num = store(0), denom = store(1);
+        unsigned num = store(0);
         gc_protect(&num);
+        unsigned denom = store(1);
         gc_protect(&denom);
         for (unsigned i = 0; i < argc; i++) {
             unsigned n, d;
             get_rational_cells(argv[i], &n, &d);
+            gc_protect(&n);
+            gc_protect(&d);
             unsigned ad = multiply_cells(num, d);
             RETURN_IF_ERROR(ad);
             gc_protect(&ad);
@@ -109,6 +130,7 @@ slow_path:;
             gc_unprotect(2);
             denom = multiply_cells(denom, d);
             RETURN_IF_ERROR(denom);
+            gc_unprotect(2);
         }
         return normalize_rational_cells(num, denom);
     }
@@ -133,7 +155,11 @@ slow_path:;
     case NUM_INTEGER: {
         int64_t sum = 0;
         for (unsigned i = 0; i < argc; i++) {
-            int64_t x = CELL_ID(argv[i]);
+            int64_t x;
+            if (!exact_int64_value(argv[i], &x)) {
+                show_error("+: invalid integer operand");
+                return TOK_ERROR;
+            }
             int64_t new_sum;
             if (__builtin_add_overflow(sum, x, &new_sum)) {
                 bignum *result = bn_from_int(sum);
@@ -174,9 +200,10 @@ unsigned prim_mult(unsigned argc, unsigned *argv)
     int64_t v = 1;
     for (unsigned i = 0; i < argc; i++) {
         unsigned x = argv[i];
-        if (!IS_NUM(x))
+        int64_t xi;
+        if (!exact_int64_value(x, &xi))
             goto slow_path;
-        if (__builtin_mul_overflow(v, CELL_ID(x), &v))
+        if (__builtin_mul_overflow(v, xi, &v))
             goto slow_path;
     }
     return store(v);
@@ -199,12 +226,15 @@ slow_path:;
 
         if (all_complex_exact) {
             GC_GUARD;
-            unsigned real_prod = store(1), imag_prod = store(0);
+            unsigned real_prod = store(1);
             gc_protect(&real_prod);
+            unsigned imag_prod = store(0);
             gc_protect(&imag_prod);
             for (unsigned i = 0; i < argc; i++) {
                 unsigned r, im;
                 get_complex_cells(argv[i], &r, &im);
+                gc_protect(&r);
+                gc_protect(&im);
                 unsigned ac = binary_mul(real_prod, r);
                 RETURN_IF_ERROR(ac);
                 gc_protect(&ac);
@@ -225,6 +255,7 @@ slow_path:;
                 gc_unprotect(5);
                 real_prod = new_real;
                 imag_prod = new_imag;
+                gc_unprotect(2);
             }
             return make_complex_exact(real_prod, imag_prod);
         }
@@ -248,16 +279,20 @@ slow_path:;
     }
     case NUM_RATIONAL: {
         GC_GUARD;
-        unsigned num = store(1), denom = store(1);
+        unsigned num = store(1);
         gc_protect(&num);
+        unsigned denom = store(1);
         gc_protect(&denom);
         for (unsigned i = 0; i < argc; i++) {
             unsigned n, d;
             get_rational_cells(argv[i], &n, &d);
+            gc_protect(&n);
+            gc_protect(&d);
             num = multiply_cells(num, n);
             RETURN_IF_ERROR(num);
             denom = multiply_cells(denom, d);
             RETURN_IF_ERROR(denom);
+            gc_unprotect(2);
         }
         return normalize_rational_cells(num, denom);
     }
@@ -297,21 +332,22 @@ unsigned prim_minus(unsigned argc, unsigned *argv)
         return TOK_ERROR;
     }
 
-    if (IS_NUM(argv[0])) {
-        int64_t res = CELL_ID(argv[0]);
+    int64_t fast_res;
+    if (exact_int64_value(argv[0], &fast_res)) {
         if (argc == 1) {
-            if (res == INT64_MIN)
+            if (fast_res == INT64_MIN)
                 goto slow_path;
-            return store(-res);
+            return store(-fast_res);
         }
         for (unsigned i = 1; i < argc; i++) {
             unsigned x = argv[i];
-            if (!IS_NUM(x))
+            int64_t xi;
+            if (!exact_int64_value(x, &xi))
                 goto slow_path;
-            if (__builtin_sub_overflow(res, CELL_ID(x), &res))
+            if (__builtin_sub_overflow(fast_res, xi, &fast_res))
                 goto slow_path;
         }
-        return store(res);
+        return store(fast_res);
     }
 
 slow_path:;
@@ -347,10 +383,13 @@ slow_path:;
             for (unsigned i = 1; i < argc; i++) {
                 unsigned r, im;
                 get_complex_cells(argv[i], &r, &im);
+                gc_protect(&r);
+                gc_protect(&im);
                 real_res = binary_sub(real_res, r);
                 RETURN_IF_ERROR(real_res);
                 imag_res = binary_sub(imag_res, im);
                 RETURN_IF_ERROR(imag_res);
+                gc_unprotect(2);
             }
             return make_complex_exact(real_res, imag_res);
         }
@@ -393,6 +432,8 @@ slow_path:;
         for (unsigned i = 1; i < argc; i++) {
             unsigned n, d;
             get_rational_cells(argv[i], &n, &d);
+            gc_protect(&n);
+            gc_protect(&d);
             unsigned ad = multiply_cells(num, d);
             RETURN_IF_ERROR(ad);
             gc_protect(&ad);
@@ -405,6 +446,7 @@ slow_path:;
             num = new_num;
             denom = multiply_cells(denom, d);
             RETURN_IF_ERROR(denom);
+            gc_unprotect(2);
         }
         return normalize_rational_cells(num, denom);
     }
@@ -431,11 +473,21 @@ slow_path:;
         return store_integer(result);
     }
     case NUM_INTEGER: {
-        int64_t res = CELL_ID(argv[0]);
+        int64_t res;
+        if (!exact_int64_value(argv[0], &res)) {
+            show_error("-: invalid integer operand");
+            return TOK_ERROR;
+        }
         if (argc == 1)
             return store(-res);
-        for (unsigned i = 1; i < argc; i++)
-            res -= CELL_ID(argv[i]);
+        for (unsigned i = 1; i < argc; i++) {
+            int64_t x;
+            if (!exact_int64_value(argv[i], &x)) {
+                show_error("-: invalid integer operand");
+                return TOK_ERROR;
+            }
+            res -= x;
+        }
         return store(res);
     }
     }
@@ -449,23 +501,23 @@ unsigned prim_div(unsigned argc, unsigned *argv)
         return TOK_ERROR;
     }
 
-    if (IS_NUM(argv[0])) {
-        int64_t num = CELL_ID(argv[0]);
+    int64_t fast_num;
+    if (exact_int64_value(argv[0], &fast_num)) {
         int64_t denom = 1;
         if (argc == 1) {
-            CHECK_DIV_ZERO(num, "/");
-            return normalize_rational(1, num);
+            CHECK_DIV_ZERO(fast_num, "/");
+            return normalize_rational(1, fast_num);
         }
         for (unsigned i = 1; i < argc; i++) {
             unsigned x = argv[i];
-            if (!IS_NUM(x))
+            int64_t d;
+            if (!exact_int64_value(x, &d))
                 goto slow_path;
-            int64_t d = CELL_ID(x);
             CHECK_DIV_ZERO(d, "/");
             if (__builtin_mul_overflow(denom, d, &denom))
                 goto slow_path;
         }
-        return normalize_rational(num, denom);
+        return normalize_rational(fast_num, denom);
     }
 
 slow_path:;
@@ -500,7 +552,7 @@ slow_path:;
                 unsigned denom = binary_add(a2, b2);
                 RETURN_IF_ERROR(denom);
                 gc_protect(&denom);
-                if (to_double(denom) == 0.0) {
+                if (is_zero_number(denom)) {
                     ERROR_RETURN("/: division by zero");
                 }
                 unsigned new_real = binary_div(real_res, denom);
@@ -516,6 +568,8 @@ slow_path:;
             for (unsigned i = 1; i < argc; i++) {
                 unsigned c, d;
                 get_complex_cells(argv[i], &c, &d);
+                gc_protect(&c);
+                gc_protect(&d);
                 unsigned ac = binary_mul(real_res, c);
                 RETURN_IF_ERROR(ac);
                 gc_protect(&ac);
@@ -537,7 +591,7 @@ slow_path:;
                 unsigned denom = binary_add(c2, d2);
                 RETURN_IF_ERROR(denom);
                 gc_protect(&denom);
-                if (to_double(denom) == 0.0) {
+                if (is_zero_number(denom)) {
                     ERROR_RETURN("/: division by zero");
                 }
                 unsigned num_real = binary_add(ac, bd);
@@ -553,7 +607,7 @@ slow_path:;
                 RETURN_IF_ERROR(new_imag);
                 real_res = new_real;
                 imag_res = new_imag;
-                gc_unprotect(10);
+                gc_unprotect(12);
             }
             return make_complex_exact(real_res, imag_res);
         }
@@ -608,6 +662,8 @@ slow_path:;
         for (unsigned i = 1; i < argc; i++) {
             unsigned n, d;
             get_rational_cells(argv[i], &n, &d);
+            gc_protect(&n);
+            gc_protect(&d);
             if (is_zero_cell(n)) {
                 ERROR_RETURN("/: division by zero");
             }
@@ -615,6 +671,7 @@ slow_path:;
             RETURN_IF_ERROR(num);
             denom = multiply_cells(denom, n);
             RETURN_IF_ERROR(denom);
+            gc_unprotect(2);
         }
         return normalize_rational_cells(num, denom);
     }
@@ -665,8 +722,9 @@ unsigned prim_modulo(unsigned argc, unsigned *argv)
         bn_free(b);
         return store_integer(r);
     }
-    int64_t a = CELL_ID(xa);
-    int64_t b = CELL_ID(xb);
+    int64_t a, b;
+    exact_int64_value(xa, &a);
+    exact_int64_value(xb, &b);
     CHECK_DIV_ZERO(b, "modulo");
     if (a == INT64_MIN && b == -1)
         return store(0);
@@ -705,8 +763,9 @@ unsigned prim_remainder(unsigned argc, unsigned *argv)
         bn_free(b);
         return store_integer(r);
     }
-    int64_t a = CELL_ID(xa);
-    int64_t b = CELL_ID(xb);
+    int64_t a, b;
+    exact_int64_value(xa, &a);
+    exact_int64_value(xb, &b);
     CHECK_DIV_ZERO(b, "remainder");
     if (a == INT64_MIN && b == -1)
         return store(0);
@@ -742,8 +801,9 @@ unsigned prim_quotient(unsigned argc, unsigned *argv)
         bn_free(b);
         return store_integer(q);
     }
-    int64_t a = CELL_ID(xa);
-    int64_t b = CELL_ID(xb);
+    int64_t a, b;
+    exact_int64_value(xa, &a);
+    exact_int64_value(xb, &b);
     CHECK_DIV_ZERO(b, "quotient");
     if (a == INT64_MIN && b == -1) {
         bignum *result = bn_from_int(a);
@@ -761,6 +821,14 @@ unsigned prim_abs(unsigned argc, unsigned *argv)
 {
     REQUIRE_ARGC(argc, 1, 1, "abs");
     unsigned x = argv[0];
+    if (IS_FIXNUM(x)) {
+        int32_t n = FIXNUM_VALUE(x);
+        return n < 0 ? store(-(int64_t)n) : store(n);
+    }
+    if (!IS_CELL(x)) {
+        show_error("abs: not a real number");
+        return TOK_ERROR;
+    }
     switch (CELL_TYPE(x)) {
     case BT_NUM: {
         int64_t n = CELL_ID(x);

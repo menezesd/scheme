@@ -17,6 +17,7 @@
 #include "context.h"
 #include "env.h"
 #include "eval.h"
+#include "eval_internal.h"
 #include "macros.h"
 #include "prim_internal.h"
 #include "primitives.h"
@@ -62,6 +63,24 @@ static void *malloc_array(unsigned count, size_t elem_size)
     return malloc(size);
 }
 
+static void protect_and_box2(unsigned *a, unsigned *b)
+{
+    gc_protect(a);
+    gc_protect(b);
+    *a = ensure_boxed(*a);
+    *b = ensure_boxed(*b);
+}
+
+static void protect_and_box3(unsigned *a, unsigned *b, unsigned *c)
+{
+    gc_protect(a);
+    gc_protect(b);
+    gc_protect(c);
+    *a = ensure_boxed(*a);
+    *b = ensure_boxed(*b);
+    *c = ensure_boxed(*c);
+}
+
 // Error handling macro - reduces boilerplate in dispatch loop
 #define VM_ERROR(vm, msg)                                                      \
     do {                                                                       \
@@ -74,7 +93,7 @@ static void *malloc_array(unsigned count, size_t elem_size)
 #define VM_ERROR_BREAK(vm, msg)                                                \
     do {                                                                       \
         VM_ERROR(vm, msg);                                                     \
-        break;                                                                 \
+        goto vm_dispatch_error;                                                \
     } while (0)
 
 static unsigned vm_store_bignum_add_one(vm_state *vm, bignum *bn)
@@ -194,7 +213,10 @@ static inline unsigned ic_lookup(int64_t sym_id, unsigned env,
 // so that GC can update VM roots
 static vm_state *active_vm = NULL;
 
-vm_state *get_active_vm(void) { return active_vm; }
+vm_state *get_active_vm(void)
+{
+    return active_vm;
+}
 
 // ============================================================================
 // VM Initialization
@@ -250,10 +272,9 @@ unsigned vm_call_closure(unsigned closure, unsigned args)
         return TOK_ERROR;
     }
 
-    // Check arity
     unsigned argc = 0;
-    for (unsigned a = args; a; a = cdr(a))
-        argc++;
+    if (!list_length_checked(args, &argc, "closure arguments"))
+        return TOK_ERROR;
 
     if (!code->has_rest && argc != code->arity) {
         show_error("wrong number of arguments to closure");
@@ -264,22 +285,31 @@ unsigned vm_call_closure(unsigned closure, unsigned args)
         return TOK_ERROR;
     }
 
-    // Bind parameters to arguments
-    unsigned params = code->constants[code->params];
-    unsigned frame, new_env;
-    {
-        GC_PROTECT_GUARD3(&closure_env, &args, &params);
-        frame = bind_params(params, args);
-    }
-    {
-        GC_PROTECT_GUARD2(&frame, &closure_env);
-        new_env = alloc_cons(frame, closure_env);
-    }
-
     // Create a temporary VM and run the code
     vm_state vm;
     vm_init(&vm);
-    unsigned result = vm_run(&vm, code, new_env);
+    unsigned run_env = closure_env;
+
+    if (code->use_locals && !code->has_rest) {
+        for (unsigned a = args; a; a = cdr(a))
+            vm_push(&vm, car(a));
+    } else {
+        // Bind parameters to arguments
+        unsigned params = code->constants[code->params];
+        unsigned frame;
+        {
+            GC_PROTECT_GUARD3(&closure_env, &args, &params);
+            frame = bind_params(params, args);
+        }
+        if (frame == TOK_ERROR)
+            return TOK_ERROR;
+        {
+            GC_PROTECT_GUARD2(&frame, &closure_env);
+            run_env = alloc_cons(frame, closure_env);
+        }
+    }
+
+    unsigned result = vm_run(&vm, code, run_env);
     bool had_error = vm.error;
     const char *error_msg = vm.error_msg;
     vm_free(&vm);
@@ -413,6 +443,11 @@ static unsigned capture_continuation(vm_state *vm)
     LISP_ASSERT_MSG(checked_add_size(total_size, letrec_size, &total_size),
                     "capture_continuation: size overflow");
 
+    // Allocate the wrapper cell before copying VM roots. alloc() can trigger
+    // GC, which may update vm->stack/env/frame cells; copying after alloc()
+    // ensures the continuation captures forwarded cell IDs.
+    unsigned cell = alloc();
+
     // Single allocation for entire continuation
     char *block = malloc(total_size);
     LISP_ASSERT_MSG(block != NULL, "capture_continuation: malloc failed");
@@ -456,8 +491,6 @@ static unsigned capture_continuation(vm_state *vm)
         cont->letrec_frame = 0;
     }
 
-    // Wrap in a cell
-    unsigned cell = alloc();
     CELL_TYPE(cell) = BT_VMCONT;
     CELL_PTR(cell) = cont;
 
@@ -534,6 +567,8 @@ static void restore_continuation(vm_state *vm, unsigned cont_cell,
     vm->ip = cont->ip;
     vm->env = cont->env;
     vm->bp = cont->bp;
+    vm->letrec_frame = cont->letrec_frame;
+    vm->letrec_count = cont->letrec_saved_len;
 }
 
 // ============================================================================
@@ -542,6 +577,16 @@ static void restore_continuation(vm_state *vm, unsigned cont_cell,
 
 // Forward declaration for vm_handle_apply
 static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail);
+
+static bool vm_require_proper_list(vm_state *vm, unsigned list,
+                                   const char *msg)
+{
+    if (!list_length_checked(list, NULL, "apply")) {
+        VM_ERROR(vm, msg);
+        return false;
+    }
+    return true;
+}
 
 // Maximum middle arguments for apply (proc arg1 ... argN list)
 // Most apply calls have few middle args; use heap allocation for more
@@ -559,6 +604,8 @@ static bool vm_handle_apply(vm_state *vm, unsigned argc, unsigned *argv,
 
     unsigned proc = argv[0];
     unsigned last_list = argv[argc - 1];
+    if (!vm_require_proper_list(vm, last_list, "apply: expected proper list"))
+        return false;
 
     // Copy middle args before popping (they'll be overwritten)
     unsigned middle_count = (argc > 2) ? argc - 2 : 0;
@@ -679,7 +726,7 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
     }
 
     // Check for VM closure: cons cell with BT_CLOSURE marker in car
-    if (IS_PAIR(fn) && CELL_TYPE(car(fn)) == BT_CLOSURE) {
+    if (IS_PAIR(fn) && IS_CELL(car(fn)) && CELL_TYPE(car(fn)) == BT_CLOSURE) {
         code_object *code = GET_CLOSURE_CODE(fn);
         unsigned closure_env = GET_CLOSURE_ENV(fn);
 
@@ -753,16 +800,21 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
                 gc_unprotect(4);
             } else {
                 unsigned args = 0;
+                gc_protect(&args);
                 for (int i = (int)argc - 1; i >= 0; i--) {
                     args = alloc_cons(vm->stack[vm->sp - argc + i], args);
                 }
                 vm->sp -= argc;
-                gc_protect(&args);
                 unsigned frame = bind_params(params, args);
-                gc_unprotect(1);
+                if (frame == TOK_ERROR) {
+                    gc_unprotect(3); // args, params, closure_env
+                    VM_ERROR(vm, ctx.last_error[0] ? ctx.last_error
+                                                   : "wrong number of arguments");
+                    return;
+                }
                 gc_protect(&frame);
                 new_env = alloc_cons(frame, closure_env);
-                gc_unprotect(3);
+                gc_unprotect(4);
             }
 
             if (tail && vm->fp > 0) {
@@ -796,6 +848,7 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
 
         // Build argument list in correct order by iterating in reverse
         unsigned args = 0;
+        gc_protect(&args);
         for (int i = (int)argc - 1; i >= 0; i--) {
             args = alloc_cons(vm->stack[vm->sp - argc + i], args);
         }
@@ -803,18 +856,31 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
         vm->sp -= argc;
 
         // Bind parameters
-        gc_protect(&args);
         unsigned frame = bind_params(params, args);
         gc_unprotect(1); // args
+        if (frame == TOK_ERROR) {
+            gc_unprotect(3); // def_env, body, params
+            VM_ERROR(vm, ctx.last_error[0] ? ctx.last_error
+                                           : "wrong number of arguments");
+            return;
+        }
         gc_protect(&frame);
         unsigned new_env = alloc_cons(frame, def_env);
         gc_unprotect(4); // frame, def_env, body, params
+        gc_protect(&body);
+        gc_protect(&new_env);
 
         // Evaluate body using interpreter
         // For now, fall back to eval_cps
         // This allows mixed mode operation
         unsigned result = 0;
-        FORLIST(expr, body) { result = eval_cps(car(expr), new_env); }
+        unsigned expr = body;
+        gc_protect(&expr);
+        while (expr) {
+            result = eval_cps(car(expr), new_env);
+            expr = cdr(expr);
+        }
+        gc_unprotect(3);
 
         if (result == TOK_ERROR) {
             vm->error = true;
@@ -827,7 +893,7 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
         return;
     }
 
-    if (CELL_TYPE(fn) == BT_VMCONT) {
+    if (IS_CELL(fn) && CELL_TYPE(fn) == BT_VMCONT) {
         // VM continuation invocation
         if (argc != 1) {
             vm->error = true;
@@ -862,8 +928,12 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
     vm->code = code;
     vm->ip = 0;
     vm->env = env;
-    vm->sp = 0;
+    // Preserve arguments preloaded by vm_call_closure for stack-local
+    // closures; ordinary VM runs always start with an empty operand stack.
+    if (!code->use_locals || code->has_rest)
+        vm->sp = 0;
     vm->fp = 0;
+    vm->bp = 0;
     vm->running = true;
     vm->error = false;
 
@@ -895,7 +965,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             unsigned idx = vm->code->code[vm->ip++];
             unsigned val = vm->code->constants[idx];
             // Eagerly unbox small integers to fixnum tags
-            if (CELL_TYPE(val) == BT_NUM) {
+            if (IS_NUM(val)) {
                 int64_t n = CELL_ID(val);
                 if (FITS_FIXNUM(n))
                     val = MAKE_FIXNUM((int32_t)n);
@@ -915,7 +985,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             unsigned val = ic_lookup(sym_id, vm->env, cache_slot);
             if (__builtin_expect(val != TOK_ERROR, 1)) {
                 // Eagerly unbox small integers to fixnum tags
-                if (CELL_TYPE(val) == BT_NUM) {
+                if (IS_NUM(val)) {
                     int64_t n = CELL_ID(val);
                     if (FITS_FIXNUM(n))
                         val = MAKE_FIXNUM((int32_t)n);
@@ -943,7 +1013,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             // Fallback (shouldn't reach here normally)
             unsigned idx = vm->code->code[vm->ip++];
             unsigned val = vm->code->constants[idx];
-            if (CELL_TYPE(val) == BT_NUM) {
+            if (IS_NUM(val)) {
                 int64_t n = CELL_ID(val);
                 if (FITS_FIXNUM(n))
                     val = MAKE_FIXNUM((int32_t)n);
@@ -985,7 +1055,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 vm->running = false;
                 break;
             }
-            if (CELL_TYPE(val) == BT_NUM) {
+            if (IS_NUM(val)) {
                 int64_t n = CELL_ID(val);
                 if (FITS_FIXNUM(n))
                     val = MAKE_FIXNUM((int32_t)n);
@@ -1004,8 +1074,9 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             unsigned atom = alloc();
             CELL_TYPE(atom) = BT_ATOM;
             CELL_ID(atom) = sym_id;
+            gc_protect(&atom);
             defvar(atom, val, vm->env);
-            gc_unprotect(1);
+            gc_unprotect(2);
             break;
         }
 
@@ -1075,9 +1146,8 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
         case OP_LOCAL_SET: {
             unsigned slot = vm->code->code[vm->ip++];
             unsigned val = vm_pop(vm);
-            unsigned old = vm->stack[vm->bp + slot];
             vm->stack[vm->bp + slot] = val;
-            vm_push(vm, old);
+            vm_push(vm, val);
             break;
         }
         case OP_LOCAL_SET_VOID: {
@@ -1180,14 +1250,18 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 }
                 unsigned filename_cell = argv[0];
                 vm->sp -= argc;
-                if (CELL_TYPE(filename_cell) != BT_STRING) {
+                if (!IS_STRING(filename_cell)) {
                     VM_ERROR_BREAK(vm, "load: expected string argument");
                 }
                 if (!ctx.load_callback) {
                     VM_ERROR_BREAK(vm, "load: callback not set");
                 }
-                const char *filename = GET_STRING_PTR(filename_cell);
+                char *filename = strdup(GET_STRING_PTR(filename_cell));
+                if (!filename) {
+                    VM_ERROR_BREAK(vm, "load: out of memory");
+                }
                 unsigned result = ctx.load_callback(filename, &vm->env);
+                free(filename);
                 if (result == TOK_ERROR) {
                     VM_ERROR_BREAK(vm, "load failed");
                 }
@@ -1211,7 +1285,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 gc_protect(&producer);
 
                 // Call producer with 0 args - handle different closure types
-                if (IS_PAIR(producer) &&
+                if (IS_PAIR(producer) && IS_CELL(car(producer)) &&
                     CELL_TYPE(car(producer)) == BT_CLOSURE) {
                     // Bytecode closure - use vm_call_closure
                     result = vm_call_closure(producer, 0);
@@ -1219,17 +1293,19 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                     // CPS closure - use CPS evaluator via callback
                     // Build: (producer)
                     unsigned call_expr = alloc_cons(producer, 0);
+                    gc_protect(&call_expr);
                     if (ctx.eval_callback) {
                         result = ctx.eval_callback(call_expr, vm->env);
                     } else {
-                        gc_unprotect(2);
+                        gc_unprotect(3);
                         vm->error = true;
                         vm->error_msg =
                             "call-with-values: cannot call CPS producer";
                         vm->running = false;
                         break;
                     }
-                } else if (CELL_TYPE(producer) == BT_BUILTIN) {
+                    gc_unprotect(1);
+                } else if (IS_BUILTIN(producer)) {
                     // Builtin - call directly with no args
                     result = apply_primitive_argv(CELL_ID(producer), 0, NULL);
                 } else {
@@ -1241,9 +1317,10 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                     break;
                 }
 
-                gc_unprotect(2);
+                gc_unprotect(1); // producer
 
                 if (result == TOK_ERROR) {
+                    gc_unprotect(1); // consumer
                     VM_ERROR_BREAK(vm, "call-with-values: producer failed");
                 }
 
@@ -1262,6 +1339,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                     vm_push(vm, result);
                     vm_apply(vm, consumer, 1, false);
                 }
+                gc_unprotect(1); // consumer
                 break;
             }
 
@@ -1285,6 +1363,9 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 unsigned expr = argv[0];
                 unsigned eval_env = (argc == 2) ? argv[1] : vm->env;
                 vm->sp -= argc;
+                GC_GUARD;
+                gc_protect(&expr);
+                gc_protect(&eval_env);
                 if (!ctx.eval_callback) {
                     VM_ERROR_BREAK(vm, "eval: callback not set");
                 }
@@ -1334,6 +1415,9 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             // Stack: [proc, args-list]
             unsigned args_list = vm_pop(vm);
             unsigned proc = vm_pop(vm);
+            if (!vm_require_proper_list(vm, args_list,
+                                        "apply: expected proper list"))
+                break;
 
             // Push args from list
             unsigned argc = 0;
@@ -1389,12 +1473,15 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             // Box fixnums before building value list
             vm_box_stack_args(vm, n);
             // Collect n values into a multival
+            GC_GUARD;
             unsigned vals = 0;
+            gc_protect(&vals);
             for (unsigned i = 0; i < n; i++) {
                 vals = alloc_cons(vm->stack[vm->sp - n + i], vals);
             }
             // Reverse
             unsigned rev_vals = 0;
+            gc_protect(&rev_vals);
             while (vals) {
                 rev_vals = alloc_cons(car(vals), rev_vals);
                 vals = cdr(vals);
@@ -1410,6 +1497,9 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             // Stack: [producer, consumer]
             unsigned consumer = vm_pop(vm);
             unsigned producer = vm_pop(vm);
+            GC_GUARD;
+            gc_protect(&consumer);
+            gc_protect(&producer);
 
             // Call producer with no args
             vm_apply(vm, producer, 0, false);
@@ -1417,6 +1507,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             // After producer returns, get result
             // If result is multival, unpack it; otherwise use as single arg
             unsigned result = vm_pop(vm);
+            gc_protect(&result);
             if (IS_MULTIVAL(result)) {
                 unsigned vals = car(result);
                 unsigned argc = 0;
@@ -1437,77 +1528,35 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             int64_t sym_id = vm->code->code[vm->ip++];
             unsigned transformer_form = vm_pop(vm);
 
-            // Create syntax transformer
-            if (!IS_KEYWORD(car(transformer_form), ctx.kw_syntax_rules)) {
+            if (!syntax_rules_valid(transformer_form,
+                                    syntax_default_ellipsis_id(vm->env),
+                                    "define-syntax")) {
                 vm->error = true;
-                vm->error_msg = "define-syntax: expected syntax-rules";
+                vm->error_msg = "define-syntax: invalid syntax-rules";
                 vm->running = false;
                 break;
             }
 
             // CRITICAL: Protect transformer_form before any allocations
             gc_protect(&transformer_form);
-
-            // Use default ellipsis for VM path
-            int64_t ellipsis_id = ctx.kw_ellipsis;
-            unsigned ellipsis_cell = store(ellipsis_id);
-            unsigned literals = cadr(transformer_form);
-            unsigned rules = cddr(transformer_form);
-            gc_protect(&ellipsis_cell);
-            gc_protect(&literals);
-            gc_protect(&rules);
-
-            // Compile patterns for each rule
-            unsigned compiled_rules = 0;
-            gc_protect(&compiled_rules);
-            unsigned compiled_tail = 0;
-            gc_protect(&compiled_tail);
-
-            for (unsigned r = rules; r; r = cdr(r)) {
-                unsigned rule = car(r);
-                unsigned pattern = car(rule);
-                unsigned tmpl = cadr(rule);
-
-                // Skip the macro name in pattern
-                if (IS_PAIR(pattern))
-                    pattern = cdr(pattern);
-
-                // Compile the pattern
-                compiled_pattern *cpat =
-                    compile_pattern(pattern, literals, ellipsis_id);
-
-                // Create cell to hold compiled pattern
-                unsigned cpat_cell = alloc();
-                CELL_TYPE(cpat_cell) = BT_COMPILED_PATTERN;
-                CELL_PTR(cpat_cell) = cpat;
-
-                // Build compiled rule: (cpat_cell . template)
-                gc_protect(&cpat_cell);
-                gc_protect(&tmpl);
-                unsigned new_rule = alloc_cons(cpat_cell, tmpl);
-                unsigned new_node = alloc_cons(new_rule, 0);
-                gc_unprotect(2);
-
-                if (!compiled_rules) {
-                    compiled_rules = new_node;
-                    compiled_tail = new_node;
-                } else {
-                    cell_set_cdr(compiled_tail, new_node);
-                    compiled_tail = new_node;
-                }
+            unsigned transformer = make_syntax_transformer(transformer_form,
+                                                           vm->env);
+            if (transformer == TOK_ERROR) {
+                vm->error = true;
+                vm->error_msg = "define-syntax: transformer creation failed";
+                vm->running = false;
+                gc_unprotect(1);
+                break;
             }
-
-            // Build transformer structure
-            unsigned lit_rules = alloc_cons(literals, compiled_rules);
-            unsigned car_val = alloc_cons(ellipsis_cell, lit_rules);
-            unsigned transformer = make_typed_cell(BT_SYNTAX, car_val, vm->env);
-            gc_unprotect(6);
+            gc_protect(&transformer);
 
             // Define in current environment
             unsigned atom = alloc();
             CELL_TYPE(atom) = BT_ATOM;
             CELL_ID(atom) = sym_id;
+            gc_protect(&atom);
             defvar(atom, transformer, vm->env);
+            gc_unprotect(3);
             break;
         }
 
@@ -1534,11 +1583,10 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
         case OP_CONS: {
             unsigned cdr_val = vm_pop(vm);
             unsigned car_val = vm_pop(vm);
-            car_val = ensure_boxed(car_val);
-            gc_protect(&car_val);
-            cdr_val = ensure_boxed(cdr_val);
-            gc_unprotect(1);
-            vm_push(vm, alloc_cons(car_val, cdr_val));
+            GC_GUARD;
+            protect_and_box2(&car_val, &cdr_val);
+            unsigned result = alloc_cons(car_val, cdr_val);
+            vm_push(vm, result);
             break;
         }
 
@@ -1550,7 +1598,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
 
         case OP_PAIRP: {
             unsigned val = vm_pop(vm);
-            vm_push(vm, (!IS_FIXNUM(val) && val && CELL_TYPE(val) == BT_CONS)
+            vm_push(vm, IS_PAIR(val)
                             ? ctx.atom_true : ctx.atom_false);
             break;
         }
@@ -1566,7 +1614,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 }
                 break;
             }
-            if (CELL_TYPE(n) == BT_NUM) {
+            if (IS_NUM(n)) {
                 int64_t val = CELL_ID(n);
                 if (val < INT64_MAX) {
                     vm_push(vm, store(val + 1));
@@ -1580,7 +1628,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                     }
                     vm_push(vm, result);
                 }
-            } else if (CELL_TYPE(n) == BT_BIGNUM) {
+            } else if (IS_BIGNUM(n)) {
                 bignum *bn = bn_copy(get_bignum(n));
                 unsigned result = bn ? vm_store_bignum_add_one(vm, bn)
                                      : TOK_ERROR;
@@ -1607,7 +1655,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 }
                 break;
             }
-            if (CELL_TYPE(n) == BT_NUM) {
+            if (IS_NUM(n)) {
                 int64_t val = CELL_ID(n);
                 if (val > INT64_MIN) {
                     vm_push(vm, store(val - 1));
@@ -1621,7 +1669,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                     }
                     vm_push(vm, result);
                 }
-            } else if (CELL_TYPE(n) == BT_BIGNUM) {
+            } else if (IS_BIGNUM(n)) {
                 bignum *bn = bn_copy(get_bignum(n));
                 unsigned result = bn ? vm_store_bignum_sub_one(vm, bn)
                                      : TOK_ERROR;
@@ -1643,15 +1691,15 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 vm_push(vm, FIXNUM_VALUE(n) == 0 ? ctx.atom_true : ctx.atom_false);
                 break;
             }
-            bool is_zero = false;
-            if (n == 0) {
-                is_zero = true;
-            } else if (CELL_TYPE(n) == BT_NUM) {
-                is_zero = CELL_ID(n) == 0;
-            } else if (CELL_TYPE(n) == BT_BIGNUM) {
-                is_zero = bn_is_zero(get_bignum(n));
-            }
-            vm_push(vm, is_zero ? ctx.atom_true : ctx.atom_false);
+            n = ensure_boxed(n);
+            gc_protect(&n);
+            unsigned zero = store(0);
+            gc_protect(&zero);
+            unsigned result = binary_numeq(n, zero);
+            gc_unprotect(2);
+            if (result == TOK_ERROR)
+                VM_ERROR_BREAK(vm, "=: invalid operands");
+            vm_push(vm, result);
             break;
         }
 
@@ -1673,12 +1721,11 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 eq = false; // Different fixnums (same-value caught above)
             } else if (IS_FIXNUM(a)) {
                 // Fixnum vs cell: eq? if cell is BT_NUM with same value
-                eq = CELL_TYPE(b) == BT_NUM &&
-                     CELL_ID(b) == (int64_t)FIXNUM_VALUE(a);
+                eq = IS_NUM(b) && CELL_ID(b) == (int64_t)FIXNUM_VALUE(a);
             } else if (IS_FIXNUM(b)) {
-                eq = CELL_TYPE(a) == BT_NUM &&
-                     CELL_ID(a) == (int64_t)FIXNUM_VALUE(b);
-            } else if (CELL_TYPE(a) == CELL_TYPE(b)) {
+                eq = IS_NUM(a) && CELL_ID(a) == (int64_t)FIXNUM_VALUE(b);
+            } else if (IS_CELL(a) && IS_CELL(b) &&
+                       CELL_TYPE(a) == CELL_TYPE(b)) {
                 switch (CELL_TYPE(a)) {
                 case BT_ATOM:
                 case BT_NUM:
@@ -1707,11 +1754,9 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 vm->code->code[vm->ip - 1] = OP_ADD_INT;
                 break;
             }
-            a = ensure_boxed(a);
-            gc_protect(&a);
-            b = ensure_boxed(b);
-            gc_unprotect(1);
+            protect_and_box2(&a, &b);
             unsigned result = binary_add(a, b);
+            gc_unprotect(2);
             if (result == TOK_ERROR)
                 VM_ERROR_BREAK(vm, "+: invalid operands");
             vm_push(vm, result);
@@ -1728,11 +1773,9 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 vm->code->code[vm->ip - 1] = OP_SUB_INT;
                 break;
             }
-            a = ensure_boxed(a);
-            gc_protect(&a);
-            b = ensure_boxed(b);
-            gc_unprotect(1);
+            protect_and_box2(&a, &b);
             unsigned result = binary_sub(a, b);
+            gc_unprotect(2);
             if (result == TOK_ERROR)
                 VM_ERROR_BREAK(vm, "-: invalid operands");
             vm_push(vm, result);
@@ -1749,11 +1792,9 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 vm->code->code[vm->ip - 1] = OP_MUL_INT;
                 break;
             }
-            a = ensure_boxed(a);
-            gc_protect(&a);
-            b = ensure_boxed(b);
-            gc_unprotect(1);
+            protect_and_box2(&a, &b);
             unsigned result = binary_mul(a, b);
+            gc_unprotect(2);
             if (result == TOK_ERROR)
                 VM_ERROR_BREAK(vm, "*: invalid operands");
             vm_push(vm, result);
@@ -1777,14 +1818,12 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 a = store((int64_t)va);
                 gc_protect(&a);
                 b = store((int64_t)vb);
-                gc_unprotect(1);
+                gc_protect(&b);
             } else {
-                a = ensure_boxed(a);
-                gc_protect(&a);
-                b = ensure_boxed(b);
-                gc_unprotect(1);
+                protect_and_box2(&a, &b);
             }
             unsigned result = binary_div(a, b);
+            gc_unprotect(2);
             if (result == TOK_ERROR)
                 VM_ERROR_BREAK(vm, "/: invalid operands or division by zero");
             vm_push(vm, result);
@@ -1804,11 +1843,9 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 vm_push(vm, MAKE_FIXNUM(r));
                 break;
             }
-            a = ensure_boxed(a);
-            gc_protect(&a);
-            b = ensure_boxed(b);
-            gc_unprotect(1);
+            protect_and_box2(&a, &b);
             unsigned result = binary_mod(a, b);
+            gc_unprotect(2);
             if (result == TOK_ERROR)
                 VM_ERROR_BREAK(vm, "modulo: invalid operands");
             vm_push(vm, result);
@@ -1824,9 +1861,9 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                                                               : ctx.atom_false);
                 break;
             }
-            a = ensure_boxed(a); gc_protect(&a);
-            b = ensure_boxed(b); gc_unprotect(1);
+            protect_and_box2(&a, &b);
             unsigned result = binary_lt(a, b);
+            gc_unprotect(2);
             if (result == TOK_ERROR)
                 VM_ERROR_BREAK(vm, "<: invalid operands");
             vm_push(vm, result);
@@ -1841,9 +1878,9 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                                                               : ctx.atom_false);
                 break;
             }
-            a = ensure_boxed(a); gc_protect(&a);
-            b = ensure_boxed(b); gc_unprotect(1);
+            protect_and_box2(&a, &b);
             unsigned result = binary_gt(a, b);
+            gc_unprotect(2);
             if (result == TOK_ERROR)
                 VM_ERROR_BREAK(vm, ">: invalid operands");
             vm_push(vm, result);
@@ -1858,9 +1895,9 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                                                                : ctx.atom_false);
                 break;
             }
-            a = ensure_boxed(a); gc_protect(&a);
-            b = ensure_boxed(b); gc_unprotect(1);
+            protect_and_box2(&a, &b);
             unsigned result = binary_le(a, b);
+            gc_unprotect(2);
             if (result == TOK_ERROR)
                 VM_ERROR_BREAK(vm, "<=: invalid operands");
             vm_push(vm, result);
@@ -1875,9 +1912,9 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                                                                : ctx.atom_false);
                 break;
             }
-            a = ensure_boxed(a); gc_protect(&a);
-            b = ensure_boxed(b); gc_unprotect(1);
+            protect_and_box2(&a, &b);
             unsigned result = binary_ge(a, b);
+            gc_unprotect(2);
             if (result == TOK_ERROR)
                 VM_ERROR_BREAK(vm, ">=: invalid operands");
             vm_push(vm, result);
@@ -1891,9 +1928,9 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 vm_push(vm, a == b ? ctx.atom_true : ctx.atom_false);
                 break;
             }
-            a = ensure_boxed(a); gc_protect(&a);
-            b = ensure_boxed(b); gc_unprotect(1);
+            protect_and_box2(&a, &b);
             unsigned result = binary_numeq(a, b);
+            gc_unprotect(2);
             if (result == TOK_ERROR)
                 VM_ERROR_BREAK(vm, "=: invalid operands");
             vm_push(vm, result);
@@ -1944,39 +1981,39 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
         }
 
         case OP_LIST1: {
+            GC_GUARD;
             unsigned a = vm_pop(vm);
             a = ensure_boxed(a);
-            vm_push(vm, alloc_cons(a, 0));
+            gc_protect(&a);
+            unsigned result = alloc_cons(a, 0);
+            vm_push(vm, result);
             break;
         }
 
         case OP_LIST2: {
+            GC_GUARD;
             unsigned b = vm_pop(vm);
             unsigned a = vm_pop(vm);
-            a = ensure_boxed(a);
-            gc_protect(&a);
-            b = ensure_boxed(b);
+            protect_and_box2(&a, &b);
             // Build bottom-up to avoid unspecified evaluation order
             unsigned tail = alloc_cons(b, 0);
+            gc_protect(&tail);
             unsigned result = alloc_cons(a, tail);
-            gc_unprotect(1);
             vm_push(vm, result);
             break;
         }
 
         case OP_LIST3: {
+            GC_GUARD;
             unsigned c = vm_pop(vm);
             unsigned b = vm_pop(vm);
             unsigned a = vm_pop(vm);
-            a = ensure_boxed(a);
-            gc_protect(&a);
-            b = ensure_boxed(b);
-            gc_protect(&b);
-            c = ensure_boxed(c);
+            protect_and_box3(&a, &b, &c);
             unsigned t2 = alloc_cons(c, 0);
+            gc_protect(&t2);
             unsigned t1 = alloc_cons(b, t2);
+            gc_protect(&t1);
             unsigned result = alloc_cons(a, t1);
-            gc_unprotect(2);
             vm_push(vm, result);
             break;
         }
@@ -2003,13 +2040,19 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
         case OP_JUMPIFZERO: {
             unsigned target = vm->code->code[vm->ip++];
             unsigned n = vm_pop(vm);
-            bool is_zero;
+            bool is_zero = false;
             if (IS_FIXNUM(n)) {
                 is_zero = FIXNUM_VALUE(n) == 0;
             } else {
-                is_zero =
-                    (n == 0) || (CELL_TYPE(n) == BT_NUM && CELL_ID(n) == 0) ||
-                    (CELL_TYPE(n) == BT_BIGNUM && bn_is_zero(get_bignum(n)));
+                n = ensure_boxed(n);
+                gc_protect(&n);
+                unsigned zero = store(0);
+                gc_protect(&zero);
+                unsigned result = binary_numeq(n, zero);
+                gc_unprotect(2);
+                if (result == TOK_ERROR)
+                    VM_ERROR_BREAK(vm, "=: invalid operands");
+                is_zero = (result == ctx.atom_true);
             }
             if (is_zero) {
                 vm->ip = target;
@@ -2020,13 +2063,19 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
         case OP_JUMPIFNOTZERO: {
             unsigned target = vm->code->code[vm->ip++];
             unsigned n = vm_pop(vm);
-            bool is_zero;
+            bool is_zero = false;
             if (IS_FIXNUM(n)) {
                 is_zero = FIXNUM_VALUE(n) == 0;
             } else {
-                is_zero =
-                    (n == 0) || (CELL_TYPE(n) == BT_NUM && CELL_ID(n) == 0) ||
-                    (CELL_TYPE(n) == BT_BIGNUM && bn_is_zero(get_bignum(n)));
+                n = ensure_boxed(n);
+                gc_protect(&n);
+                unsigned zero = store(0);
+                gc_protect(&zero);
+                unsigned result = binary_numeq(n, zero);
+                gc_unprotect(2);
+                if (result == TOK_ERROR)
+                    VM_ERROR_BREAK(vm, "=: invalid operands");
+                is_zero = (result == ctx.atom_true);
             }
             if (!is_zero) {
                 vm->ip = target;
@@ -2096,15 +2145,13 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
 
         case OP_STRINGP: {
             unsigned val = vm_pop(vm);
-            vm_push(vm, (!IS_FIXNUM(val) && val && CELL_TYPE(val) == BT_STRING)
-                            ? ctx.atom_true : ctx.atom_false);
+            vm_push(vm, IS_STRING(val) ? ctx.atom_true : ctx.atom_false);
             break;
         }
 
         case OP_VECTORP: {
             unsigned val = vm_pop(vm);
-            vm_push(vm, (!IS_FIXNUM(val) && val && CELL_TYPE(val) == BT_VECTOR)
-                            ? ctx.atom_true : ctx.atom_false);
+            vm_push(vm, IS_VECTOR(val) ? ctx.atom_true : ctx.atom_false);
             break;
         }
 
@@ -2122,15 +2169,19 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 vm_push(vm, ctx.atom_false);
                 break;
             }
-            bool is_list = true;
-            unsigned p = val;
-            while (p != 0) {
-                if (IS_FIXNUM(p) || !IS_PAIR(p)) {
-                    is_list = false;
+            unsigned slow = val;
+            unsigned fast = val;
+            bool is_list = false;
+            while (!IS_FIXNUM(fast) && IS_PAIR(fast)) {
+                fast = cdr(fast);
+                if (IS_FIXNUM(fast) || !IS_PAIR(fast))
                     break;
-                }
-                p = cdr(p);
+                fast = cdr(fast);
+                slow = cdr(slow);
+                if (slow == fast)
+                    break;
             }
+            is_list = fast == 0;
             vm_push(vm, is_list ? ctx.atom_true : ctx.atom_false);
             break;
         }
@@ -2141,28 +2192,30 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 vm_push(vm, ctx.atom_true);
                 break;
             }
-            bool is_int = (val != 0) && (CELL_TYPE(val) == BT_NUM ||
-                                         CELL_TYPE(val) == BT_BIGNUM);
+            bool is_int = IS_NUM(val) || IS_BIGNUM(val);
             vm_push(vm, is_int ? ctx.atom_true : ctx.atom_false);
             break;
         }
 
         // List operations
         case OP_LENGTH: {
-            unsigned list = vm_pop(vm);
+            unsigned val = vm_pop(vm);
+            if (IS_FIXNUM(val)) {
+                VM_ERROR_BREAK(vm, "length: not a proper list");
+            }
+            if (IS_STRING(val)) {
+                vm_push(vm, store(strlen(GET_STRING_PTR(val))));
+                break;
+            }
+            if (IS_VECTOR(val)) {
+                vm_push(vm, store(vector_len(val)));
+                break;
+            }
             unsigned len = 0;
-            for (unsigned p = list; p != 0; p = cdr(p)) {
-                if (IS_FIXNUM(p) || !IS_PAIR(p)) {
-                    vm->error = true;
-                    vm->error_msg = "length: not a proper list";
-                    vm->running = false;
-                    break;
-                }
-                len++;
-            }
-            if (vm->running) {
-                vm_push(vm, store(len));
-            }
+            if (!list_length_checked(val, &len, "length"))
+                VM_ERROR_BREAK(vm, ctx.last_error[0] ? ctx.last_error
+                                                     : "length: invalid list");
+            vm_push(vm, store(len));
             break;
         }
 
@@ -2173,9 +2226,11 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 vm_push(vm, b);
                 break;
             }
+            if (!list_length_checked(a, NULL, "append"))
+                VM_ERROR_BREAK(vm, ctx.last_error[0] ? ctx.last_error
+                                                     : "append: invalid list");
             // Build result by copying a, then appending b
-            gc_protect(&b);
-            gc_protect(&a);
+            protect_and_box2(&a, &b);
             unsigned result = 0;
             unsigned tail = 0;
             gc_protect(&result);
@@ -2211,6 +2266,9 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
 
         case OP_REVERSE: {
             unsigned list = vm_pop(vm);
+            if (!list_length_checked(list, NULL, "reverse"))
+                VM_ERROR_BREAK(vm, ctx.last_error[0] ? ctx.last_error
+                                                     : "reverse: invalid list");
             gc_protect(&list);
             unsigned result = 0;
             gc_protect(&result);
@@ -2247,7 +2305,8 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 }
                 unsigned elem = car(p);
                 if (elem == obj ||
-                    (CELL_TYPE(elem) == CELL_TYPE(obj) &&
+                    (IS_CELL(elem) && IS_CELL(obj) &&
+                     CELL_TYPE(elem) == CELL_TYPE(obj) &&
                      (CELL_TYPE(elem) == BT_ATOM ||
                       CELL_TYPE(elem) == BT_NUM ||
                       CELL_TYPE(elem) == BT_CHAR) &&
@@ -2264,13 +2323,13 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
         case OP_VECTORREF: {
             unsigned idx = vm_pop(vm);
             unsigned vec = vm_pop(vm);
-            if (IS_FIXNUM(vec) || CELL_TYPE(vec) != BT_VECTOR) {
+            if (!IS_VECTOR(vec)) {
                 VM_ERROR_BREAK(vm, "vector-ref: not a vector");
             }
             int64_t i = 0;
             if (IS_FIXNUM(idx)) {
                 i = FIXNUM_VALUE(idx);
-            } else if (CELL_TYPE(idx) == BT_NUM) {
+            } else if (IS_NUM(idx)) {
                 i = CELL_ID(idx);
             } else {
                 VM_ERROR_BREAK(vm, "vector-ref: index not an integer");
@@ -2287,13 +2346,13 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             unsigned val = vm_pop(vm);
             unsigned idx = vm_pop(vm);
             unsigned vec = vm_pop(vm);
-            if (IS_FIXNUM(vec) || CELL_TYPE(vec) != BT_VECTOR) {
+            if (!IS_VECTOR(vec)) {
                 VM_ERROR_BREAK(vm, "vector-set!: not a vector");
             }
             int64_t i = 0;
             if (IS_FIXNUM(idx)) {
                 i = FIXNUM_VALUE(idx);
-            } else if (CELL_TYPE(idx) == BT_NUM) {
+            } else if (IS_NUM(idx)) {
                 i = CELL_ID(idx);
             } else {
                 VM_ERROR_BREAK(vm, "vector-set!: index not an integer");
@@ -2302,7 +2361,9 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             if (i < 0 || (uint64_t)i >= vd->len) {
                 VM_ERROR_BREAK(vm, "vector-set!: index out of bounds");
             }
+            gc_protect(&vec);
             val = ensure_boxed(val);
+            gc_unprotect(1);
             vector_set_elem(vec, (unsigned)i, val);
             vm_push(vm, val);
             break;
@@ -2310,7 +2371,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
 
         case OP_VECTORLEN: {
             unsigned vec = vm_pop(vm);
-            if (IS_FIXNUM(vec) || CELL_TYPE(vec) != BT_VECTOR) {
+            if (!IS_VECTOR(vec)) {
                 VM_ERROR_BREAK(vm, "vector-length: not a vector");
             }
             vector_data *vd = GET_VECTOR_PTR(vec);
@@ -2330,7 +2391,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 }
                 break;
             }
-            if (CELL_TYPE(n) == BT_NUM) {
+            if (IS_NUM(n)) {
                 int64_t val = CELL_ID(n);
                 if (val == INT64_MIN) {
                     // Overflow to bignum
@@ -2343,16 +2404,16 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 } else {
                     vm_push(vm, store(-val));
                 }
-            } else if (CELL_TYPE(n) == BT_BIGNUM) {
+            } else if (IS_BIGNUM(n)) {
                 unsigned result =
                     vm_store_bignum_neg(vm, get_bignum(n), "-: out of memory");
                 if (result == TOK_ERROR) {
                     VM_ERROR_BREAK(vm, "-: out of memory");
                 }
                 vm_push(vm, result);
-            } else if (CELL_TYPE(n) == BT_INEXACT) {
+            } else if (IS_INEXACT(n)) {
                 vm_push(vm, store_inexact(-to_double(n)));
-            } else if (CELL_TYPE(n) == BT_RATIONAL) {
+            } else if (IS_RATIONAL(n)) {
                 GC_GUARD;
                 gc_protect(&n);
                 unsigned neg_num = negate_number(car(n));
@@ -2388,7 +2449,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 }
                 break;
             }
-            if (CELL_TYPE(n) == BT_NUM) {
+            if (IS_NUM(n)) {
                 int64_t val = CELL_ID(n);
                 if (val == INT64_MIN) {
                     bignum *bn = bn_from_int(val);
@@ -2400,7 +2461,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 } else {
                     vm_push(vm, store(val < 0 ? -val : val));
                 }
-            } else if (CELL_TYPE(n) == BT_BIGNUM) {
+            } else if (IS_BIGNUM(n)) {
                 bignum *bn = get_bignum(n);
                 if (bn->sign) {
                     unsigned result =
@@ -2412,10 +2473,10 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 } else {
                     vm_push(vm, n);
                 }
-            } else if (CELL_TYPE(n) == BT_INEXACT) {
+            } else if (IS_INEXACT(n)) {
                 double d = to_double(n);
                 vm_push(vm, store_inexact(d < 0 ? -d : d));
-            } else if (CELL_TYPE(n) == BT_RATIONAL) {
+            } else if (IS_RATIONAL(n)) {
                 if (is_negative_number(car(n))) {
                     GC_GUARD;
                     gc_protect(&n);
@@ -2449,16 +2510,16 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 break;
             }
             bool positive = false;
-            if (CELL_TYPE(n) == BT_NUM) {
+            if (IS_NUM(n)) {
                 positive = CELL_ID(n) > 0;
-            } else if (CELL_TYPE(n) == BT_BIGNUM) {
+            } else if (IS_BIGNUM(n)) {
                 bignum *bn = get_bignum(n);
                 positive = !bn->sign && bn->len > 0;
-            } else if (CELL_TYPE(n) == BT_INEXACT) {
+            } else if (IS_INEXACT(n)) {
                 positive = to_double(n) > 0;
-            } else if (CELL_TYPE(n) == BT_RATIONAL) {
+            } else if (IS_RATIONAL(n)) {
                 positive = !is_negative_number(car(n)) &&
-                           !(CELL_TYPE(car(n)) == BT_NUM && CELL_ID(car(n)) == 0);
+                           !(IS_NUM(car(n)) && CELL_ID(car(n)) == 0);
             }
             vm_push(vm, positive ? ctx.atom_true : ctx.atom_false);
             break;
@@ -2471,13 +2532,13 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 break;
             }
             bool negative = false;
-            if (CELL_TYPE(n) == BT_NUM) {
+            if (IS_NUM(n)) {
                 negative = CELL_ID(n) < 0;
-            } else if (CELL_TYPE(n) == BT_BIGNUM) {
+            } else if (IS_BIGNUM(n)) {
                 negative = bn_sign(get_bignum(n)) < 0;
-            } else if (CELL_TYPE(n) == BT_INEXACT) {
+            } else if (IS_INEXACT(n)) {
                 negative = to_double(n) < 0;
-            } else if (CELL_TYPE(n) == BT_RATIONAL) {
+            } else if (IS_RATIONAL(n)) {
                 negative = is_negative_number(car(n));
             }
             vm_push(vm, negative ? ctx.atom_true : ctx.atom_false);
@@ -2491,9 +2552,9 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 break;
             }
             bool even = false;
-            if (CELL_TYPE(n) == BT_NUM) {
+            if (IS_NUM(n)) {
                 even = (CELL_ID(n) & 1) == 0;
-            } else if (CELL_TYPE(n) == BT_BIGNUM) {
+            } else if (IS_BIGNUM(n)) {
                 bignum *bn = get_bignum(n);
                 even = bn->len == 0 || (bn->limbs[0] & 1) == 0;
             } else {
@@ -2513,9 +2574,9 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 break;
             }
             bool odd = false;
-            if (CELL_TYPE(n) == BT_NUM) {
+            if (IS_NUM(n)) {
                 odd = (CELL_ID(n) & 1) == 1;
-            } else if (CELL_TYPE(n) == BT_BIGNUM) {
+            } else if (IS_BIGNUM(n)) {
                 bignum *bn = get_bignum(n);
                 odd = bn->len > 0 && (bn->limbs[0] & 1) == 1;
             } else {
@@ -2615,20 +2676,12 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             if (IS_FIXNUM(a) && IS_FIXNUM(b)) {
                 eq = (a == b);
                 vm->code->code[vm->ip - 2] = OP_NUMEQ_INT_JUMPIFNOT;
-            } else if (IS_FIXNUM(a) || IS_FIXNUM(b)) {
-                a = ensure_boxed(a);
-                gc_protect(&a);
-                b = ensure_boxed(b);
-                gc_unprotect(1);
-                eq = (IS_NUM(a) && IS_NUM(b) && CELL_ID(a) == CELL_ID(b));
-            } else if (IS_NUM(a) && IS_NUM(b)) {
-                eq = (CELL_ID(a) == CELL_ID(b));
             } else {
-                a = ensure_boxed(a);
-                gc_protect(&a);
-                b = ensure_boxed(b);
-                gc_unprotect(1);
+                protect_and_box2(&a, &b);
                 unsigned result = binary_numeq(a, b);
+                gc_unprotect(2);
+                if (result == TOK_ERROR)
+                    VM_ERROR_BREAK(vm, "=: invalid operands");
                 eq = (result == ctx.atom_true);
             }
             if (!eq)
@@ -2657,10 +2710,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 default: cond = false; break;
                 }
             } else {
-                a = ensure_boxed(a);
-                gc_protect(&a);
-                b = ensure_boxed(b);
-                gc_unprotect(1);
+                protect_and_box2(&a, &b);
                 unsigned result;
                 switch (fused_op) {
                 case OP_LT_JUMPIFNOT: result = binary_lt(a, b); break;
@@ -2669,6 +2719,9 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 case OP_GE_JUMPIFNOT: result = binary_ge(a, b); break;
                 default: result = ctx.atom_false; break;
                 }
+                gc_unprotect(2);
+                if (result == TOK_ERROR)
+                    VM_ERROR_BREAK(vm, "comparison: invalid operands");
                 cond = (result == ctx.atom_true);
             }
             if (!cond)
@@ -2694,7 +2747,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 int32_t val = FIXNUM_VALUE(n);
                 vm_push(vm, val < FIXNUM_MAX ? MAKE_FIXNUM(val + 1)
                                              : store((int64_t)val + 1));
-            } else if (CELL_TYPE(n) == BT_NUM) {
+            } else if (IS_NUM(n)) {
                 int64_t val = CELL_ID(n);
                 if (val < INT64_MAX) {
                     int64_t r = val + 1;
@@ -2713,9 +2766,11 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 n = ensure_boxed(n);
                 gc_protect(&n);
                 unsigned one = store(1);
-                gc_unprotect(1);
                 unsigned argv[2] = {n, one};
+                gc_protect(&argv[0]);
+                gc_protect(&argv[1]);
                 unsigned result = prim_plus(2, argv);
+                gc_unprotect(3);
                 vm_push(vm, result);
             }
             break;
@@ -2738,7 +2793,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 int32_t val = FIXNUM_VALUE(n);
                 vm_push(vm, val > FIXNUM_MIN ? MAKE_FIXNUM(val - 1)
                                              : store((int64_t)val - 1));
-            } else if (CELL_TYPE(n) == BT_NUM) {
+            } else if (IS_NUM(n)) {
                 int64_t val = CELL_ID(n);
                 if (val > INT64_MIN) {
                     int64_t r = val - 1;
@@ -2757,9 +2812,11 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 n = ensure_boxed(n);
                 gc_protect(&n);
                 unsigned one = store(1);
-                gc_unprotect(1);
                 unsigned argv[2] = {n, one};
+                gc_protect(&argv[0]);
+                gc_protect(&argv[1]);
                 unsigned result = prim_minus(2, argv);
+                gc_unprotect(3);
                 vm_push(vm, result);
             }
             break;
@@ -2771,6 +2828,8 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             vm->running = false;
             break;
         }
+vm_dispatch_error:
+        ;
     }
 
     // Unregister VM from GC system
@@ -2809,6 +2868,7 @@ void gc_update_vm_roots(vm_state *vm)
 
     // Update current environment
     vm->env = collect(vm->env);
+    vm->letrec_frame = collect(vm->letrec_frame);
 
     // Update code object constants
     gc_collect_code(vm->code);
@@ -2832,4 +2892,5 @@ void gc_update_vm_roots_minor(vm_state *vm, unsigned (*collector)(unsigned))
 
     // Update current environment
     vm->env = collector(vm->env);
+    vm->letrec_frame = collector(vm->letrec_frame);
 }

@@ -46,9 +46,13 @@ static inline numeric_level classify_args(unsigned args, bool *all_exact_out)
         unsigned x = car(a);
         if (x == 0)
             continue;
+        if (IS_FIXNUM(x) || !IS_CELL(x))
+            continue;
 
         switch (CELL_TYPE(x)) {
         case BT_COMPLEX:
+            if (!is_exact(x))
+                all_ex = false;
             level = NUM_COMPLEX;
             break;
         case BT_INEXACT:
@@ -87,9 +91,13 @@ static inline numeric_level classify_args_argv(unsigned argc, unsigned *argv,
         unsigned x = argv[i];
         if (x == 0)
             continue;
+        if (IS_FIXNUM(x) || !IS_CELL(x))
+            continue;
 
         switch (CELL_TYPE(x)) {
         case BT_COMPLEX:
+            if (!is_exact(x))
+                all_ex = false;
             level = NUM_COMPLEX;
             break;
         case BT_INEXACT:
@@ -136,7 +144,7 @@ static inline void get_complex_parts(unsigned x, double *real, double *imag)
         *imag = 0.0;
         return;
     }
-    if (CELL_TYPE(x) == BT_COMPLEX) {
+    if (IS_COMPLEX(x)) {
         *real = to_double(CELL_CAR(x));
         *imag = to_double(CELL_CDR(x));
     } else {
@@ -150,34 +158,38 @@ static inline void get_complex_cells(unsigned x, unsigned *real, unsigned *imag)
 {
     if (x == 0) {
         *real = store(0);
+        gc_protect(real);
         *imag = store(0);
+        gc_unprotect(1);
         return;
     }
-    if (CELL_TYPE(x) == BT_COMPLEX) {
+    if (IS_COMPLEX(x)) {
         *real = CELL_CAR(x);
         *imag = CELL_CDR(x);
     } else {
         *real = x;
+        gc_protect(real);
         *imag = store(0);
+        gc_unprotect(1);
     }
 }
 
 // Check if a complex number (or any number) is exact
 static inline bool is_complex_exact(unsigned x)
 {
-    if (CELL_TYPE(x) == BT_COMPLEX) {
+    if (IS_COMPLEX(x)) {
         return is_exact(CELL_CAR(x)) && is_exact(CELL_CDR(x));
     }
     return is_exact(x);
 }
 
+static inline bool is_zero_number(unsigned x);
+
 // Create complex result, simplifying to real if imaginary part is zero
 // Preserves exactness of components
 static inline unsigned make_complex_exact(unsigned real, unsigned imag)
 {
-    // Check if imaginary part is zero
-    double imag_d = to_double(imag);
-    if (imag_d == 0.0)
+    if (is_zero_number(imag))
         return real;
     return store_complex(real, imag);
 }
@@ -198,10 +210,11 @@ static inline unsigned make_complex_result(double real, double imag, bool exact)
 {
     if (imag == 0.0)
         return make_real_result(real, exact);
+    GC_GUARD;
     unsigned real_part = make_real_result(real, exact);
     gc_protect(&real_part);
     unsigned imag_part = make_real_result(imag, exact);
-    gc_unprotect(1);
+    gc_protect(&imag_part);
     return store_complex(real_part, imag_part);
 }
 
@@ -210,10 +223,11 @@ static inline unsigned make_complex_inexact(double real, double imag)
 {
     if (imag == 0.0)
         return store_inexact(real);
+    GC_GUARD;
     unsigned real_part = store_inexact(real);
     gc_protect(&real_part);
     unsigned imag_part = store_inexact(imag);
-    gc_unprotect(1);
+    gc_protect(&imag_part);
     return store_complex(real_part, imag_part);
 }
 
@@ -221,6 +235,16 @@ static inline unsigned make_complex_inexact(double real, double imag)
 // NOTE: Only works correctly if num/denom fit in int64_t
 static inline void get_rational_parts(unsigned x, int64_t *num, int64_t *denom)
 {
+    if (IS_FIXNUM(x)) {
+        *num = FIXNUM_VALUE(x);
+        *denom = 1;
+        return;
+    }
+    if (!IS_CELL(x)) {
+        *num = 0;
+        *denom = 1;
+        return;
+    }
     enum lisp_type t = CELL_TYPE(x);
     if (t == BT_NUM) {
         *num = CELL_ID(x);
@@ -238,16 +262,34 @@ static inline void get_rational_parts(unsigned x, int64_t *num, int64_t *denom)
 static inline void get_rational_cells(unsigned x, unsigned *num,
                                       unsigned *denom)
 {
+    if (IS_FIXNUM(x)) {
+        *num = x;
+        gc_protect(num);
+        *denom = store(1);
+        gc_unprotect(1);
+        return;
+    }
+    if (!IS_CELL(x)) {
+        *num = store(0);
+        gc_protect(num);
+        *denom = store(1);
+        gc_unprotect(1);
+        return;
+    }
     enum lisp_type t = CELL_TYPE(x);
     if (t == BT_NUM || t == BT_BIGNUM) {
         *num = x;
+        gc_protect(num);
         *denom = store(1);
+        gc_unprotect(1);
     } else if (t == BT_RATIONAL) {
         *num = CELL_CAR(x);
         *denom = CELL_CDR(x);
     } else {
         *num = store(0);
+        gc_protect(num);
         *denom = store(1);
+        gc_unprotect(1);
     }
 }
 
@@ -337,16 +379,36 @@ static inline unsigned subtract_cells(unsigned a, unsigned b)
 // Check if an integer cell (BT_NUM or BT_BIGNUM) is zero
 static inline bool is_zero_cell(unsigned x)
 {
-    if (CELL_TYPE(x) == BT_NUM)
+    if (IS_FIXNUM(x))
+        return FIXNUM_VALUE(x) == 0;
+    if (IS_NUM(x))
         return CELL_ID(x) == 0;
-    if (CELL_TYPE(x) == BT_BIGNUM)
+    if (IS_BIGNUM(x))
         return bn_is_zero(get_bignum(x));
+    return false;
+}
+
+static inline bool is_zero_number(unsigned x)
+{
+    if (is_zero_cell(x))
+        return true;
+    if (IS_RATIONAL(x))
+        return is_zero_number(CELL_CAR(x));
+    if (IS_INEXACT(x))
+        return to_double(x) == 0.0;
+    if (IS_COMPLEX(x))
+        return is_zero_number(CELL_CAR(x)) &&
+               is_zero_number(CELL_CDR(x));
     return false;
 }
 
 static inline bool expect_exact_int64(unsigned val, int64_t *out,
                                       const char *name)
 {
+    if (IS_FIXNUM(val)) {
+        *out = FIXNUM_VALUE(val);
+        return true;
+    }
     if (IS_NUM(val)) {
         *out = CELL_ID(val);
         return true;
@@ -622,11 +684,12 @@ static inline unsigned binary_lt(unsigned a, unsigned b)
         return CELL_ID(a) < CELL_ID(b) ? ctx.atom_true : ctx.atom_false;
     }
     // Fall back to full comparison
-    gc_protect(&a);
-    gc_protect(&b);
     unsigned argv[2] = {a, b};
+    gc_protect(&argv[0]);
+    gc_protect(&argv[1]);
+    unsigned result = numeric_compare(2, argv, CMP_LT);
     gc_unprotect(2);
-    return numeric_compare(2, argv, CMP_LT);
+    return result;
 }
 
 // Binary numeric equality: a = b
@@ -637,11 +700,12 @@ static inline unsigned binary_numeq(unsigned a, unsigned b)
         return CELL_ID(a) == CELL_ID(b) ? ctx.atom_true : ctx.atom_false;
     }
     // Fall back to full comparison
-    gc_protect(&a);
-    gc_protect(&b);
     unsigned argv[2] = {a, b};
+    gc_protect(&argv[0]);
+    gc_protect(&argv[1]);
+    unsigned result = numeric_compare(2, argv, CMP_EQ);
     gc_unprotect(2);
-    return numeric_compare(2, argv, CMP_EQ);
+    return result;
 }
 
 // Binary greater-than comparison: a > b
@@ -652,11 +716,12 @@ static inline unsigned binary_gt(unsigned a, unsigned b)
         return CELL_ID(a) > CELL_ID(b) ? ctx.atom_true : ctx.atom_false;
     }
     // Fall back to full comparison
-    gc_protect(&a);
-    gc_protect(&b);
     unsigned argv[2] = {a, b};
+    gc_protect(&argv[0]);
+    gc_protect(&argv[1]);
+    unsigned result = numeric_compare(2, argv, CMP_GT);
     gc_unprotect(2);
-    return numeric_compare(2, argv, CMP_GT);
+    return result;
 }
 
 // Binary less-than-or-equal comparison: a <= b
@@ -667,11 +732,12 @@ static inline unsigned binary_le(unsigned a, unsigned b)
         return CELL_ID(a) <= CELL_ID(b) ? ctx.atom_true : ctx.atom_false;
     }
     // Fall back to full comparison
-    gc_protect(&a);
-    gc_protect(&b);
     unsigned argv[2] = {a, b};
+    gc_protect(&argv[0]);
+    gc_protect(&argv[1]);
+    unsigned result = numeric_compare(2, argv, CMP_LE);
     gc_unprotect(2);
-    return numeric_compare(2, argv, CMP_LE);
+    return result;
 }
 
 // Binary greater-than-or-equal comparison: a >= b
@@ -682,11 +748,12 @@ static inline unsigned binary_ge(unsigned a, unsigned b)
         return CELL_ID(a) >= CELL_ID(b) ? ctx.atom_true : ctx.atom_false;
     }
     // Fall back to full comparison
-    gc_protect(&a);
-    gc_protect(&b);
     unsigned argv[2] = {a, b};
+    gc_protect(&argv[0]);
+    gc_protect(&argv[1]);
+    unsigned result = numeric_compare(2, argv, CMP_GE);
     gc_unprotect(2);
-    return numeric_compare(2, argv, CMP_GE);
+    return result;
 }
 
 // ============================================================================
@@ -696,6 +763,24 @@ static inline unsigned binary_ge(unsigned a, unsigned b)
 // Compare two exact integers, returns -1, 0, or 1
 static inline int compare_exact_integers(unsigned a, unsigned b)
 {
+    if (IS_FIXNUM(a) && IS_FIXNUM(b)) {
+        int32_t va = FIXNUM_VALUE(a);
+        int32_t vb = FIXNUM_VALUE(b);
+        return (va < vb) ? -1 : (va > vb) ? 1 : 0;
+    }
+    if (IS_FIXNUM(a) && IS_NUM(b)) {
+        int64_t va = FIXNUM_VALUE(a);
+        int64_t vb = CELL_ID(b);
+        return (va < vb) ? -1 : (va > vb) ? 1 : 0;
+    }
+    if (IS_NUM(a) && IS_FIXNUM(b)) {
+        int64_t va = CELL_ID(a);
+        int64_t vb = FIXNUM_VALUE(b);
+        return (va < vb) ? -1 : (va > vb) ? 1 : 0;
+    }
+    if (!IS_CELL(a) || !IS_CELL(b))
+        return 0;
+
     enum lisp_type ta = CELL_TYPE(a);
     enum lisp_type tb = CELL_TYPE(b);
 
@@ -760,50 +845,42 @@ static inline string_port *strport_from_string(const char *s)
 }
 
 // Write a character to string port (fast amortized O(1))
-static inline void strport_putc(string_port *sp, int c)
+static inline bool strport_putc(string_port *sp, int c)
 {
     if (sp->len + 1 >= sp->cap) {
-        if (sp->cap > SIZE_MAX / 2) {
-            fprintf(stderr, "string port: capacity overflow\n");
-            abort();
-        }
+        if (sp->cap > SIZE_MAX / 2)
+            return false;
         size_t new_cap = sp->cap * 2;
         char *new_data = realloc(sp->data, new_cap);
-        if (!new_data) {
-            fprintf(stderr, "string port: out of memory\n");
-            abort();
-        }
+        if (!new_data)
+            return false;
         sp->data = new_data;
         sp->cap = new_cap;
     }
     sp->data[sp->len++] = (char)c;
     sp->data[sp->len] = '\0';
+    return true;
 }
 
 // Write a string to string port
-static inline void strport_puts(string_port *sp, const char *s)
+static inline bool strport_puts(string_port *sp, const char *s)
 {
     size_t slen = strlen(s);
-    if (slen > SIZE_MAX - sp->len - 1) {
-        fprintf(stderr, "string port: capacity overflow\n");
-        abort();
-    }
+    if (slen > SIZE_MAX - sp->len - 1)
+        return false;
     while (sp->len + slen >= sp->cap) {
-        if (sp->cap > SIZE_MAX / 2) {
-            fprintf(stderr, "string port: capacity overflow\n");
-            abort();
-        }
+        if (sp->cap > SIZE_MAX / 2)
+            return false;
         size_t new_cap = sp->cap * 2;
         char *new_data = realloc(sp->data, new_cap);
-        if (!new_data) {
-            fprintf(stderr, "string port: out of memory\n");
-            abort();
-        }
+        if (!new_data)
+            return false;
         sp->data = new_data;
         sp->cap = new_cap;
     }
     memcpy(sp->data + sp->len, s, slen + 1);
     sp->len += slen;
+    return true;
 }
 
 // Read a character from string input port
@@ -838,6 +915,38 @@ static inline void strport_free(string_port *sp)
 // Port direction for extract_port
 typedef enum { PORT_INPUT, PORT_OUTPUT } port_dir;
 
+static inline int extract_current_port_cell(unsigned current_cell, port_dir dir,
+                                            FILE **file_out,
+                                            string_port **strport_out,
+                                            const char *fn_name)
+{
+    bool is_strport =
+        (dir == PORT_INPUT) ? IS_STRINPORT(current_cell)
+                            : IS_STROUTPORT(current_cell);
+    if (is_strport) {
+        *strport_out = GET_STRPORT_PTR(current_cell);
+        if (!*strport_out) {
+            show_error("%s: current port is closed", fn_name);
+            return -1;
+        }
+        return 1;
+    }
+
+    bool is_fileport =
+        (dir == PORT_INPUT) ? IS_INPORT(current_cell) : IS_OUTPORT(current_cell);
+    if (is_fileport) {
+        *file_out = GET_PORT_PTR(current_cell);
+        if (!*file_out) {
+            show_error("%s: current port is closed", fn_name);
+            return -1;
+        }
+        return 0;
+    }
+
+    show_error("%s: current port has invalid type", fn_name);
+    return -1;
+}
+
 // Unified port extraction - handles both file and string ports
 // Returns: 0 = file port, 1 = string port, -1 = error
 static inline int extract_port(unsigned args, port_dir dir, bool use_second_arg,
@@ -850,16 +959,11 @@ static inline int extract_port(unsigned args, port_dir dir, bool use_second_arg,
     // Determine which arg contains the port
     unsigned port_arg = use_second_arg ? cdr(args) : args;
     if (!port_arg) {
-        // Check if current port is a string port
         unsigned current_cell = (dir == PORT_INPUT) ? ctx.current_input_cell
                                                     : ctx.current_output_cell;
         if (current_cell != 0) {
-            *strport_out = GET_STRPORT_PTR(current_cell);
-            if (!*strport_out) {
-                show_error("%s: current port is closed", fn_name);
-                return -1;
-            }
-            return 1; // String port
+            return extract_current_port_cell(current_cell, dir, file_out,
+                                             strport_out, fn_name);
         }
         return 0; // Use default file port
     }
@@ -907,20 +1011,13 @@ static inline int extract_port_argv(unsigned *argv, int port_index,
         unsigned current_cell = (dir == PORT_INPUT) ? ctx.current_input_cell
                                                     : ctx.current_output_cell;
         if (current_cell != 0) {
-            *strport_out = GET_STRPORT_PTR(current_cell);
-            if (!*strport_out) {
-                show_error("%s: current port is closed", fn_name);
-                return -1;
-            }
-            return 1;
+            return extract_current_port_cell(current_cell, dir, file_out,
+                                             strport_out, fn_name);
         }
         return 0;
     }
 
     unsigned p = argv[port_index];
-
-    // Tolerate nil/empty-list ports (e.g., closed transcript) by silently skipping
-    if (p == 0) return -2;
 
     bool is_strport = (dir == PORT_INPUT) ? IS_STRINPORT(p) : IS_STROUTPORT(p);
     if (is_strport) {
@@ -991,6 +1088,10 @@ static inline bool extract_input_port(unsigned args, FILE **port_out,
 // Create a string cell from an already-allocated string (takes ownership)
 static inline unsigned make_string_owned(char *s)
 {
+    if (!s) {
+        show_error("string: out of memory");
+        return TOK_ERROR;
+    }
     unsigned p = alloc();
     CELL_TYPE(p) = BT_STRING;
     CELL_PTR(p) = s;

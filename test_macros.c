@@ -9,7 +9,10 @@
 // Helper: Create patterns and templates from atoms
 // ============================================================================
 
-static unsigned atom(const char *s) { return atom_from_string(s); }
+static unsigned atom(const char *s)
+{
+    return atom_from_string(s);
+}
 
 // ============================================================================
 // Pattern Matching Tests - Basic
@@ -68,6 +71,19 @@ TEST(match_literal_fails)
     unsigned literals = alloc_cons(atom("foo"), 0);
     unsigned bindings =
         syntax_match(pattern, input, literals, 0, ctx.kw_ellipsis);
+    ASSERT(bindings == TOK_ERROR);
+    PASS();
+}
+
+TEST(match_direct_fixnum_literal)
+{
+    unsigned pattern = MAKE_FIXNUM(42);
+    unsigned input = MAKE_FIXNUM(42);
+    unsigned bindings = syntax_match(pattern, input, 0, 0, ctx.kw_ellipsis);
+    ASSERT(bindings != TOK_ERROR);
+
+    input = MAKE_FIXNUM(41);
+    bindings = syntax_match(pattern, input, 0, 0, ctx.kw_ellipsis);
     ASSERT(bindings == TOK_ERROR);
     PASS();
 }
@@ -315,6 +331,7 @@ int main(void)
     RUN_TEST(match_atom_binds_value);
     RUN_TEST(match_literal_exact);
     RUN_TEST(match_literal_fails);
+    RUN_TEST(match_direct_fixnum_literal);
     RUN_TEST(match_underscore);
 
     // List pattern matching

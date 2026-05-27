@@ -32,8 +32,10 @@ unsigned prim_append(unsigned argc, unsigned *argv)
 
     for (unsigned i = 0; i + 1 < argc; i++) {
         unsigned lst = argv[i];
+        if (!list_length_checked(lst, NULL, "append"))
+            return TOK_ERROR;
         gc_protect(&lst);
-        while (lst && CELL_TYPE(lst) == BT_CONS) {
+        while (IS_PAIR(lst)) {
             list_append(&result, &tail, car(lst));
             lst = cdr(lst);
         }
@@ -58,10 +60,12 @@ unsigned prim_reverse(unsigned argc, unsigned *argv)
     REQUIRE_ARGC(argc, 1, 1, "reverse");
     GC_GUARD;
     unsigned lst = argv[0];
+    if (!list_length_checked(lst, NULL, "reverse"))
+        return TOK_ERROR;
     unsigned result = 0;
     gc_protect(&lst);
     gc_protect(&result);
-    for (; lst && CELL_TYPE(lst) == BT_CONS; lst = cdr(lst))
+    for (; IS_PAIR(lst); lst = cdr(lst))
         result = alloc_cons(car(lst), result);
     if (lst) {
         show_error("reverse: improper list");

@@ -30,7 +30,296 @@ typedef bool (*special_form_handler)(unsigned id, unsigned env, unsigned cont);
 // Check if transformer_form starts with (syntax-rules ...)
 static inline bool is_syntax_rules(unsigned transformer_form)
 {
-    return IS_KEYWORD(car(transformer_form), ctx.kw_syntax_rules);
+    return IS_PAIR(transformer_form) &&
+           IS_KEYWORD(car(transformer_form), ctx.kw_syntax_rules);
+}
+
+static inline bool syntax_ellipsis_atom(unsigned x, int64_t ellipsis_id)
+{
+    return ellipsis_id != 0 && IS_ATOM(x) && CELL_ID(x) == ellipsis_id;
+}
+
+static inline int64_t syntax_default_ellipsis_id(unsigned env)
+{
+    return lookup_silent(ctx.kw_ellipsis, env) == TOK_ERROR ? ctx.kw_ellipsis
+                                                            : 0;
+}
+
+static inline void syntax_rules_parts(unsigned transformer_form,
+                                      int64_t default_ellipsis_id,
+                                      int64_t *ellipsis_id,
+                                      unsigned *literals, unsigned *rules)
+{
+    unsigned second = cadr(transformer_form);
+    if (IS_ATOM(second)) {
+        *ellipsis_id = CELL_ID(second);
+        *literals = caddr(transformer_form);
+        *rules = cdddr(transformer_form);
+    } else {
+        *ellipsis_id = default_ellipsis_id;
+        *literals = second;
+        *rules = cddr(transformer_form);
+    }
+}
+
+static inline bool syntax_pattern_valid(unsigned pattern, int64_t ellipsis_id,
+                                        const char *context)
+{
+    if (syntax_ellipsis_atom(pattern, ellipsis_id)) {
+        show_error("%s: invalid ellipsis in pattern", context);
+        return false;
+    }
+    if (IS_PAIR(pattern)) {
+        unsigned it = pattern;
+        while (IS_PAIR(it)) {
+            unsigned elem = car(it);
+            unsigned rest = cdr(it);
+            if (syntax_ellipsis_atom(elem, ellipsis_id)) {
+                show_error("%s: invalid ellipsis in pattern", context);
+                return false;
+            }
+            if (IS_PAIR(rest) && syntax_ellipsis_atom(car(rest), ellipsis_id)) {
+                if (!syntax_pattern_valid(elem, ellipsis_id, context))
+                    return false;
+                it = cdr(rest);
+                continue;
+            }
+            if (!syntax_pattern_valid(elem, ellipsis_id, context))
+                return false;
+            it = rest;
+        }
+        if (it && !syntax_pattern_valid(it, ellipsis_id, context))
+            return false;
+    } else if (IS_VECTOR(pattern)) {
+        unsigned len = vector_len(pattern);
+        unsigned *data = vector_data_ptr(pattern);
+        bool saw_ellipsis = false;
+        for (unsigned i = 0; i < len; i++) {
+            if (syntax_ellipsis_atom(data[i], ellipsis_id)) {
+                if (i == 0 || saw_ellipsis) {
+                    show_error("%s: invalid ellipsis in pattern", context);
+                    return false;
+                }
+                saw_ellipsis = true;
+                continue;
+            }
+            if (!syntax_pattern_valid(data[i], ellipsis_id, context))
+                return false;
+        }
+    }
+    return true;
+}
+
+static inline bool syntax_pattern_var_under_ellipsis(unsigned pattern,
+                                                     unsigned literals,
+                                                     int64_t ellipsis_id,
+                                                     bool under_ellipsis,
+                                                     int64_t id)
+{
+    if (!pattern)
+        return false;
+    if (syntax_ellipsis_atom(pattern, ellipsis_id))
+        return false;
+    if (IS_ATOM(pattern)) {
+        if (IS_KEYWORD(pattern, ctx.kw_underscore))
+            return false;
+        FORLIST(lit, literals) {
+            if (IS_ATOM(car(lit)) && CELL_ID(car(lit)) == CELL_ID(pattern))
+                return false;
+        }
+        return under_ellipsis && CELL_ID(pattern) == id;
+    }
+    if (IS_PAIR(pattern)) {
+        unsigned it = pattern;
+        while (IS_PAIR(it)) {
+            unsigned elem = car(it);
+            unsigned rest = cdr(it);
+            bool elem_under_ellipsis =
+                under_ellipsis &&
+                !(IS_PAIR(rest) && syntax_ellipsis_atom(car(rest), ellipsis_id));
+            if (IS_PAIR(rest) && syntax_ellipsis_atom(car(rest), ellipsis_id)) {
+                elem_under_ellipsis = true;
+                it = cdr(rest);
+            } else {
+                it = rest;
+            }
+            if (syntax_pattern_var_under_ellipsis(elem, literals, ellipsis_id,
+                                                  elem_under_ellipsis, id))
+                return true;
+        }
+        return syntax_pattern_var_under_ellipsis(it, literals, ellipsis_id,
+                                                 under_ellipsis, id);
+    }
+    if (IS_VECTOR(pattern)) {
+        unsigned len = vector_len(pattern);
+        unsigned *data = vector_data_ptr(pattern);
+        for (unsigned i = 0; i < len; i++) {
+            if (syntax_ellipsis_atom(data[i], ellipsis_id))
+                continue;
+            bool elem_under_ellipsis =
+                under_ellipsis ||
+                (i + 1 < len && syntax_ellipsis_atom(data[i + 1], ellipsis_id));
+            if (syntax_pattern_var_under_ellipsis(data[i], literals, ellipsis_id,
+                                                  elem_under_ellipsis, id))
+                return true;
+        }
+    }
+    return false;
+}
+
+static inline bool syntax_template_has_ellipsis_var(unsigned tmpl,
+                                                    unsigned pattern,
+                                                    unsigned literals,
+                                                    int64_t ellipsis_id)
+{
+    if (!tmpl || syntax_ellipsis_atom(tmpl, ellipsis_id))
+        return false;
+    if (IS_ATOM(tmpl)) {
+        return syntax_pattern_var_under_ellipsis(
+            pattern, literals, ellipsis_id, false, CELL_ID(tmpl));
+    }
+    if (IS_PAIR(tmpl)) {
+        unsigned it = tmpl;
+        for (; IS_PAIR(it); it = cdr(it)) {
+            if (syntax_template_has_ellipsis_var(car(it), pattern, literals,
+                                                 ellipsis_id))
+                return true;
+        }
+        return syntax_template_has_ellipsis_var(it, pattern, literals,
+                                                ellipsis_id);
+    }
+    if (IS_VECTOR(tmpl)) {
+        unsigned len = vector_len(tmpl);
+        unsigned *data = vector_data_ptr(tmpl);
+        for (unsigned i = 0; i < len; i++) {
+            if (syntax_template_has_ellipsis_var(data[i], pattern, literals,
+                                                 ellipsis_id))
+                return true;
+        }
+    }
+    return false;
+}
+
+static inline bool syntax_template_valid(unsigned tmpl, unsigned pattern,
+                                         unsigned literals,
+                                         int64_t ellipsis_id,
+                                         const char *context)
+{
+    if (syntax_ellipsis_atom(tmpl, ellipsis_id)) {
+        show_error("%s: invalid ellipsis in template", context);
+        return false;
+    }
+    if (IS_PAIR(tmpl)) {
+        unsigned it = tmpl;
+        while (IS_PAIR(it)) {
+            unsigned elem = car(it);
+            unsigned rest = cdr(it);
+            if (syntax_ellipsis_atom(elem, ellipsis_id)) {
+                show_error("%s: invalid ellipsis in template", context);
+                return false;
+            }
+            if (IS_PAIR(rest) && syntax_ellipsis_atom(car(rest), ellipsis_id)) {
+                if (!syntax_template_valid(elem, pattern, literals,
+                                           ellipsis_id, context))
+                    return false;
+                if (!syntax_template_has_ellipsis_var(elem, pattern, literals,
+                                                      ellipsis_id)) {
+                    show_error("%s: invalid ellipsis in template", context);
+                    return false;
+                }
+                it = cdr(rest);
+                continue;
+            }
+            if (!syntax_template_valid(elem, pattern, literals, ellipsis_id,
+                                       context))
+                return false;
+            it = rest;
+        }
+        if (it && !syntax_template_valid(it, pattern, literals, ellipsis_id,
+                                         context))
+            return false;
+    } else if (IS_VECTOR(tmpl)) {
+        unsigned len = vector_len(tmpl);
+        unsigned *data = vector_data_ptr(tmpl);
+        bool saw_ellipsis = false;
+        for (unsigned i = 0; i < len; i++) {
+            if (syntax_ellipsis_atom(data[i], ellipsis_id)) {
+                if (i == 0 || saw_ellipsis) {
+                    show_error("%s: invalid ellipsis in template", context);
+                    return false;
+                }
+                if (!syntax_template_has_ellipsis_var(data[i - 1], pattern,
+                                                      literals, ellipsis_id)) {
+                    show_error("%s: invalid ellipsis in template", context);
+                    return false;
+                }
+                saw_ellipsis = true;
+                continue;
+            }
+            if (!syntax_template_valid(data[i], pattern, literals, ellipsis_id,
+                                       context))
+                return false;
+        }
+    }
+    return true;
+}
+
+static inline bool syntax_rules_valid(unsigned transformer_form,
+                                      int64_t default_ellipsis_id,
+                                      const char *context)
+{
+    if (!is_syntax_rules(transformer_form)) {
+        show_error("%s: expected syntax-rules", context);
+        return false;
+    }
+
+    unsigned len = 0;
+    if (!list_length_checked(cdr(transformer_form), &len, context))
+        return false;
+    if (len < 1) {
+        show_error("%s: invalid syntax-rules", context);
+        return false;
+    }
+
+    unsigned second = cadr(transformer_form);
+    if (IS_ATOM(second) && len < 2) {
+        show_error("%s: invalid syntax-rules", context);
+        return false;
+    }
+    int64_t ellipsis_id = 0;
+    unsigned literals = 0;
+    unsigned rules = 0;
+    syntax_rules_parts(transformer_form, default_ellipsis_id, &ellipsis_id,
+                       &literals, &rules);
+
+    if (!list_length_checked(literals, NULL, context))
+        return false;
+    FORLIST(lit, literals) {
+        if (!IS_ATOM(car(lit))) {
+            show_error("%s: invalid literal", context);
+            return false;
+        }
+    }
+
+    if (!list_length_checked(rules, NULL, context))
+        return false;
+    FORLIST(r, rules) {
+        unsigned rule = car(r);
+        unsigned rule_len = 0;
+        if (!IS_PAIR(rule) || !list_length_checked(rule, &rule_len, context) ||
+            rule_len != 2 || !IS_PAIR(car(rule))) {
+            show_error("%s: invalid syntax rule", context);
+            return false;
+        }
+        unsigned pattern = cdr(car(rule));
+        unsigned tmpl = cadr(rule);
+        if (!syntax_pattern_valid(pattern, ellipsis_id, context) ||
+            !syntax_template_valid(tmpl, pattern, literals, ellipsis_id,
+                                   context))
+            return false;
+    }
+
+    return true;
 }
 
 // Check if a keyword is shadowed by a local binding
@@ -93,30 +382,14 @@ static inline void eval_seq(unsigned data, enum cont_type cont_type,
 // Create a syntax transformer from a syntax-rules form
 // Handles: (syntax-rules (<literal> ...) <rule> ...)
 //      or: (syntax-rules <ellipsis> (<literal> ...) <rule> ...)
-static inline unsigned make_syntax_transformer(unsigned transformer_form,
-                                               unsigned closure_env)
+static inline unsigned make_syntax_transformer_with_default_ellipsis(
+    unsigned transformer_form, unsigned closure_env, int64_t default_ellipsis_id)
 {
-    unsigned second = cadr(transformer_form);
     int64_t ellipsis_id = 0; // 0 means no ellipsis (disabled/shadowed)
-    unsigned literals, rules;
-
-    // Check for custom ellipsis: (syntax-rules <ellipsis> (<literal> ...) ...)
-    if (IS_ATOM(second) && !IS_PAIR(second)) {
-        // Custom ellipsis specified - get its symbol ID
-        ellipsis_id = CELL_ID(second);
-        literals = caddr(transformer_form);
-        rules = cdddr(transformer_form);
-    } else {
-        // Standard form: (syntax-rules (<literal> ...) ...)
-        literals = second;
-        rules = cddr(transformer_form);
-        // Check if default ellipsis (...) is shadowed in closure_env
-        if (lookup_silent(ctx.kw_ellipsis, closure_env) == TOK_ERROR) {
-            // Not shadowed, use default ellipsis
-            ellipsis_id = ctx.kw_ellipsis;
-        }
-        // If shadowed, ellipsis_id stays 0 (no ellipsis)
-    }
+    unsigned literals = 0;
+    unsigned rules = 0;
+    syntax_rules_parts(transformer_form, default_ellipsis_id, &ellipsis_id,
+                       &literals, &rules);
 
     gc_protect(&closure_env);
     gc_protect(&literals);
@@ -128,7 +401,9 @@ static inline unsigned make_syntax_transformer(unsigned transformer_form,
     unsigned compiled_tail = 0;
     gc_protect(&compiled_tail);
 
-    for (unsigned r = rules; r; r = cdr(r)) {
+    unsigned r = rules;
+    gc_protect(&r);
+    while (r) {
         unsigned rule = car(r);
         unsigned pattern = car(rule);
         unsigned tmpl = cadr(rule);
@@ -139,6 +414,13 @@ static inline unsigned make_syntax_transformer(unsigned transformer_form,
 
         // Compile the pattern
         compiled_pattern *cpat = compile_pattern(pattern, literals, ellipsis_id);
+        if (!cpat) {
+            show_error("syntax-rules: out of memory");
+            gc_unprotect(6);
+            return TOK_ERROR;
+        }
+
+        gc_protect(&tmpl);
 
         // Create a cell to hold the compiled pattern pointer
         unsigned cpat_cell = alloc();
@@ -147,10 +429,10 @@ static inline unsigned make_syntax_transformer(unsigned transformer_form,
 
         // Build compiled rule: (cpat_cell . template)
         gc_protect(&cpat_cell);
-        gc_protect(&tmpl);
         unsigned new_rule = alloc_cons(cpat_cell, tmpl);
+        gc_protect(&new_rule);
         unsigned new_node = alloc_cons(new_rule, 0);
-        gc_unprotect(2);
+        gc_unprotect(3);
 
         if (!compiled_rules) {
             compiled_rules = new_node;
@@ -159,16 +441,28 @@ static inline unsigned make_syntax_transformer(unsigned transformer_form,
             cell_set_cdr(compiled_tail, new_node);
             compiled_tail = new_node;
         }
+        r = cdr(r);
     }
+    gc_unprotect(1);
 
     // Store ellipsis_id as a number cell
     unsigned ellipsis_cell = store(ellipsis_id);
+    gc_protect(&ellipsis_cell);
     // Store: (ellipsis_cell . (literals . compiled_rules))
     unsigned lit_rules = alloc_cons(literals, compiled_rules);
+    gc_protect(&lit_rules);
     unsigned car_val = alloc_cons(ellipsis_cell, lit_rules);
+    gc_protect(&car_val);
     unsigned result = make_typed_cell(BT_SYNTAX, car_val, closure_env);
-    gc_unprotect(5);
+    gc_unprotect(8);
     return result;
+}
+
+static inline unsigned make_syntax_transformer(unsigned transformer_form,
+                                               unsigned closure_env)
+{
+    return make_syntax_transformer_with_default_ellipsis(
+        transformer_form, closure_env, syntax_default_ellipsis_id(closure_env));
 }
 
 // Bind syntax transformers from a list of bindings
@@ -176,21 +470,33 @@ static inline unsigned make_syntax_transformer(unsigned transformer_form,
 static inline bool bind_syntax_rules(unsigned bindings, unsigned def_env,
                                      unsigned closure_env, const char *context)
 {
-    for (unsigned b = bindings; b; b = cdr(b)) {
-        gc_protect(&b);
+    unsigned b = bindings;
+    gc_protect(&b);
+    while (b) {
         unsigned binding = car(b);
         unsigned name = car(binding);
         unsigned transformer_form = cadr(binding);
-        if (!is_syntax_rules(transformer_form)) {
+        if (!syntax_rules_valid(transformer_form,
+                                syntax_default_ellipsis_id(closure_env),
+                                context)) {
             gc_unprotect(1);
-            show_error("%s: expected syntax-rules", context);
             tramp_error();
             return false;
         }
+        gc_protect(&name);
+        gc_protect(&def_env);
         unsigned p = make_syntax_transformer(transformer_form, closure_env);
+        if (p == TOK_ERROR) {
+            gc_unprotect(3);
+            tramp_error();
+            return false;
+        }
+        gc_protect(&p);
         defvar(name, p, def_env);
-        gc_unprotect(1);
+        gc_unprotect(3);
+        b = cdr(b);
     }
+    gc_unprotect(1);
     return true;
 }
 

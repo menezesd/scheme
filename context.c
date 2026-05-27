@@ -28,6 +28,7 @@
 #include "bytecode.h"
 #include "compiled_pattern.h"
 #include "env.h"
+#include "reader.h"
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
@@ -126,7 +127,10 @@ static bool in_gc_mode = false;
 // Forward declaration for generational GC
 unsigned minor_gc(unsigned root);
 
-void set_alloc_gc_root(unsigned *root) { alloc_gc_root = root; }
+void set_alloc_gc_root(unsigned *root)
+{
+    alloc_gc_root = root;
+}
 
 // Shadow stack for GC roots - protects local C variables during allocation
 // When GC runs, these are collected and updated in place
@@ -183,9 +187,15 @@ void gc_unprotect(int count)
     }
 }
 
-int gc_mark(void) { return shadow_stack_top; }
+int gc_mark(void)
+{
+    return shadow_stack_top;
+}
 
-int get_shadow_stack_top(void) { return shadow_stack_top; }
+int get_shadow_stack_top(void)
+{
+    return shadow_stack_top;
+}
 
 void gc_release(int mark)
 {
@@ -334,16 +344,18 @@ unsigned store_bignum(bignum *bn)
 
 bignum *get_bignum(unsigned x)
 {
-    if (CELL_TYPE(x) != BT_BIGNUM)
+    if (!IS_CELL(x) || CELL_TYPE(x) != BT_BIGNUM)
         return NULL;
     return (bignum *)CELL_PTR(x);
 }
 
 bignum *to_bignum(unsigned x)
 {
-    if (CELL_TYPE(x) == BT_NUM) {
+    if (IS_FIXNUM(x)) {
+        return bn_from_int(FIXNUM_VALUE(x));
+    } else if (IS_NUM(x)) {
         return bn_from_int(CELL_ID(x));
-    } else if (CELL_TYPE(x) == BT_BIGNUM) {
+    } else if (IS_BIGNUM(x)) {
         bignum *bn = get_bignum(x);
         if (!bn) {
             // This shouldn't happen - indicates GC corruption
@@ -374,6 +386,58 @@ void free_bignum_cell(unsigned x)
         if (bn)
             bn_free(bn);
         CELL_ID(x) = 0;
+    }
+}
+
+static void free_external_cell_data(unsigned x)
+{
+    if (CELL_TYPE(x) == BT_BIGNUM) {
+        free_bignum_cell(x);
+    } else if (CELL_TYPE(x) == BT_VECTOR) {
+        vector_data *vd = (vector_data *)CELL_PTR(x);
+        if (vd)
+            free(vd);
+        CELL_PTR(x) = NULL;
+    } else if (CELL_TYPE(x) == BT_STRING || CELL_TYPE(x) == BT_BYTEVEC) {
+        if (CELL_PTR(x))
+            free(CELL_PTR(x));
+        CELL_PTR(x) = NULL;
+    } else if (CELL_TYPE(x) == BT_STRINPORT ||
+               CELL_TYPE(x) == BT_STROUTPORT) {
+        string_port *sp = (string_port *)CELL_PTR(x);
+        if (sp) {
+            free(sp->data);
+            free(sp);
+        }
+        CELL_PTR(x) = NULL;
+    } else if (CELL_TYPE(x) == BT_INPORT || CELL_TYPE(x) == BT_OUTPORT) {
+        FILE *f = (FILE *)CELL_PTR(x);
+        if (f && f != stdin && f != stdout && f != ctx.current_input &&
+            f != ctx.current_output) {
+            reader_forget_port(f);
+            fclose(f);
+        }
+        CELL_PTR(x) = NULL;
+    } else if (CELL_TYPE(x) == BT_VMCONT) {
+        if (CELL_PTR(x))
+            free(CELL_PTR(x));
+        CELL_PTR(x) = NULL;
+    }
+}
+
+static void collect_vm_continuation_roots(vm_continuation *cont,
+                                          unsigned (*collector)(unsigned))
+{
+    for (unsigned i = 0; i < cont->sp; i++) {
+        cont->stack[i] = collector(cont->stack[i]);
+    }
+    cont->env = collector(cont->env);
+    for (unsigned i = 0; i < cont->fp; i++) {
+        cont->frames[i].env = collector(cont->frames[i].env);
+    }
+    cont->letrec_frame = collector(cont->letrec_frame);
+    for (unsigned i = 0; i < cont->letrec_saved_len; i++) {
+        cont->letrec_saved[i] = collector(cont->letrec_saved[i]);
     }
 }
 
@@ -450,6 +514,10 @@ unsigned store_rational(int64_t num, int64_t denom)
 
 bool is_negative_number(unsigned x)
 {
+    if (IS_FIXNUM(x))
+        return FIXNUM_VALUE(x) < 0;
+    if (!IS_CELL(x))
+        return false;
     switch (CELL_TYPE(x)) {
     case BT_NUM:
         return CELL_ID(x) < 0;
@@ -462,6 +530,14 @@ bool is_negative_number(unsigned x)
 
 unsigned negate_number(unsigned x)
 {
+    if (IS_FIXNUM(x)) {
+        int32_t val = FIXNUM_VALUE(x);
+        if (val == FIXNUM_MIN)
+            return store(-(int64_t)val);
+        return MAKE_FIXNUM(-val);
+    }
+    if (!IS_CELL(x))
+        return x;
     switch (CELL_TYPE(x)) {
     case BT_NUM: {
         int64_t val = CELL_ID(x);
@@ -556,7 +632,10 @@ unsigned normalize_rational_cells(unsigned num_cell, unsigned denom_cell)
 unsigned store_complex(unsigned real_part, unsigned imag_part)
 {
     // If imaginary part is zero, return just the real part
-    if (CELL_TYPE(imag_part) == BT_NUM && CELL_ID(imag_part) == 0) {
+    if (IS_FIXNUM(imag_part) && FIXNUM_VALUE(imag_part) == 0) {
+        return real_part;
+    }
+    if (IS_NUM(imag_part) && CELL_ID(imag_part) == 0) {
         return real_part;
     }
     GC_PROTECT_GUARD2(&real_part, &imag_part);
@@ -570,6 +649,10 @@ unsigned store_complex(unsigned real_part, unsigned imag_part)
 double to_double(unsigned x)
 {
     if (x == 0)
+        return 0.0;
+    if (IS_FIXNUM(x))
+        return (double)FIXNUM_VALUE(x);
+    if (!IS_CELL(x))
         return 0.0;
     switch (CELL_TYPE(x)) {
     case BT_NUM:
@@ -614,15 +697,35 @@ bool is_numeric(unsigned x)
 {
     if (x == 0)
         return false;
+    if (IS_FIXNUM(x))
+        return true;
+    if (!IS_CELL(x))
+        return false;
     enum lisp_type t = CELL_TYPE(x);
     return t == BT_NUM || t == BT_BIGNUM || t == BT_INEXACT ||
            t == BT_RATIONAL || t == BT_COMPLEX;
 }
 
+static unsigned parse_real_number_slice(const char *start, size_t len)
+{
+    char *slice = strndup(start, len);
+    if (!slice) {
+        show_error("out of memory");
+        return TOK_ERROR;
+    }
+    unsigned parsed = atom_from_string(slice);
+    free(slice);
+    return is_numeric(parsed) && !IS_COMPLEX(parsed) ? parsed : TOK_ERROR;
+}
+
 bool is_exact(unsigned x)
 {
     if (x == 0)
-        return true; // 0 is exact
+        return false;
+    if (IS_FIXNUM(x))
+        return true;
+    if (!IS_CELL(x))
+        return false;
     switch (CELL_TYPE(x)) {
     case BT_NUM:
     case BT_BIGNUM:
@@ -655,11 +758,14 @@ unsigned make_vector(unsigned len, unsigned fill)
     gc_protect(&fill);
 
     if ((size_t)len > (SIZE_MAX - sizeof(vector_data)) / sizeof(unsigned)) {
-        lisp_panic("vector too large");
+        show_error("make-vector: length too large");
+        return TOK_ERROR;
     }
-    vector_data *vd = malloc(sizeof(vector_data) + len * sizeof(unsigned));
+    vector_data *vd =
+        malloc(sizeof(vector_data) + (size_t)len * sizeof(unsigned));
     if (!vd) {
-        lisp_panic("failed to allocate vector");
+        show_error("make-vector: out of memory");
+        return TOK_ERROR;
     }
     vd->len = len;
 
@@ -737,7 +843,10 @@ unsigned make_cont_from_protected(enum cont_type type, unsigned *data_ptr,
     return p;
 }
 
-unsigned make_halt_cont(void) { return make_cont(CONT_HALT, 0, 0, 0); }
+unsigned make_halt_cont(void)
+{
+    return make_cont(CONT_HALT, 0, 0, 0);
+}
 
 // ============================================================================
 // Atom/String Interning
@@ -754,7 +863,10 @@ static int hash_with_cap(const char *s, unsigned cap)
     return (int)(h % cap);
 }
 
-int hash_function(const char *s) { return hash_with_cap(s, ctx.atom_table_cap); }
+int hash_function(const char *s)
+{
+    return hash_with_cap(s, ctx.atom_table_cap);
+}
 
 static bool str_equals(const char *a, const char *b)
 {
@@ -827,10 +939,6 @@ static void rehash_atom_table(void)
         return;
     }
     unsigned new_cap = next_prime(old_cap * 2);
-    if ((size_t)new_cap > SIZE_MAX / sizeof(const char *)) {
-        fprintf(stderr, "Warning: atom table too large to resize\n");
-        return;
-    }
 
     const char **new_table = calloc(new_cap, sizeof(const char *));
     if (!new_table) {
@@ -924,10 +1032,18 @@ unsigned atom_from_string(const char *s)
 
     // Check for pure imaginary: +i, -i (but not bare "i" - that's a symbol)
     if (strcmp(s, "+i") == 0) {
-        return store_complex(store(0), store(1));
+        GC_GUARD;
+        unsigned real_part = store(0);
+        gc_protect(&real_part);
+        unsigned imag_part = store(1);
+        return store_complex(real_part, imag_part);
     }
     if (strcmp(s, "-i") == 0) {
-        return store_complex(store(0), store(-1));
+        GC_GUARD;
+        unsigned real_part = store(0);
+        gc_protect(&real_part);
+        unsigned imag_part = store(-1);
+        return store_complex(real_part, imag_part);
     }
 
     // Check if the string might be a number
@@ -952,42 +1068,36 @@ unsigned atom_from_string(const char *s)
                 }
             }
             if (sep) {
-                // Parse real part directly using strtod (avoids strndup)
-                double real_val = strtod(s, &endptr);
                 unsigned real_part =
-                    (endptr == sep) ? store_inexact(real_val) : store(0);
+                    parse_real_number_slice(s, (size_t)(sep - s));
+                if (real_part == TOK_ERROR)
+                    goto not_rational;
 
-                // Parse imaginary part (without the trailing i)
                 unsigned imag_part;
                 {
                     GC_PROTECT_GUARD;
                     gc_protect(&real_part);
-                    double imag_val = strtod(sep, &endptr);
-                    imag_part = store_inexact(imag_val);
+                    if ((sep[1] == 'i' || sep[1] == 'I') && sep[2] == '\0') {
+                        imag_part = store(*sep == '-' ? -1 : 1);
+                    } else {
+                        imag_part =
+                            parse_real_number_slice(
+                                sep, (size_t)(s + n - 1 - sep));
+                        if (imag_part == TOK_ERROR)
+                            goto not_rational;
+                    }
                 }
 
                 return store_complex(real_part, imag_part);
             }
-            // Pure imaginary: 5i, 3.14i, etc. - parse without trailing 'i'
-            double imag_val = strtod(s, &endptr);
-            // Check that we parsed up to the 'i'
-            if (endptr == s + n - 1) {
-                return store_complex(store(0), store_inexact(imag_val));
+            // Pure imaginary: 5i, 3.14i, 3/4i, etc.
+            unsigned imag_part = parse_real_number_slice(s, n - 1);
+            if (imag_part != TOK_ERROR) {
+                GC_GUARD;
+                unsigned real_part = store(0);
+                gc_protect(&real_part);
+                return store_complex(real_part, imag_part);
             }
-            // Fallback for integers: try strtoll
-            int64_t imag_int = strtoll(s, &endptr, 10);
-            if (endptr == s + n - 1) {
-                return store_complex(store(0), store(imag_int));
-            }
-            // Last resort: use recursive parsing with temp string
-            char *imag_str = strndup(s, n - 1);
-            if (!imag_str) {
-                show_error("out of memory");
-                return TOK_ERROR;
-            }
-            unsigned imag_part = atom_from_string(imag_str);
-            free(imag_str);
-            return store_complex(store(0), imag_part);
         }
 
         // Try parsing as integer first
@@ -1131,7 +1241,7 @@ unsigned atom_from_string(const char *s)
 unsigned list_length(unsigned lst)
 {
     unsigned len = 0;
-    while (lst && CELL_TYPE(lst) == BT_CONS) {
+    while (IS_PAIR(lst)) {
         len++;
         lst = cdr(lst);
     }
@@ -1140,16 +1250,127 @@ unsigned list_length(unsigned lst)
 
 bool list_length_checked(unsigned lst, unsigned *len_out, const char *name)
 {
-    unsigned len = 0;
-    for (unsigned it = lst; it; it = cdr(it)) {
-        if (!IS_PAIR(it)) {
-            show_error("%s: improper list", name);
+    unsigned slow = lst;
+    unsigned fast = lst;
+    while (IS_PAIR(fast)) {
+        fast = cdr(fast);
+        if (!IS_PAIR(fast))
+            break;
+        fast = cdr(fast);
+        slow = cdr(slow);
+        if (slow == fast) {
+            show_error("%s: circular list", name);
             return false;
         }
+    }
+    if (fast) {
+        show_error("%s: improper list", name);
+        return false;
+    }
+
+    unsigned len = 0;
+    for (unsigned it = lst; it; it = cdr(it)) {
         len++;
     }
     if (len_out)
         *len_out = len;
+    return true;
+}
+
+bool syntax_arity_checked(unsigned form, unsigned min_args, unsigned max_args,
+                          const char *name)
+{
+    unsigned len = 0;
+    if (!list_length_checked(cdr(form), &len, name))
+        return false;
+    if (len < min_args || (max_args != UINT_MAX && len > max_args)) {
+        show_error("%s: invalid syntax", name);
+        return false;
+    }
+    return true;
+}
+
+bool lambda_params_valid(unsigned params)
+{
+    GC_GUARD;
+    if (IS_ATOM(params))
+        return true;
+
+    unsigned seen = 0;
+    gc_protect(&seen);
+    while (params) {
+        if (IS_ATOM(params)) {
+            FORLIST(p, seen) {
+                if (CELL_ID(car(p)) == CELL_ID(params)) {
+                    gc_unprotect(1);
+                    return false;
+                }
+            }
+            gc_unprotect(1);
+            return true;
+        }
+        if (!IS_PAIR(params)) {
+            gc_unprotect(1);
+            return false;
+        }
+        unsigned param = car(params);
+        if (!IS_ATOM(param)) {
+            gc_unprotect(1);
+            return false;
+        }
+        FORLIST(p, seen) {
+            if (CELL_ID(car(p)) == CELL_ID(param)) {
+                gc_unprotect(1);
+                return false;
+            }
+        }
+        seen = alloc_cons(param, seen);
+        params = cdr(params);
+    }
+    gc_unprotect(1);
+    return true;
+}
+
+bool binding_list_valid(unsigned bindings, const char *name)
+{
+    if (!list_length_checked(bindings, NULL, name))
+        return false;
+    FORLIST(b, bindings) {
+        unsigned binding = car(b);
+        unsigned len = 0;
+        if (!IS_PAIR(binding) ||
+            !list_length_checked(binding, &len, name) || len != 2 ||
+            !IS_ATOM(car(binding))) {
+            show_error("%s: invalid binding syntax", name);
+            return false;
+        }
+    }
+    return true;
+}
+
+bool cond_clauses_valid(unsigned clauses, const char *name)
+{
+    if (!list_length_checked(clauses, NULL, name))
+        return false;
+    FORLIST(c, clauses) {
+        unsigned clause = car(c);
+        unsigned len = 0;
+        if (!IS_PAIR(clause) ||
+            !list_length_checked(clause, &len, name) || len == 0) {
+            show_error("%s: invalid clause syntax", name);
+            return false;
+        }
+        unsigned test = car(clause);
+        unsigned conseq = cdr(clause);
+        if (IS_KEYWORD(test, ctx.kw_else) && cdr(c)) {
+            show_error("%s: else clause must be last", name);
+            return false;
+        }
+        if (conseq && IS_KEYWORD(car(conseq), ctx.kw_arrow) && len != 3) {
+            show_error("%s: invalid => clause", name);
+            return false;
+        }
+    }
     return true;
 }
 
@@ -1161,7 +1382,7 @@ bool check_args(unsigned args, unsigned min, unsigned max, const char *name)
     unsigned len = 0;
     unsigned a = args;
 
-    while (a && CELL_TYPE(a) == BT_CONS && len < limit) {
+    while (IS_PAIR(a) && len < limit) {
         len++;
         a = cdr(a);
     }
@@ -1173,7 +1394,7 @@ bool check_args(unsigned args, unsigned min, unsigned max, const char *name)
     }
 
     // If max is bounded and we counted more than max, or there are still more
-    if (max != (unsigned)-1 && (len > max || (a && CELL_TYPE(a) == BT_CONS))) {
+    if (max != (unsigned)-1 && (len > max || IS_PAIR(a))) {
         show_error("%s: too many arguments (expected at most %u)", name, max);
         return false;
     }
@@ -1203,12 +1424,60 @@ void list_append(unsigned *head, unsigned *tail, unsigned elem)
     }
 }
 
-bool deep_equal(unsigned a, unsigned b)
+typedef struct {
+    unsigned a;
+    unsigned b;
+} equal_seen_pair;
+
+typedef struct {
+    equal_seen_pair *items;
+    size_t len;
+    size_t cap;
+} equal_seen_set;
+
+static bool deep_equal_seen(unsigned a, unsigned b, equal_seen_set *seen);
+
+static bool equal_seen_contains(equal_seen_set *seen, unsigned a, unsigned b)
+{
+    for (size_t i = 0; i < seen->len; i++) {
+        if (seen->items[i].a == a && seen->items[i].b == b)
+            return true;
+    }
+    return false;
+}
+
+static bool equal_seen_add(equal_seen_set *seen, unsigned a, unsigned b)
+{
+    if (seen->len == seen->cap) {
+        size_t new_cap = seen->cap ? seen->cap * 2 : 16;
+        if (new_cap < seen->cap ||
+            new_cap > SIZE_MAX / sizeof(*seen->items))
+            return false;
+        equal_seen_pair *new_items =
+            realloc(seen->items, new_cap * sizeof(*seen->items));
+        if (!new_items)
+            return false;
+        seen->items = new_items;
+        seen->cap = new_cap;
+    }
+    seen->items[seen->len++] = (equal_seen_pair){a, b};
+    return true;
+}
+
+static bool deep_equal_seen(unsigned a, unsigned b, equal_seen_set *seen)
 {
     if (a == b)
         return true;
     if (a == 0 || b == 0)
         return a == b;
+    if (IS_FIXNUM(a)) {
+        return IS_NUM(b) && CELL_ID(b) == (int64_t)FIXNUM_VALUE(a);
+    }
+    if (IS_FIXNUM(b)) {
+        return IS_NUM(a) && CELL_ID(a) == (int64_t)FIXNUM_VALUE(b);
+    }
+    if (!IS_CELL(a) || !IS_CELL(b))
+        return false;
     if (CELL_TYPE(a) != CELL_TYPE(b))
         return false;
 
@@ -1225,20 +1494,34 @@ bool deep_equal(unsigned a, unsigned b)
     }
     case BT_RATIONAL:
     case BT_COMPLEX:
-        return deep_equal(car(a), car(b)) && deep_equal(cdr(a), cdr(b));
+        if (equal_seen_contains(seen, a, b))
+            return true;
+        if (!equal_seen_add(seen, a, b))
+            return false;
+        return deep_equal_seen(car(a), car(b), seen) &&
+               deep_equal_seen(cdr(a), cdr(b), seen);
     case BT_STRING:
         return strcmp(GET_STRING_PTR(a), GET_STRING_PTR(b)) == 0;
     case BT_CONS:
-        return deep_equal(car(a), car(b)) && deep_equal(cdr(a), cdr(b));
+        if (equal_seen_contains(seen, a, b))
+            return true;
+        if (!equal_seen_add(seen, a, b))
+            return false;
+        return deep_equal_seen(car(a), car(b), seen) &&
+               deep_equal_seen(cdr(a), cdr(b), seen);
     case BT_VECTOR: {
         unsigned len_a = vector_len(a);
         unsigned len_b = vector_len(b);
         if (len_a != len_b)
             return false;
+        if (equal_seen_contains(seen, a, b))
+            return true;
+        if (!equal_seen_add(seen, a, b))
+            return false;
         unsigned *da = vector_data_ptr(a);
         unsigned *db = vector_data_ptr(b);
         for (unsigned i = 0; i < len_a; i++) {
-            if (!deep_equal(da[i], db[i]))
+            if (!deep_equal_seen(da[i], db[i], seen))
                 return false;
         }
         return true;
@@ -1246,6 +1529,14 @@ bool deep_equal(unsigned a, unsigned b)
     default:
         return false;
     }
+}
+
+bool deep_equal(unsigned a, unsigned b)
+{
+    equal_seen_set seen = {0};
+    bool result = deep_equal_seen(a, b, &seen);
+    free(seen.items);
+    return result;
 }
 
 // ============================================================================
@@ -1337,24 +1628,13 @@ unsigned collect(unsigned x)
 
     case BT_VMCONT: {
         // VM continuation contains cell references that must be updated.
-        // The vm_continuation struct has stack values, env, and frame envs.
         unsigned xx = alloc();
         CELL_TYPE(xx) = BT_VMCONT;
         CELL_PTR(xx) = CELL_PTR(x);
         CELL_TYPE(x) = BT_BROKENHEART;
         CELL_CAR(x) = xx;
-        // Now update all cell references in the continuation
-        vm_continuation *cont = (vm_continuation *)CELL_PTR(xx);
-        // Update stack values
-        for (unsigned i = 0; i < cont->sp; i++) {
-            cont->stack[i] = collect(cont->stack[i]);
-        }
-        // Update environment
-        cont->env = collect(cont->env);
-        // Update frame environments
-        for (unsigned i = 0; i < cont->fp; i++) {
-            cont->frames[i].env = collect(cont->frames[i].env);
-        }
+        collect_vm_continuation_roots((vm_continuation *)CELL_PTR(xx),
+                                      collect);
         return xx;
     }
 
@@ -1400,6 +1680,9 @@ unsigned gc(unsigned root)
     tramp.env = collect(tramp.env);
     tramp.cont = collect(tramp.cont);
     tramp.value = collect(tramp.value);
+    ctx.current_input_cell = collect(ctx.current_input_cell);
+    ctx.current_output_cell = collect(ctx.current_output_cell);
+    reader_update_datum_labels(collect);
 
     // Collect shadow stack entries - these are pointers to local C variables
     // that hold cell IDs. After GC, we update them to point to new locations.
@@ -1458,26 +1741,7 @@ unsigned gc(unsigned root)
     unsigned old_end =
         (ctx.nmin < SEMISPACE_SIZE) ? SEMISPACE_SIZE : 2 * SEMISPACE_SIZE;
     for (unsigned i = old_start; i < old_end; i++) {
-        if (CELL_TYPE(i) == BT_BIGNUM) {
-            free_bignum_cell(i);
-        } else if (CELL_TYPE(i) == BT_VECTOR) {
-            vector_data *vd = (vector_data *)CELL_PTR(i);
-            if (vd)
-                free(vd);
-            CELL_PTR(i) = NULL;
-        } else if (CELL_TYPE(i) == BT_STRING || CELL_TYPE(i) == BT_BYTEVEC) {
-            if (CELL_PTR(i))
-                free(CELL_PTR(i));
-            CELL_PTR(i) = NULL;
-        } else if (CELL_TYPE(i) == BT_STRINPORT ||
-                   CELL_TYPE(i) == BT_STROUTPORT) {
-            string_port *sp = (string_port *)CELL_PTR(i);
-            if (sp) {
-                free(sp->data);
-                free(sp);
-            }
-            CELL_PTR(i) = NULL;
-        }
+        free_external_cell_data(i);
         CELL_TYPE(i) = BT_FREE;
     }
 
@@ -1631,15 +1895,8 @@ unsigned collect_to_old(unsigned x)
         CELL_PTR(xx) = CELL_PTR(x);
         CELL_TYPE(x) = BT_BROKENHEART;
         CELL_CAR(x) = xx;
-        // Update all cell references in the continuation
-        vm_continuation *cont = (vm_continuation *)CELL_PTR(xx);
-        for (unsigned i = 0; i < cont->sp; i++) {
-            cont->stack[i] = collect_to_old(cont->stack[i]);
-        }
-        cont->env = collect_to_old(cont->env);
-        for (unsigned i = 0; i < cont->fp; i++) {
-            cont->frames[i].env = collect_to_old(cont->frames[i].env);
-        }
+        collect_vm_continuation_roots((vm_continuation *)CELL_PTR(xx),
+                                      collect_to_old);
         return xx;
     }
 
@@ -1669,6 +1926,9 @@ unsigned minor_gc(unsigned root)
     tramp.env = collect_to_old(tramp.env);
     tramp.cont = collect_to_old(tramp.cont);
     tramp.value = collect_to_old(tramp.value);
+    ctx.current_input_cell = collect_to_old(ctx.current_input_cell);
+    ctx.current_output_cell = collect_to_old(ctx.current_output_cell);
+    reader_update_datum_labels(collect_to_old);
 
     // Collect shadow stack entries
     for (int i = 0; i < shadow_stack_top; i++) {
@@ -1679,21 +1939,7 @@ unsigned minor_gc(unsigned root)
     minor_gc_update_active_pattern_state();
 
     // Update VM roots if VM is active
-    {
-        vm_state *vm = get_active_vm();
-        if (vm) {
-            // Update stack values
-            for (unsigned i = 0; i < vm->sp; i++) {
-                vm->stack[i] = collect_to_old(vm->stack[i]);
-            }
-            // Update frame environments
-            for (unsigned i = 0; i < vm->fp; i++) {
-                vm->frames[i].env = collect_to_old(vm->frames[i].env);
-            }
-            // Update current environment
-            vm->env = collect_to_old(vm->env);
-        }
-    }
+    gc_update_vm_roots_minor(get_active_vm(), collect_to_old);
 
     // Update code object constants - they may point to nursery cells
     for (code_object *code = code_object_registry; code; code = code->gc_next) {
@@ -1736,15 +1982,8 @@ unsigned minor_gc(unsigned root)
                     }
                 } else if (t == BT_VMCONT) {
                     // VM continuation: update cell references inside struct
-                    vm_continuation *cont = (vm_continuation *)CELL_PTR(cell);
-                    for (unsigned j = 0; j < cont->sp; j++) {
-                        cont->stack[j] = collect_to_old(cont->stack[j]);
-                    }
-                    cont->env = collect_to_old(cont->env);
-                    for (unsigned j = 0; j < cont->fp; j++) {
-                        cont->frames[j].env =
-                            collect_to_old(cont->frames[j].env);
-                    }
+                    collect_vm_continuation_roots(
+                        (vm_continuation *)CELL_PTR(cell), collect_to_old);
                 }
             }
             // Clear the card
@@ -1766,6 +2005,15 @@ unsigned minor_gc(unsigned root)
             // the cell was promoted - no need to scan again
         }
         scan++;
+    }
+
+    // Free external data for unreachable nursery cells. Promoted cells were
+    // rewritten as BT_BROKENHEART, so they are skipped here.
+    unsigned nursery_end =
+        (ctx.mmin < SEMISPACE_SIZE) ? SEMISPACE_SIZE : 2 * SEMISPACE_SIZE;
+    for (unsigned i = ctx.nursery_start; i < nursery_end; i++) {
+        free_external_cell_data(i);
+        CELL_TYPE(i) = BT_FREE;
     }
 
     // Reset nursery - all survivors are now in old gen

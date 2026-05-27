@@ -78,6 +78,12 @@ static void bn_ensure_cap(bignum *b, size_t cap)
     b->cap = new_cap;
 }
 
+static void bn_abort_oom(void)
+{
+    fprintf(stderr, "bignum: out of memory\n");
+    abort();
+}
+
 // Remove leading zeros
 static void bn_normalize(bignum *b)
 {
@@ -93,7 +99,10 @@ static void bn_normalize(bignum *b)
 // Creation and Destruction
 // ============================================================================
 
-bignum *bn_new(void) { return bn_alloc(4); }
+bignum *bn_new(void)
+{
+    return bn_alloc(4);
+}
 
 bignum *bn_from_int(int64_t val)
 {
@@ -286,9 +295,11 @@ static char *bn_to_string_simple(const bignum *a, int base)
     if (a->len > SIZE_MAX / LIMB_BITS) {
         return NULL;  // Number too large to convert to string
     }
-    // Estimate size: log_base(2^(len*LIMB_BITS)) + sign + null
-    size_t est_digits = (a->len * LIMB_BITS) / 3 + 3;
-    char *buf = malloc(est_digits);
+    // Worst case is base 2: one digit per bit, plus sign and NUL.
+    size_t max_digits = a->len * LIMB_BITS;
+    if (max_digits > SIZE_MAX - 2)
+        return NULL;
+    char *buf = malloc(max_digits + 2);
     if (!buf)
         return NULL;
 
@@ -516,7 +527,10 @@ int bn_cmp(const bignum *a, const bignum *b)
     return a->sign ? -cmp : cmp;
 }
 
-bool bn_is_zero(const bignum *a) { return a->len == 0; }
+bool bn_is_zero(const bignum *a)
+{
+    return a->len == 0;
+}
 
 int bn_sign(const bignum *a)
 {
@@ -689,6 +703,8 @@ static void bn_split(const bignum *a, size_t k, bignum **low, bignum **high)
 {
     *low = bn_alloc(k > a->len ? a->len : k);
     *high = bn_alloc(a->len > k ? a->len - k : 1);
+    if (!*low || !*high)
+        bn_abort_oom();
 
     size_t low_len = k < a->len ? k : a->len;
     memcpy((*low)->limbs, a->limbs, low_len * sizeof(limb_t));
@@ -789,6 +805,8 @@ static void bn_split3(const bignum *a, size_t k, bignum **p0, bignum **p1,
 {
     // p0 = a mod B^k (lowest k limbs)
     *p0 = bn_alloc(k > a->len ? a->len : k);
+    if (!*p0)
+        bn_abort_oom();
     size_t p0_len = k < a->len ? k : a->len;
     memcpy((*p0)->limbs, a->limbs, p0_len * sizeof(limb_t));
     (*p0)->len = p0_len;
@@ -796,6 +814,8 @@ static void bn_split3(const bignum *a, size_t k, bignum **p0, bignum **p1,
 
     // p1 = (a / B^k) mod B^k (middle k limbs)
     *p1 = bn_alloc(k);
+    if (!*p1)
+        bn_abort_oom();
     if (a->len > k) {
         size_t p1_len = (a->len - k) < k ? (a->len - k) : k;
         memcpy((*p1)->limbs, a->limbs + k, p1_len * sizeof(limb_t));
@@ -805,6 +825,8 @@ static void bn_split3(const bignum *a, size_t k, bignum **p0, bignum **p1,
 
     // p2 = a / B^(2k) (highest limbs)
     *p2 = bn_alloc(a->len > 2 * k ? a->len - 2 * k : 1);
+    if (!*p2)
+        bn_abort_oom();
     if (a->len > 2 * k) {
         memcpy((*p2)->limbs, a->limbs + 2 * k, (a->len - 2 * k) * sizeof(limb_t));
         (*p2)->len = a->len - 2 * k;
@@ -1323,18 +1345,31 @@ bignum *bn_pow(const bignum *base, uint64_t exp)
 
     bignum *result = bn_from_int(1);
     bignum *b = bn_copy(base);
+    if (!result || !b) {
+        bn_free(result);
+        bn_free(b);
+        return NULL;
+    }
 
     while (exp > 0) {
         if (exp & 1) {
             bignum *tmp = bn_mul(result, b);
             bn_free(result);
             result = tmp;
+            if (!result) {
+                bn_free(b);
+                return NULL;
+            }
         }
         exp >>= 1;
         if (exp > 0) {
             bignum *tmp = bn_mul(b, b);
             bn_free(b);
             b = tmp;
+            if (!b) {
+                bn_free(result);
+                return NULL;
+            }
         }
     }
 
@@ -1407,6 +1442,10 @@ void bn_add_ip(bignum *a, const bignum *b)
             // |b| > |a|, switch sign
             // Need to copy b and subtract a from it
             bignum *tmp = bn_sub_abs(b, a);
+            if (!tmp) {
+                fprintf(stderr, "bignum: out of memory\n");
+                abort();
+            }
             // Copy result back to a
             bn_ensure_cap(a, tmp->len);
             memcpy(a->limbs, tmp->limbs, tmp->len * sizeof(limb_t));

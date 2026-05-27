@@ -68,6 +68,35 @@ typedef struct {
 static const math_func_entry math_funcs[] = {
     {PASIN, asin, "asin"}, {PACOS, acos, "acos"}, {0, NULL, NULL}};
 
+static bool require_number(unsigned x, const char *name)
+{
+    if (is_numeric(x))
+        return true;
+    show_error("%s: not a number", name);
+    return false;
+}
+
+static bool require_real(unsigned x, const char *name)
+{
+    if (is_numeric(x) && !IS_COMPLEX(x))
+        return true;
+    show_error("%s: not a real number", name);
+    return false;
+}
+
+static bool exact_int64_cell_value(unsigned x, int64_t *out)
+{
+    if (IS_FIXNUM(x)) {
+        *out = FIXNUM_VALUE(x);
+        return true;
+    }
+    if (IS_NUM(x)) {
+        *out = CELL_ID(x);
+        return true;
+    }
+    return false;
+}
+
 /**
  * Compute integer nth root of a bignum using Newton's method.
  * Returns the root if base is a perfect nth power, NULL otherwise.
@@ -217,6 +246,8 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned argc,
     for (const math_func_entry *e = math_funcs; e->func; e++) {
         if (e->id == prim_id) {
             REQUIRE_ARGC(argc, 1, 1, e->name);
+            if (!require_real(argv[0], e->name))
+                return TOK_ERROR;
             return store_inexact(e->func(to_double(argv[0])));
         }
     }
@@ -227,10 +258,11 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned argc,
         // where r = |a+bi| = sqrt(a^2+b^2)
         REQUIRE_ARGC(argc, 1, 1, "sqrt");
         unsigned arg = argv[0];
-        enum lisp_type t = CELL_TYPE(arg);
+        if (!require_number(arg, "sqrt"))
+            return TOK_ERROR;
 
         // Handle complex numbers
-        if (t == BT_COMPLEX) {
+        if (IS_COMPLEX(arg)) {
             double a, b;
             get_complex_parts(arg, &a, &b);
             double r = sqrt(a * a + b * b);
@@ -240,25 +272,43 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned argc,
         }
 
         // Handle exact rationals: sqrt(a/b) = sqrt(a)/sqrt(b) if both perfect
-        // squares
-        if (t == BT_RATIONAL) {
-            int64_t num, denom;
-            get_rational_parts(arg, &num, &denom);
-            if (num >= 0 && denom > 0) {
-                int64_t sqrt_num = (int64_t)sqrt((double)num);
-                int64_t sqrt_denom = (int64_t)sqrt((double)denom);
-                // Verify both are perfect squares
-                if (sqrt_num * sqrt_num == num &&
-                    sqrt_denom * sqrt_denom == denom) {
-                    return store_rational(sqrt_num, sqrt_denom);
+        // squares.
+        if (IS_RATIONAL(arg)) {
+            unsigned num_cell = CELL_CAR(arg);
+            unsigned denom_cell = CELL_CDR(arg);
+            if (!is_negative_number(num_cell)) {
+                bignum *num_bn = to_bignum(num_cell);
+                bignum *denom_bn = to_bignum(denom_cell);
+                bignum *sqrt_num = num_bn ? bn_exact_nth_root(num_bn, 2) : NULL;
+                bignum *sqrt_denom =
+                    denom_bn ? bn_exact_nth_root(denom_bn, 2) : NULL;
+                bn_free(num_bn);
+                bn_free(denom_bn);
+                if (sqrt_num && sqrt_denom) {
+                    GC_GUARD;
+                    unsigned root_num = store_integer(sqrt_num);
+                    gc_protect(&root_num);
+                    unsigned root_denom = store_integer(sqrt_denom);
+                    gc_protect(&root_denom);
+                    return normalize_rational_cells(root_num, root_denom);
                 }
+                bn_free(sqrt_num);
+                bn_free(sqrt_denom);
             }
             // Fall through to inexact
         }
 
         // Handle exact integers: return exact if perfect square
-        if (t == BT_NUM) {
-            int64_t n = CELL_ID(arg);
+        int64_t n;
+        bool exact_integer_arg = false;
+        if (IS_FIXNUM(arg)) {
+            n = FIXNUM_VALUE(arg);
+            exact_integer_arg = true;
+        } else if (IS_NUM(arg)) {
+            n = CELL_ID(arg);
+            exact_integer_arg = true;
+        }
+        if (exact_integer_arg) {
             if (n >= 0) {
                 int64_t s = (int64_t)sqrt((double)n);
                 if (s * s == n) {
@@ -266,10 +316,22 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned argc,
                 }
             }
         }
+        if (IS_BIGNUM(arg)) {
+            bignum *bn = get_bignum(arg);
+            if (bn && !bn->sign) {
+                bignum *root = bn_exact_nth_root(bn, 2);
+                if (root)
+                    return store_integer(root);
+            }
+        }
 
         double x = to_double(arg);
         if (x < 0) {
-            return store_complex(store(0), store_inexact(sqrt(-x)));
+            GC_GUARD;
+            unsigned real_part = store(0);
+            gc_protect(&real_part);
+            unsigned imag_part = store_inexact(sqrt(-x));
+            return store_complex(real_part, imag_part);
         }
         return store_inexact(sqrt(x));
     }
@@ -278,12 +340,17 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned argc,
         REQUIRE_ARGC(argc, 2, 2, "expt");
         unsigned base_arg = argv[0];
         unsigned exp_arg = argv[1];
+        if (!require_number(base_arg, "expt") ||
+            !require_number(exp_arg, "expt"))
+            return TOK_ERROR;
 
         // Exact base with exact integer exponent -> exact result
         // Covers integers, rationals, and complex with exact parts
         if (is_exact(base_arg) && IS_EXACT_INT(exp_arg)) {
             int64_t exp_val;
-            if (IS_NUM(exp_arg)) {
+            if (IS_FIXNUM(exp_arg)) {
+                exp_val = FIXNUM_VALUE(exp_arg);
+            } else if (IS_NUM(exp_arg)) {
                 exp_val = CELL_ID(exp_arg);
             } else {
                 // Bignum exponent - check if it fits in int64
@@ -309,7 +376,10 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned argc,
                 if (e & 1) {
                     // result = result * base (exact multiplication)
                     unsigned mul_argv[2] = {result, base};
+                    gc_protect(&mul_argv[0]);
+                    gc_protect(&mul_argv[1]);
                     result = prim_mult(2, mul_argv);
+                    gc_unprotect(2);
                     if (result == TOK_ERROR) {
                         return TOK_ERROR;
                     }
@@ -318,7 +388,10 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned argc,
                 if (e > 0) {
                     // base = base * base
                     unsigned sq_argv[2] = {base, base};
+                    gc_protect(&sq_argv[0]);
+                    gc_protect(&sq_argv[1]);
                     base = prim_mult(2, sq_argv);
+                    gc_unprotect(2);
                     if (base == TOK_ERROR) {
                         return TOK_ERROR;
                     }
@@ -330,17 +403,23 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned argc,
                 unsigned one = store(1);
                 gc_protect(&one);
                 unsigned div_argv[2] = {one, result};
-                return prim_div(2, div_argv);
+                gc_protect(&div_argv[0]);
+                gc_protect(&div_argv[1]);
+                unsigned quotient = prim_div(2, div_argv);
+                return quotient;
             }
             return result;
         }
 
         // Exact integer or rational base with exact rational exponent p/q
         // Try to compute exact (base^(1/q))^p if base is a perfect qth power
-        if ((IS_EXACT_INT(base_arg) || CELL_TYPE(base_arg) == BT_RATIONAL) &&
-            CELL_TYPE(exp_arg) == BT_RATIONAL) {
+        if ((IS_EXACT_INT(base_arg) || IS_RATIONAL(base_arg)) &&
+            IS_RATIONAL(exp_arg)) {
             int64_t exp_numer, exp_denom;
-            get_rational_parts(exp_arg, &exp_numer, &exp_denom);
+            if (!exact_int64_cell_value(CELL_CAR(exp_arg), &exp_numer) ||
+                !exact_int64_cell_value(CELL_CDR(exp_arg), &exp_denom)) {
+                goto inexact_expt;
+            }
 
             // Only handle small roots (avoid expensive computation)
             if (exp_denom > 0 && exp_denom <= 1000) {
@@ -434,8 +513,8 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned argc,
         }
 
     inexact_expt:;
-        bool base_complex = CELL_TYPE(base_arg) == BT_COMPLEX;
-        bool exp_complex = CELL_TYPE(exp_arg) == BT_COMPLEX;
+        bool base_complex = IS_COMPLEX(base_arg);
+        bool exp_complex = IS_COMPLEX(exp_arg);
 
         // If base is negative real and exponent is non-integer, we need complex
         double base_d = to_double(base_arg);
@@ -471,6 +550,9 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned argc,
     }
     case PATAN: {
         REQUIRE_ARGC(argc, 1, 2, "atan");
+        if (!require_real(argv[0], "atan") ||
+            (argc == 2 && !require_real(argv[1], "atan")))
+            return TOK_ERROR;
         double y = to_double(argv[0]);
         if (argc == 2) {
             double x = to_double(argv[1]);
@@ -482,8 +564,10 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned argc,
         // Complex logarithm: log(z) = ln|z| + i*arg(z)
         REQUIRE_ARGC(argc, 1, 1, "log");
         unsigned arg = argv[0];
+        if (!require_number(arg, "log"))
+            return TOK_ERROR;
 
-        if (CELL_TYPE(arg) == BT_COMPLEX) {
+        if (IS_COMPLEX(arg)) {
             double real, imag;
             get_complex_parts(arg, &real, &imag);
             double mag = sqrt(real * real + imag * imag);
@@ -502,8 +586,10 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned argc,
         // Complex exp: e^(a+bi) = e^a * (cos(b) + i*sin(b))
         REQUIRE_ARGC(argc, 1, 1, "exp");
         unsigned arg = argv[0];
+        if (!require_number(arg, "exp"))
+            return TOK_ERROR;
 
-        if (CELL_TYPE(arg) == BT_COMPLEX) {
+        if (IS_COMPLEX(arg)) {
             double real, imag;
             get_complex_parts(arg, &real, &imag);
             double mag = exp(real);
@@ -515,8 +601,10 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned argc,
         // Complex sin: sin(a+bi) = sin(a)*cosh(b) + i*cos(a)*sinh(b)
         REQUIRE_ARGC(argc, 1, 1, "sin");
         unsigned arg = argv[0];
+        if (!require_number(arg, "sin"))
+            return TOK_ERROR;
 
-        if (CELL_TYPE(arg) == BT_COMPLEX) {
+        if (IS_COMPLEX(arg)) {
             double a, b;
             get_complex_parts(arg, &a, &b);
             return make_complex_inexact(sin(a) * cosh(b), cos(a) * sinh(b));
@@ -527,8 +615,10 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned argc,
         // Complex cos: cos(a+bi) = cos(a)*cosh(b) - i*sin(a)*sinh(b)
         REQUIRE_ARGC(argc, 1, 1, "cos");
         unsigned arg = argv[0];
+        if (!require_number(arg, "cos"))
+            return TOK_ERROR;
 
-        if (CELL_TYPE(arg) == BT_COMPLEX) {
+        if (IS_COMPLEX(arg)) {
             double a, b;
             get_complex_parts(arg, &a, &b);
             return make_complex_inexact(cos(a) * cosh(b), -sin(a) * sinh(b));
@@ -539,8 +629,10 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned argc,
         // Complex tan: tan(z) = sin(z)/cos(z)
         REQUIRE_ARGC(argc, 1, 1, "tan");
         unsigned arg = argv[0];
+        if (!require_number(arg, "tan"))
+            return TOK_ERROR;
 
-        if (CELL_TYPE(arg) == BT_COMPLEX) {
+        if (IS_COMPLEX(arg)) {
             double a, b;
             get_complex_parts(arg, &a, &b);
             // tan(a+bi) = (sin(2a) + i*sinh(2b)) / (cos(2a) + cosh(2b))
@@ -553,7 +645,9 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned argc,
     case PFLOOR: {
         REQUIRE_ARGC(argc, 1, 1, "floor");
         unsigned x = argv[0];
-        if (CELL_TYPE(x) == BT_NUM || CELL_TYPE(x) == BT_BIGNUM)
+        if (!require_real(x, "floor"))
+            return TOK_ERROR;
+        if (IS_FIXNUM(x) || IS_NUM(x) || IS_BIGNUM(x))
             return x;
         double d = to_double(x);
         return make_real_result(floor(d), is_exact(x));
@@ -561,7 +655,9 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned argc,
     case PCEILING: {
         REQUIRE_ARGC(argc, 1, 1, "ceiling");
         unsigned x = argv[0];
-        if (CELL_TYPE(x) == BT_NUM || CELL_TYPE(x) == BT_BIGNUM)
+        if (!require_real(x, "ceiling"))
+            return TOK_ERROR;
+        if (IS_FIXNUM(x) || IS_NUM(x) || IS_BIGNUM(x))
             return x;
         double d = to_double(x);
         return make_real_result(ceil(d), is_exact(x));
@@ -569,7 +665,9 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned argc,
     case PTRUNCATE: {
         REQUIRE_ARGC(argc, 1, 1, "truncate");
         unsigned x = argv[0];
-        if (CELL_TYPE(x) == BT_NUM || CELL_TYPE(x) == BT_BIGNUM)
+        if (!require_real(x, "truncate"))
+            return TOK_ERROR;
+        if (IS_FIXNUM(x) || IS_NUM(x) || IS_BIGNUM(x))
             return x;
         double d = to_double(x);
         return make_real_result(trunc(d), is_exact(x));
@@ -577,7 +675,9 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned argc,
     case PROUND: {
         REQUIRE_ARGC(argc, 1, 1, "round");
         unsigned x = argv[0];
-        if (CELL_TYPE(x) == BT_NUM || CELL_TYPE(x) == BT_BIGNUM)
+        if (!require_real(x, "round"))
+            return TOK_ERROR;
+        if (IS_FIXNUM(x) || IS_NUM(x) || IS_BIGNUM(x))
             return x;
         double d = to_double(x);
         return make_real_result(round(d), is_exact(x));
@@ -612,11 +712,12 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned argc,
     case PRANDOMSEED: {
         REQUIRE_ARGC(argc, 1, 1, "random-seed!");
         unsigned x = argv[0];
-        enum lisp_type t = CELL_TYPE(x);
         uint64_t seed;
-        if (t == BT_NUM) {
+        if (IS_FIXNUM(x)) {
+            seed = (uint64_t)FIXNUM_VALUE(x);
+        } else if (IS_NUM(x)) {
             seed = (uint64_t)CELL_ID(x);
-        } else if (t == BT_BIGNUM) {
+        } else if (IS_BIGNUM(x)) {
             if (bn_to_uint64(get_bignum(x), &seed) != 0) {
                 show_error("random-seed!: integer out of range");
                 return TOK_ERROR;

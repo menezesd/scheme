@@ -123,6 +123,8 @@ enum token {
     TOK_VECTOR_OPEN
 };
 
+#define TOK_EOF ((unsigned)-1)
+
 // CPS trampoline state
 enum tramp_mode {
     TRAMP_EVAL,  // Evaluate expression
@@ -289,10 +291,8 @@ typedef struct {
     // Current ports for dynamic I/O
     FILE *current_input;
     FILE *current_output;
-    unsigned
-        current_input_cell; // Cell index for current input port (0 = use FILE*)
-    unsigned current_output_cell; // Cell index for current output port (0 = use
-                                  // FILE*)
+    unsigned current_input_cell;  // Current input port cell (0 = use FILE*)
+    unsigned current_output_cell; // Current output port cell (0 = use FILE*)
     FILE *transcript;             // NULL if not recording
     // Callbacks for VM special primitives (set by main.c)
     unsigned (*load_callback)(const char *filename,
@@ -541,7 +541,7 @@ extern jmp_buf panic_jmp;
 extern bool panic_jmp_set;
 
 // Panic function - longjmps back to REPL on fatal errors
-void lisp_panic(const char *msg);
+void lisp_panic(const char *msg) __attribute__((noreturn));
 
 // ============================================================================
 // Error/Warning Macros
@@ -615,33 +615,36 @@ static inline int32_t FIXNUM_VALUE(unsigned v)
 #define CELL_ID(c) (ctx.cons_cells[c].id)
 
 // Type checking macros
-#define IS_PAIR(c) ((c) != 0 && CELL_TYPE(c) == BT_CONS)
-#define IS_ATOM(c) ((c) != 0 && CELL_TYPE(c) == BT_ATOM)
-#define IS_NUM(c) ((c) != 0 && CELL_TYPE(c) == BT_NUM)
-#define IS_BIGNUM(c) ((c) != 0 && CELL_TYPE(c) == BT_BIGNUM)
+#define IS_CELL(c) ((c) != 0 && !IS_FIXNUM(c))
+#define IS_PAIR(c) (IS_CELL(c) && CELL_TYPE(c) == BT_CONS)
+#define IS_ATOM(c) (IS_CELL(c) && CELL_TYPE(c) == BT_ATOM)
+#define IS_NUM(c) (IS_CELL(c) && CELL_TYPE(c) == BT_NUM)
+#define IS_BIGNUM(c) (IS_CELL(c) && CELL_TYPE(c) == BT_BIGNUM)
 #define IS_EXACT_INT(c)                                                        \
-    ((c) != 0 && (CELL_TYPE(c) == BT_NUM || CELL_TYPE(c) == BT_BIGNUM))
-#define IS_STRING(c) ((c) != 0 && CELL_TYPE(c) == BT_STRING)
-#define IS_CHAR(c) ((c) != 0 && CELL_TYPE(c) == BT_CHAR)
-#define IS_VECTOR(c) ((c) != 0 && CELL_TYPE(c) == BT_VECTOR)
+    (IS_FIXNUM(c) ||                                                           \
+     (IS_CELL(c) && (CELL_TYPE(c) == BT_NUM || CELL_TYPE(c) == BT_BIGNUM)))
+#define IS_STRING(c) (IS_CELL(c) && CELL_TYPE(c) == BT_STRING)
+#define IS_CHAR(c) (IS_CELL(c) && CELL_TYPE(c) == BT_CHAR)
+#define IS_VECTOR(c) (IS_CELL(c) && CELL_TYPE(c) == BT_VECTOR)
+#define IS_BYTEVEC(c) (IS_CELL(c) && CELL_TYPE(c) == BT_BYTEVEC)
 #define IS_NIL(c) ((c) == 0)
 #define IS_FALSE(c) ((c) == CELL_ATOM_FALSE)
 #define IS_TRUTHY(c) ((c) != CELL_ATOM_FALSE)
-#define IS_INEXACT(c) ((c) != 0 && CELL_TYPE(c) == BT_INEXACT)
-#define IS_RATIONAL(c) ((c) != 0 && CELL_TYPE(c) == BT_RATIONAL)
-#define IS_COMPLEX(c) ((c) != 0 && CELL_TYPE(c) == BT_COMPLEX)
-#define IS_FUNCTION(c) ((c) != 0 && CELL_TYPE(c) == BT_FUNCTION)
-#define IS_BUILTIN(c) ((c) != 0 && CELL_TYPE(c) == BT_BUILTIN)
-#define IS_MACRO(c) ((c) != 0 && CELL_TYPE(c) == BT_MACRO)
-#define IS_SYNTAX(c) ((c) != 0 && CELL_TYPE(c) == BT_SYNTAX)
-#define IS_CONT(c) ((c) != 0 && CELL_TYPE(c) == BT_CONT)
-#define IS_INPORT(c) ((c) != 0 && CELL_TYPE(c) == BT_INPORT)
-#define IS_OUTPORT(c) ((c) != 0 && CELL_TYPE(c) == BT_OUTPORT)
-#define IS_STRINPORT(c) ((c) != 0 && CELL_TYPE(c) == BT_STRINPORT)
-#define IS_STROUTPORT(c) ((c) != 0 && CELL_TYPE(c) == BT_STROUTPORT)
+#define IS_INEXACT(c) (IS_CELL(c) && CELL_TYPE(c) == BT_INEXACT)
+#define IS_RATIONAL(c) (IS_CELL(c) && CELL_TYPE(c) == BT_RATIONAL)
+#define IS_COMPLEX(c) (IS_CELL(c) && CELL_TYPE(c) == BT_COMPLEX)
+#define IS_FUNCTION(c) (IS_CELL(c) && CELL_TYPE(c) == BT_FUNCTION)
+#define IS_BUILTIN(c) (IS_CELL(c) && CELL_TYPE(c) == BT_BUILTIN)
+#define IS_MACRO(c) (IS_CELL(c) && CELL_TYPE(c) == BT_MACRO)
+#define IS_SYNTAX(c) (IS_CELL(c) && CELL_TYPE(c) == BT_SYNTAX)
+#define IS_CONT(c) (IS_CELL(c) && CELL_TYPE(c) == BT_CONT)
+#define IS_INPORT(c) (IS_CELL(c) && CELL_TYPE(c) == BT_INPORT)
+#define IS_OUTPORT(c) (IS_CELL(c) && CELL_TYPE(c) == BT_OUTPORT)
+#define IS_STRINPORT(c) (IS_CELL(c) && CELL_TYPE(c) == BT_STRINPORT)
+#define IS_STROUTPORT(c) (IS_CELL(c) && CELL_TYPE(c) == BT_STROUTPORT)
 #define IS_INPUT_PORT(c) (IS_INPORT(c) || IS_STRINPORT(c))
 #define IS_OUTPUT_PORT(c) (IS_OUTPORT(c) || IS_STROUTPORT(c))
-#define IS_MULTIVAL(c) ((c) != 0 && CELL_TYPE(c) == BT_MULTIVAL)
+#define IS_MULTIVAL(c) (IS_CELL(c) && CELL_TYPE(c) == BT_MULTIVAL)
 
 // Keyword checking macro (for special forms)
 #define IS_KEYWORD(c, kw) (IS_ATOM(c) && CELL_ID(c) == (kw))
@@ -729,7 +732,7 @@ static inline int32_t FIXNUM_VALUE(unsigned v)
 
 // Check if either of two values is a bignum (requiring bignum arithmetic)
 #define EITHER_BIGNUM(a, b)                                                    \
-    (CELL_TYPE(a) == BT_BIGNUM || CELL_TYPE(b) == BT_BIGNUM)
+    (IS_BIGNUM(a) || IS_BIGNUM(b))
 
 #define CHECK_DIV_ZERO_DBL(val, name)                                          \
     do {                                                                       \

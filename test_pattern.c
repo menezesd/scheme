@@ -8,13 +8,18 @@
 #include "context.h"
 #include "test_framework.h"
 #include "types.h"
+#include "writer.h"
+#include <stdlib.h>
 #include <string.h>
 
 // ============================================================================
 // Helpers
 // ============================================================================
 
-static unsigned atom(const char *s) { return atom_from_string(s); }
+static unsigned atom(const char *s)
+{
+    return atom_from_string(s);
+}
 
 // Create a list: (a b c) from varargs
 static unsigned list2(unsigned a, unsigned b)
@@ -48,6 +53,15 @@ static unsigned binding_value(unsigned bindings, const char *name)
             return cdr(binding);
     }
     return TOK_ERROR;
+}
+
+static bool pattern_registry_contains(compiled_pattern *needle)
+{
+    for (compiled_pattern *p = compiled_pattern_registry; p; p = p->gc_next) {
+        if (p == needle)
+            return true;
+    }
+    return false;
 }
 
 // ============================================================================
@@ -151,9 +165,56 @@ TEST(compiled_pattern_free_unregisters)
     ASSERT(cpat != NULL);
     compiled_pattern_free(cpat);
 
-    for (compiled_pattern *p = compiled_pattern_registry; p; p = p->gc_next) {
-        ASSERT(p != cpat);
-    }
+    ASSERT(!pattern_registry_contains(cpat));
+    PASS();
+}
+
+TEST(gc_sweep_patterns_preserves_heap_references)
+{
+    unsigned pat = atom("x");
+    compiled_pattern *kept = compile_pattern(pat, 0, ctx.kw_ellipsis);
+    compiled_pattern *swept = compile_pattern(pat, 0, ctx.kw_ellipsis);
+    ASSERT(kept != NULL);
+    ASSERT(swept != NULL);
+
+    unsigned cell = alloc();
+    CELL_TYPE(cell) = BT_COMPILED_PATTERN;
+    CELL_PTR(cell) = kept;
+
+    gc_sweep_patterns();
+    ASSERT(pattern_registry_contains(kept));
+    ASSERT(!pattern_registry_contains(swept));
+
+    CELL_TYPE(cell) = BT_FREE;
+    CELL_PTR(cell) = NULL;
+    gc_sweep_patterns();
+    ASSERT(!pattern_registry_contains(kept));
+    PASS();
+}
+
+TEST(writer_handles_compiled_pattern_cell)
+{
+    compiled_pattern *cpat = compiled_pattern_new();
+    ASSERT(cpat != NULL);
+
+    unsigned cell = alloc();
+    CELL_TYPE(cell) = BT_COMPILED_PATTERN;
+    CELL_PTR(cell) = cpat;
+
+    char *buf = NULL;
+    size_t len = 0;
+    FILE *mem = open_memstream(&buf, &len);
+    ASSERT(mem != NULL);
+
+    write_obj_port(cell, mem);
+    fclose(mem);
+    ASSERT_STR_EQ(buf, "[compiled-pattern]");
+    ASSERT_STR_EQ(type_name(cell), "compiled-pattern");
+    free(buf);
+
+    CELL_TYPE(cell) = BT_FREE;
+    CELL_PTR(cell) = NULL;
+    compiled_pattern_free(cpat);
     PASS();
 }
 
@@ -535,6 +596,8 @@ int main(void)
     RUN_TEST(compile_literal);
     RUN_TEST(compile_ellipsis);
     RUN_TEST(compiled_pattern_free_unregisters);
+    RUN_TEST(gc_sweep_patterns_preserves_heap_references);
+    RUN_TEST(writer_handles_compiled_pattern_cell);
 
     // Execution tests
     printf("\nExecution:\n");

@@ -26,6 +26,7 @@
  */
 
 #include "prim_internal.h"
+#include <errno.h>
 #include <poll.h>
 
 unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
@@ -40,19 +41,30 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         int ptype = extract_port_argv(argv, port_index, PORT_OUTPUT, &fport,
                                       &sport, "display");
         if (ptype == -1) return TOK_ERROR;
-        if (ptype == -2) return 0; // silently discard (nil port)
         if (ptype == 1) {
             // String port: use open_memstream to capture output
             char *buf = NULL;
             size_t buflen = 0;
             FILE *memfp = open_memstream(&buf, &buflen);
+            if (!memfp) {
+                show_error("display: out of memory");
+                return TOK_ERROR;
+            }
             if (IS_STRING(arg)) {
                 fprintf(memfp, "%s", GET_STRING_PTR(arg));
             } else {
                 display_obj_port(arg, memfp);
             }
-            fclose(memfp);
-            strport_puts(sport, buf);
+            if (fclose(memfp) != 0) {
+                free(buf);
+                show_error("display: write failed");
+                return TOK_ERROR;
+            }
+            if (!strport_puts(sport, buf)) {
+                free(buf);
+                show_error("display: string port write failed");
+                return TOK_ERROR;
+            }
             free(buf);
         } else {
             if (IS_STRING(arg)) {
@@ -68,7 +80,10 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
                     display_obj_port(arg, ctx.transcript);
                 }
             }
-            fflush(fport);
+            if (fflush(fport) != 0) {
+                show_error("display: flush failed");
+                return TOK_ERROR;
+            }
         }
         return arg;
     }
@@ -81,15 +96,26 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         int ptype = extract_port_argv(argv, port_index, PORT_OUTPUT, &fport,
                                       &sport, "write");
         if (ptype == -1) return TOK_ERROR;
-        if (ptype == -2) return 0;
         if (ptype == 1) {
             // String port: use open_memstream to capture output
             char *buf = NULL;
             size_t buflen = 0;
             FILE *memfp = open_memstream(&buf, &buflen);
+            if (!memfp) {
+                show_error("write: out of memory");
+                return TOK_ERROR;
+            }
             write_obj_port(arg, memfp);
-            fclose(memfp);
-            strport_puts(sport, buf);
+            if (fclose(memfp) != 0) {
+                free(buf);
+                show_error("write: write failed");
+                return TOK_ERROR;
+            }
+            if (!strport_puts(sport, buf)) {
+                free(buf);
+                show_error("write: string port write failed");
+                return TOK_ERROR;
+            }
             free(buf);
         } else {
             write_obj_port(arg, fport);
@@ -97,48 +123,35 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
             if (ctx.transcript && fport == ctx.current_output) {
                 write_obj_port(arg, ctx.transcript);
             }
-            fflush(fport);
+            if (fflush(fport) != 0) {
+                show_error("write: flush failed");
+                return TOK_ERROR;
+            }
         }
         return arg;
     }
     case PNEWLINE: {
         REQUIRE_ARGC(argc, 0, 1, "newline");
-        // newline takes optional port as first arg, not second
-        if (argc == 1) {
-            unsigned p = argv[0];
-            if (IS_STROUTPORT(p)) {
-                string_port *sport = GET_STRPORT_PTR(p);
-                if (!sport) {
-                    show_error("newline: port is closed");
-                    return TOK_ERROR;
-                }
-                strport_putc(sport, '\n');
-                return 0;
-            }
-            if (!IS_OUTPORT(p)) {
-                show_error("newline: argument must be output port");
+        FILE *port;
+        string_port *sport;
+        int port_index = (argc == 1) ? 0 : -1;
+        int ptype = extract_port_argv(argv, port_index, PORT_OUTPUT, &port,
+                                      &sport, "newline");
+        if (ptype == -1) return TOK_ERROR;
+
+        if (ptype == 1) {
+            if (!strport_putc(sport, '\n')) {
+                show_error("newline: string port write failed");
                 return TOK_ERROR;
             }
-            FILE *port = GET_PORT_PTR(p);
+        } else {
             fprintf(port, "\n");
-            // Transcript
             if (ctx.transcript && port == ctx.current_output) {
                 fprintf(ctx.transcript, "\n");
             }
-            fflush(port);
-        } else {
-            // Use current output port (may be string port)
-            if (ctx.current_output_cell != 0) {
-                string_port *sport = GET_STRPORT_PTR(ctx.current_output_cell);
-                if (sport)
-                    strport_putc(sport, '\n');
-            } else {
-                fprintf(ctx.current_output, "\n");
-                // Transcript
-                if (ctx.transcript) {
-                    fprintf(ctx.transcript, "\n");
-                }
-                fflush(ctx.current_output);
+            if (fflush(port) != 0) {
+                show_error("newline: flush failed");
+                return TOK_ERROR;
             }
         }
         return 0;
@@ -151,7 +164,6 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         int ptype = extract_port_argv(argv, port_index, PORT_INPUT, &fport,
                                       &sport, "read");
         if (ptype == -1) return TOK_ERROR;
-        if (ptype == -2) return 0;
         if (ptype == 1) {
             // String port: use fmemopen on remaining content
             size_t remaining = sport->len - sport->pos;
@@ -165,8 +177,26 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
             }
             unsigned result = read_obj_port(mem);
             // Update string port position based on how much was consumed
-            sport->pos += ftell(mem);
-            fclose(mem);
+            long consumed = ftell(mem);
+            if (consumed < 0) {
+                reader_forget_port(mem);
+                fclose(mem);
+                show_error("read: failed to update string port position");
+                return TOK_ERROR;
+            }
+            size_t pending = reader_port_pending_bytes(mem);
+            if ((size_t)consumed < pending) {
+                reader_forget_port(mem);
+                fclose(mem);
+                show_error("read: invalid reader pushback state");
+                return TOK_ERROR;
+            }
+            sport->pos += (size_t)consumed - pending;
+            reader_forget_port(mem);
+            if (fclose(mem) != 0) {
+                show_error("read: close failed");
+                return TOK_ERROR;
+            }
             return result;
         }
         return read_obj_port(fport);
@@ -179,15 +209,19 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         int ptype = extract_port_argv(argv, port_index, PORT_INPUT, &fport,
                                       &sport, "read-char");
         if (ptype == -1) return TOK_ERROR;
-        if (ptype == -2) return 0;
         int c;
         if (ptype == 1) {
             c = strport_getc(sport);
         } else {
-            c = fgetc(fport);
+            c = reader_port_getc(fport);
         }
-        if (c == EOF)
+        if (c == EOF) {
+            if (ptype == 0 && ferror(fport)) {
+                show_error("read-char: read failed");
+                return TOK_ERROR;
+            }
             return atom_from_string("eof-object");
+        }
         return make_char(c);
     }
     case PPEEKCHAR: {
@@ -198,17 +232,19 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         int ptype = extract_port_argv(argv, port_index, PORT_INPUT, &fport,
                                       &sport, "peek-char");
         if (ptype == -1) return TOK_ERROR;
-        if (ptype == -2) return 0;
         int c;
         if (ptype == 1) {
             c = strport_peekc(sport);
         } else {
-            c = fgetc(fport);
-            if (c != EOF)
-                ungetc(c, fport);
+            c = reader_port_peekc(fport);
         }
-        if (c == EOF)
+        if (c == EOF) {
+            if (ptype == 0 && ferror(fport)) {
+                show_error("peek-char: read failed");
+                return TOK_ERROR;
+            }
             return atom_from_string("eof-object");
+        }
         return make_char(c);
     }
     case PWRITECHAR: {
@@ -221,19 +257,24 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         int ptype = extract_port_argv(argv, port_index, PORT_OUTPUT, &fport,
                                       &sport, "write-char");
         if (ptype == -1) return TOK_ERROR;
-        if (ptype == -2) return 0;
         if (ptype == 1) {
-            strport_putc(sport, c);
+            if (!strport_putc(sport, c)) {
+                show_error("write-char: string port write failed");
+                return TOK_ERROR;
+            }
         } else {
             fputc(c, fport);
-            fflush(fport);
+            if (fflush(fport) != 0) {
+                show_error("write-char: flush failed");
+                return TOK_ERROR;
+            }
         }
         return 0;
     }
     case PEOF: {
         REQUIRE_ARGC(argc, 1, 1, "eof-object?");
         unsigned arg = argv[0];
-        return (CELL_TYPE(arg) == BT_ATOM &&
+        return (IS_ATOM(arg) &&
                 strcmp(ctx.atom_table[CELL_ID(arg)], "eof-object") == 0)
                    ? ctx.atom_true
                    : ctx.atom_false;
@@ -246,12 +287,13 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         int ptype = extract_port_argv(argv, port_index, PORT_INPUT, &fport,
                                       &sport, "char-ready?");
         if (ptype == -1) return TOK_ERROR;
-        if (ptype == -2) return 0;
 
         if (ptype == 1) {
             // String port: ready if there are characters remaining
             return (sport->pos < sport->len) ? ctx.atom_true : ctx.atom_false;
         }
+        if (reader_port_pending_bytes(fport) > 0)
+            return ctx.atom_true;
 
         // File port: use poll() to check if data is available
         int fd = fileno(fport);
@@ -262,6 +304,16 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
 
         struct pollfd pfd = {.fd = fd, .events = POLLIN, .revents = 0};
         int ret = poll(&pfd, 1, 0); // Non-blocking check
+        if (ret < 0) {
+            if (errno == EINTR)
+                return ctx.atom_false;
+            show_error("char-ready?: poll failed");
+            return TOK_ERROR;
+        }
+        if (pfd.revents & (POLLERR | POLLNVAL)) {
+            show_error("char-ready?: port error");
+            return TOK_ERROR;
+        }
         return (ret > 0 && (pfd.revents & POLLIN)) ? ctx.atom_true
                                                    : ctx.atom_false;
     }
@@ -273,7 +325,6 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         int ptype = extract_port_argv(argv, port_index, PORT_INPUT, &fport,
                                       &sport, "read-line");
         if (ptype == -1) return TOK_ERROR;
-        if (ptype == -2) return 0;
 
         // Build line in temporary buffer
         size_t cap = 128;
@@ -289,7 +340,7 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
             if (ptype == 1) {
                 c = strport_getc(sport);
             } else {
-                c = fgetc(fport);
+                c = reader_port_getc(fport);
             }
             if (c == EOF || c == '\n')
                 break;
@@ -309,6 +360,12 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
                 buf = newbuf;
             }
             buf[len++] = (char)c;
+        }
+
+        if (c == EOF && ptype == 0 && ferror(fport)) {
+            free(buf);
+            show_error("read-line: read failed");
+            return TOK_ERROR;
         }
 
         // EOF with no characters read -> return eof-object

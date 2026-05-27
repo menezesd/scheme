@@ -17,6 +17,7 @@ static unsigned read_from_string(const char *str)
     if (!f)
         return TOK_ERROR;
     unsigned result = read_obj_port(f);
+    reader_forget_port(f);
     fclose(f);
     return result;
 }
@@ -92,6 +93,14 @@ TEST(read_prefixed_int64_min)
     unsigned x = read_from_string("#x-8000000000000000");
     ASSERT(CELL_TYPE(x) == BT_NUM);
     ASSERT_EQ(CELL_ID(x), INT64_MIN);
+    PASS();
+}
+
+TEST(read_prefixed_integer_rejects_trailing_junk)
+{
+    ASSERT(read_from_string("#x1z") == TOK_ERROR);
+    ASSERT(read_from_string("#o18") == TOK_ERROR);
+    ASSERT(read_from_string("#b102") == TOK_ERROR);
     PASS();
 }
 
@@ -179,6 +188,13 @@ TEST(read_char_tab)
 TEST(read_char_rejects_eof)
 {
     unsigned x = read_from_string("#\\");
+    ASSERT(x == TOK_ERROR);
+    PASS();
+}
+
+TEST(read_char_rejects_unknown_name)
+{
+    unsigned x = read_from_string("#\\spacebar");
     ASSERT(x == TOK_ERROR);
     PASS();
 }
@@ -275,6 +291,30 @@ TEST(read_nested_list)
     PASS();
 }
 
+TEST(read_allows_eof_object_symbol_in_list)
+{
+    unsigned x = read_from_string("(eof-object)");
+    ASSERT(CELL_TYPE(x) == BT_CONS);
+    ASSERT(IS_ATOM(car(x)));
+    ASSERT(strcmp(ctx.atom_table[CELL_ID(car(x))], "eof-object") == 0);
+    ASSERT(cdr(x) == 0);
+    PASS();
+}
+
+TEST(read_rejects_unterminated_list)
+{
+    unsigned x = read_from_string("(1 2");
+    ASSERT(x == TOK_ERROR);
+    PASS();
+}
+
+TEST(read_rejects_unterminated_dotted_pair)
+{
+    unsigned x = read_from_string("(1 .");
+    ASSERT(x == TOK_ERROR);
+    PASS();
+}
+
 // ============================================================================
 // Reader Tests - Vectors
 // ============================================================================
@@ -296,6 +336,13 @@ TEST(read_empty_vector)
     unsigned x = read_from_string("#()");
     ASSERT(CELL_TYPE(x) == BT_VECTOR);
     ASSERT_EQ(vector_len(x), 0);
+    PASS();
+}
+
+TEST(read_rejects_unterminated_vector)
+{
+    unsigned x = read_from_string("#(1 2");
+    ASSERT(x == TOK_ERROR);
     PASS();
 }
 
@@ -321,6 +368,42 @@ TEST(read_bytevector_rejects_out_of_range)
 TEST(read_bytevector_rejects_non_integer)
 {
     unsigned x = read_from_string("#u8(foo)");
+    ASSERT(x == TOK_ERROR);
+    PASS();
+}
+
+TEST(read_bytevector_rejects_unterminated_literal)
+{
+    unsigned x = read_from_string("#u8(1 2");
+    ASSERT(x == TOK_ERROR);
+    PASS();
+}
+
+TEST(read_bytevector_rejects_incomplete_prefix)
+{
+    ASSERT(read_from_string("#u") == TOK_ERROR);
+    ASSERT(read_from_string("#u8") == TOK_ERROR);
+    PASS();
+}
+
+TEST(read_datum_label_number)
+{
+    unsigned x = read_from_string("#0=42");
+    ASSERT(IS_NUM(x));
+    ASSERT_EQ(CELL_ID(x), 42);
+    PASS();
+}
+
+TEST(read_datum_label_empty_list)
+{
+    unsigned x = read_from_string("#0=()");
+    ASSERT_EQ(x, 0);
+    PASS();
+}
+
+TEST(read_datum_label_rejects_missing_datum)
+{
+    unsigned x = read_from_string("#0=");
     ASSERT(x == TOK_ERROR);
     PASS();
 }
@@ -363,6 +446,15 @@ TEST(read_unquote_splicing)
     PASS();
 }
 
+TEST(read_prefix_rejects_missing_datum)
+{
+    ASSERT(read_from_string("'") == TOK_ERROR);
+    ASSERT(read_from_string("`") == TOK_ERROR);
+    ASSERT(read_from_string(",") == TOK_ERROR);
+    ASSERT(read_from_string(",@") == TOK_ERROR);
+    PASS();
+}
+
 // ============================================================================
 // Reader Tests - Comments
 // ============================================================================
@@ -395,10 +487,32 @@ TEST(reader_tracks_line)
 {
     FILE *f = fmemopen((void *)"line1\nline2\n42", 14, "r");
     read_obj_port(f);
+    reader_forget_port(f);
     fclose(f);
     // After reading, line should have advanced
     // (We can't directly test internal state, but test API works)
     ASSERT(reader_get_line() >= 1);
+    PASS();
+}
+
+TEST(reader_preserves_multi_char_pushback_across_port_reads)
+{
+    FILE *f = fmemopen((void *)"12.\n34", 6, "r");
+    ASSERT(f != NULL);
+
+    unsigned first = read_obj_port(f);
+    ASSERT(CELL_TYPE(first) == BT_NUM);
+    ASSERT_EQ(CELL_ID(first), 12);
+
+    unsigned second = read_obj_port(f);
+    ASSERT(second == TOK_DOT);
+
+    unsigned third = read_obj_port(f);
+    ASSERT(CELL_TYPE(third) == BT_NUM);
+    ASSERT_EQ(CELL_ID(third), 34);
+
+    reader_forget_port(f);
+    fclose(f);
     PASS();
 }
 
@@ -423,6 +537,7 @@ int main(void)
     RUN_TEST(read_bignum);
     RUN_TEST(read_prefixed_bignum);
     RUN_TEST(read_prefixed_int64_min);
+    RUN_TEST(read_prefixed_integer_rejects_trailing_junk);
     RUN_TEST(read_malformed_rational_as_symbol);
     RUN_TEST(read_malformed_denominator_as_symbol);
 
@@ -437,6 +552,7 @@ int main(void)
     RUN_TEST(read_char_newline);
     RUN_TEST(read_char_tab);
     RUN_TEST(read_char_rejects_eof);
+    RUN_TEST(read_char_rejects_unknown_name);
 
     // Symbols
     RUN_TEST(read_symbol);
@@ -452,19 +568,29 @@ int main(void)
     RUN_TEST(read_simple_list);
     RUN_TEST(read_dotted_pair);
     RUN_TEST(read_nested_list);
+    RUN_TEST(read_allows_eof_object_symbol_in_list);
+    RUN_TEST(read_rejects_unterminated_list);
+    RUN_TEST(read_rejects_unterminated_dotted_pair);
 
     // Vectors
     RUN_TEST(read_vector);
     RUN_TEST(read_empty_vector);
+    RUN_TEST(read_rejects_unterminated_vector);
     RUN_TEST(read_bytevector);
     RUN_TEST(read_bytevector_rejects_out_of_range);
     RUN_TEST(read_bytevector_rejects_non_integer);
+    RUN_TEST(read_bytevector_rejects_unterminated_literal);
+    RUN_TEST(read_bytevector_rejects_incomplete_prefix);
+    RUN_TEST(read_datum_label_number);
+    RUN_TEST(read_datum_label_empty_list);
+    RUN_TEST(read_datum_label_rejects_missing_datum);
 
     // Quotes
     RUN_TEST(read_quote);
     RUN_TEST(read_quasiquote);
     RUN_TEST(read_unquote);
     RUN_TEST(read_unquote_splicing);
+    RUN_TEST(read_prefix_rejects_missing_datum);
 
     // Comments
     RUN_TEST(read_skip_comment);
@@ -474,6 +600,7 @@ int main(void)
 
     // Position tracking
     RUN_TEST(reader_tracks_line);
+    RUN_TEST(reader_preserves_multi_char_pushback_across_port_reads);
 
     TEST_SUMMARY("reader");
 }

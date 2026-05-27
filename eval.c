@@ -46,6 +46,12 @@
 static void eval_step(void);
 static void apply_cont_step(void);
 
+static bool is_eof_object(unsigned expr)
+{
+    return IS_ATOM(expr) &&
+           strcmp(ctx.atom_table[CELL_ID(expr)], "eof-object") == 0;
+}
+
 // ============================================================================
 // Quasiquote Expansion
 // ============================================================================
@@ -53,6 +59,27 @@ static void apply_cont_step(void);
 // Helper for nested quasiquote expansion with depth tracking
 static unsigned qq_expand_depth(unsigned x, unsigned env, int depth)
 {
+    if (IS_VECTOR(x)) {
+        GC_GUARD;
+        gc_protect(&x);
+        gc_protect(&env);
+        unsigned len = vector_len(x);
+        unsigned result = make_vector(len, 0);
+        if (result == TOK_ERROR)
+            return TOK_ERROR;
+        gc_protect(&result);
+        for (unsigned i = 0; i < len; i++) {
+            unsigned elem = vector_data_ptr(x)[i];
+            gc_protect(&elem);
+            unsigned expanded = qq_expand_depth(elem, env, depth);
+            if (expanded == TOK_ERROR)
+                return TOK_ERROR;
+            vector_set_elem(result, i, expanded);
+            gc_unprotect(1);
+        }
+        return result;
+    }
+
     if (!IS_PAIR(x)) {
         return x;
     }
@@ -118,8 +145,9 @@ static unsigned qq_expand_depth(unsigned x, unsigned env, int depth)
     unsigned result = 0, tail = 0;
     gc_protect(&result);
     gc_protect(&tail);
-    for (unsigned l = x; IS_PAIR(l); l = cdr(l)) {
-        gc_protect(&l);
+    unsigned l = x;
+    gc_protect(&l);
+    for (; IS_PAIR(l); l = cdr(l)) {
         unsigned elem = car(l);
 
         // Check if element is (unquote-splicing expr) - only if not shadowed
@@ -156,7 +184,15 @@ static unsigned qq_expand_depth(unsigned x, unsigned env, int depth)
             }
             list_append(&result, &tail, expanded);
         }
-        gc_unprotect(1); // l - per-iteration cleanup
+    }
+    if (l) {
+        unsigned expanded_tail = qq_expand_depth(l, env, depth);
+        if (expanded_tail == TOK_ERROR)
+            return TOK_ERROR;
+        if (tail)
+            cell_set_cdr(tail, expanded_tail);
+        else
+            result = expanded_tail;
     }
     return result;
 }
@@ -178,6 +214,15 @@ static void eval_step(void)
 
     if (!id) {
         tramp_apply(0, cont);
+        return;
+    }
+    if (IS_FIXNUM(id)) {
+        tramp_apply(id, cont);
+        return;
+    }
+    if (!IS_CELL(id)) {
+        show_error("invalid expression");
+        tramp_error();
         return;
     }
 
@@ -222,6 +267,10 @@ static void eval_step(void)
         // safety
         GC_GUARD;
         unsigned arg_exprs = cdr(id);
+        if (!list_length_checked(arg_exprs, NULL, "application")) {
+            tramp_error();
+            return;
+        }
         gc_protect(&head);
         gc_protect(&arg_exprs);
         gc_protect(&env);
@@ -409,39 +458,50 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
                 tramp_error();
                 return;
             }
-            char *filename = GET_STRING_PTR(car(args));
-            FILE *old_stdin = stdin;
+            unsigned filename_arg = car(args);
+            if (!IS_STRING(filename_arg)) {
+                show_error("load: expected string argument");
+                tramp_error();
+                return;
+            }
+            const char *filename = GET_STRING_PTR(filename_arg);
+            const char *old_filename = reader_get_filename();
             FILE *f = fopen(filename, "r");
             if (!f) {
                 show_error("load: cannot open file: %s", filename);
                 tramp_error();
                 return;
             }
-            stdin = f;
+            reader_set_filename(filename);
+            reader_reset_position();
 
             unsigned exprs = 0, exprs_tail = 0;
+            bool load_failed = false;
             GC_GUARD;
             gc_protect(&exprs);
             gc_protect(&exprs_tail);
             for (;;) {
-                int c = getchar();
-                while (c != EOF && isspace(c))
-                    c = getchar();
-                if (c == EOF)
-                    break;
-                ungetc(c, stdin);
-                reader_reset_labels();
-                unsigned expr = read_obj();
+                unsigned expr = read_obj_port(f);
                 if (expr == TOK_ERROR) {
-                    fclose(f);
-                    stdin = old_stdin;
-                    tramp_error();
-                    return;
+                    load_failed = true;
+                    break;
                 }
+                if (is_eof_object(expr))
+                    break;
                 list_append(&exprs, &exprs_tail, expr);
             }
-            fclose(f);
-            stdin = old_stdin;
+            reader_forget_port(f);
+            if (fclose(f) != 0) {
+                show_error("load: close failed");
+                load_failed = true;
+            }
+            reader_set_filename(old_filename);
+            reader_reset_position();
+
+            if (load_failed) {
+                tramp_error();
+                return;
+            }
 
             if (!exprs) {
                 tramp_apply(0, cont);
@@ -467,6 +527,7 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
         // Protect cont across apply_primitive (which can allocate/trigger GC)
         {
             GC_GUARD;
+            gc_protect(&args);
             gc_protect(&cont);
             unsigned result = apply_primitive(prim_id, args);
             if (result == TOK_ERROR) {
@@ -495,6 +556,10 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
         unsigned frame = 0;
         gc_protect(&frame);
         frame = bind_params(params, args);
+        if (frame == TOK_ERROR) {
+            tramp_error();
+            return;
+        }
         unsigned new_env = alloc_cons(frame, def_env);
 
         if (!cdr(body)) {
@@ -522,8 +587,13 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
     }
 
     // Handle bytecode VM closures (for CPS/bytecode interop)
-    if (IS_PAIR(fn) && CELL_TYPE(car(fn)) == BT_CLOSURE) {
+    if (IS_PAIR(fn) && IS_CELL(car(fn)) && CELL_TYPE(car(fn)) == BT_CLOSURE) {
+        GC_GUARD;
+        gc_protect(&fn);
+        gc_protect(&args);
+        gc_protect(&cont);
         unsigned result = vm_call_closure(fn, args);
+        gc_protect(&result);
         if (result == TOK_ERROR) {
             tramp_error();
             return;
@@ -563,4 +633,7 @@ unsigned eval_cps(unsigned expr, unsigned env)
     return tramp.value;
 }
 
-unsigned eval_obj(unsigned id, unsigned env) { return eval_cps(id, env); }
+unsigned eval_obj(unsigned id, unsigned env)
+{
+    return eval_cps(id, env);
+}

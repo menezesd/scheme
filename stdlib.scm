@@ -91,9 +91,10 @@
 
 (define (call-with-binary-input-file filename proc)
   (let ((port (open-binary-input-file filename)))
-    (let ((result (proc port)))
-      (close-input-port port)
-      result)))
+    (dynamic-wind
+      (lambda () #f)
+      (lambda () (proc port))
+      (lambda () (close-input-port port)))))
 
 ;;; ============================================================================
 ;;; Bytevector ports (in-memory I/O using bytevectors)
@@ -286,47 +287,82 @@
 ;;; List utilities
 ;;; ============================================================================
 
+(define (%require-proper-list who lst)
+  (if (list? lst)
+      lst
+      (error (string-append who ": expected proper list"))))
+
+(define (%require-nonnegative-integer who k)
+  (if (and (integer? k) (>= k 0))
+      k
+      (error (string-append who ": expected nonnegative integer"))))
+
+(define (%require-proper-lists who lists)
+  (%require-proper-list who lists)
+  (let loop ((lists lists))
+    (if (not (null? lists))
+        (begin
+          (%require-proper-list who (car lists))
+          (loop (cdr lists)))))
+  lists)
+
 (define (list-ref lst k)
-  (if (= k 0)
-      (car lst)
-      (list-ref (cdr lst) (- k 1))))
+  (%require-nonnegative-integer "list-ref" k)
+  (let loop ((lst lst) (k k))
+    (cond ((not (pair? lst)) (error "list-ref: index out of bounds"))
+          ((= k 0) (car lst))
+          (else (loop (cdr lst) (- k 1))))))
 
 (define (list-tail lst k)
-  (if (= k 0)
-      lst
-      (list-tail (cdr lst) (- k 1))))
+  (%require-nonnegative-integer "list-tail" k)
+  (let loop ((lst lst) (k k))
+    (cond ((= k 0) lst)
+          ((not (pair? lst)) (error "list-tail: index out of bounds"))
+          (else (loop (cdr lst) (- k 1))))))
 
 ; Membership functions
 (define (memq obj lst)
-  (cond ((null? lst) #f)
-        ((eq? obj (car lst)) lst)
-        (else (memq obj (cdr lst)))))
+  (%require-proper-list "memq" lst)
+  (let loop ((lst lst))
+    (cond ((null? lst) #f)
+          ((eq? obj (car lst)) lst)
+          (else (loop (cdr lst))))))
 
 (define (memv obj lst)
-  (cond ((null? lst) #f)
-        ((eqv? obj (car lst)) lst)
-        (else (memv obj (cdr lst)))))
+  (%require-proper-list "memv" lst)
+  (let loop ((lst lst))
+    (cond ((null? lst) #f)
+          ((eqv? obj (car lst)) lst)
+          (else (loop (cdr lst))))))
 
 (define (member obj lst)
-  (cond ((null? lst) #f)
-        ((equal? obj (car lst)) lst)
-        (else (member obj (cdr lst)))))
+  (%require-proper-list "member" lst)
+  (let loop ((lst lst))
+    (cond ((null? lst) #f)
+          ((equal? obj (car lst)) lst)
+          (else (loop (cdr lst))))))
 
 ; Association list functions
 (define (assq obj alist)
-  (cond ((null? alist) #f)
-        ((eq? obj (caar alist)) (car alist))
-        (else (assq obj (cdr alist)))))
+  (%require-proper-list "assq" alist)
+  (let loop ((alist alist))
+    (cond ((null? alist) #f)
+          ((eq? obj (caar alist)) (car alist))
+          (else (loop (cdr alist))))))
 
 (define (assv obj alist)
-  (cond ((null? alist) #f)
-        ((eqv? obj (caar alist)) (car alist))
-        (else (assv obj (cdr alist)))))
+  (%require-proper-list "assv" alist)
+  (let loop ((alist alist))
+    (cond ((null? alist) #f)
+          ((eqv? obj (caar alist)) (car alist))
+          (else (loop (cdr alist))))))
 
 (define (assoc obj alist)
-  (cond ((null? alist) #f)
-        ((equal? obj (caar alist)) (car alist))
-        (else (assoc obj (cdr alist)))))
+  (%require-proper-list "assoc" alist)
+  (let loop ((alist alist))
+    (cond ((null? alist) #f)
+          ((equal? obj (caar alist)) (car alist))
+          (else (loop (cdr alist))))))
 
 ;;; ============================================================================
 ;;; Numeric predicates
@@ -379,6 +415,8 @@
 ;;; ============================================================================
 
 (define (map proc lst . lsts)
+  (%require-proper-list "map" lst)
+  (%require-proper-lists "map" lsts)
   (if (null? lsts)
       ; Single list case - tail-recursive, builds in order via set-cdr!
       (let ((head (cons '() '())))
@@ -398,6 +436,8 @@
                 (loop (cdr lst) (map cdr lsts) new-cell)))))))
 
 (define (for-each proc lst . lsts)
+  (%require-proper-list "for-each" lst)
+  (%require-proper-lists "for-each" lsts)
   (if (null? lsts)
       ; Single list case
       (if (not (null? lst))
@@ -439,35 +479,39 @@
 
 (define (call-with-input-file filename proc)
   (let ((port (open-input-file filename)))
-    (let ((result (proc port)))
-      (close-input-port port)
-      result)))
+    (dynamic-wind
+      (lambda () #f)
+      (lambda () (proc port))
+      (lambda () (close-input-port port)))))
 
 (define (call-with-output-file filename proc)
   (let ((port (open-output-file filename)))
-    (let ((result (proc port)))
-      (close-output-port port)
-      result)))
+    (dynamic-wind
+      (lambda () #f)
+      (lambda () (proc port))
+      (lambda () (close-output-port port)))))
 
 ; with-input-from-file temporarily redirects current-input-port
 (define (with-input-from-file filename thunk)
   (let* ((new-port (open-input-file filename))
          (old-port (current-input-port)))
-    (set-current-input-port! new-port)
-    (let ((result (thunk)))
-      (set-current-input-port! old-port)
-      (close-input-port new-port)
-      result)))
+    (dynamic-wind
+      (lambda () (set-current-input-port! new-port))
+      thunk
+      (lambda ()
+        (set-current-input-port! old-port)
+        (close-input-port new-port)))))
 
 ; with-output-to-file temporarily redirects current-output-port
 (define (with-output-to-file filename thunk)
   (let* ((new-port (open-output-file filename))
          (old-port (current-output-port)))
-    (set-current-output-port! new-port)
-    (let ((result (thunk)))
-      (set-current-output-port! old-port)
-      (close-output-port new-port)
-      result)))
+    (dynamic-wind
+      (lambda () (set-current-output-port! new-port))
+      thunk
+      (lambda ()
+        (set-current-output-port! old-port)
+        (close-output-port new-port)))))
 
 ;;; ============================================================================
 ;;; String port convenience functions
@@ -484,24 +528,34 @@
   (let ((port (open-input-string str)))
     (proc port)))
 
+(define (%with-output-to-string thunk)
+  (let ((port (open-output-string))
+        (old-port (current-output-port)))
+    (dynamic-wind
+      (lambda () (set-current-output-port! port))
+      thunk
+      (lambda () (set-current-output-port! old-port)))
+    (get-output-string port)))
+
+(define (%with-input-from-string str thunk)
+  (let ((port (open-input-string str))
+        (old-port (current-input-port)))
+    (dynamic-wind
+      (lambda () (set-current-input-port! port))
+      thunk
+      (lambda () (set-current-input-port! old-port)))))
+
 ; Execute thunk with output captured to a string
 (define-syntax with-output-to-string
   (syntax-rules ()
     ((with-output-to-string body ...)
-     (let ((port (open-output-string)))
-       (let ((write-to-port (lambda args
-                              (if (null? args)
-                                  (newline port)
-                                  (display (car args) port)))))
-         body ...)
-       (get-output-string port)))))
+     (%with-output-to-string (lambda () body ...)))))
 
 ; Execute thunk with input coming from a string
 (define-syntax with-input-from-string
   (syntax-rules ()
     ((with-input-from-string str body ...)
-     (let ((port (open-input-string str)))
-       body ...))))
+     (%with-input-from-string str (lambda () body ...)))))
 
 ;;; ============================================================================
 ;;; List Processing Utilities (SRFI-1 style)
@@ -509,6 +563,7 @@
 
 ; filter - return list of elements satisfying predicate (tail-recursive, in-order)
 (define (filter pred lst)
+  (%require-proper-list "filter" lst)
   (let ((head (cons '() '()))) ; dummy head cell
     (let loop ((lst lst) (tail head))
       (cond ((null? lst) (cdr head))
@@ -524,24 +579,31 @@
 
 ; find - return first element satisfying predicate, or #f
 (define (find pred lst)
-  (cond ((null? lst) #f)
-        ((pred (car lst)) (car lst))
-        (else (find pred (cdr lst)))))
+  (%require-proper-list "find" lst)
+  (let loop ((lst lst))
+    (cond ((null? lst) #f)
+          ((pred (car lst)) (car lst))
+          (else (loop (cdr lst))))))
 
 ; any - return #t if any element satisfies predicate
 (define (any pred lst)
-  (cond ((null? lst) #f)
-        ((pred (car lst)) #t)
-        (else (any pred (cdr lst)))))
+  (%require-proper-list "any" lst)
+  (let loop ((lst lst))
+    (cond ((null? lst) #f)
+          ((pred (car lst)) #t)
+          (else (loop (cdr lst))))))
 
 ; every - return #t if all elements satisfy predicate
 (define (every pred lst)
-  (cond ((null? lst) #t)
-        ((not (pred (car lst))) #f)
-        (else (every pred (cdr lst)))))
+  (%require-proper-list "every" lst)
+  (let loop ((lst lst))
+    (cond ((null? lst) #t)
+          ((not (pred (car lst))) #f)
+          (else (loop (cdr lst))))))
 
 ; count - count elements satisfying predicate
 (define (count pred lst)
+  (%require-proper-list "count" lst)
   (let loop ((lst lst) (n 0))
     (cond ((null? lst) n)
           ((pred (car lst)) (loop (cdr lst) (+ n 1)))
@@ -549,12 +611,15 @@
 
 ; fold-left (reduce) - left-associative fold
 (define (fold proc init lst)
-  (if (null? lst)
-      init
-      (fold proc (proc (car lst) init) (cdr lst))))
+  (%require-proper-list "fold" lst)
+  (let loop ((lst lst) (acc init))
+    (if (null? lst)
+        acc
+        (loop (cdr lst) (proc (car lst) acc)))))
 
 ; fold-right - right-associative fold
 (define (fold-right proc init lst)
+  (%require-proper-list "fold-right" lst)
   (if (null? lst)
       init
       (proc (car lst) (fold-right proc init (cdr lst)))))
@@ -567,18 +632,23 @@
 
 ; take - return first n elements of list
 (define (take n lst)
-  (if (or (= n 0) (null? lst))
-      '()
-      (cons (car lst) (take (- n 1) (cdr lst)))))
+  (%require-nonnegative-integer "take" n)
+  (let loop ((n n) (lst lst))
+    (if (or (= n 0) (null? lst))
+        '()
+        (cons (car lst) (loop (- n 1) (cdr lst))))))
 
 ; drop - return list without first n elements
 (define (drop n lst)
-  (if (or (= n 0) (null? lst))
-      lst
-      (drop (- n 1) (cdr lst))))
+  (%require-nonnegative-integer "drop" n)
+  (let loop ((n n) (lst lst))
+    (if (or (= n 0) (null? lst))
+        lst
+        (loop (- n 1) (cdr lst)))))
 
 ; partition - split list into two lists based on predicate
 (define (partition pred lst)
+  (%require-proper-list "partition" lst)
   (let loop ((lst lst) (yes '()) (no '()))
     (cond ((null? lst) (list (reverse yes) (reverse no)))
           ((pred (car lst)) (loop (cdr lst) (cons (car lst) yes) no))
@@ -586,6 +656,8 @@
 
 ; zip - combine corresponding elements of two lists
 (define (zip lst1 lst2)
+  (%require-proper-list "zip" lst1)
+  (%require-proper-list "zip" lst2)
   (if (or (null? lst1) (null? lst2))
       '()
       (cons (list (car lst1) (car lst2))
@@ -593,15 +665,15 @@
 
 ; flatten - flatten nested list structure
 (define (flatten lst)
+  (if (pair? lst)
+      (%require-proper-list "flatten" lst))
   (cond ((null? lst) '())
         ((not (pair? lst)) (list lst))
         (else (append (flatten (car lst)) (flatten (cdr lst))))))
 
 ; last - return last element of list
 (define (last lst)
-  (if (null? (cdr lst))
-      (car lst)
-      (last (cdr lst))))
+  (car (last-pair lst)))
 
 ; iota - generate list of integers [0, n)
 (define (iota n)
@@ -632,6 +704,7 @@
 
 ; make-list - create list of n elements, optionally filled with fill
 (define (make-list n . fill)
+  (%require-nonnegative-integer "make-list" n)
   (let ((f (if (null? fill) #f (car fill))))
     (let loop ((n n) (acc '()))
       (if (<= n 0)
@@ -640,6 +713,7 @@
 
 ; list-tabulate - create list by calling init-proc on indices 0..n-1
 (define (list-tabulate n init-proc)
+  (%require-nonnegative-integer "list-tabulate" n)
   (let loop ((i (- n 1)) (acc '()))
     (if (< i 0)
         acc
@@ -647,6 +721,7 @@
 
 ; list-copy - shallow copy of list
 (define (list-copy lst)
+  (%require-proper-list "list-copy" lst)
   (if (null? lst)
       '()
       (cons (car lst) (list-copy (cdr lst)))))
@@ -690,6 +765,7 @@
 
 ; list= - compare lists element-wise using elt=
 (define (list= elt= . lists)
+  (%require-proper-lists "list=" lists)
   (or (null? lists)
       (null? (cdr lists))
       (let loop ((lists lists))
@@ -724,23 +800,32 @@
 
 ; take-right - return last n elements
 (define (take-right lst n)
+  (%require-proper-list "take-right" lst)
+  (%require-nonnegative-integer "take-right" n)
   (let ((len (length lst)))
     (drop (- len n) lst)))
 
 ; drop-right - return all but last n elements
 (define (drop-right lst n)
+  (%require-proper-list "drop-right" lst)
+  (%require-nonnegative-integer "drop-right" n)
   (let ((len (length lst)))
     (take (- len n) lst)))
 
 ; split-at - split list at index, return two lists
 (define (split-at lst n)
+  (%require-nonnegative-integer "split-at" n)
   (values (take n lst) (drop n lst)))
 
 ; last-pair - return last pair of list
 (define (last-pair lst)
-  (if (null? (cdr lst))
-      lst
-      (last-pair (cdr lst))))
+  (%require-proper-list "last-pair" lst)
+  (if (not (pair? lst))
+      (error "last-pair: expected pair")
+      (let loop ((lst lst))
+        (if (null? (cdr lst))
+            lst
+            (loop (cdr lst))))))
 
 ;;; ============================================================================
 ;;; Additional SRFI-1 Miscellaneous
@@ -748,13 +833,16 @@
 
 ; concatenate - append all lists in list-of-lists
 (define (concatenate lists)
+  (%require-proper-lists "concatenate" lists)
   (apply append lists))
 
 ; append-reverse - (append (reverse rev-head) tail)
 (define (append-reverse rev-head tail)
-  (if (null? rev-head)
-      tail
-      (append-reverse (cdr rev-head) (cons (car rev-head) tail))))
+  (%require-proper-list "append-reverse" rev-head)
+  (let loop ((rev-head rev-head) (tail tail))
+    (if (null? rev-head)
+        tail
+        (loop (cdr rev-head) (cons (car rev-head) tail)))))
 
 ; unzip1 - extract first elements from list of lists
 (define (unzip1 lists)
@@ -783,19 +871,22 @@
 
 ; pair-fold - like fold but proc receives pairs, not elements
 (define (pair-fold proc init lst)
-  (if (null? lst)
-      init
-      (let ((tail (cdr lst)))
-        (pair-fold proc (proc lst init) tail))))
+  (%require-proper-list "pair-fold" lst)
+  (let loop ((lst lst) (acc init))
+    (if (null? lst)
+        acc
+        (loop (cdr lst) (proc lst acc)))))
 
 ; pair-fold-right - like fold-right but proc receives pairs
 (define (pair-fold-right proc init lst)
+  (%require-proper-list "pair-fold-right" lst)
   (if (null? lst)
       init
       (proc lst (pair-fold-right proc init (cdr lst)))))
 
 ; reduce-right - like reduce but right-associative
 (define (reduce-right proc init lst)
+  (%require-proper-list "reduce-right" lst)
   (if (null? lst)
       init
       (let loop ((lst lst))
@@ -825,6 +916,7 @@
 
 ; filter-map - map and filter in one pass
 (define (filter-map proc lst)
+  (%require-proper-list "filter-map" lst)
   (let loop ((lst lst) (acc '()))
     (if (null? lst)
         (reverse acc)
@@ -833,6 +925,7 @@
 
 ; pair-for-each - like for-each but proc receives pairs
 (define (pair-for-each proc lst)
+  (%require-proper-list "pair-for-each" lst)
   (if (not (null? lst))
       (begin
         (proc lst)
@@ -844,12 +937,15 @@
 
 ; find-tail - return tail of list starting at first match
 (define (find-tail pred lst)
-  (cond ((null? lst) #f)
-        ((pred (car lst)) lst)
-        (else (find-tail pred (cdr lst)))))
+  (%require-proper-list "find-tail" lst)
+  (let loop ((lst lst))
+    (cond ((null? lst) #f)
+          ((pred (car lst)) lst)
+          (else (loop (cdr lst))))))
 
 ; list-index - return index of first element satisfying pred
 (define (list-index pred lst)
+  (%require-proper-list "list-index" lst)
   (let loop ((lst lst) (i 0))
     (cond ((null? lst) #f)
           ((pred (car lst)) i)
@@ -857,15 +953,19 @@
 
 ; take-while - return longest prefix satisfying pred
 (define (take-while pred lst)
-  (if (or (null? lst) (not (pred (car lst))))
-      '()
-      (cons (car lst) (take-while pred (cdr lst)))))
+  (%require-proper-list "take-while" lst)
+  (let loop ((lst lst))
+    (if (or (null? lst) (not (pred (car lst))))
+        '()
+        (cons (car lst) (loop (cdr lst))))))
 
 ; drop-while - drop longest prefix satisfying pred
 (define (drop-while pred lst)
-  (cond ((null? lst) '())
-        ((pred (car lst)) (drop-while pred (cdr lst)))
-        (else lst)))
+  (%require-proper-list "drop-while" lst)
+  (let loop ((lst lst))
+    (cond ((null? lst) '())
+          ((pred (car lst)) (loop (cdr lst)))
+          (else lst))))
 
 ; span - split at first element not satisfying pred
 (define (span pred lst)
@@ -886,6 +986,7 @@
 
 ; delete-duplicates - remove duplicate elements
 (define (delete-duplicates lst . maybe-eq)
+  (%require-proper-list "delete-duplicates" lst)
   (let ((eq (if (null? maybe-eq) equal? (car maybe-eq))))
     (let loop ((lst lst) (seen '()))
       (cond ((null? lst) (reverse seen))
@@ -903,6 +1004,7 @@
 
 ; alist-copy - shallow copy of alist
 (define (alist-copy alist)
+  (%require-proper-list "alist-copy" alist)
   (map (lambda (pair) (cons (car pair) (cdr pair))) alist))
 
 ; alist-delete - remove entries matching key
@@ -916,6 +1018,8 @@
 
 ; take! - destructive version of take
 (define (take! lst n)
+  (%require-proper-list "take!" lst)
+  (%require-nonnegative-integer "take!" n)
   (cond ((<= n 0) '())
         ((null? lst) '())
         (else
@@ -926,6 +1030,8 @@
 
 ; drop-right! - destructive version of drop-right
 (define (drop-right! lst n)
+  (%require-proper-list "drop-right!" lst)
+  (%require-nonnegative-integer "drop-right!" n)
   (let ((len (length lst)))
     (if (<= (- len n) 0)
         '()
@@ -933,6 +1039,8 @@
 
 ; split-at! - destructive version of split-at
 (define (split-at! lst n)
+  (%require-proper-list "split-at!" lst)
+  (%require-nonnegative-integer "split-at!" n)
   (if (<= n 0)
       (values '() lst)
       (let ((tail (drop lst (- n 1))))
@@ -942,6 +1050,7 @@
 
 ; append! - destructive append
 (define (append! . lists)
+  (%require-proper-lists "append!" lists)
   (if (null? lists)
       '()
       (let loop ((result '()) (lists lists))
@@ -954,10 +1063,12 @@
 
 ; concatenate! - destructive concatenate
 (define (concatenate! list-of-lists)
+  (%require-proper-lists "concatenate!" list-of-lists)
   (apply append! list-of-lists))
 
 ; reverse! - destructive reverse
 (define (reverse! lst)
+  (%require-proper-list "reverse!" lst)
   (let loop ((prev '()) (curr lst))
     (if (null? curr)
         prev
@@ -967,6 +1078,7 @@
 
 ; append-reverse! - destructive append-reverse
 (define (append-reverse! rev-head tail)
+  (%require-proper-list "append-reverse!" rev-head)
   (let loop ((curr rev-head) (acc tail))
     (if (null? curr)
         acc
@@ -976,6 +1088,8 @@
 
 ; map! - destructive map (mutates first list)
 (define (map! proc lst . lsts)
+  (%require-proper-list "map!" lst)
+  (%require-proper-lists "map!" lsts)
   (if (null? lsts)
       ; Single list case
       (let loop ((pair lst))
@@ -994,6 +1108,7 @@
 
 ; filter! - destructive filter
 (define (filter! pred lst)
+  (%require-proper-list "filter!" lst)
   ; Skip leading non-matching elements to find new head
   (let find-head ((lst lst))
     (cond ((null? lst) '())
@@ -1021,6 +1136,7 @@
 
 ; take-while! - destructive take-while
 (define (take-while! pred lst)
+  (%require-proper-list "take-while!" lst)
   (if (or (null? lst) (not (pred (car lst))))
       '()
       (let loop ((prev lst) (curr (cdr lst)))
@@ -1032,6 +1148,7 @@
 
 ; span! - destructive span
 (define (span! pred lst)
+  (%require-proper-list "span!" lst)
   (if (or (null? lst) (not (pred (car lst))))
       (values '() lst)
       (let loop ((prev lst) (curr (cdr lst)))
@@ -1052,6 +1169,7 @@
 
 ; delete-duplicates! - destructive delete-duplicates
 (define (delete-duplicates! lst . maybe-eq)
+  (%require-proper-list "delete-duplicates!" lst)
   (let ((eq (if (null? maybe-eq) equal? (car maybe-eq))))
     (let loop ((curr lst))
       (if (null? curr)
@@ -1062,6 +1180,7 @@
 
 ; alist-delete! - destructive alist-delete
 (define (alist-delete! key alist . maybe-eq)
+  (%require-proper-list "alist-delete!" alist)
   (let ((eq (if (null? maybe-eq) equal? (car maybe-eq))))
     (filter! (lambda (pair) (not (eq key (car pair)))) alist)))
 
@@ -1447,4 +1566,3 @@
        (if var
            (and-let* (more ...) body ...)
            #f)))))
-
