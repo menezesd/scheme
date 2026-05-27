@@ -29,9 +29,15 @@ static unsigned prim_inexact_to_exact(unsigned x)
         d = -d;
 
     // If it's a whole number that fits in int64, return as integer
-    if (d == floor(d) && d <= (double)INT64_MAX) {
-        int64_t n = (int64_t)d;
-        return store(negative ? -n : n);
+    if (d == floor(d)) {
+        const double int64_min_magnitude = 0x1p63;
+        if (d < int64_min_magnitude) {
+            int64_t n = (int64_t)d;
+            return store(negative ? -n : n);
+        }
+        if (negative && d == int64_min_magnitude) {
+            return store(INT64_MIN);
+        }
     }
 
     // Extract IEEE754 components: d = mantissa * 2^exp where 1 <= mantissa < 2
@@ -51,8 +57,12 @@ static unsigned prim_inexact_to_exact(unsigned x)
         // Use bignum for large shifts
         bignum *bn =
             bn_from_int(int_mantissa < 0 ? -int_mantissa : int_mantissa);
-        bignum *shifted = bn_lshift(bn, exp);
+        bignum *shifted = bn ? bn_lshift(bn, exp) : NULL;
         bn_free(bn);
+        if (!shifted) {
+            show_error("inexact->exact: out of memory");
+            return TOK_ERROR;
+        }
         if (int_mantissa < 0)
             shifted->sign = 1;
         return store_integer(shifted);
@@ -79,8 +89,13 @@ static unsigned prim_inexact_to_exact(unsigned x)
             unsigned numer = store(num);
             gc_protect(&numer);
             bignum *denom_bn = bn_from_int(1);
-            bignum *shifted = bn_lshift(denom_bn, (int)denom_exp);
+            bignum *shifted =
+                denom_bn ? bn_lshift(denom_bn, (int)denom_exp) : NULL;
             bn_free(denom_bn);
+            if (!shifted) {
+                show_error("inexact->exact: out of memory");
+                return TOK_ERROR;
+            }
             unsigned denom = store_integer(shifted);
             return normalize_rational_cells(numer, denom);
         }
@@ -177,8 +192,32 @@ unsigned apply_numtower_primitive(unsigned prim_id, unsigned argc,
             return store_inexact(sqrt(real * real + imag * imag));
         }
         // For real numbers, magnitude is abs
-        double d = to_double(x);
-        return is_exact(x) ? store((int64_t)fabs(d)) : store_inexact(fabs(d));
+        if (CELL_TYPE(x) == BT_NUM)
+            return CELL_ID(x) < 0 ? negate_number(x) : x;
+        if (CELL_TYPE(x) == BT_BIGNUM) {
+            bignum *bn = get_bignum(x);
+            if (bn->sign) {
+                bignum *abs_bn = bn_neg(bn);
+                if (!abs_bn) {
+                    show_error("magnitude: out of memory");
+                    return TOK_ERROR;
+                }
+                return store_integer(abs_bn);
+            }
+            return x;
+        }
+        if (CELL_TYPE(x) == BT_RATIONAL) {
+            unsigned num = CELL_CAR(x);
+            if (!is_negative_number(num))
+                return x;
+            GC_GUARD;
+            gc_protect(&x);
+            unsigned abs_num = negate_number(num);
+            gc_protect(&abs_num);
+            unsigned denom = CELL_CDR(x);
+            return normalize_rational_cells(abs_num, denom);
+        }
+        return store_inexact(fabs(to_double(x)));
     }
     case PANGLE: {
         REQUIRE_ARGC(argc, 1, 1, "angle");
@@ -227,6 +266,17 @@ unsigned apply_numtower_primitive(unsigned prim_id, unsigned argc,
             x = -x;
 
         // Integer case
+        if (!isfinite(x) || isnan(epsilon)) {
+            show_error("rationalize: expected finite real arguments");
+            return TOK_ERROR;
+        }
+        if (x >= 0x1p63) {
+            if (negative && x == 0x1p63 && epsilon >= 0.0) {
+                return store(INT64_MIN);
+            }
+            show_error("rationalize: magnitude too large");
+            return TOK_ERROR;
+        }
         int64_t n = (int64_t)floor(x);
         if (x - n <= epsilon) {
             return store(negative ? -n : n);

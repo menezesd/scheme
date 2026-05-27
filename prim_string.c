@@ -10,6 +10,10 @@ unsigned prim_string_append(unsigned argc, unsigned *argv)
     // First pass: validate and compute total length, cache individual lengths
     size_t total = 0;
     size_t lens[64];    // Stack-allocated for common case
+    if ((size_t)argc > SIZE_MAX / sizeof(size_t)) {
+        show_error("string-append: too many arguments");
+        return TOK_ERROR;
+    }
     size_t *lengths = (argc <= 64) ? lens : malloc(argc * sizeof(size_t));
     if (!lengths) {
         show_error("string-append: out of memory");
@@ -19,6 +23,12 @@ unsigned prim_string_append(unsigned argc, unsigned *argv)
     for (unsigned i = 0; i < argc; i++) {
         CHECK_STRING(argv[i], "string-append");
         lengths[i] = strlen(GET_STRING_PTR(argv[i]));
+        if (lengths[i] > SIZE_MAX - total - 1) {
+            if (argc > 64)
+                free(lengths);
+            show_error("string-append: result too large");
+            return TOK_ERROR;
+        }
         total += lengths[i];
     }
 
@@ -65,6 +75,10 @@ unsigned prim_substring(unsigned argc, unsigned *argv)
         return TOK_ERROR;
     }
     size_t result_len = end - start;
+    if (result_len == SIZE_MAX) {
+        show_error("substring: result too large");
+        return TOK_ERROR;
+    }
     char *result = malloc(result_len + 1);
     if (!result) {
         show_error("substring: out of memory");

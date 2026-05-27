@@ -11,6 +11,7 @@ SRCS = main.c context.c reader.c writer.c env.c primitives.c macros.c eval.c big
        eval_forms.c eval_cont.c compile.c code_object.c optimize.c vm.c compiled_pattern.c
 OBJS = $(SRCS:.c=.o)
 DEBUG_OBJS = $(SRCS:.c=.debug.o)
+SAN_OBJS = $(SRCS:.c=.san.o)
 HEADERS = types.h context.h reader.h writer.h env.h primitives.h macros.h eval.h bignum.h \
           prim_internal.h eval_internal.h bytecode.h compile_internal.h compiled_pattern.h
 GENERATED = stdlib_data.h
@@ -19,11 +20,13 @@ GENERATED = stdlib_data.h
 TARGET = vesper
 DEBUG_TARGET = vesper-debug
 DEBUG_CFLAGS = -Wall -Wextra -Wshadow -Wstrict-prototypes -std=c11 -g -O0 \
-               -DDEBUG -DDEBUG_GC -fsanitize=address,undefined \
-               -fno-omit-frame-pointer
-DEBUG_LDFLAGS = $(LDFLAGS) -fsanitize=address,undefined
+               -DDEBUG -DDEBUG_GC -fno-omit-frame-pointer
+DEBUG_LDFLAGS = $(LDFLAGS)
+SAN_TARGET = vesper-asan
+SAN_CFLAGS = $(DEBUG_CFLAGS) -fsanitize=address,undefined
+SAN_LDFLAGS = $(LDFLAGS) -fsanitize=address,undefined
 
-.PHONY: all clean distclean debug test test-c test-prop test-all
+.PHONY: all clean distclean debug sanitize test test-c test-prop test-all
 
 all: $(TARGET)
 
@@ -42,6 +45,7 @@ $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $(OBJS) $(LDFLAGS)
 
 # Object file dependencies
+$(OBJS): $(HEADERS)
 main.o: main.c $(HEADERS) stdlib_data.h
 context.o: context.c context.h types.h
 reader.o: reader.c reader.h context.h types.h
@@ -67,7 +71,8 @@ bignum.o: bignum.c bignum.h
 compile.o: compile.c bytecode.h compile_internal.h context.h env.h macros.h types.h
 code_object.o: code_object.c bytecode.h compile_internal.h context.h types.h
 optimize.o: optimize.c bytecode.h compile_internal.h context.h writer.h types.h
-vm.o: vm.c bytecode.h context.h env.h primitives.h macros.h types.h
+vm.o: vm.c bytecode.h compiled_pattern.h context.h env.h primitives.h macros.h \
+      prim_internal.h writer.h types.h
 compiled_pattern.o: compiled_pattern.c compiled_pattern.h context.h types.h
 
 %.o: %.c
@@ -80,6 +85,14 @@ $(DEBUG_TARGET): $(DEBUG_OBJS)
 	$(CC) $(DEBUG_CFLAGS) -o $@ $(DEBUG_OBJS) $(DEBUG_LDFLAGS)
 
 debug: $(DEBUG_TARGET)
+
+%.san.o: %.c $(HEADERS) stdlib_data.h
+	$(CC) $(SAN_CFLAGS) -c $< -o $@
+
+$(SAN_TARGET): $(SAN_OBJS)
+	$(CC) $(SAN_CFLAGS) -o $@ $(SAN_OBJS) $(SAN_LDFLAGS)
+
+sanitize: $(SAN_TARGET)
 
 distclean: clean
 	rm -f $(GENERATED)
@@ -131,7 +144,8 @@ test-prop: $(TARGET)
 test-all: test test-c test-prop
 
 clean:
-	rm -f $(OBJS) $(DEBUG_OBJS) $(TARGET) $(DEBUG_TARGET) $(TEST_BINS)
+	rm -f $(OBJS) $(DEBUG_OBJS) $(SAN_OBJS) $(TARGET) $(DEBUG_TARGET) \
+	      $(SAN_TARGET) $(TEST_BINS)
 
 # Format code (requires clang-format)
 format:

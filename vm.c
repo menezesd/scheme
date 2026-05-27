@@ -21,6 +21,8 @@
 #include "prim_internal.h"
 #include "primitives.h"
 #include "writer.h"
+#include <limits.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -34,6 +36,31 @@
 #define INITIAL_FRAMES_SIZE 256
 #define MAX_STACK_SIZE (1024 * 1024)
 #define MAX_FRAMES_SIZE (64 * 1024)
+
+static bool checked_array_size(unsigned count, size_t elem_size,
+                               size_t *size_out)
+{
+    if (elem_size != 0 && (size_t)count > SIZE_MAX / elem_size)
+        return false;
+    *size_out = (size_t)count * elem_size;
+    return true;
+}
+
+static bool checked_add_size(size_t a, size_t b, size_t *out)
+{
+    if (a > SIZE_MAX - b)
+        return false;
+    *out = a + b;
+    return true;
+}
+
+static void *malloc_array(unsigned count, size_t elem_size)
+{
+    size_t size;
+    if (!checked_array_size(count, elem_size, &size))
+        return NULL;
+    return malloc(size);
+}
 
 // Error handling macro - reduces boilerplate in dispatch loop
 #define VM_ERROR(vm, msg)                                                      \
@@ -49,6 +76,43 @@
         VM_ERROR(vm, msg);                                                     \
         break;                                                                 \
     } while (0)
+
+static unsigned vm_store_bignum_add_one(vm_state *vm, bignum *bn)
+{
+    bignum *one = bn_from_int(1);
+    bignum *result = one ? bn_add(bn, one) : NULL;
+    bn_free(bn);
+    bn_free(one);
+    if (!result) {
+        VM_ERROR(vm, "add1: out of memory");
+        return TOK_ERROR;
+    }
+    return store_integer(result);
+}
+
+static unsigned vm_store_bignum_sub_one(vm_state *vm, bignum *bn)
+{
+    bignum *one = bn_from_int(1);
+    bignum *result = one ? bn_sub(bn, one) : NULL;
+    bn_free(bn);
+    bn_free(one);
+    if (!result) {
+        VM_ERROR(vm, "sub1: out of memory");
+        return TOK_ERROR;
+    }
+    return store_integer(result);
+}
+
+static unsigned vm_store_bignum_neg(vm_state *vm, const bignum *bn,
+                                    const char *name)
+{
+    bignum *result = bn_neg(bn);
+    if (!result) {
+        VM_ERROR(vm, name);
+        return TOK_ERROR;
+    }
+    return store_integer(result);
+}
 
 // Type check macros that break on failure (handle fixnums safely)
 #define VM_CHECK_PAIR(vm, val, msg)                                            \
@@ -333,11 +397,21 @@ static unsigned capture_continuation(vm_state *vm)
     // Calculate sizes for single allocation
     unsigned letrec_count =
         (vm->letrec_frame && vm->letrec_count > 0) ? vm->letrec_count : 0;
-    size_t stack_size = vm->sp * sizeof(unsigned);
-    size_t frames_size = vm->fp * sizeof(vm_frame);
-    size_t letrec_size = letrec_count * sizeof(unsigned);
-    size_t total_size =
-        sizeof(vm_continuation) + stack_size + frames_size + letrec_size;
+    size_t stack_size, frames_size, letrec_size, total_size;
+    LISP_ASSERT_MSG(checked_array_size(vm->sp, sizeof(unsigned), &stack_size),
+                    "capture_continuation: stack size overflow");
+    LISP_ASSERT_MSG(checked_array_size(vm->fp, sizeof(vm_frame), &frames_size),
+                    "capture_continuation: frame size overflow");
+    LISP_ASSERT_MSG(checked_array_size(letrec_count, sizeof(unsigned),
+                                       &letrec_size),
+                    "capture_continuation: letrec size overflow");
+    LISP_ASSERT_MSG(checked_add_size(sizeof(vm_continuation), stack_size,
+                                     &total_size),
+                    "capture_continuation: size overflow");
+    LISP_ASSERT_MSG(checked_add_size(total_size, frames_size, &total_size),
+                    "capture_continuation: size overflow");
+    LISP_ASSERT_MSG(checked_add_size(total_size, letrec_size, &total_size),
+                    "capture_continuation: size overflow");
 
     // Single allocation for entire continuation
     char *block = malloc(total_size);
@@ -413,9 +487,18 @@ static void restore_continuation(vm_state *vm, unsigned cont_cell,
     }
 
     // Restore stack (with return value on top)
+    if (cont->sp == UINT_MAX) {
+        VM_ERROR(vm, "restore_continuation: stack size overflow");
+        return;
+    }
     if (vm->stack_cap < cont->sp + 1) {
         unsigned new_cap = cont->sp + 1;
-        unsigned *new_stack = realloc(vm->stack, new_cap * sizeof(unsigned));
+        size_t new_size;
+        if (!checked_array_size(new_cap, sizeof(unsigned), &new_size)) {
+            VM_ERROR(vm, "restore_continuation: stack size overflow");
+            return;
+        }
+        unsigned *new_stack = realloc(vm->stack, new_size);
         if (!new_stack) {
             VM_ERROR(vm, "restore_continuation: stack realloc failed");
             return;
@@ -430,7 +513,12 @@ static void restore_continuation(vm_state *vm, unsigned cont_cell,
     // Restore frames
     if (vm->frames_cap < cont->fp) {
         unsigned new_cap = cont->fp;
-        vm_frame *new_frames = realloc(vm->frames, new_cap * sizeof(vm_frame));
+        size_t new_size;
+        if (!checked_array_size(new_cap, sizeof(vm_frame), &new_size)) {
+            VM_ERROR(vm, "restore_continuation: frame size overflow");
+            return;
+        }
+        vm_frame *new_frames = realloc(vm->frames, new_size);
         if (!new_frames) {
             VM_ERROR(vm, "restore_continuation: frames realloc failed");
             return;
@@ -481,7 +569,7 @@ static bool vm_handle_apply(vm_state *vm, unsigned argc, unsigned *argv,
     unsigned *middle_args_heap = NULL;
 
     if (middle_count > MAX_APPLY_MIDDLE_ARGS) {
-        middle_args_heap = malloc(middle_count * sizeof(unsigned));
+        middle_args_heap = malloc_array(middle_count, sizeof(unsigned));
         if (!middle_args_heap) {
             VM_ERROR(vm, "apply: out of memory for middle arguments");
             return false;
@@ -1485,19 +1573,21 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 } else {
                     // Overflow to bignum
                     bignum *bn = bn_from_int(val);
-                    bignum *one = bn_from_int(1);
-                    bignum *result = bn_add(bn, one);
-                    bn_free(bn);
-                    bn_free(one);
-                    vm_push(vm, store_integer(result));
+                    unsigned result = bn ? vm_store_bignum_add_one(vm, bn)
+                                         : TOK_ERROR;
+                    if (result == TOK_ERROR) {
+                        VM_ERROR_BREAK(vm, "add1: out of memory");
+                    }
+                    vm_push(vm, result);
                 }
             } else if (CELL_TYPE(n) == BT_BIGNUM) {
                 bignum *bn = bn_copy(get_bignum(n));
-                bignum *one = bn_from_int(1);
-                bignum *result = bn_add(bn, one);
-                bn_free(bn);
-                bn_free(one);
-                vm_push(vm, store_integer(result));
+                unsigned result = bn ? vm_store_bignum_add_one(vm, bn)
+                                     : TOK_ERROR;
+                if (result == TOK_ERROR) {
+                    VM_ERROR_BREAK(vm, "add1: out of memory");
+                }
+                vm_push(vm, result);
             } else {
                 vm->error = true;
                 vm->error_msg = "add1: not a number";
@@ -1524,19 +1614,21 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 } else {
                     // Underflow to bignum
                     bignum *bn = bn_from_int(val);
-                    bignum *one = bn_from_int(1);
-                    bignum *result = bn_sub(bn, one);
-                    bn_free(bn);
-                    bn_free(one);
-                    vm_push(vm, store_integer(result));
+                    unsigned result = bn ? vm_store_bignum_sub_one(vm, bn)
+                                         : TOK_ERROR;
+                    if (result == TOK_ERROR) {
+                        VM_ERROR_BREAK(vm, "sub1: out of memory");
+                    }
+                    vm_push(vm, result);
                 }
             } else if (CELL_TYPE(n) == BT_BIGNUM) {
                 bignum *bn = bn_copy(get_bignum(n));
-                bignum *one = bn_from_int(1);
-                bignum *result = bn_sub(bn, one);
-                bn_free(bn);
-                bn_free(one);
-                vm_push(vm, store_integer(result));
+                unsigned result = bn ? vm_store_bignum_sub_one(vm, bn)
+                                     : TOK_ERROR;
+                if (result == TOK_ERROR) {
+                    VM_ERROR_BREAK(vm, "sub1: out of memory");
+                }
+                vm_push(vm, result);
             } else {
                 vm->error = true;
                 vm->error_msg = "sub1: not a number";
@@ -1676,8 +1768,9 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 if (vb == 0)
                     VM_ERROR_BREAK(vm, "/: division by zero");
                 if (va % vb == 0) {
-                    int32_t q = va / vb;
-                    vm_push(vm, MAKE_FIXNUM(q));
+                    int64_t q = (int64_t)va / (int64_t)vb;
+                    vm_push(vm, FITS_FIXNUM(q) ? MAKE_FIXNUM((int32_t)q)
+                                                : store(q));
                     break;
                 }
                 // Result is rational — box and use full path
@@ -2242,22 +2335,34 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 if (val == INT64_MIN) {
                     // Overflow to bignum
                     bignum *bn = bn_from_int(val);
+                    if (!bn) {
+                        VM_ERROR_BREAK(vm, "-: out of memory");
+                    }
                     bn_neg_ip(bn);
                     vm_push(vm, store_integer(bn));
                 } else {
                     vm_push(vm, store(-val));
                 }
             } else if (CELL_TYPE(n) == BT_BIGNUM) {
-                bignum *bn = bn_neg(get_bignum(n));
-                vm_push(vm, store_integer(bn));
+                unsigned result =
+                    vm_store_bignum_neg(vm, get_bignum(n), "-: out of memory");
+                if (result == TOK_ERROR) {
+                    VM_ERROR_BREAK(vm, "-: out of memory");
+                }
+                vm_push(vm, result);
             } else if (CELL_TYPE(n) == BT_INEXACT) {
                 vm_push(vm, store_inexact(-to_double(n)));
             } else if (CELL_TYPE(n) == BT_RATIONAL) {
+                GC_GUARD;
+                gc_protect(&n);
                 unsigned neg_num = negate_number(car(n));
+                if (neg_num == TOK_ERROR) {
+                    VM_ERROR_BREAK(vm, "-: out of memory");
+                }
                 gc_protect(&neg_num);
                 unsigned denom = cdr(n);
+                gc_protect(&denom);
                 unsigned result = alloc();
-                gc_unprotect(1);
                 CELL_TYPE(result) = BT_RATIONAL;
                 CELL_CAR(result) = neg_num;
                 CELL_CDR(result) = denom;
@@ -2287,6 +2392,9 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 int64_t val = CELL_ID(n);
                 if (val == INT64_MIN) {
                     bignum *bn = bn_from_int(val);
+                    if (!bn) {
+                        VM_ERROR_BREAK(vm, "abs: out of memory");
+                    }
                     bn_neg_ip(bn);
                     vm_push(vm, store_integer(bn));
                 } else {
@@ -2295,8 +2403,12 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             } else if (CELL_TYPE(n) == BT_BIGNUM) {
                 bignum *bn = get_bignum(n);
                 if (bn->sign) {
-                    bignum *result = bn_neg(bn);
-                    vm_push(vm, store_integer(result));
+                    unsigned result =
+                        vm_store_bignum_neg(vm, bn, "abs: out of memory");
+                    if (result == TOK_ERROR) {
+                        VM_ERROR_BREAK(vm, "abs: out of memory");
+                    }
+                    vm_push(vm, result);
                 } else {
                     vm_push(vm, n);
                 }
@@ -2305,11 +2417,16 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 vm_push(vm, store_inexact(d < 0 ? -d : d));
             } else if (CELL_TYPE(n) == BT_RATIONAL) {
                 if (is_negative_number(car(n))) {
+                    GC_GUARD;
+                    gc_protect(&n);
                     unsigned abs_num = negate_number(car(n));
+                    if (abs_num == TOK_ERROR) {
+                        VM_ERROR_BREAK(vm, "abs: out of memory");
+                    }
                     gc_protect(&abs_num);
                     unsigned denom = cdr(n);
+                    gc_protect(&denom);
                     unsigned result = alloc();
-                    gc_unprotect(1);
                     CELL_TYPE(result) = BT_RATIONAL;
                     CELL_CAR(result) = abs_num;
                     CELL_CDR(result) = denom;
@@ -2579,9 +2696,19 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                                              : store((int64_t)val + 1));
             } else if (CELL_TYPE(n) == BT_NUM) {
                 int64_t val = CELL_ID(n);
-                int64_t r = val + 1;
-                vm_push(vm, FITS_FIXNUM(r) ? MAKE_FIXNUM((int32_t)r)
-                                           : store(r));
+                if (val < INT64_MAX) {
+                    int64_t r = val + 1;
+                    vm_push(vm, FITS_FIXNUM(r) ? MAKE_FIXNUM((int32_t)r)
+                                               : store(r));
+                } else {
+                    bignum *bn = bn_from_int(val);
+                    unsigned result = bn ? vm_store_bignum_add_one(vm, bn)
+                                         : TOK_ERROR;
+                    if (result == TOK_ERROR) {
+                        VM_ERROR_BREAK(vm, "add1: out of memory");
+                    }
+                    vm_push(vm, result);
+                }
             } else {
                 n = ensure_boxed(n);
                 gc_protect(&n);
@@ -2613,9 +2740,19 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                                              : store((int64_t)val - 1));
             } else if (CELL_TYPE(n) == BT_NUM) {
                 int64_t val = CELL_ID(n);
-                int64_t r = val - 1;
-                vm_push(vm, FITS_FIXNUM(r) ? MAKE_FIXNUM((int32_t)r)
-                                           : store(r));
+                if (val > INT64_MIN) {
+                    int64_t r = val - 1;
+                    vm_push(vm, FITS_FIXNUM(r) ? MAKE_FIXNUM((int32_t)r)
+                                               : store(r));
+                } else {
+                    bignum *bn = bn_from_int(val);
+                    unsigned result = bn ? vm_store_bignum_sub_one(vm, bn)
+                                         : TOK_ERROR;
+                    if (result == TOK_ERROR) {
+                        VM_ERROR_BREAK(vm, "sub1: out of memory");
+                    }
+                    vm_push(vm, result);
+                }
             } else {
                 n = ensure_boxed(n);
                 gc_protect(&n);

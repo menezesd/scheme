@@ -1,6 +1,7 @@
 // Unit tests for bignum module
 #include "bignum.h"
 #include "test_framework.h"
+#include <stdint.h>
 #include <stdlib.h>
 
 // ============================================================================
@@ -32,6 +33,23 @@ TEST(bn_from_int_negative)
     ASSERT(bn != NULL);
     ASSERT(!bn_is_zero(bn));
     ASSERT(bn_sign(bn) < 0);
+    bn_free(bn);
+    PASS();
+}
+
+TEST(bn_from_int_min)
+{
+    bignum *bn = bn_from_int(INT64_MIN);
+    ASSERT(bn != NULL);
+    ASSERT(bn_sign(bn) < 0);
+
+    int64_t value;
+    ASSERT_EQ(bn_to_int64(bn, &value), 0);
+    ASSERT_EQ(value, INT64_MIN);
+
+    char *s = bn_to_string(bn, 10);
+    ASSERT_STR_EQ(s, "-9223372036854775808");
+    free(s);
     bn_free(bn);
     PASS();
 }
@@ -299,6 +317,20 @@ TEST(bn_from_string_negative)
     PASS();
 }
 
+TEST(bn_from_string_rejects_trailing_junk)
+{
+    bignum *a = bn_from_string("123abc", 10);
+    ASSERT(a == NULL);
+    PASS();
+}
+
+TEST(bn_from_string_rejects_empty_digits)
+{
+    bignum *a = bn_from_string("-", 10);
+    ASSERT(a == NULL);
+    PASS();
+}
+
 TEST(bn_to_string_test)
 {
     bignum *a = bn_from_int(12345);
@@ -434,6 +466,7 @@ int main(void)
     RUN_TEST(bn_from_int_zero);
     RUN_TEST(bn_from_int_positive);
     RUN_TEST(bn_from_int_negative);
+    RUN_TEST(bn_from_int_min);
     RUN_TEST(bn_add_simple);
     RUN_TEST(bn_add_negative);
     RUN_TEST(bn_sub_simple);
@@ -452,6 +485,8 @@ int main(void)
     RUN_TEST(bn_large_factorial);
     RUN_TEST(bn_from_string_positive);
     RUN_TEST(bn_from_string_negative);
+    RUN_TEST(bn_from_string_rejects_trailing_junk);
+    RUN_TEST(bn_from_string_rejects_empty_digits);
     RUN_TEST(bn_to_string_test);
     RUN_TEST(bn_to_string_negative);
 

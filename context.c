@@ -152,6 +152,10 @@ void gc_protect(unsigned *ptr)
     init_shadow_stack();
     if (shadow_stack_top >= shadow_stack_size) {
         // Expand the shadow stack
+        if (shadow_stack_size > INT_MAX / 2 ||
+            (size_t)shadow_stack_size * 2 > SIZE_MAX / sizeof(unsigned *)) {
+            lisp_panic("shadow stack too large");
+        }
         int new_size = shadow_stack_size * 2;
         unsigned **new_stack =
             realloc(shadow_stack, new_size * sizeof(unsigned *));
@@ -464,6 +468,8 @@ unsigned negate_number(unsigned x)
         // Handle INT64_MIN overflow
         if (val == INT64_MIN) {
             bignum *bn = bn_from_int(val);
+            if (!bn)
+                lisp_panic("negate_number: out of memory");
             bn_neg_ip(bn);
             return store_integer(bn);
         }
@@ -471,6 +477,8 @@ unsigned negate_number(unsigned x)
     }
     case BT_BIGNUM: {
         bignum *bn = bn_neg(get_bignum(x));
+        if (!bn)
+            lisp_panic("negate_number: out of memory");
         return store_integer(bn);
     }
     default:
@@ -517,6 +525,11 @@ unsigned normalize_rational_cells(unsigned num_cell, unsigned denom_cell)
     bn_free(num);
     bn_free(denom);
     bn_free(g);
+    if (!reduced_num || !reduced_denom) {
+        bn_free(reduced_num);
+        bn_free(reduced_denom);
+        lisp_panic("normalize_rational_cells: out of memory");
+    }
 
     // Check if denominator is 1 - return integer
     int64_t denom_val;
@@ -530,6 +543,7 @@ unsigned normalize_rational_cells(unsigned num_cell, unsigned denom_cell)
     unsigned num_stored = store_integer(reduced_num);
     gc_protect(&num_stored);
     unsigned denom_stored = store_integer(reduced_denom);
+    gc_protect(&denom_stored);
 
     // Create rational cell
     unsigned p = alloc();
@@ -640,6 +654,9 @@ unsigned make_vector(unsigned len, unsigned fill)
     GC_GUARD;
     gc_protect(&fill);
 
+    if ((size_t)len > (SIZE_MAX - sizeof(vector_data)) / sizeof(unsigned)) {
+        lisp_panic("vector too large");
+    }
     vector_data *vd = malloc(sizeof(vector_data) + len * sizeof(unsigned));
     if (!vd) {
         lisp_panic("failed to allocate vector");
@@ -786,7 +803,7 @@ static bool is_prime(unsigned n)
         return true;
     if (n % 2 == 0)
         return false;
-    for (unsigned i = 3; i * i <= n; i += 2) {
+    for (unsigned i = 3; i <= n / i; i += 2) {
         if (n % i == 0)
             return false;
     }
@@ -805,7 +822,15 @@ static unsigned next_prime(unsigned n)
 static void rehash_atom_table(void)
 {
     unsigned old_cap = ctx.atom_table_cap;
+    if (old_cap > UINT_MAX / 2) {
+        fprintf(stderr, "Warning: atom table too large to resize\n");
+        return;
+    }
     unsigned new_cap = next_prime(old_cap * 2);
+    if ((size_t)new_cap > SIZE_MAX / sizeof(const char *)) {
+        fprintf(stderr, "Warning: atom table too large to resize\n");
+        return;
+    }
 
     const char **new_table = calloc(new_cap, sizeof(const char *));
     if (!new_table) {
@@ -1158,12 +1183,12 @@ bool check_args(unsigned args, unsigned min, unsigned max, const char *name)
 
 void list_append(unsigned *head, unsigned *tail, unsigned elem)
 {
-    // CRITICAL: Protect elem - alloc() can trigger GC which may move elem.
-    // If we pass elem by value to alloc_cons, GC could make that value stale.
-    // By protecting elem here, we ensure it's updated if GC moves it.
+    // Protect in-progress list roots and elem; alloc() can trigger GC.
     unsigned cell;
     {
         GC_PROTECT_GUARD;
+        gc_protect(head);
+        gc_protect(tail);
         gc_protect(&elem);
         cell = alloc();
         CELL_TYPE(cell) = BT_CONS;
@@ -1173,8 +1198,7 @@ void list_append(unsigned *head, unsigned *tail, unsigned elem)
     if (!*head) {
         *head = *tail = cell;
     } else {
-        write_barrier(*tail, cell); // *tail may be in old gen
-        CELL_CDR(*tail) = cell;
+        cell_set_cdr(*tail, cell);
         *tail = cell;
     }
 }

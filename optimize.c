@@ -11,10 +11,36 @@
 #include "compile_internal.h"
 #include "context.h"
 #include "writer.h"
+#include <limits.h>
+#include <stdint.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+static void *malloc_array(unsigned count, size_t elem_size)
+{
+    if (elem_size != 0 && (size_t)count > SIZE_MAX / elem_size)
+        return NULL;
+    return malloc((size_t)count * elem_size);
+}
+
+static void *calloc_array(unsigned count, size_t elem_size)
+{
+    if (elem_size != 0 && (size_t)count > SIZE_MAX / elem_size)
+        return NULL;
+    return calloc(count, elem_size);
+}
+
+static void *calloc_array_plus_one(unsigned count, size_t elem_size)
+{
+    if (count == UINT_MAX)
+        return NULL;
+    unsigned count_plus_one = count + 1;
+    if (elem_size != 0 && (size_t)count_plus_one > SIZE_MAX / elem_size)
+        return NULL;
+    return calloc(count_plus_one, elem_size);
+}
 
 // ============================================================================
 // Instruction Size
@@ -99,12 +125,12 @@ static void cse_pass(code_object *code)
     unsigned len = code->code_len;
 
     // Allocate new code buffer (max same size as original)
-    unsigned *new_code = malloc(len * sizeof(unsigned));
+    unsigned *new_code = malloc_array(len, sizeof(unsigned));
     if (!new_code)
         return;
 
     // First, identify jump targets to avoid unsafe optimizations
-    bool *is_jump_target = calloc(len + 1, sizeof(bool));
+    bool *is_jump_target = calloc_array_plus_one(len, sizeof(bool));
     if (!is_jump_target) {
         free(new_code);
         return;
@@ -127,7 +153,7 @@ static void cse_pass(code_object *code)
     }
 
     // Build offset map as we go (old position -> new position)
-    unsigned *offset_map = calloc(len + 1, sizeof(unsigned));
+    unsigned *offset_map = calloc_array_plus_one(len, sizeof(unsigned));
     if (!offset_map) {
         free(new_code);
         free(is_jump_target);
@@ -310,7 +336,7 @@ void peephole_optimize(code_object *code)
     unsigned len = code->code_len;
 
     // Collect all jump targets - needed to avoid unsafe fusions
-    bool *is_jump_target = calloc(len + 1, sizeof(bool));
+    bool *is_jump_target = calloc_array_plus_one(len, sizeof(bool));
     if (!is_jump_target)
         return;
     for (unsigned i = 0; i < len;) {
@@ -332,13 +358,13 @@ void peephole_optimize(code_object *code)
 
     // First pass: identify which bytes to remove and build offset map
     // offset_map[old] = new offset after compaction
-    unsigned *offset_map = malloc(len * sizeof(unsigned));
+    unsigned *offset_map = malloc_array(len, sizeof(unsigned));
     if (!offset_map) {
         free(is_jump_target);
         return;
     }
 
-    bool *remove = calloc(len, sizeof(bool));
+    bool *remove = calloc_array(len, sizeof(bool));
     if (!remove) {
         free(offset_map);
         free(is_jump_target);

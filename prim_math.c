@@ -89,39 +89,86 @@ static bignum *bn_exact_nth_root(const bignum *base, int64_t n)
     }
     double guess_d = pow(d, 1.0 / n);
     bignum *guess = bn_from_int((int64_t)guess_d);
+    if (!guess)
+        return NULL;
     if (bn_is_zero(guess)) {
         bn_free(guess);
         guess = bn_from_int(1);
+        if (!guess)
+            return NULL;
     }
 
     // Newton iteration: x_new = ((n-1)*x + base/x^(n-1)) / n
     bignum *n_bn = bn_from_int(n);
     bignum *n_minus_1 = bn_from_int(n - 1);
+    if (!n_bn || !n_minus_1) {
+        bn_free(guess);
+        bn_free(n_bn);
+        bn_free(n_minus_1);
+        return NULL;
+    }
 
     for (int iter = 0; iter < 100; iter++) {
         // Compute guess^(n-1)
         bignum *power = bn_from_int(1);
+        if (!power) {
+            bn_free(guess);
+            bn_free(n_bn);
+            bn_free(n_minus_1);
+            return NULL;
+        }
         for (int64_t i = 0; i < n - 1; i++) {
             bignum *temp = bn_mul(power, guess);
             bn_free(power);
             power = temp;
+            if (!power) {
+                bn_free(guess);
+                bn_free(n_bn);
+                bn_free(n_minus_1);
+                return NULL;
+            }
         }
 
         // Compute base / guess^(n-1)
         bignum *quotient = bn_div(base, power, NULL);
         bn_free(power);
+        if (!quotient) {
+            bn_free(guess);
+            bn_free(n_bn);
+            bn_free(n_minus_1);
+            return NULL;
+        }
 
         // Compute (n-1) * guess
         bignum *term1 = bn_mul(n_minus_1, guess);
+        if (!term1) {
+            bn_free(quotient);
+            bn_free(guess);
+            bn_free(n_bn);
+            bn_free(n_minus_1);
+            return NULL;
+        }
 
         // Sum: (n-1)*guess + base/guess^(n-1)
         bignum *sum = bn_add(term1, quotient);
         bn_free(term1);
         bn_free(quotient);
+        if (!sum) {
+            bn_free(guess);
+            bn_free(n_bn);
+            bn_free(n_minus_1);
+            return NULL;
+        }
 
         // New guess: sum / n
         bignum *new_guess = bn_div(sum, n_bn, NULL);
         bn_free(sum);
+        if (!new_guess) {
+            bn_free(guess);
+            bn_free(n_bn);
+            bn_free(n_minus_1);
+            return NULL;
+        }
 
         // Check convergence
         int cmp = bn_cmp(new_guess, guess);
@@ -139,10 +186,18 @@ static bignum *bn_exact_nth_root(const bignum *base, int64_t n)
 
     // Verify: guess^n == base
     bignum *check = bn_from_int(1);
+    if (!check) {
+        bn_free(guess);
+        return NULL;
+    }
     for (int64_t i = 0; i < n; i++) {
         bignum *temp = bn_mul(check, guess);
         bn_free(check);
         check = temp;
+        if (!check) {
+            bn_free(guess);
+            return NULL;
+        }
     }
 
     if (bn_cmp(check, base) == 0) {
@@ -295,7 +350,8 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned argc,
                 if (IS_EXACT_INT(base_arg)) {
                     // Integer base - denominator is implicitly 1
                     bignum *base_bn = to_bignum(base_arg);
-                    num_root = bn_exact_nth_root(base_bn, exp_denom);
+                    if (base_bn)
+                        num_root = bn_exact_nth_root(base_bn, exp_denom);
                     bn_free(base_bn);
                     if (num_root)
                         den_root = bn_from_int(1);
@@ -305,8 +361,9 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned argc,
                     unsigned base_den = CELL_CDR(base_arg);
                     bignum *num_bn = to_bignum(base_num);
                     bignum *den_bn = to_bignum(base_den);
-                    num_root = bn_exact_nth_root(num_bn, exp_denom);
-                    if (num_root)
+                    if (num_bn)
+                        num_root = bn_exact_nth_root(num_bn, exp_denom);
+                    if (num_root && den_bn)
                         den_root = bn_exact_nth_root(den_bn, exp_denom);
                     bn_free(num_bn);
                     bn_free(den_bn);
@@ -317,17 +374,39 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned argc,
                     // Now compute (num_root/den_root)^|exp_numer|
                     bool neg_exp = exp_numer < 0;
                     uint64_t p =
-                        neg_exp ? (uint64_t)(-exp_numer) : (uint64_t)exp_numer;
+                        neg_exp ? -(uint64_t)exp_numer : (uint64_t)exp_numer;
 
                     bignum *num_power = bn_from_int(1);
                     bignum *den_power = bn_from_int(1);
+                    if (!num_power || !den_power) {
+                        bn_free(num_power);
+                        bn_free(den_power);
+                        bn_free(num_root);
+                        bn_free(den_root);
+                        show_error("expt: out of memory");
+                        return TOK_ERROR;
+                    }
                     for (uint64_t i = 0; i < p; i++) {
                         bignum *temp = bn_mul(num_power, num_root);
                         bn_free(num_power);
                         num_power = temp;
+                        if (!num_power) {
+                            bn_free(den_power);
+                            bn_free(num_root);
+                            bn_free(den_root);
+                            show_error("expt: out of memory");
+                            return TOK_ERROR;
+                        }
                         temp = bn_mul(den_power, den_root);
                         bn_free(den_power);
                         den_power = temp;
+                        if (!den_power) {
+                            bn_free(num_power);
+                            bn_free(num_root);
+                            bn_free(den_root);
+                            show_error("expt: out of memory");
+                            return TOK_ERROR;
+                        }
                     }
                     bn_free(num_root);
                     bn_free(den_root);
@@ -474,34 +553,34 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned argc,
     case PFLOOR: {
         REQUIRE_ARGC(argc, 1, 1, "floor");
         unsigned x = argv[0];
-        if (CELL_TYPE(x) == BT_NUM)
+        if (CELL_TYPE(x) == BT_NUM || CELL_TYPE(x) == BT_BIGNUM)
             return x;
         double d = to_double(x);
-        return is_exact(x) ? store((int64_t)floor(d)) : store_inexact(floor(d));
+        return make_real_result(floor(d), is_exact(x));
     }
     case PCEILING: {
         REQUIRE_ARGC(argc, 1, 1, "ceiling");
         unsigned x = argv[0];
-        if (CELL_TYPE(x) == BT_NUM)
+        if (CELL_TYPE(x) == BT_NUM || CELL_TYPE(x) == BT_BIGNUM)
             return x;
         double d = to_double(x);
-        return is_exact(x) ? store((int64_t)ceil(d)) : store_inexact(ceil(d));
+        return make_real_result(ceil(d), is_exact(x));
     }
     case PTRUNCATE: {
         REQUIRE_ARGC(argc, 1, 1, "truncate");
         unsigned x = argv[0];
-        if (CELL_TYPE(x) == BT_NUM)
+        if (CELL_TYPE(x) == BT_NUM || CELL_TYPE(x) == BT_BIGNUM)
             return x;
         double d = to_double(x);
-        return is_exact(x) ? store((int64_t)trunc(d)) : store_inexact(trunc(d));
+        return make_real_result(trunc(d), is_exact(x));
     }
     case PROUND: {
         REQUIRE_ARGC(argc, 1, 1, "round");
         unsigned x = argv[0];
-        if (CELL_TYPE(x) == BT_NUM)
+        if (CELL_TYPE(x) == BT_NUM || CELL_TYPE(x) == BT_BIGNUM)
             return x;
         double d = to_double(x);
-        return is_exact(x) ? store((int64_t)round(d)) : store_inexact(round(d));
+        return make_real_result(round(d), is_exact(x));
     }
 
     // Random number generation (SRFI-27 style)

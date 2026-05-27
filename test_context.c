@@ -1,5 +1,6 @@
 // Unit tests for context and env modules
 #define _POSIX_C_SOURCE 200809L
+#include "bytecode.h"
 #include "context.h"
 #include "env.h"
 #include "test_framework.h"
@@ -299,6 +300,23 @@ TEST(make_halt_cont_test)
     PASS();
 }
 
+TEST(code_free_unregisters_tree)
+{
+    code_object *parent = code_new();
+    code_object *child = code_new();
+    ASSERT(parent != NULL);
+    ASSERT(child != NULL);
+    code_add_child(parent, child);
+
+    code_free(parent);
+
+    for (code_object *code = code_object_registry; code; code = code->gc_next) {
+        ASSERT(code != parent);
+        ASSERT(code != child);
+    }
+    PASS();
+}
+
 // ============================================================================
 // Env Tests
 // ============================================================================
@@ -587,6 +605,7 @@ int main(void)
     // Continuations
     RUN_TEST(make_cont_test);
     RUN_TEST(make_halt_cont_test);
+    RUN_TEST(code_free_unregisters_tree);
 
     // Environment
     RUN_TEST(empty_environment_test);

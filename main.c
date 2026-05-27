@@ -7,6 +7,7 @@
 #include "types.h"
 #include "writer.h"
 #include <ctype.h>
+#include <stdint.h>
 #include <string.h>
 
 // Embedded standard library
@@ -225,6 +226,10 @@ static unsigned load_callback(const char *filename, unsigned *env_ptr)
         size_t len = strlen(filename);
         // Only add .scm if file doesn't already end with .scm
         if (len < 4 || strcmp(filename + len - 4, ".scm") != 0) {
+            if (len > SIZE_MAX - 5) {
+                show_error("load: filename too long");
+                return TOK_ERROR;
+            }
             with_ext = malloc(len + 5);
             if (with_ext) {
                 memcpy(with_ext, filename, len);

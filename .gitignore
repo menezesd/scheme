@@ -5,6 +5,8 @@
 lisp
 vesper
 vesper-debug
+vesper-asan
+vesper-debug-nosan
 test_bignum
 test_reader
 test_context

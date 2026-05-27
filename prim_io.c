@@ -294,6 +294,11 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
             if (c == EOF || c == '\n')
                 break;
             if (len + 1 >= cap) {
+                if (cap > SIZE_MAX / 2) {
+                    free(buf);
+                    show_error("read-line: line too long");
+                    return TOK_ERROR;
+                }
                 cap *= 2;
                 char *newbuf = realloc(buf, cap);
                 if (!newbuf) {

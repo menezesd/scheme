@@ -25,9 +25,12 @@
  */
 
 #include "reader.h"
+#include "bignum.h"
 #include "context.h"
 #include <ctype.h>
+#include <errno.h>
 #include <limits.h>
+#include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 
@@ -75,6 +78,11 @@ static int add_datum_label(int label)
 {
     // Grow the array if needed
     if (datum_label_count >= datum_label_cap) {
+        if (datum_label_cap > INT_MAX / 2 ||
+            (size_t)datum_label_cap * 2 > SIZE_MAX / sizeof(datum_label_entry)) {
+            show_error("too many datum labels");
+            return -1;
+        }
         int new_cap = datum_label_cap == 0 ? INITIAL_DATUM_LABELS
                                            : datum_label_cap * 2;
         datum_label_entry *new_labels =
@@ -108,10 +116,13 @@ static int reader_getchar(void)
 
 static void reader_ungetc(int c)
 {
+    if (c == EOF)
+        return;
+
     FILE *fp = reader_port ? reader_port : stdin;
     if (c == '\n') {
         reader_line--;
-    } else if (c != EOF) {
+    } else {
         reader_col--;
     }
     ungetc(c, fp);
@@ -157,11 +168,16 @@ static void sb_init(string_buffer *sb)
 static void sb_append(string_buffer *sb, int ch)
 {
     if (sb->len + 1 >= sb->cap) {
-        sb->cap *= 2;
-        sb->data = realloc(sb->data, sb->cap);
-        if (!sb->data) {
+        if (sb->cap > SIZE_MAX / 2) {
+            lisp_panic("string buffer too large");
+        }
+        size_t new_cap = sb->cap * 2;
+        char *new_data = realloc(sb->data, new_cap);
+        if (!new_data) {
             lisp_panic("failed to grow string buffer");
         }
+        sb->data = new_data;
+        sb->cap = new_cap;
     }
     sb->data[sb->len++] = (char)ch;
     sb->data[sb->len] = '\0';
@@ -177,6 +193,30 @@ static void sb_free(string_buffer *sb)
     free(sb->data);
     sb->data = NULL;
     sb->len = sb->cap = 0;
+}
+
+static unsigned read_prefixed_integer(const char *digits, int base, bool neg)
+{
+    errno = 0;
+    char *end = NULL;
+    int64_t val = strtoll(digits, &end, base);
+    if (end && *end == '\0' && errno != ERANGE) {
+        if (neg) {
+            bignum *bn = bn_from_int(val);
+            if (!bn)
+                return TOK_ERROR;
+            bn_neg_ip(bn);
+            return store_integer(bn);
+        }
+        return store(val);
+    }
+
+    bignum *bn = bn_from_string(digits, base);
+    if (!bn)
+        return TOK_ERROR;
+    if (neg)
+        bn_neg_ip(bn);
+    return store_integer(bn);
 }
 
 // ============================================================================
@@ -215,6 +255,10 @@ static int lookup_char_name(const char *name)
 static unsigned read_character_literal(void)
 {
     int c = reader_getchar();
+    if (c == EOF) {
+        show_error("incomplete character literal");
+        return TOK_ERROR;
+    }
 
     // Try to read a named character
     if (isalpha(c)) {
@@ -423,9 +467,9 @@ unsigned read_token(void)
                     show_error("invalid hex literal: #x");
                     return TOK_ERROR;
                 }
-                int64_t val = (int64_t)strtoll(sb.data, NULL, 16);
+                unsigned result = read_prefixed_integer(sb.data, 16, neg);
                 sb_free(&sb);
-                return store(neg ? -val : val);
+                return result;
             } else if (c == 'o' || c == 'O') {
                 // Octal literal: #o77
                 string_buffer sb;
@@ -444,9 +488,9 @@ unsigned read_token(void)
                     show_error("invalid octal literal: #o");
                     return TOK_ERROR;
                 }
-                int64_t val = (int64_t)strtoll(sb.data, NULL, 8);
+                unsigned result = read_prefixed_integer(sb.data, 8, neg);
                 sb_free(&sb);
-                return store(neg ? -val : val);
+                return result;
             } else if (c == 'b' || c == 'B') {
                 // Binary literal: #b1010
                 string_buffer sb;
@@ -465,9 +509,9 @@ unsigned read_token(void)
                     show_error("invalid binary literal: #b");
                     return TOK_ERROR;
                 }
-                int64_t val = (int64_t)strtoll(sb.data, NULL, 2);
+                unsigned result = read_prefixed_integer(sb.data, 2, neg);
                 sb_free(&sb);
-                return store(neg ? -val : val);
+                return result;
             } else if (c == 'u') {
                 // Bytevector literal: #u8(...)
                 c = reader_getchar();
@@ -618,8 +662,11 @@ unsigned read_token(void)
 
 unsigned read_vector(void)
 {
+    GC_GUARD;
     unsigned head = 0, tail = 0;
     unsigned count = 0;
+    gc_protect(&head);
+    gc_protect(&tail);
 
     for (;;) {
         unsigned elem = read_obj();
@@ -662,8 +709,13 @@ unsigned read_obj(void)
             return tok;
         case TOK_ERROR:
             return tok;
-        default:
-            return alloc_cons(ctx.atom_quote, alloc_cons(tok, 0));
+        default: {
+            GC_GUARD;
+            gc_protect(&tok);
+            unsigned args = alloc_cons(tok, 0);
+            gc_protect(&args);
+            return alloc_cons(ctx.atom_quote, args);
+        }
         }
     case TOK_QUASIQUOTE:
         tok = read_obj();
@@ -671,21 +723,39 @@ unsigned read_obj(void)
             show_warning("ignoring quasiquote before special token");
             return tok;
         }
-        return alloc_cons(ctx.atom_quasiquote, alloc_cons(tok, 0));
+        {
+            GC_GUARD;
+            gc_protect(&tok);
+            unsigned args = alloc_cons(tok, 0);
+            gc_protect(&args);
+            return alloc_cons(ctx.atom_quasiquote, args);
+        }
     case TOK_UNQUOTE:
         tok = read_obj();
         if (tok == TOK_CLOSE || tok == TOK_DOT || tok == TOK_ERROR) {
             show_warning("ignoring unquote before special token");
             return tok;
         }
-        return alloc_cons(ctx.atom_unquote, alloc_cons(tok, 0));
+        {
+            GC_GUARD;
+            gc_protect(&tok);
+            unsigned args = alloc_cons(tok, 0);
+            gc_protect(&args);
+            return alloc_cons(ctx.atom_unquote, args);
+        }
     case TOK_UNQUOTE_SPLICING:
         tok = read_obj();
         if (tok == TOK_CLOSE || tok == TOK_DOT || tok == TOK_ERROR) {
             show_warning("ignoring unquote-splicing before special token");
             return tok;
         }
-        return alloc_cons(ctx.atom_unquote_splicing, alloc_cons(tok, 0));
+        {
+            GC_GUARD;
+            gc_protect(&tok);
+            unsigned args = alloc_cons(tok, 0);
+            gc_protect(&args);
+            return alloc_cons(ctx.atom_unquote_splicing, args);
+        }
     default:
         return tok;
     }
@@ -693,8 +763,10 @@ unsigned read_obj(void)
 
 unsigned read_list(void)
 {
+    GC_GUARD;
     unsigned sh = read_obj();
     unsigned st;
+    gc_protect(&sh);
     switch (sh) {
     case TOK_ERROR:
         return TOK_ERROR;

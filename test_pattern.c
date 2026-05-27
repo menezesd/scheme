@@ -145,6 +145,18 @@ TEST(compile_ellipsis)
     PASS();
 }
 
+TEST(compiled_pattern_free_unregisters)
+{
+    compiled_pattern *cpat = compiled_pattern_new();
+    ASSERT(cpat != NULL);
+    compiled_pattern_free(cpat);
+
+    for (compiled_pattern *p = compiled_pattern_registry; p; p = p->gc_next) {
+        ASSERT(p != cpat);
+    }
+    PASS();
+}
+
 // ============================================================================
 // Execution Tests
 // ============================================================================
@@ -522,6 +534,7 @@ int main(void)
     RUN_TEST(compile_null);
     RUN_TEST(compile_literal);
     RUN_TEST(compile_ellipsis);
+    RUN_TEST(compiled_pattern_free_unregisters);
 
     // Execution tests
     printf("\nExecution:\n");

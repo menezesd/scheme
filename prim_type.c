@@ -22,7 +22,8 @@ unsigned apply_type_predicate(unsigned prim_id, unsigned argc,
             return ctx.atom_true;
         if (IS_INEXACT(arg)) {
             double d = to_double(arg);
-            return (floor(d) == d) ? ctx.atom_true : ctx.atom_false;
+            return (isfinite(d) && floor(d) == d) ? ctx.atom_true
+                                                  : ctx.atom_false;
         }
         return ctx.atom_false;
     }

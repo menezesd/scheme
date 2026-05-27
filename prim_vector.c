@@ -75,7 +75,9 @@ unsigned apply_vector_primitive(unsigned prim_id, unsigned argc,
     }
     case PLIST2VEC: {
         REQUIRE_ARGC(argc, 1, 1, "list->vector");
+        GC_GUARD;
         unsigned lst = argv[0];
+        gc_protect(&lst);
         unsigned len = 0;
         for (unsigned it = lst; it; it = cdr(it)) {
             if (!IS_PAIR(it)) {

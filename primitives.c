@@ -21,15 +21,37 @@
 
 #include "primitives.h"
 #include "prim_internal.h"
+#include <limits.h>
+#include <stdint.h>
 #include <time.h>
 
 // Command line args (set by main.c, defaults for test binaries)
 int saved_argc __attribute__((weak)) = 0;
 char **saved_argv __attribute__((weak)) = NULL;
 
+static void *malloc_array(unsigned count, size_t elem_size)
+{
+    if (elem_size != 0 && (size_t)count > SIZE_MAX / elem_size)
+        return NULL;
+    return malloc((size_t)count * elem_size);
+}
+
 // ============================================================================
 // Main Dispatch Function
 // ============================================================================
+
+static bool expect_u8(unsigned value, int64_t *out, const char *name)
+{
+    int64_t byte;
+    if (!expect_exact_int64(value, &byte, name))
+        return false;
+    if (byte < 0 || byte > 255) {
+        show_error("%s: byte out of range", name);
+        return false;
+    }
+    *out = byte;
+    return true;
+}
 
 unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
 {
@@ -304,15 +326,14 @@ unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
                 char *p = buf + sizeof(buf) - 1;
                 *p = '\0';
                 bool neg = n < 0;
-                if (neg)
-                    n = -n;
-                if (n == 0) {
+                uint64_t magnitude = neg ? -(uint64_t)n : (uint64_t)n;
+                if (magnitude == 0) {
                     *--p = '0';
                 } else {
-                    while (n > 0) {
-                        int d = n % radix;
+                    while (magnitude > 0) {
+                        int d = (int)(magnitude % (uint64_t)radix);
                         *--p = (d < 10) ? '0' + d : 'a' + d - 10;
-                        n /= radix;
+                        magnitude /= (uint64_t)radix;
                     }
                 }
                 if (neg)
@@ -349,15 +370,20 @@ unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
         }
         if (radix == 10) {
             // Use standard parsing which handles floats
-            return atom_from_string(s);
+            unsigned parsed = atom_from_string(s);
+            enum lisp_type t = CELL_TYPE(parsed);
+            if (t == BT_NUM || t == BT_BIGNUM || t == BT_RATIONAL ||
+                t == BT_INEXACT || t == BT_COMPLEX) {
+                return parsed;
+            }
+            return ctx.atom_false;
         }
         // Parse integer in specified radix
-        char *end;
-        long long val = strtoll(s, &end, radix);
-        if (end == s || *end != '\0') {
+        bignum *bn = bn_from_string(s, radix);
+        if (!bn) {
             return ctx.atom_false; // Return #f for invalid number
         }
-        return store(val);
+        return store_integer(bn);
     }
     case PMAKESTR: {
         REQUIRE_ARGC(argc, 1, 2, "make-string");
@@ -414,7 +440,15 @@ unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
                 show_error("list->string: list elements must be characters");
                 return TOK_ERROR;
             }
+            if (len == SIZE_MAX) {
+                show_error("list->string: result too large");
+                return TOK_ERROR;
+            }
             len++;
+        }
+        if (len == SIZE_MAX) {
+            show_error("list->string: result too large");
+            return TOK_ERROR;
         }
         char *s = malloc(len + 1);
         if (!s) {
@@ -528,7 +562,7 @@ unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
     case PGCSTATS: {
         REQUIRE_ARGC(argc, 0, 0, "gc-stats");
         GC_GUARD;
-        // Return ((minor . count) (major . count) (heap-used . bytes))
+        // Return ((minor-gc . count) (major-gc . count) ...)
         unsigned minor = store(ctx.minor_gc_count);
         gc_protect(&minor);
         unsigned major = store(ctx.major_gc_count);
@@ -536,14 +570,38 @@ unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
         unsigned heap_used = store(ctx.hptr - ctx.mmin);
         gc_protect(&heap_used);
         unsigned nursery_used = store(ctx.nursery_ptr - ctx.nursery_start);
-        unsigned result = alloc_cons(
-            alloc_cons(atom_from_string("minor-gc"), minor),
-            alloc_cons(
-                alloc_cons(atom_from_string("major-gc"), major),
-                alloc_cons(alloc_cons(atom_from_string("old-gen"), heap_used),
-                           alloc_cons(alloc_cons(atom_from_string("nursery"),
-                                                 nursery_used),
-                                      0))));
+        gc_protect(&nursery_used);
+        unsigned result = 0;
+        gc_protect(&result);
+
+        unsigned key = atom_from_string("nursery");
+        gc_protect(&key);
+        unsigned entry = alloc_cons(key, nursery_used);
+        gc_protect(&entry);
+        result = alloc_cons(entry, result);
+        gc_unprotect(2);
+
+        key = atom_from_string("old-gen");
+        gc_protect(&key);
+        entry = alloc_cons(key, heap_used);
+        gc_protect(&entry);
+        result = alloc_cons(entry, result);
+        gc_unprotect(2);
+
+        key = atom_from_string("major-gc");
+        gc_protect(&key);
+        entry = alloc_cons(key, major);
+        gc_protect(&entry);
+        result = alloc_cons(entry, result);
+        gc_unprotect(2);
+
+        key = atom_from_string("minor-gc");
+        gc_protect(&key);
+        entry = alloc_cons(key, minor);
+        gc_protect(&entry);
+        result = alloc_cons(entry, result);
+        gc_unprotect(2);
+
         return result;
     }
     // PGCFLIP is handled specially in eval.c (needs environment as root)
@@ -568,6 +626,10 @@ unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
     // String constructor
     case PSTRING: {
         // (string char ...) - construct string from characters
+        if (argc == UINT_MAX) {
+            show_error("string: result too large");
+            return TOK_ERROR;
+        }
         char *s = malloc(argc + 1);
         if (!s) {
             show_error("string: out of memory");
@@ -742,12 +804,19 @@ unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
             !expect_exact_int64(argv[1], &count, "arithmetic-shift"))
             return TOK_ERROR;
         if (count >= 0) {
-            if (count >= 63) return store(0);
-            return store(val << count);
+            if ((uint64_t)count > SIZE_MAX)
+                ERROR_RETURN("arithmetic-shift: count too large");
+            bignum *bn = bn_from_int(val);
+            bignum *shifted = bn ? bn_lshift(bn, (size_t)count) : NULL;
+            bn_free(bn);
+            if (!shifted)
+                ERROR_RETURN("arithmetic-shift: out of memory");
+            return store_integer(shifted);
         } else {
-            count = -count;
-            if (count >= 63) return store(val < 0 ? -1 : 0);
-            return store(val >> count);
+            uint64_t shift = -(uint64_t)count;
+            if (shift >= 63)
+                return store(val < 0 ? -1 : 0);
+            return store(val >> shift);
         }
     }
 
@@ -759,15 +828,23 @@ unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
         int64_t len;
         if (!expect_nonneg_int64(argv[0], &len, "make-bytevector"))
             return TOK_ERROR;
+        if ((uint64_t)len > UINT_MAX ||
+            (uint64_t)len > SIZE_MAX - sizeof(bytevec_data)) {
+            show_error("make-bytevector: length too large");
+            return TOK_ERROR;
+        }
         uint8_t fill = 0;
         if (argc > 1) {
             int64_t f;
-            if (!expect_exact_int64(argv[1], &f, "make-bytevector"))
+            if (!expect_u8(argv[1], &f, "make-bytevector"))
                 return TOK_ERROR;
-            fill = (uint8_t)(f & 0xFF);
+            fill = (uint8_t)f;
         }
         bytevec_data *bv = malloc(sizeof(bytevec_data) + (size_t)len);
-        if (!bv) { show_error("make-bytevector: out of memory"); return TOK_ERROR; }
+        if (!bv) {
+            show_error("make-bytevector: out of memory");
+            return TOK_ERROR;
+        }
         bv->len = (unsigned)len;
         memset(bv->data, fill, (size_t)len);
         unsigned cell = alloc();
@@ -778,37 +855,42 @@ unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
     case PBYTEVECREF: {
         REQUIRE_ARGC(argc, 2, 2, "bytevector-u8-ref");
         if (CELL_TYPE(argv[0]) != BT_BYTEVEC) {
-            show_error("bytevector-u8-ref: not a bytevector"); return TOK_ERROR;
+            show_error("bytevector-u8-ref: not a bytevector");
+            return TOK_ERROR;
         }
         bytevec_data *bv = (bytevec_data *)CELL_PTR(argv[0]);
         int64_t idx;
         if (!expect_nonneg_int64(argv[1], &idx, "bytevector-u8-ref"))
             return TOK_ERROR;
-        if ((unsigned)idx >= bv->len) {
-            show_error("bytevector-u8-ref: index out of bounds"); return TOK_ERROR;
+        if ((uint64_t)idx >= bv->len) {
+            show_error("bytevector-u8-ref: index out of bounds");
+            return TOK_ERROR;
         }
         return store(bv->data[idx]);
     }
     case PBYTEVECSET: {
         REQUIRE_ARGC(argc, 3, 3, "bytevector-u8-set!");
         if (CELL_TYPE(argv[0]) != BT_BYTEVEC) {
-            show_error("bytevector-u8-set!: not a bytevector"); return TOK_ERROR;
+            show_error("bytevector-u8-set!: not a bytevector");
+            return TOK_ERROR;
         }
         bytevec_data *bv = (bytevec_data *)CELL_PTR(argv[0]);
         int64_t idx, val;
         if (!expect_nonneg_int64(argv[1], &idx, "bytevector-u8-set!") ||
-            !expect_exact_int64(argv[2], &val, "bytevector-u8-set!"))
+            !expect_u8(argv[2], &val, "bytevector-u8-set!"))
             return TOK_ERROR;
-        if ((unsigned)idx >= bv->len) {
-            show_error("bytevector-u8-set!: index out of bounds"); return TOK_ERROR;
+        if ((uint64_t)idx >= bv->len) {
+            show_error("bytevector-u8-set!: index out of bounds");
+            return TOK_ERROR;
         }
-        bv->data[idx] = (uint8_t)(val & 0xFF);
+        bv->data[idx] = (uint8_t)val;
         return 0;
     }
     case PBYTEVECLEN: {
         REQUIRE_ARGC(argc, 1, 1, "bytevector-length");
         if (CELL_TYPE(argv[0]) != BT_BYTEVEC) {
-            show_error("bytevector-length: not a bytevector"); return TOK_ERROR;
+            show_error("bytevector-length: not a bytevector");
+            return TOK_ERROR;
         }
         return store(((bytevec_data *)CELL_PTR(argv[0]))->len);
     }
@@ -818,15 +900,24 @@ unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
                    ? ctx.atom_true : ctx.atom_false;
     }
     case PBYTEVEC: {
-        // (bytevector b1 b2 ...) — construct from byte values
+        // (bytevector b1 b2 ...) - construct from byte values
+        if ((size_t)argc > SIZE_MAX - sizeof(bytevec_data)) {
+            show_error("bytevector: result too large");
+            return TOK_ERROR;
+        }
         bytevec_data *bv = malloc(sizeof(bytevec_data) + argc);
-        if (!bv) { show_error("bytevector: out of memory"); return TOK_ERROR; }
+        if (!bv) {
+            show_error("bytevector: out of memory");
+            return TOK_ERROR;
+        }
         bv->len = argc;
         for (unsigned i = 0; i < argc; i++) {
             int64_t val;
-            if (!expect_exact_int64(argv[i], &val, "bytevector"))
-                { free(bv); return TOK_ERROR; }
-            bv->data[i] = (uint8_t)(val & 0xFF);
+            if (!expect_u8(argv[i], &val, "bytevector")) {
+                free(bv);
+                return TOK_ERROR;
+            }
+            bv->data[i] = (uint8_t)val;
         }
         unsigned cell = alloc();
         CELL_TYPE(cell) = BT_BYTEVEC;
@@ -836,20 +927,31 @@ unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
     case PBYTEVECCOPY: {
         REQUIRE_ARGC(argc, 1, 3, "bytevector-copy");
         if (CELL_TYPE(argv[0]) != BT_BYTEVEC) {
-            show_error("bytevector-copy: not a bytevector"); return TOK_ERROR;
+            show_error("bytevector-copy: not a bytevector");
+            return TOK_ERROR;
         }
         bytevec_data *src = (bytevec_data *)CELL_PTR(argv[0]);
         int64_t start = 0, end = src->len;
-        if (argc > 1 && !expect_nonneg_int64(argv[1], &start, "bytevector-copy"))
+        if (argc > 1 &&
+            !expect_nonneg_int64(argv[1], &start, "bytevector-copy"))
             return TOK_ERROR;
-        if (argc > 2 && !expect_nonneg_int64(argv[2], &end, "bytevector-copy"))
+        if (argc > 2 &&
+            !expect_nonneg_int64(argv[2], &end, "bytevector-copy"))
             return TOK_ERROR;
-        if (start > end || (unsigned)end > src->len) {
-            show_error("bytevector-copy: invalid range"); return TOK_ERROR;
+        if (start > end || (uint64_t)end > src->len) {
+            show_error("bytevector-copy: invalid range");
+            return TOK_ERROR;
         }
         unsigned len = (unsigned)(end - start);
+        if ((size_t)len > SIZE_MAX - sizeof(bytevec_data)) {
+            show_error("bytevector-copy: result too large");
+            return TOK_ERROR;
+        }
         bytevec_data *bv = malloc(sizeof(bytevec_data) + len);
-        if (!bv) { show_error("bytevector-copy: out of memory"); return TOK_ERROR; }
+        if (!bv) {
+            show_error("bytevector-copy: out of memory");
+            return TOK_ERROR;
+        }
         bv->len = len;
         memcpy(bv->data, src->data + start, len);
         unsigned cell = alloc();
@@ -859,21 +961,30 @@ unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
     }
     case PBYTEVECCOPYTO: {
         REQUIRE_ARGC(argc, 3, 5, "bytevector-copy!");
-        if (CELL_TYPE(argv[0]) != BT_BYTEVEC || CELL_TYPE(argv[2]) != BT_BYTEVEC) {
-            show_error("bytevector-copy!: not a bytevector"); return TOK_ERROR;
+        if (CELL_TYPE(argv[0]) != BT_BYTEVEC ||
+            CELL_TYPE(argv[2]) != BT_BYTEVEC) {
+            show_error("bytevector-copy!: not a bytevector");
+            return TOK_ERROR;
         }
         bytevec_data *dst = (bytevec_data *)CELL_PTR(argv[0]);
         bytevec_data *src = (bytevec_data *)CELL_PTR(argv[2]);
         int64_t at, start = 0, end = src->len;
         if (!expect_nonneg_int64(argv[1], &at, "bytevector-copy!"))
             return TOK_ERROR;
-        if (argc > 3 && !expect_nonneg_int64(argv[3], &start, "bytevector-copy!"))
+        if (argc > 3 &&
+            !expect_nonneg_int64(argv[3], &start, "bytevector-copy!"))
             return TOK_ERROR;
-        if (argc > 4 && !expect_nonneg_int64(argv[4], &end, "bytevector-copy!"))
+        if (argc > 4 &&
+            !expect_nonneg_int64(argv[4], &end, "bytevector-copy!"))
             return TOK_ERROR;
+        if (start > end) {
+            show_error("bytevector-copy!: invalid range");
+            return TOK_ERROR;
+        }
         unsigned len = (unsigned)(end - start);
-        if ((unsigned)at + len > dst->len || (unsigned)end > src->len) {
-            show_error("bytevector-copy!: out of bounds"); return TOK_ERROR;
+        if ((uint64_t)at + len > dst->len || (uint64_t)end > src->len) {
+            show_error("bytevector-copy!: out of bounds");
+            return TOK_ERROR;
         }
         memmove(dst->data + at, src->data + start, len);
         return 0;
@@ -883,12 +994,25 @@ unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
         unsigned total = 0;
         for (unsigned i = 0; i < argc; i++) {
             if (CELL_TYPE(argv[i]) != BT_BYTEVEC) {
-                show_error("bytevector-append: not a bytevector"); return TOK_ERROR;
+                show_error("bytevector-append: not a bytevector");
+                return TOK_ERROR;
             }
-            total += ((bytevec_data *)CELL_PTR(argv[i]))->len;
+            bytevec_data *src = (bytevec_data *)CELL_PTR(argv[i]);
+            if (src->len > UINT_MAX - total) {
+                show_error("bytevector-append: result too large");
+                return TOK_ERROR;
+            }
+            total += src->len;
+        }
+        if ((size_t)total > SIZE_MAX - sizeof(bytevec_data)) {
+            show_error("bytevector-append: result too large");
+            return TOK_ERROR;
         }
         bytevec_data *bv = malloc(sizeof(bytevec_data) + total);
-        if (!bv) { show_error("bytevector-append: out of memory"); return TOK_ERROR; }
+        if (!bv) {
+            show_error("bytevector-append: out of memory");
+            return TOK_ERROR;
+        }
         bv->len = total;
         unsigned pos = 0;
         for (unsigned i = 0; i < argc; i++) {
@@ -976,9 +1100,32 @@ unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
             show_error("read-bytevector: not an input port");
             return TOK_ERROR;
         }
+        if ((uint64_t)count > UINT_MAX) {
+            show_error("read-bytevector: count too large");
+            return TOK_ERROR;
+        }
+        if ((uint64_t)count > SIZE_MAX - sizeof(bytevec_data)) {
+            show_error("read-bytevector: count too large");
+            return TOK_ERROR;
+        }
+        if (count == 0) {
+            bytevec_data *bv = malloc(sizeof(bytevec_data));
+            if (!bv) {
+                show_error("read-bytevector: out of memory");
+                return TOK_ERROR;
+            }
+            bv->len = 0;
+            unsigned cell = alloc();
+            CELL_TYPE(cell) = BT_BYTEVEC;
+            CELL_PTR(cell) = bv;
+            return cell;
+        }
         FILE *f = GET_PORT_PTR(argv[1]);
         uint8_t *buf = malloc((size_t)count);
-        if (!buf) { show_error("read-bytevector: out of memory"); return TOK_ERROR; }
+        if (!buf) {
+            show_error("read-bytevector: out of memory");
+            return TOK_ERROR;
+        }
         size_t n = fread(buf, 1, (size_t)count, f);
         if (n == 0) {
             free(buf);
@@ -986,7 +1133,11 @@ unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
             return atom_from_string("eof-object");
         }
         bytevec_data *bv = malloc(sizeof(bytevec_data) + n);
-        if (!bv) { free(buf); return TOK_ERROR; }
+        if (!bv) {
+            free(buf);
+            show_error("read-bytevector: out of memory");
+            return TOK_ERROR;
+        }
         bv->len = (unsigned)n;
         memcpy(bv->data, buf, n);
         free(buf);
@@ -1018,7 +1169,7 @@ unsigned apply_primitive(unsigned prim_id, unsigned args)
     unsigned argv_stack[8];
     unsigned *argv = argv_stack;
     if (argc > sizeof(argv_stack) / sizeof(argv_stack[0])) {
-        argv = malloc(argc * sizeof(*argv));
+        argv = malloc_array(argc, sizeof(*argv));
         if (!argv) {
             show_error("primitive: out of memory");
             return TOK_ERROR;

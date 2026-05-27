@@ -185,7 +185,9 @@ static inline unsigned make_complex_exact(unsigned real, unsigned imag)
 // Create result with appropriate exactness
 static inline unsigned make_real_result(double val, bool exact)
 {
-    if (exact && floor(val) == val && val >= INT64_MIN && val <= INT64_MAX) {
+    const double int64_min_magnitude = 0x1p63;
+    if (exact && floor(val) == val && val >= -int64_min_magnitude &&
+        val < int64_min_magnitude) {
         return store((int64_t)val);
     }
     return store_inexact(val);
@@ -264,9 +266,19 @@ static inline unsigned multiply_cells(unsigned a, unsigned b)
     // Slow path: use bignum arithmetic
     bignum *ba = to_bignum(a);
     bignum *bb = to_bignum(b);
+    if (!ba || !bb) {
+        bn_free(ba);
+        bn_free(bb);
+        show_error("*: out of memory");
+        return TOK_ERROR;
+    }
     bignum *result = bn_mul(ba, bb);
     bn_free(ba);
     bn_free(bb);
+    if (!result) {
+        show_error("*: out of memory");
+        return TOK_ERROR;
+    }
     return store_integer(result);
 }
 
@@ -285,6 +297,12 @@ static inline unsigned add_cells(unsigned a, unsigned b)
     // Slow path: use bignum arithmetic
     bignum *ba = to_bignum(a);
     bignum *bb = to_bignum(b);
+    if (!ba || !bb) {
+        bn_free(ba);
+        bn_free(bb);
+        show_error("+: out of memory");
+        return TOK_ERROR;
+    }
     bn_add_ip(ba, bb);
     bn_free(bb);
     return store_integer(ba);
@@ -305,6 +323,12 @@ static inline unsigned subtract_cells(unsigned a, unsigned b)
     // Slow path: use bignum arithmetic
     bignum *ba = to_bignum(a);
     bignum *bb = to_bignum(b);
+    if (!ba || !bb) {
+        bn_free(ba);
+        bn_free(bb);
+        show_error("-: out of memory");
+        return TOK_ERROR;
+    }
     bn_sub_ip(ba, bb);
     bn_free(bb);
     return store_integer(ba);
@@ -435,6 +459,12 @@ static inline unsigned binary_add(unsigned a, unsigned b)
         // Overflow - use bignum
         bignum *ba = bn_from_int(va);
         bignum *bb = bn_from_int(vb);
+        if (!ba || !bb) {
+            bn_free(ba);
+            bn_free(bb);
+            show_error("+: out of memory");
+            return TOK_ERROR;
+        }
         bn_add_ip(ba, bb);
         bn_free(bb);
         return store_integer(ba);
@@ -462,6 +492,12 @@ static inline unsigned binary_sub(unsigned a, unsigned b)
         // Overflow - use bignum
         bignum *ba = bn_from_int(va);
         bignum *bb = bn_from_int(vb);
+        if (!ba || !bb) {
+            bn_free(ba);
+            bn_free(bb);
+            show_error("-: out of memory");
+            return TOK_ERROR;
+        }
         bn_sub_ip(ba, bb);
         bn_free(bb);
         return store_integer(ba);
@@ -489,9 +525,19 @@ static inline unsigned binary_mul(unsigned a, unsigned b)
         // Overflow - use bignum
         bignum *ba = bn_from_int(va);
         bignum *bb = bn_from_int(vb);
+        if (!ba || !bb) {
+            bn_free(ba);
+            bn_free(bb);
+            show_error("*: out of memory");
+            return TOK_ERROR;
+        }
         bignum *br = bn_mul(ba, bb);
         bn_free(ba);
         bn_free(bb);
+        if (!br) {
+            show_error("*: out of memory");
+            return TOK_ERROR;
+        }
         return store_integer(br);
     }
     // Fall back to full numeric tower
@@ -513,6 +559,15 @@ static inline unsigned binary_div(unsigned a, unsigned b)
         if (vb == 0) {
             show_error("/: division by zero");
             return TOK_ERROR;
+        }
+        if (va == INT64_MIN && vb == -1) {
+            bignum *bn = bn_from_int(va);
+            if (!bn) {
+                show_error("/: out of memory");
+                return TOK_ERROR;
+            }
+            bn_neg_ip(bn);
+            return store_integer(bn);
         }
         if (va % vb == 0) {
             // Exact division
@@ -541,6 +596,8 @@ static inline unsigned binary_mod(unsigned a, unsigned b)
             show_error("modulo: division by zero");
             return TOK_ERROR;
         }
+        if (va == INT64_MIN && vb == -1)
+            return store(0);
         // Scheme modulo: result has same sign as divisor
         int64_t r = va % vb;
         if ((r > 0 && vb < 0) || (r < 0 && vb > 0))
@@ -686,6 +743,10 @@ static inline string_port *strport_from_string(const char *s)
     if (!sp)
         return NULL;
     size_t len = strlen(s);
+    if (len == SIZE_MAX) {
+        free(sp);
+        return NULL;
+    }
     sp->data = malloc(len + 1);
     if (!sp->data) {
         free(sp);
@@ -702,11 +763,11 @@ static inline string_port *strport_from_string(const char *s)
 static inline void strport_putc(string_port *sp, int c)
 {
     if (sp->len + 1 >= sp->cap) {
-        size_t new_cap = sp->cap * 2;
-        if (new_cap <= sp->cap) {
+        if (sp->cap > SIZE_MAX / 2) {
             fprintf(stderr, "string port: capacity overflow\n");
             abort();
         }
+        size_t new_cap = sp->cap * 2;
         char *new_data = realloc(sp->data, new_cap);
         if (!new_data) {
             fprintf(stderr, "string port: out of memory\n");
@@ -723,12 +784,16 @@ static inline void strport_putc(string_port *sp, int c)
 static inline void strport_puts(string_port *sp, const char *s)
 {
     size_t slen = strlen(s);
+    if (slen > SIZE_MAX - sp->len - 1) {
+        fprintf(stderr, "string port: capacity overflow\n");
+        abort();
+    }
     while (sp->len + slen >= sp->cap) {
-        size_t new_cap = sp->cap * 2;
-        if (new_cap <= sp->cap) {
+        if (sp->cap > SIZE_MAX / 2) {
             fprintf(stderr, "string port: capacity overflow\n");
             abort();
         }
+        size_t new_cap = sp->cap * 2;
         char *new_data = realloc(sp->data, new_cap);
         if (!new_data) {
             fprintf(stderr, "string port: out of memory\n");

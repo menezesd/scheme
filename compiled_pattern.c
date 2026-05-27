@@ -15,8 +15,37 @@
 
 #include "compiled_pattern.h"
 #include "context.h"
+#include <limits.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+
+static unsigned grow_capacity(unsigned cap, size_t elem_size,
+                              const char *error_msg)
+{
+    if (cap > UINT_MAX / 2) {
+        lisp_panic(error_msg);
+    }
+    unsigned new_cap = cap * 2;
+    if ((size_t)new_cap > SIZE_MAX / elem_size) {
+        lisp_panic(error_msg);
+    }
+    return new_cap;
+}
+
+static void *malloc_array(unsigned count, size_t elem_size)
+{
+    if (elem_size != 0 && (size_t)count > SIZE_MAX / elem_size)
+        return NULL;
+    return malloc((size_t)count * elem_size);
+}
+
+static void *calloc_array(unsigned count, size_t elem_size)
+{
+    if (elem_size != 0 && (size_t)count > SIZE_MAX / elem_size)
+        return NULL;
+    return calloc(count, elem_size);
+}
 
 // ============================================================================
 // Pattern Registry (for GC)
@@ -29,6 +58,19 @@ void pattern_register(compiled_pattern *pat)
 {
     pat->gc_next = compiled_pattern_registry;
     compiled_pattern_registry = pat;
+}
+
+static void pattern_unregister(compiled_pattern *pat)
+{
+    compiled_pattern **prev = &compiled_pattern_registry;
+    while (*prev) {
+        if (*prev == pat) {
+            *prev = pat->gc_next;
+            pat->gc_next = NULL;
+            return;
+        }
+        prev = &(*prev)->gc_next;
+    }
 }
 
 // ============================================================================
@@ -75,6 +117,7 @@ void compiled_pattern_free(compiled_pattern *pat)
 {
     if (!pat)
         return;
+    pattern_unregister(pat);
     free(pat->code);
     free(pat->constants);
     free(pat->var_slots);
@@ -88,7 +131,9 @@ void compiled_pattern_free(compiled_pattern *pat)
 void pattern_emit(compiled_pattern *pat, unsigned opcode, unsigned operand)
 {
     if (pat->code_len >= pat->code_cap) {
-        unsigned new_cap = pat->code_cap * 2;
+        unsigned new_cap = grow_capacity(pat->code_cap,
+                                         sizeof(pat_instruction),
+                                         "pattern_emit: capacity overflow");
         pat_instruction *new_code =
             realloc(pat->code, new_cap * sizeof(pat_instruction));
         if (!new_code)
@@ -124,7 +169,9 @@ unsigned pattern_add_constant(compiled_pattern *pat, unsigned value)
     }
 
     if (pat->const_len >= pat->const_cap) {
-        unsigned new_cap = pat->const_cap * 2;
+        unsigned new_cap =
+            grow_capacity(pat->const_cap, sizeof(unsigned),
+                          "pattern_add_constant: capacity overflow");
         unsigned *new_constants =
             realloc(pat->constants, new_cap * sizeof(unsigned));
         if (!new_constants)
@@ -156,7 +203,9 @@ unsigned pattern_add_var(compiled_pattern *pat, unsigned atom, bool is_ellipsis,
     }
 
     if (pat->var_count >= pat->var_cap) {
-        unsigned new_cap = pat->var_cap * 2;
+        unsigned new_cap =
+            grow_capacity(pat->var_cap, sizeof(pat_var_slot),
+                          "pattern_add_var: capacity overflow");
         pat_var_slot *new_slots =
             realloc(pat->var_slots, new_cap * sizeof(pat_var_slot));
         if (!new_slots)
@@ -635,18 +684,18 @@ static bool init_match_state(pat_match_state *state, compiled_pattern *pat,
 
     // Input stack
     state->input_cap = 32;
-    state->input_stack = malloc(state->input_cap * sizeof(unsigned));
+    state->input_stack = malloc_array(state->input_cap, sizeof(unsigned));
     if (!state->input_stack)
         return false;
     state->input_sp = 0;
 
     // Bindings
     if (pat->var_count > 0) {
-        state->bindings = calloc(pat->var_count, sizeof(unsigned));
-        state->ellipsis_lists = calloc(pat->var_count, sizeof(unsigned));
-        state->ellipsis_tails = calloc(pat->var_count, sizeof(unsigned));
-        state->inner_lists = calloc(pat->var_count, sizeof(unsigned));
-        state->inner_tails = calloc(pat->var_count, sizeof(unsigned));
+        state->bindings = calloc_array(pat->var_count, sizeof(unsigned));
+        state->ellipsis_lists = calloc_array(pat->var_count, sizeof(unsigned));
+        state->ellipsis_tails = calloc_array(pat->var_count, sizeof(unsigned));
+        state->inner_lists = calloc_array(pat->var_count, sizeof(unsigned));
+        state->inner_tails = calloc_array(pat->var_count, sizeof(unsigned));
         if (!state->bindings || !state->ellipsis_lists ||
             !state->ellipsis_tails || !state->inner_lists ||
             !state->inner_tails) {
@@ -662,7 +711,7 @@ static bool init_match_state(pat_match_state *state, compiled_pattern *pat,
 
     // Choice points
     state->choice_cap = 16;
-    state->choices = malloc(state->choice_cap * sizeof(pat_choice_point));
+    state->choices = malloc_array(state->choice_cap, sizeof(pat_choice_point));
     if (!state->choices) {
         free(state->input_stack);
         free(state->bindings);
@@ -692,7 +741,8 @@ static void cleanup_match_state(pat_match_state *state)
 static void push_input(pat_match_state *state, unsigned input)
 {
     if (state->input_sp >= state->input_cap) {
-        unsigned new_cap = state->input_cap * 2;
+        unsigned new_cap = grow_capacity(state->input_cap, sizeof(unsigned),
+                                         "pattern input stack: capacity overflow");
         unsigned *new_stack =
             realloc(state->input_stack, new_cap * sizeof(unsigned));
         if (!new_stack)
@@ -716,7 +766,9 @@ static unsigned pop_input(pat_match_state *state)
 static void push_choice(pat_match_state *state, unsigned retry_ip)
 {
     if (state->choice_sp >= state->choice_cap) {
-        unsigned new_cap = state->choice_cap * 2;
+        unsigned new_cap = grow_capacity(state->choice_cap,
+                                         sizeof(pat_choice_point),
+                                         "pattern choice stack: capacity overflow");
         pat_choice_point *new_choices =
             realloc(state->choices, new_cap * sizeof(pat_choice_point));
         if (!new_choices)

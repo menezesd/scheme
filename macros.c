@@ -456,8 +456,11 @@ static unsigned rename_free_ids(unsigned tmpl, unsigned rename_map)
                 if (expr && IS_PAIR(expr)) {
                     unsigned new_expr = rename_free_ids(car(expr), rename_map);
                     gc_protect(&new_expr);
-                    return alloc_cons(head,
-                                      alloc_cons(var, alloc_cons(new_expr, 0)));
+                    unsigned expr_tail = alloc_cons(new_expr, 0);
+                    gc_protect(&expr_tail);
+                    unsigned var_tail = alloc_cons(var, expr_tail);
+                    gc_protect(&var_tail);
+                    return alloc_cons(head, var_tail);
                 }
                 return tmpl;
             }
@@ -465,6 +468,7 @@ static unsigned rename_free_ids(unsigned tmpl, unsigned rename_map)
         unsigned new_car = rename_free_ids(car(tmpl), rename_map);
         gc_protect(&new_car);
         unsigned new_cdr = rename_free_ids(cdr(tmpl), rename_map);
+        gc_protect(&new_cdr);
         if (new_car == car(tmpl) && new_cdr == cdr(tmpl))
             return tmpl;
         return alloc_cons(new_car, new_cdr);
@@ -525,6 +529,7 @@ static unsigned rename_in_template(unsigned tmpl, int64_t old_id,
         unsigned new_car = rename_in_template(car(tmpl), old_id, new_sym);
         gc_protect(&new_car);
         unsigned new_cdr = rename_in_template(cdr(tmpl), old_id, new_sym);
+        gc_protect(&new_cdr);
         if (new_car == car(tmpl) && new_cdr == cdr(tmpl))
             return tmpl;
         return alloc_cons(new_car, new_cdr);
@@ -622,16 +627,20 @@ static unsigned hygienize_let(unsigned tmpl, unsigned bindings, bool is_letrec)
             unsigned val = cadr(binding);
             unsigned new_val = hygienize_template(val, bindings);
             gc_protect(&new_val);
-            unsigned new_binding = alloc_cons(var, alloc_cons(new_val, 0));
+            unsigned binding_tail = alloc_cons(new_val, 0);
+            gc_protect(&binding_tail);
+            unsigned new_binding = alloc_cons(var, binding_tail);
+            gc_protect(&new_binding);
             list_append(&new_bindings, &new_bindings_tail, new_binding);
-            gc_unprotect(1);
+            gc_unprotect(3);
         }
 
         unsigned new_body = hygienize_template(body, bindings);
         gc_protect(&new_body);
-        unsigned result =
-            alloc_cons(keyword, alloc_cons(new_bindings, new_body));
-        gc_unprotect(9);
+        unsigned result_tail = alloc_cons(new_bindings, new_body);
+        gc_protect(&result_tail);
+        unsigned result = alloc_cons(keyword, result_tail);
+        gc_unprotect(10);
         return result;
     }
 
@@ -663,8 +672,12 @@ static unsigned hygienize_let(unsigned tmpl, unsigned bindings, bool is_letrec)
                 unsigned new_var = var;
                 if (IS_ATOM(var) && CELL_ID(var) == old_id)
                     new_var = new_sym;
-                unsigned new_bind = alloc_cons(new_var, alloc_cons(val, 0));
+                unsigned bind_tail = alloc_cons(val, 0);
+                gc_protect(&bind_tail);
+                unsigned new_bind = alloc_cons(new_var, bind_tail);
+                gc_protect(&new_bind);
                 list_append(&renamed_bindings, &renamed_tail, new_bind);
+                gc_unprotect(2);
             }
             gc_unprotect(2);
             new_binding_list = renamed_bindings;
@@ -683,17 +696,21 @@ static unsigned hygienize_let(unsigned tmpl, unsigned bindings, bool is_letrec)
         unsigned val = cadr(binding);
         unsigned new_val = hygienize_template(val, bindings);
         gc_protect(&new_val);
-        unsigned new_binding = alloc_cons(var, alloc_cons(new_val, 0));
+        unsigned binding_tail = alloc_cons(new_val, 0);
+        gc_protect(&binding_tail);
+        unsigned new_binding = alloc_cons(var, binding_tail);
+        gc_protect(&new_binding);
         list_append(&final_bindings, &final_tail, new_binding);
-        gc_unprotect(1);
+        gc_unprotect(3);
     }
 
     unsigned final_body = hygienize_template(new_body, bindings);
     gc_protect(&final_body);
-    unsigned result =
-        alloc_cons(keyword, alloc_cons(final_bindings, final_body));
-    gc_unprotect(11); // 5 initial + renames + new_binding_list + new_body +
-                      // final_bindings + final_tail + final_body
+    unsigned result_tail = alloc_cons(final_bindings, final_body);
+    gc_protect(&result_tail);
+    unsigned result = alloc_cons(keyword, result_tail);
+    gc_unprotect(12); // 5 initial + renames + new_binding_list + new_body +
+                      // final_bindings + final_tail + final_body + result_tail
     return result;
 }
 
@@ -739,8 +756,10 @@ static unsigned hygienize_lambda(unsigned tmpl, unsigned bindings)
         // No introduced params - just hygienize body
         unsigned new_body = hygienize_template(body, bindings);
         gc_protect(&new_body);
-        unsigned result = alloc_cons(keyword, alloc_cons(params, new_body));
-        gc_unprotect(7);
+        unsigned result_tail = alloc_cons(params, new_body);
+        gc_protect(&result_tail);
+        unsigned result = alloc_cons(keyword, result_tail);
+        gc_unprotect(8);
         return result;
     }
 
@@ -761,8 +780,11 @@ static unsigned hygienize_lambda(unsigned tmpl, unsigned bindings)
     // Hygienize body
     unsigned final_body = hygienize_template(new_body, bindings);
     gc_protect(&final_body);
-    unsigned result = alloc_cons(keyword, alloc_cons(new_params, final_body));
-    gc_unprotect(9); // 5 initial + renames + new_params + new_body + final_body
+    unsigned result_tail = alloc_cons(new_params, final_body);
+    gc_protect(&result_tail);
+    unsigned result = alloc_cons(keyword, result_tail);
+    gc_unprotect(10); // 5 initial + renames + new_params + new_body +
+                      // final_body + result_tail
     return result;
 }
 
@@ -835,10 +857,11 @@ static unsigned hygienize_template(unsigned tmpl, unsigned bindings)
                 // Only hygienize the body, not the transformer bindings
                 unsigned new_body = hygienize_template(syn_body, bindings);
                 gc_protect(&new_body);
-                unsigned result =
-                    alloc_cons(head, alloc_cons(syn_bindings, new_body));
+                unsigned result_tail = alloc_cons(syn_bindings, new_body);
+                gc_protect(&result_tail);
+                unsigned result = alloc_cons(head, result_tail);
                 gc_unprotect(
-                    5); // new_body, syn_body, syn_bindings, tmpl, bindings
+                    6); // result_tail, new_body, syn_body, syn_bindings, tmpl, bindings
                 return result;
             }
         }

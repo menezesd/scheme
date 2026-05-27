@@ -20,12 +20,20 @@
 #include "macros.h"
 #include "primitives.h"
 #include "writer.h"
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 // Forward declaration from eval.c
 unsigned qq_expand_cps(unsigned x, unsigned env);
+
+static void *malloc_array(unsigned count, size_t elem_size)
+{
+    if (elem_size != 0 && (size_t)count > SIZE_MAX / elem_size)
+        return NULL;
+    return malloc((size_t)count * elem_size);
+}
 
 // Forward declaration for helper
 static void emit_gensym_definitions(compile_ctx *cctx, unsigned old_gensym,
@@ -777,10 +785,13 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
 
                             unsigned renamed_tmpl = rename_template_vars(tmpl, rename_map);
                             gc_protect(&renamed_tmpl);
-                            unsigned new_rule = alloc_cons(pattern, alloc_cons(renamed_tmpl, 0));
-                            gc_unprotect(1);
+                            unsigned new_rule_tail = alloc_cons(renamed_tmpl, 0);
+                            gc_protect(&new_rule_tail);
+                            unsigned new_rule = alloc_cons(pattern, new_rule_tail);
+                            gc_protect(&new_rule);
 
                             unsigned new_cell = alloc_cons(new_rule, 0);
+                            gc_unprotect(3);
                             if (!renamed_rules) {
                                 renamed_rules = new_cell;
                                 renamed_tail = new_cell;
@@ -791,9 +802,10 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
                         }
 
                         unsigned sr_atom = car(transformer_form);
-                        renamed_form = alloc_cons(sr_atom,
-                                          alloc_cons(literals, renamed_rules));
-                        gc_unprotect(6);
+                        unsigned sr_tail = alloc_cons(literals, renamed_rules);
+                        gc_protect(&sr_tail);
+                        renamed_form = alloc_cons(sr_atom, sr_tail);
+                        gc_unprotect(7);
                     }
 
                     // Create syntax transformer with renamed form
@@ -1290,7 +1302,7 @@ static compile_result compile_let(unsigned expr, compile_ctx *cctx)
     // Dynamically allocate variable array
     unsigned *vars = NULL;
     if (count > 0) {
-        vars = malloc(count * sizeof(unsigned));
+        vars = malloc_array(count, sizeof(unsigned));
         if (!vars) {
             show_error("let: out of memory for bindings");
             emit(cctx, OP_HALT);
@@ -1502,7 +1514,7 @@ static compile_result compile_and(unsigned expr, compile_ctx *cctx)
     unsigned saved_pos = cctx->code->code_len;
 
     // Dynamically allocate jump array
-    unsigned *false_jumps = malloc(expr_count * sizeof(unsigned));
+    unsigned *false_jumps = malloc_array(expr_count, sizeof(unsigned));
     if (!false_jumps) {
         show_error("and: out of memory");
         emit(cctx, OP_HALT);
@@ -1574,7 +1586,7 @@ static compile_result compile_or(unsigned expr, compile_ctx *cctx)
     unsigned saved_pos = cctx->code->code_len;
 
     // Dynamically allocate jump array
-    unsigned *true_jumps = malloc(expr_count * sizeof(unsigned));
+    unsigned *true_jumps = malloc_array(expr_count, sizeof(unsigned));
     if (!true_jumps) {
         show_error("or: out of memory");
         emit(cctx, OP_HALT);
@@ -1643,7 +1655,7 @@ static compile_result compile_cond(unsigned expr, compile_ctx *cctx)
     bool tail = cctx->tail_position;
 
     // Dynamically allocate end jump array
-    unsigned *end_jumps = malloc(clause_count * sizeof(unsigned));
+    unsigned *end_jumps = malloc_array(clause_count, sizeof(unsigned));
     if (!end_jumps) {
         show_error("cond: out of memory");
         emit(cctx, OP_HALT);
@@ -1742,8 +1754,13 @@ static compile_result compile_define(unsigned expr, compile_ctx *cctx)
         unsigned body = cddr(expr);
 
         // Build lambda expression
-        unsigned lambda_expr =
-            alloc_cons(atom_from_string("lambda"), alloc_cons(params, body));
+        GC_GUARD;
+        unsigned lambda_atom = atom_from_string("lambda");
+        gc_protect(&lambda_atom);
+        unsigned lambda_args = alloc_cons(params, body);
+        gc_protect(&lambda_args);
+        unsigned lambda_expr = alloc_cons(lambda_atom, lambda_args);
+        gc_protect(&lambda_expr);
 
         cctx->tail_position = false;
         compile_expr_internal(lambda_expr, cctx);
@@ -2196,7 +2213,7 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
         // Only safe when not inside nested let/begin frames (env_depth == 0)
         // because JUMP 0 would skip their POPENV instructions
         unsigned argc = list_length(args);
-        if (argc == cctx->loop_arity) {
+        if (argc == cctx->loop_arity && cctx->loop_arity <= 16) {
             // Compile all arguments first (before any SET)
             cctx->tail_position = false;
             FORLIST(a, args) { compile_expr_internal(car(a), cctx); }
@@ -2353,7 +2370,7 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
             // Dynamically allocate parameter ID array
             unsigned *param_ids = NULL;
             if (param_count > 0) {
-                param_ids = malloc(param_count * sizeof(unsigned));
+                param_ids = malloc_array(param_count, sizeof(unsigned));
                 if (!param_ids) {
                     show_error("lambda: out of memory for parameters");
                     emit(cctx, OP_HALT);
@@ -2695,4 +2712,3 @@ code_object *compile_toplevel(unsigned expr, unsigned env)
     cctx_free(cctx);
     return result;
 }
-

@@ -121,6 +121,10 @@ unsigned apply_port_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
             return TOK_ERROR;
         }
         // Copy the string to a new BT_STRING cell
+        if (sp->len == SIZE_MAX) {
+            show_error("get-output-string: result too large");
+            return TOK_ERROR;
+        }
         char *copy = malloc(sp->len + 1);
         if (!copy) {
             show_error("get-output-string: out of memory");

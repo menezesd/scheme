@@ -15,7 +15,22 @@
 #include "bytecode.h"
 #include "compile_internal.h"
 #include "context.h"
+#include <limits.h>
+#include <stdint.h>
 #include <stdlib.h>
+
+static unsigned grow_capacity(unsigned cap, size_t elem_size,
+                              const char *error_msg)
+{
+    if (cap > UINT_MAX / 2) {
+        lisp_panic(error_msg);
+    }
+    unsigned new_cap = cap * 2;
+    if ((size_t)new_cap > SIZE_MAX / elem_size) {
+        lisp_panic(error_msg);
+    }
+    return new_cap;
+}
 
 // ============================================================================
 // Code Object Registry
@@ -29,6 +44,19 @@ void code_register(code_object *code)
 {
     code->gc_next = code_object_registry;
     code_object_registry = code;
+}
+
+static void code_unregister(code_object *code)
+{
+    code_object **prev = &code_object_registry;
+    while (*prev) {
+        if (*prev == code) {
+            *prev = code->gc_next;
+            code->gc_next = NULL;
+            return;
+        }
+        prev = &(*prev)->gc_next;
+    }
 }
 
 // ============================================================================
@@ -74,6 +102,7 @@ void code_free(code_object *code)
 {
     if (!code)
         return;
+    code_unregister(code);
     free(code->code);
     free(code->constants);
     for (unsigned i = 0; i < code->children_len; i++) {
@@ -90,7 +119,9 @@ void code_free(code_object *code)
 void code_emit(code_object *code, unsigned instr)
 {
     if (code->code_len >= code->code_cap) {
-        unsigned new_cap = code->code_cap * 2;
+        unsigned new_cap =
+            grow_capacity(code->code_cap, sizeof(unsigned),
+                          "code_emit: capacity overflow");
         unsigned *new_code = realloc(code->code, new_cap * sizeof(unsigned));
         if (!new_code) {
             lisp_panic("code_emit: realloc failed");
@@ -109,8 +140,11 @@ unsigned code_add_const(code_object *code, unsigned val)
             return i;
     }
     if (code->const_len >= code->const_cap) {
-        unsigned new_cap = code->const_cap * 2;
-        unsigned *new_consts = realloc(code->constants, new_cap * sizeof(unsigned));
+        unsigned new_cap =
+            grow_capacity(code->const_cap, sizeof(unsigned),
+                          "code_add_const: capacity overflow");
+        unsigned *new_consts =
+            realloc(code->constants, new_cap * sizeof(unsigned));
         if (!new_consts) {
             lisp_panic("code_add_const: realloc failed");
         }
@@ -124,7 +158,9 @@ unsigned code_add_const(code_object *code, unsigned val)
 unsigned code_add_child(code_object *code, code_object *child)
 {
     if (code->children_len >= code->children_cap) {
-        unsigned new_cap = code->children_cap * 2;
+        unsigned new_cap = grow_capacity(code->children_cap,
+                                         sizeof(code_object *),
+                                         "code_add_child: capacity overflow");
         code_object **new_children =
             realloc(code->children, new_cap * sizeof(code_object *));
         if (!new_children) {

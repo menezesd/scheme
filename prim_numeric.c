@@ -21,6 +21,12 @@
 
 #include "prim_internal.h"
 
+#define RETURN_IF_ERROR(value)                                                 \
+    do {                                                                       \
+        if ((value) == TOK_ERROR)                                              \
+            return TOK_ERROR;                                                  \
+    } while (0)
+
 unsigned prim_plus(unsigned argc, unsigned *argv)
 {
     if (argc == 0)
@@ -62,7 +68,9 @@ slow_path:;
                 unsigned r, im;
                 get_complex_cells(argv[i], &r, &im);
                 real_sum = binary_add(real_sum, r);
+                RETURN_IF_ERROR(real_sum);
                 imag_sum = binary_add(imag_sum, im);
+                RETURN_IF_ERROR(imag_sum);
             }
             return make_complex_exact(real_sum, imag_sum);
         }
@@ -91,18 +99,32 @@ slow_path:;
             unsigned n, d;
             get_rational_cells(argv[i], &n, &d);
             unsigned ad = multiply_cells(num, d);
+            RETURN_IF_ERROR(ad);
             gc_protect(&ad);
             unsigned bc = multiply_cells(n, denom);
+            RETURN_IF_ERROR(bc);
+            gc_protect(&bc);
             num = add_cells(ad, bc);
-            gc_unprotect(1);
+            RETURN_IF_ERROR(num);
+            gc_unprotect(2);
             denom = multiply_cells(denom, d);
+            RETURN_IF_ERROR(denom);
         }
         return normalize_rational_cells(num, denom);
     }
     case NUM_BIGNUM: {
         bignum *result = bn_from_int(0);
+        if (!result) {
+            show_error("+: out of memory");
+            return TOK_ERROR;
+        }
         for (unsigned i = 0; i < argc; i++) {
             bignum *operand = to_bignum(argv[i]);
+            if (!operand) {
+                bn_free(result);
+                show_error("+: out of memory");
+                return TOK_ERROR;
+            }
             bn_add_ip(result, operand);
             bn_free(operand);
         }
@@ -116,10 +138,21 @@ slow_path:;
             if (__builtin_add_overflow(sum, x, &new_sum)) {
                 bignum *result = bn_from_int(sum);
                 bignum *operand = bn_from_int(x);
+                if (!result || !operand) {
+                    bn_free(result);
+                    bn_free(operand);
+                    show_error("+: out of memory");
+                    return TOK_ERROR;
+                }
                 bn_add_ip(result, operand);
                 bn_free(operand);
                 for (unsigned j = i + 1; j < argc; j++) {
                     operand = to_bignum(argv[j]);
+                    if (!operand) {
+                        bn_free(result);
+                        show_error("+: out of memory");
+                        return TOK_ERROR;
+                    }
                     bn_add_ip(result, operand);
                     bn_free(operand);
                 }
@@ -173,15 +206,23 @@ slow_path:;
                 unsigned r, im;
                 get_complex_cells(argv[i], &r, &im);
                 unsigned ac = binary_mul(real_prod, r);
+                RETURN_IF_ERROR(ac);
                 gc_protect(&ac);
                 unsigned bd = binary_mul(imag_prod, im);
+                RETURN_IF_ERROR(bd);
                 gc_protect(&bd);
                 unsigned ad = binary_mul(real_prod, im);
+                RETURN_IF_ERROR(ad);
                 gc_protect(&ad);
                 unsigned bc = binary_mul(imag_prod, r);
+                RETURN_IF_ERROR(bc);
+                gc_protect(&bc);
                 unsigned new_real = binary_sub(ac, bd);
+                RETURN_IF_ERROR(new_real);
+                gc_protect(&new_real);
                 unsigned new_imag = binary_add(ad, bc);
-                gc_unprotect(3);
+                RETURN_IF_ERROR(new_imag);
+                gc_unprotect(5);
                 real_prod = new_real;
                 imag_prod = new_imag;
             }
@@ -214,23 +255,33 @@ slow_path:;
             unsigned n, d;
             get_rational_cells(argv[i], &n, &d);
             num = multiply_cells(num, n);
+            RETURN_IF_ERROR(num);
             denom = multiply_cells(denom, d);
+            RETURN_IF_ERROR(denom);
         }
         return normalize_rational_cells(num, denom);
     }
     case NUM_BIGNUM:
     case NUM_INTEGER: {
         bignum *result = bn_from_int(1);
+        if (!result) {
+            show_error("*: out of memory");
+            return TOK_ERROR;
+        }
         for (unsigned i = 0; i < argc; i++) {
             bignum *operand = to_bignum(argv[i]);
             if (!operand) {
-                show_error("*: not a number");
+                show_error("*: out of memory");
                 bn_free(result);
                 return TOK_ERROR;
             }
             bignum *tmp = bn_mul(result, operand);
             bn_free(result);
             bn_free(operand);
+            if (!tmp) {
+                show_error("*: out of memory");
+                return TOK_ERROR;
+            }
             result = tmp;
         }
         return store_integer(result);
@@ -287,15 +338,19 @@ slow_path:;
             gc_protect(&imag_res);
             if (argc == 1) {
                 unsigned neg_real = negate_number(real_res);
+                RETURN_IF_ERROR(neg_real);
                 gc_protect(&neg_real);
                 unsigned neg_imag = negate_number(imag_res);
+                RETURN_IF_ERROR(neg_imag);
                 return make_complex_exact(neg_real, neg_imag);
             }
             for (unsigned i = 1; i < argc; i++) {
                 unsigned r, im;
                 get_complex_cells(argv[i], &r, &im);
                 real_res = binary_sub(real_res, r);
+                RETURN_IF_ERROR(real_res);
                 imag_res = binary_sub(imag_res, im);
+                RETURN_IF_ERROR(imag_res);
             }
             return make_complex_exact(real_res, imag_res);
         }
@@ -330,29 +385,46 @@ slow_path:;
         gc_protect(&num);
         gc_protect(&denom);
         if (argc == 1) {
-            return normalize_rational_cells(negate_number(num), denom);
+            unsigned neg_num = negate_number(num);
+            RETURN_IF_ERROR(neg_num);
+            gc_protect(&neg_num);
+            return normalize_rational_cells(neg_num, denom);
         }
         for (unsigned i = 1; i < argc; i++) {
             unsigned n, d;
             get_rational_cells(argv[i], &n, &d);
             unsigned ad = multiply_cells(num, d);
+            RETURN_IF_ERROR(ad);
             gc_protect(&ad);
             unsigned bc = multiply_cells(n, denom);
+            RETURN_IF_ERROR(bc);
+            gc_protect(&bc);
             unsigned new_num = subtract_cells(ad, bc);
-            gc_unprotect(1);
+            RETURN_IF_ERROR(new_num);
+            gc_unprotect(2);
             num = new_num;
             denom = multiply_cells(denom, d);
+            RETURN_IF_ERROR(denom);
         }
         return normalize_rational_cells(num, denom);
     }
     case NUM_BIGNUM: {
         bignum *result = to_bignum(argv[0]);
+        if (!result) {
+            show_error("-: out of memory");
+            return TOK_ERROR;
+        }
         if (argc == 1) {
             bn_neg_ip(result);
             return store_integer(result);
         }
         for (unsigned i = 1; i < argc; i++) {
             bignum *operand = to_bignum(argv[i]);
+            if (!operand) {
+                bn_free(result);
+                show_error("-: out of memory");
+                return TOK_ERROR;
+            }
             bn_sub_ip(result, operand);
             bn_free(operand);
         }
@@ -420,49 +492,68 @@ slow_path:;
             gc_protect(&imag_res);
             if (argc == 1) {
                 unsigned a2 = binary_mul(real_res, real_res);
+                RETURN_IF_ERROR(a2);
                 gc_protect(&a2);
                 unsigned b2 = binary_mul(imag_res, imag_res);
+                RETURN_IF_ERROR(b2);
+                gc_protect(&b2);
                 unsigned denom = binary_add(a2, b2);
-                gc_unprotect(1);
+                RETURN_IF_ERROR(denom);
                 gc_protect(&denom);
                 if (to_double(denom) == 0.0) {
                     ERROR_RETURN("/: division by zero");
                 }
                 unsigned new_real = binary_div(real_res, denom);
+                RETURN_IF_ERROR(new_real);
                 gc_protect(&new_real);
                 unsigned neg_imag = negate_number(imag_res);
+                RETURN_IF_ERROR(neg_imag);
+                gc_protect(&neg_imag);
                 unsigned new_imag = binary_div(neg_imag, denom);
+                RETURN_IF_ERROR(new_imag);
                 return make_complex_exact(new_real, new_imag);
             }
             for (unsigned i = 1; i < argc; i++) {
                 unsigned c, d;
                 get_complex_cells(argv[i], &c, &d);
                 unsigned ac = binary_mul(real_res, c);
+                RETURN_IF_ERROR(ac);
                 gc_protect(&ac);
                 unsigned bd = binary_mul(imag_res, d);
+                RETURN_IF_ERROR(bd);
                 gc_protect(&bd);
                 unsigned bc = binary_mul(imag_res, c);
+                RETURN_IF_ERROR(bc);
                 gc_protect(&bc);
                 unsigned ad = binary_mul(real_res, d);
+                RETURN_IF_ERROR(ad);
                 gc_protect(&ad);
                 unsigned c2 = binary_mul(c, c);
+                RETURN_IF_ERROR(c2);
                 gc_protect(&c2);
                 unsigned d2 = binary_mul(d, d);
+                RETURN_IF_ERROR(d2);
+                gc_protect(&d2);
                 unsigned denom = binary_add(c2, d2);
-                gc_unprotect(1);
+                RETURN_IF_ERROR(denom);
                 gc_protect(&denom);
                 if (to_double(denom) == 0.0) {
                     ERROR_RETURN("/: division by zero");
                 }
                 unsigned num_real = binary_add(ac, bd);
-                gc_unprotect(2);
+                RETURN_IF_ERROR(num_real);
                 gc_protect(&num_real);
                 unsigned num_imag = binary_sub(bc, ad);
-                gc_unprotect(2);
+                RETURN_IF_ERROR(num_imag);
                 gc_protect(&num_imag);
-                real_res = binary_div(num_real, denom);
-                imag_res = binary_div(num_imag, denom);
-                gc_unprotect(3);
+                unsigned new_real = binary_div(num_real, denom);
+                RETURN_IF_ERROR(new_real);
+                gc_protect(&new_real);
+                unsigned new_imag = binary_div(num_imag, denom);
+                RETURN_IF_ERROR(new_imag);
+                real_res = new_real;
+                imag_res = new_imag;
+                gc_unprotect(10);
             }
             return make_complex_exact(real_res, imag_res);
         }
@@ -521,7 +612,9 @@ slow_path:;
                 ERROR_RETURN("/: division by zero");
             }
             num = multiply_cells(num, d);
+            RETURN_IF_ERROR(num);
             denom = multiply_cells(denom, n);
+            RETURN_IF_ERROR(denom);
         }
         return normalize_rational_cells(num, denom);
     }
@@ -548,10 +641,23 @@ unsigned prim_modulo(unsigned argc, unsigned *argv)
             return TOK_ERROR;
         }
         bignum *r = bn_mod(a, b);
+        if (!r) {
+            bn_free(a);
+            bn_free(b);
+            show_error("modulo: out of memory");
+            return TOK_ERROR;
+        }
         // Adjust sign for modulo semantics
         if ((bn_sign(r) < 0 && bn_sign(b) > 0) ||
             (bn_sign(r) > 0 && bn_sign(b) < 0)) {
             bignum *tmp = bn_add(r, b);
+            if (!tmp) {
+                bn_free(r);
+                bn_free(a);
+                bn_free(b);
+                show_error("modulo: out of memory");
+                return TOK_ERROR;
+            }
             bn_free(r);
             r = tmp;
         }
@@ -562,6 +668,8 @@ unsigned prim_modulo(unsigned argc, unsigned *argv)
     int64_t a = CELL_ID(xa);
     int64_t b = CELL_ID(xb);
     CHECK_DIV_ZERO(b, "modulo");
+    if (a == INT64_MIN && b == -1)
+        return store(0);
     int64_t r = a % b;
     if ((r < 0 && b > 0) || (r > 0 && b < 0))
         r += b;
@@ -587,6 +695,12 @@ unsigned prim_remainder(unsigned argc, unsigned *argv)
             return TOK_ERROR;
         }
         bignum *r = bn_mod(a, b);
+        if (!r) {
+            bn_free(a);
+            bn_free(b);
+            show_error("remainder: out of memory");
+            return TOK_ERROR;
+        }
         bn_free(a);
         bn_free(b);
         return store_integer(r);
@@ -594,6 +708,8 @@ unsigned prim_remainder(unsigned argc, unsigned *argv)
     int64_t a = CELL_ID(xa);
     int64_t b = CELL_ID(xb);
     CHECK_DIV_ZERO(b, "remainder");
+    if (a == INT64_MIN && b == -1)
+        return store(0);
     return store(a % b);
 }
 
@@ -616,6 +732,12 @@ unsigned prim_quotient(unsigned argc, unsigned *argv)
             return TOK_ERROR;
         }
         bignum *q = bn_div(a, b, NULL);
+        if (!q) {
+            bn_free(a);
+            bn_free(b);
+            show_error("quotient: out of memory");
+            return TOK_ERROR;
+        }
         bn_free(a);
         bn_free(b);
         return store_integer(q);
@@ -623,6 +745,15 @@ unsigned prim_quotient(unsigned argc, unsigned *argv)
     int64_t a = CELL_ID(xa);
     int64_t b = CELL_ID(xb);
     CHECK_DIV_ZERO(b, "quotient");
+    if (a == INT64_MIN && b == -1) {
+        bignum *result = bn_from_int(a);
+        if (!result) {
+            show_error("quotient: out of memory");
+            return TOK_ERROR;
+        }
+        bn_neg_ip(result);
+        return store_integer(result);
+    }
     return store(a / b);
 }
 
@@ -633,11 +764,15 @@ unsigned prim_abs(unsigned argc, unsigned *argv)
     switch (CELL_TYPE(x)) {
     case BT_NUM: {
         int64_t n = CELL_ID(x);
-        return store(n < 0 ? -n : n);
+        return n < 0 ? negate_number(x) : x;
     }
     case BT_BIGNUM: {
         bignum *bn = get_bignum(x);
         bignum *result = bn_abs(bn);
+        if (!result) {
+            show_error("abs: out of memory");
+            return TOK_ERROR;
+        }
         return store_integer(result);
     }
     case BT_INEXACT: {
@@ -645,10 +780,15 @@ unsigned prim_abs(unsigned argc, unsigned *argv)
         return store_inexact(fabs(d));
     }
     case BT_RATIONAL: {
+        GC_GUARD;
+        gc_protect(&x);
         unsigned num_cell = CELL_CAR(x);
         unsigned denom_cell = CELL_CDR(x);
+        gc_protect(&num_cell);
+        gc_protect(&denom_cell);
         if (is_negative_number(num_cell)) {
             num_cell = negate_number(num_cell);
+            gc_protect(&num_cell);
         }
         return normalize_rational_cells(num_cell, denom_cell);
     }

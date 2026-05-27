@@ -4,6 +4,8 @@
 #include "reader.h"
 #include "test_framework.h"
 #include "types.h"
+#include <stdint.h>
+#include <stdlib.h>
 
 // ============================================================================
 // Helper: Read from string
@@ -75,6 +77,38 @@ TEST(read_bignum)
     PASS();
 }
 
+TEST(read_prefixed_bignum)
+{
+    unsigned x = read_from_string("#x8000000000000000");
+    ASSERT(CELL_TYPE(x) == BT_BIGNUM);
+    char *s = bn_to_string(get_bignum(x), 10);
+    ASSERT_STR_EQ(s, "9223372036854775808");
+    free(s);
+    PASS();
+}
+
+TEST(read_prefixed_int64_min)
+{
+    unsigned x = read_from_string("#x-8000000000000000");
+    ASSERT(CELL_TYPE(x) == BT_NUM);
+    ASSERT_EQ(CELL_ID(x), INT64_MIN);
+    PASS();
+}
+
+TEST(read_malformed_rational_as_symbol)
+{
+    unsigned x = read_from_string("12abc/2");
+    ASSERT(CELL_TYPE(x) == BT_ATOM);
+    PASS();
+}
+
+TEST(read_malformed_denominator_as_symbol)
+{
+    unsigned x = read_from_string("1/abc");
+    ASSERT(CELL_TYPE(x) == BT_ATOM);
+    PASS();
+}
+
 // ============================================================================
 // Reader Tests - Strings
 // ============================================================================
@@ -139,6 +173,13 @@ TEST(read_char_tab)
     unsigned x = read_from_string("#\\tab");
     ASSERT(CELL_TYPE(x) == BT_CHAR);
     ASSERT_EQ(CELL_ID(x), '\t');
+    PASS();
+}
+
+TEST(read_char_rejects_eof)
+{
+    unsigned x = read_from_string("#\\");
+    ASSERT(x == TOK_ERROR);
     PASS();
 }
 
@@ -380,6 +421,10 @@ int main(void)
     RUN_TEST(read_floating_point);
     RUN_TEST(read_rational);
     RUN_TEST(read_bignum);
+    RUN_TEST(read_prefixed_bignum);
+    RUN_TEST(read_prefixed_int64_min);
+    RUN_TEST(read_malformed_rational_as_symbol);
+    RUN_TEST(read_malformed_denominator_as_symbol);
 
     // Strings
     RUN_TEST(read_simple_string);
@@ -391,6 +436,7 @@ int main(void)
     RUN_TEST(read_char_space);
     RUN_TEST(read_char_newline);
     RUN_TEST(read_char_tab);
+    RUN_TEST(read_char_rejects_eof);
 
     // Symbols
     RUN_TEST(read_symbol);

@@ -59,6 +59,9 @@ static unsigned qq_expand_depth(unsigned x, unsigned env, int depth)
 
     GC_GUARD;
     unsigned head = car(x);
+    gc_protect(&x);
+    gc_protect(&env);
+    gc_protect(&head);
 
     // Check for (unquote expr) - only if unquote is not shadowed
     if (IS_KEYWORD(head, ctx.kw_unquote) &&
@@ -72,7 +75,9 @@ static unsigned qq_expand_depth(unsigned x, unsigned env, int depth)
             if (inner == TOK_ERROR)
                 return TOK_ERROR;
             gc_protect(&inner);
-            unsigned result = alloc_cons(head, alloc_cons(inner, 0));
+            unsigned result_tail = alloc_cons(inner, 0);
+            gc_protect(&result_tail);
+            unsigned result = alloc_cons(head, result_tail);
             return result;
         }
     }
@@ -89,7 +94,9 @@ static unsigned qq_expand_depth(unsigned x, unsigned env, int depth)
             if (inner == TOK_ERROR)
                 return TOK_ERROR;
             gc_protect(&inner);
-            unsigned result = alloc_cons(head, alloc_cons(inner, 0));
+            unsigned result_tail = alloc_cons(inner, 0);
+            gc_protect(&result_tail);
+            unsigned result = alloc_cons(head, result_tail);
             return result;
         }
     }
@@ -101,7 +108,9 @@ static unsigned qq_expand_depth(unsigned x, unsigned env, int depth)
         if (inner == TOK_ERROR)
             return TOK_ERROR;
         gc_protect(&inner);
-        unsigned result = alloc_cons(head, alloc_cons(inner, 0));
+        unsigned result_tail = alloc_cons(inner, 0);
+        gc_protect(&result_tail);
+        unsigned result = alloc_cons(head, result_tail);
         return result;
     }
 
@@ -134,9 +143,10 @@ static unsigned qq_expand_depth(unsigned x, unsigned env, int depth)
                     return inner;
                 }
                 gc_protect(&inner);
-                unsigned kept =
-                    alloc_cons(ctx.kw_unquote_splicing, alloc_cons(inner, 0));
-                gc_unprotect(1); // inner - per-iteration cleanup
+                unsigned kept_tail = alloc_cons(inner, 0);
+                gc_protect(&kept_tail);
+                unsigned kept = alloc_cons(ctx.kw_unquote_splicing, kept_tail);
+                gc_unprotect(2); // kept_tail, inner - per-iteration cleanup
                 list_append(&result, &tail, kept);
             }
         } else {
@@ -410,6 +420,9 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
             stdin = f;
 
             unsigned exprs = 0, exprs_tail = 0;
+            GC_GUARD;
+            gc_protect(&exprs);
+            gc_protect(&exprs_tail);
             for (;;) {
                 int c = getchar();
                 while (c != EOF && isspace(c))

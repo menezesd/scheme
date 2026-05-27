@@ -26,6 +26,7 @@
 
 #include "bignum.h"
 #include <ctype.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,6 +37,8 @@
 
 static bignum *bn_alloc(size_t cap)
 {
+    if (cap > SIZE_MAX / sizeof(limb_t))
+        return NULL;
     bignum *b = malloc(sizeof(bignum));
     if (!b)
         return NULL;
@@ -54,9 +57,17 @@ static void bn_ensure_cap(bignum *b, size_t cap)
 {
     if (b->cap >= cap)
         return;
+    if (b->cap > SIZE_MAX / 2 || cap > SIZE_MAX / sizeof(limb_t)) {
+        fprintf(stderr, "bignum: capacity overflow\n");
+        abort();
+    }
     size_t new_cap = b->cap * 2;
     if (new_cap < cap)
         new_cap = cap;
+    if (new_cap > SIZE_MAX / sizeof(limb_t)) {
+        fprintf(stderr, "bignum: capacity overflow\n");
+        abort();
+    }
     limb_t *new_limbs = realloc(b->limbs, new_cap * sizeof(limb_t));
     if (!new_limbs) {
         fprintf(stderr, "bignum: out of memory\n");
@@ -90,12 +101,14 @@ bignum *bn_from_int(int64_t val)
     if (!b)
         return NULL;
 
+    uint64_t uval;
     if (val < 0) {
         b->sign = 1;
-        val = -val;
+        uval = -(uint64_t)val;
+    } else {
+        uval = (uint64_t)val;
     }
 
-    uint64_t uval = (uint64_t)val;
     if (uval == 0) {
         b->len = 0;
     } else if (uval <= LIMB_MAX) {
@@ -149,6 +162,7 @@ bignum *bn_from_string(const char *str, int base)
     // Use in-place operations to avoid allocations per digit
     // Since base <= 36 fits in a single limb, we can use bn_mul_limb_ip
     // and bn_add_limb_ip for efficient parsing
+    bool saw_digit = false;
     while (*str) {
         int digit;
         if (isdigit(*str)) {
@@ -156,17 +170,25 @@ bignum *bn_from_string(const char *str, int base)
         } else if (isalpha(*str)) {
             digit = tolower(*str) - 'a' + 10;
         } else {
-            break;
+            bn_free(result);
+            return NULL;
         }
 
-        if (digit >= base)
-            break;
+        if (digit >= base) {
+            bn_free(result);
+            return NULL;
+        }
 
         // result = result * base + digit (all in-place, no allocations)
         bn_mul_limb_ip(result, (limb_t)base);
         bn_add_limb_ip(result, (limb_t)digit);
+        saw_digit = true;
 
         str++;
+    }
+    if (!saw_digit) {
+        bn_free(result);
+        return NULL;
     }
 
     result->sign = sign;
@@ -271,14 +293,31 @@ static char *bn_to_string_simple(const bignum *a, int base)
         return NULL;
 
     bignum *tmp = bn_copy(a);
+    if (!tmp) {
+        free(buf);
+        return NULL;
+    }
     tmp->sign = 0; // Work with absolute value
 
     size_t pos = 0;
     bignum *base_bn = bn_from_int(base);
+    if (!base_bn) {
+        bn_free(tmp);
+        free(buf);
+        return NULL;
+    }
 
     while (!bn_is_zero(tmp)) {
         bignum *rem = NULL;
         bignum *quot = bn_div(tmp, base_bn, &rem);
+        if (!quot || !rem) {
+            bn_free(quot);
+            bn_free(rem);
+            bn_free(tmp);
+            bn_free(base_bn);
+            free(buf);
+            return NULL;
+        }
 
         int digit = rem->len > 0 ? (int)rem->limbs[0] : 0;
         if (digit < 10) {
@@ -325,13 +364,22 @@ static char *bn_to_string_dc(const bignum *a, size_t num_digits)
 
     // Compute 10^split using binary exponentiation
     bignum *ten = bn_from_int(10);
+    if (!ten)
+        return NULL;
     bignum *divisor = bn_pow(ten, split);
     bn_free(ten);
+    if (!divisor)
+        return NULL;
 
     // Divide: a = hi * 10^split + lo
     bignum *lo = NULL;
     bignum *hi = bn_div(a, divisor, &lo);
     bn_free(divisor);
+    if (!hi || !lo) {
+        bn_free(hi);
+        bn_free(lo);
+        return NULL;
+    }
 
     // Estimate digits in each half
     size_t hi_digits = num_digits - split;
@@ -348,15 +396,29 @@ static char *bn_to_string_dc(const bignum *a, size_t num_digits)
         hi_str = bn_to_string_dc(hi, hi_digits);
     }
     bn_free(hi);
+    if (!hi_str) {
+        bn_free(lo);
+        return NULL;
+    }
 
     char *lo_str = bn_to_string_dc(lo, lo_digits);
     bn_free(lo);
+    if (!lo_str) {
+        free(hi_str);
+        return NULL;
+    }
 
     // Concatenate with zero-padding for low part
     size_t hi_len = strlen(hi_str);
     size_t lo_len = strlen(lo_str);
     size_t pad = (lo_len < split) ? split - lo_len : 0;
 
+    if (hi_len > SIZE_MAX - pad || hi_len + pad > SIZE_MAX - lo_len ||
+        hi_len + pad + lo_len == SIZE_MAX) {
+        free(hi_str);
+        free(lo_str);
+        return NULL;
+    }
     char *result = malloc(hi_len + pad + lo_len + 1);
     if (!result) {
         free(hi_str);
@@ -393,12 +455,24 @@ char *bn_to_string(const bignum *a, int base)
         size_t est_digits = (size_t)(a->len * LIMB_BITS * 0.30103) + 1;
 
         bignum *abs_a = bn_abs(a);
+        if (!abs_a)
+            return NULL;
         char *digits = bn_to_string_dc(abs_a, est_digits);
         bn_free(abs_a);
+        if (!digits)
+            return NULL;
 
         if (a->sign) {
             size_t len = strlen(digits);
+            if (len > SIZE_MAX - 2) {
+                free(digits);
+                return NULL;
+            }
             char *result = malloc(len + 2);
+            if (!result) {
+                free(digits);
+                return NULL;
+            }
             result[0] = '-';
             memcpy(result + 1, digits, len + 1);
             free(digits);
@@ -458,7 +532,10 @@ int bn_sign(const bignum *a)
 // Add absolute values: result = |a| + |b|
 static bignum *bn_add_abs(const bignum *a, const bignum *b)
 {
-    size_t max_len = (a->len > b->len ? a->len : b->len) + 1;
+    size_t max_input_len = a->len > b->len ? a->len : b->len;
+    if (max_input_len == SIZE_MAX)
+        return NULL;
+    size_t max_len = max_input_len + 1;
     bignum *result = bn_alloc(max_len);
     if (!result)
         return NULL;
@@ -513,6 +590,8 @@ bignum *bn_add(const bignum *a, const bignum *b)
     if (a->sign == b->sign) {
         // Same sign: add absolute values
         bignum *result = bn_add_abs(a, b);
+        if (!result)
+            return NULL;
         result->sign = a->sign;
         return result;
     } else {
@@ -522,10 +601,14 @@ bignum *bn_add(const bignum *a, const bignum *b)
             return bn_new(); // Zero
         } else if (cmp > 0) {
             bignum *result = bn_sub_abs(a, b);
+            if (!result)
+                return NULL;
             result->sign = a->sign;
             return result;
         } else {
             bignum *result = bn_sub_abs(b, a);
+            if (!result)
+                return NULL;
             result->sign = b->sign;
             return result;
         }
@@ -536,9 +619,13 @@ bignum *bn_sub(const bignum *a, const bignum *b)
 {
     // a - b = a + (-b)
     bignum *neg_b = bn_copy(b);
+    if (!neg_b)
+        return NULL;
     neg_b->sign = !neg_b->sign;
     bignum *result = bn_add(a, neg_b);
     bn_free(neg_b);
+    if (!result)
+        return NULL;
     bn_normalize(result);
     return result;
 }
@@ -546,6 +633,8 @@ bignum *bn_sub(const bignum *a, const bignum *b)
 bignum *bn_neg(const bignum *a)
 {
     bignum *result = bn_copy(a);
+    if (!result)
+        return NULL;
     if (result->len > 0) {
         result->sign = !result->sign;
     }
@@ -555,6 +644,8 @@ bignum *bn_neg(const bignum *a)
 bignum *bn_abs(const bignum *a)
 {
     bignum *result = bn_copy(a);
+    if (!result)
+        return NULL;
     result->sign = 0;
     return result;
 }
@@ -570,6 +661,8 @@ static bignum *bn_mul_schoolbook(const bignum *a, const bignum *b)
         return bn_new();
     }
 
+    if (a->len > SIZE_MAX - b->len)
+        return NULL;
     size_t result_len = a->len + b->len;
     bignum *result = bn_alloc(result_len);
     if (!result)
@@ -615,6 +708,8 @@ static bignum *bn_lshift_limbs(const bignum *a, size_t k)
     if (a->len == 0)
         return bn_new();
 
+    if (k > SIZE_MAX - a->len)
+        return NULL;
     bignum *result = bn_alloc(a->len + k);
     if (!result)
         return NULL;
@@ -952,6 +1047,8 @@ static bignum *bn_mul_toom3(const bignum *a, const bignum *b)
 bignum *bn_mul(const bignum *a, const bignum *b)
 {
     bignum *result = bn_mul_karatsuba(a, b);
+    if (!result)
+        return NULL;
     result->sign = (a->sign != b->sign) && !bn_is_zero(result);
     return result;
 }
@@ -1140,6 +1237,8 @@ bignum *bn_lshift(const bignum *a, size_t bits)
     size_t limb_shift = bits / LIMB_BITS;
     size_t bit_shift = bits % LIMB_BITS;
 
+    if (a->len > SIZE_MAX - 1 || limb_shift > SIZE_MAX - a->len - 1)
+        return NULL;
     size_t new_len = a->len + limb_shift + 1;
     bignum *result = bn_alloc(new_len);
     if (!result)
