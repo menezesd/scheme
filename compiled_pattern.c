@@ -333,8 +333,6 @@ static void compile_ellipsis(unsigned pattern, pattern_compile_ctx *pctx)
     unsigned elem = car(pattern);
     unsigned rest = cddr(pattern);  // Skip the ellipsis symbol
 
-    pctx->ellipsis_depth++;
-
     // Strategy: greedy with backtracking
     // Loop that tries rest first, on failure matches one element and retries.
 
@@ -345,13 +343,17 @@ static void compile_ellipsis(unsigned pattern, pattern_compile_ctx *pctx)
     pattern_emit(pctx->pattern, PAT_CHOICE_POINT, 0);  // Placeholder
     unsigned choice_patch = pattern_current_pos(pctx->pattern) - 1;
 
-    // Try matching rest (success path)
+    // Try matching rest (success path) — at current depth, so post-ellipsis
+    // trailing patterns are NOT registered as ellipsis-bound variables.
     compile_pattern_node(rest, pctx);
     pattern_emit(pctx->pattern, PAT_COMMIT, 0);
 
     // Jump to success (skip elem path) - placeholder
     pattern_emit(pctx->pattern, PAT_JUMP, 0);
     unsigned success_patch = pattern_current_pos(pctx->pattern) - 1;
+
+    // Now increment depth: element vars ARE ellipsis-bound.
+    pctx->ellipsis_depth++;
 
     // Elem path: match one element, accumulate it, consume it, retry
     unsigned elem_path = pattern_current_pos(pctx->pattern);
