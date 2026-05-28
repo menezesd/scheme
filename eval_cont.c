@@ -131,7 +131,7 @@ void handle_cont_cond_test(unsigned val, unsigned data, unsigned env,
             // No consequent: return test value
             tramp_apply(val, next);
         } else if (IS_KEYWORD(car(conseq), ctx.kw_arrow) &&
-                   lookup_silent(ctx.kw_arrow, env) == TOK_ERROR) {
+                   env_find_binding_cell(ctx.kw_arrow, env) == 0) {
             // (test => receiver) syntax - evaluate receiver, then call with val
             // Only if => is not lexically bound (R5RS hygiene)
             GC_GUARD;
@@ -161,7 +161,8 @@ void handle_cont_cond_test(unsigned val, unsigned data, unsigned env,
         } else {
             unsigned clause = car(rest);
             unsigned test = car(clause);
-            if (IS_KEYWORD(test, ctx.kw_else)) {
+            if (IS_KEYWORD(test, ctx.kw_else) &&
+                env_find_binding_cell(ctx.kw_else, env) == 0) {
                 unsigned conseq2 = cdr(clause);
                 if (!conseq2) {
                     tramp_apply(ctx.atom_true, next);
@@ -461,6 +462,10 @@ void handle_cont_eval_fn(unsigned val, unsigned data, unsigned env,
     if (IS_SYNTAX(fn)) {
         gc_protect(&fn);
         gc_protect(&arg_exprs);
+        if (!eval_note_macro_expansion()) {
+            tramp_error();
+            return;
+        }
         unsigned input = alloc_cons(0, arg_exprs);
         gc_protect(&input);
         unsigned expanded = apply_syntax(fn, input, env);
@@ -472,6 +477,8 @@ void handle_cont_eval_fn(unsigned val, unsigned data, unsigned env,
         tramp_eval(expanded, env, next);
         return;
     }
+
+    eval_reset_macro_expansion_depth();
 
     if (!arg_exprs) {
         apply_function(fn, 0, env, next);
@@ -563,6 +570,10 @@ void handle_cont_macro_expand(unsigned val, unsigned data, unsigned env,
                               unsigned next)
 {
     (void)data;
+    if (!eval_note_macro_expansion()) {
+        tramp_error();
+        return;
+    }
     tramp_eval(val, env, next);
 }
 

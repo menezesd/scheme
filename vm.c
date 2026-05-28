@@ -153,6 +153,13 @@ static unsigned vm_store_bignum_neg(vm_state *vm, const bignum *bn,
 // Perform a variable lookup with inline cache. On cache hit (depth/offset are
 // valid and verified), walks depth frames and offset values — O(depth+offset).
 // On miss, does a full lookup and fills the cache in the bytecode.
+static inline unsigned vm_deref_binding_value(unsigned val)
+{
+    if (IS_BINDING_REF(val))
+        return car(CELL_CAR(val));
+    return val;
+}
+
 static inline unsigned ic_lookup(int64_t sym_id, unsigned env,
                                  unsigned *cache_slot)
 {
@@ -177,7 +184,7 @@ static inline unsigned ic_lookup(int64_t sym_id, unsigned env,
                                      ? CELL_ID(vars)
                                      : CELL_ID(car(vars));
                 if (var_id == sym_id)
-                    return car(vals); // Verified hit
+                    return vm_deref_binding_value(car(vals)); // Verified hit
             }
         }
         // Cache stale — fall through to full lookup
@@ -201,7 +208,7 @@ static inline unsigned ic_lookup(int64_t sym_id, unsigned env,
             if (match) {
                 cache_slot[0] = depth;
                 cache_slot[1] = offset;
-                return car(vals);
+                return vm_deref_binding_value(car(vals));
             }
         }
     }
@@ -301,8 +308,10 @@ unsigned vm_call_closure(unsigned closure, unsigned args)
             GC_PROTECT_GUARD3(&closure_env, &args, &params);
             frame = bind_params(params, args);
         }
-        if (frame == TOK_ERROR)
+        if (frame == TOK_ERROR) {
+            vm_free(&vm);
             return TOK_ERROR;
+        }
         {
             GC_PROTECT_GUARD2(&frame, &closure_env);
             run_env = alloc_cons(frame, closure_env);
@@ -1077,6 +1086,30 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             gc_protect(&atom);
             defvar(atom, val, vm->env);
             gc_unprotect(2);
+            break;
+        }
+
+        case OP_DEFINE_ALIAS: {
+            int64_t alias_id = vm->code->code[vm->ip++];
+            int64_t target_id = vm->code->code[vm->ip++];
+            unsigned target_cell = env_find_binding_cell(target_id, vm->env);
+            if (!target_cell) {
+                vm->error = true;
+                vm->error_msg = "unbound variable in alias definition";
+                vm->running = false;
+                break;
+            }
+            GC_GUARD;
+            gc_protect(&target_cell);
+            unsigned alias = alloc();
+            gc_protect(&alias);
+            CELL_TYPE(alias) = BT_ATOM;
+            CELL_ID(alias) = alias_id;
+            unsigned target = alloc();
+            gc_protect(&target);
+            CELL_TYPE(target) = BT_ATOM;
+            CELL_ID(target) = target_id;
+            defvar_alias(alias, target, target_cell, vm->env);
             break;
         }
 

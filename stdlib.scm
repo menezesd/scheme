@@ -214,17 +214,23 @@
 ;;; ============================================================================
 
 ; case - multi-way branch
-(define-syntax case
+(define-syntax %case-dispatch
   (syntax-rules (else)
-    ((case key (else result ...))
+    ((%case-dispatch key (else result ...))
      (begin result ...))
-    ((case key ((atoms ...) result ...))
+    ((%case-dispatch key ((atoms ...) result ...))
      (if (memv key '(atoms ...))
          (begin result ...)))
-    ((case key ((atoms ...) result ...) clause ...)
+    ((%case-dispatch key ((atoms ...) result ...) clause ...)
      (if (memv key '(atoms ...))
          (begin result ...)
-         (case key clause ...)))))
+         (%case-dispatch key clause ...)))))
+
+(define-syntax case
+  (syntax-rules ()
+    ((case key clause ...)
+     (let ((case-key key))
+       (%case-dispatch case-key clause ...)))))
 
 ; do - iteration (uses nested ellipsis)
 ; do - iteration (uses nested ellipsis for any number of variables)
@@ -445,7 +451,7 @@
             (proc (car lst))
             (for-each proc (cdr lst))))
       ; Multiple lists case
-      (if (not (null? lst))
+      (if (not (or (null? lst) (any null? lsts)))
           (begin
             (apply proc (car lst) (map car lsts))
             (apply for-each proc (cdr lst) (map cdr lsts))))))
@@ -803,14 +809,18 @@
   (%require-proper-list "take-right" lst)
   (%require-nonnegative-integer "take-right" n)
   (let ((len (length lst)))
-    (drop (- len n) lst)))
+    (if (>= n len)
+        lst
+        (drop (- len n) lst))))
 
 ; drop-right - return all but last n elements
 (define (drop-right lst n)
   (%require-proper-list "drop-right" lst)
   (%require-nonnegative-integer "drop-right" n)
   (let ((len (length lst)))
-    (take (- len n) lst)))
+    (if (>= n len)
+        '()
+        (take (- len n) lst))))
 
 ; split-at - split list at index, return two lists
 (define (split-at lst n)
@@ -1023,10 +1033,12 @@
   (cond ((<= n 0) '())
         ((null? lst) '())
         (else
-         (let ((tail (list-tail lst (- n 1))))
-           (if (pair? tail)
-               (set-cdr! tail '()))
-           lst))))
+         (let ((tail (drop (- n 1) lst)))
+           (if (null? tail)
+               lst
+               (begin
+                 (set-cdr! tail '())
+                 lst))))))
 
 ; drop-right! - destructive version of drop-right
 (define (drop-right! lst n)
@@ -1043,10 +1055,12 @@
   (%require-nonnegative-integer "split-at!" n)
   (if (<= n 0)
       (values '() lst)
-      (let ((tail (drop lst (- n 1))))
-        (let ((rest (cdr tail)))
-          (set-cdr! tail '())
-          (values lst rest)))))
+      (let ((tail (drop (- n 1) lst)))
+        (if (null? tail)
+            (values lst '())
+            (let ((rest (cdr tail)))
+              (set-cdr! tail '())
+              (values lst rest))))))
 
 ; append! - destructive append
 (define (append! . lists)

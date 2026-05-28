@@ -50,6 +50,13 @@ unsigned empty_environment(void);
 // Define a variable in the current frame
 unsigned defvar(unsigned var, unsigned aval, unsigned env);
 
+// Define a variable as an alias to an existing environment value cell
+unsigned defvar_alias(unsigned var, unsigned target_var, unsigned target_val_cell,
+                      unsigned env);
+
+// Find the value cell for a variable in an environment, or 0 if absent
+unsigned env_find_binding_cell(int64_t var, unsigned env);
+
 // Set an existing variable (error if not found)
 unsigned setvar(int64_t var, unsigned aval, unsigned env);
 

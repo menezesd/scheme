@@ -131,7 +131,16 @@ typedef struct compiled_pattern {
 typedef struct {
     unsigned input;      // Input position when choice was made
     unsigned ip;         // Instruction pointer for retry path
-    unsigned accum_len;  // Length of ellipsis accumulators to restore
+    unsigned input_sp;   // Input stack depth
+    unsigned vec_iter_vec;
+    unsigned vec_iter_idx;
+    unsigned vec_iter_count;
+    unsigned vec_iter_pre;
+    unsigned *bindings;
+    unsigned *ellipsis_lists;
+    unsigned *ellipsis_tails;
+    unsigned *inner_lists;
+    unsigned *inner_tails;
 } pat_choice_point;
 
 /**

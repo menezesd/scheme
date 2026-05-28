@@ -197,9 +197,18 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
                 show_error("read: close failed");
                 return TOK_ERROR;
             }
+            if (result == TOK_CLOSE || result == TOK_DOT) {
+                show_error("read: unexpected reader token");
+                return TOK_ERROR;
+            }
             return result;
         }
-        return read_obj_port(fport);
+        unsigned result = read_obj_port(fport);
+        if (result == TOK_CLOSE || result == TOK_DOT) {
+            show_error("read: unexpected reader token");
+            return TOK_ERROR;
+        }
+        return result;
     }
     case PREADCHAR: {
         REQUIRE_ARGC(argc, 0, 1, "read-char");

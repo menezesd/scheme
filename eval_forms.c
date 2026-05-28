@@ -157,7 +157,7 @@ bool handle_set(unsigned id, unsigned env, unsigned cont)
     }
     unsigned var = cadr(id);
     unsigned val_expr = caddr(id);
-    if (!IS_ATOM(var)) {
+    if (!identifier_valid(var)) {
         show_error("set!: expected variable");
         tramp_error();
         return true;
@@ -193,7 +193,7 @@ bool handle_define(unsigned id, unsigned env, unsigned cont)
         unsigned name = car(vid);
         unsigned params = cdr(vid);
         unsigned body = cddr(id);
-        if (!IS_ATOM(name) || !body ||
+        if (!identifier_valid(name) || !body ||
             !list_length_checked(body, NULL, "define") ||
             !lambda_params_valid(params)) {
             show_error("define: invalid syntax");
@@ -212,7 +212,7 @@ bool handle_define(unsigned id, unsigned env, unsigned cont)
         tramp_apply(name, cont);
         return true;
     }
-    if (!IS_ATOM(vid) || cdddr(id)) {
+    if (!identifier_valid(vid) || cdddr(id)) {
         show_error("define: invalid syntax");
         tramp_error();
         return true;
@@ -305,7 +305,7 @@ bool handle_or(unsigned id, unsigned env, unsigned cont)
 bool handle_cond(unsigned id, unsigned env, unsigned cont)
 {
     unsigned clauses = cdr(id);
-    if (!cond_clauses_valid(clauses, "cond")) {
+    if (!cond_clauses_valid(clauses, "cond", env)) {
         tramp_error();
         return true;
     }
@@ -317,7 +317,8 @@ bool handle_cond(unsigned id, unsigned env, unsigned cont)
     unsigned test = car(clause);
     unsigned rest_clauses = cdr(clauses);
 
-    if (IS_KEYWORD(test, ctx.kw_else)) {
+    if (IS_KEYWORD(test, ctx.kw_else) &&
+        env_find_binding_cell(ctx.kw_else, env) == 0) {
         unsigned conseq = cdr(clause);
         if (!conseq) {
             tramp_apply(ctx.atom_true, cont);
@@ -350,8 +351,81 @@ bool handle_cond(unsigned id, unsigned env, unsigned cont)
     return true;
 }
 
+static bool handle_named_let(unsigned id, unsigned env, unsigned cont)
+{
+    if (!syntax_arity_checked(id, 3, UINT_MAX, "let")) {
+        tramp_error();
+        return true;
+    }
+
+    unsigned name = cadr(id);
+    unsigned bindings = caddr(id);
+    unsigned body = cdddr(id);
+    if (!identifier_valid(name) || !binding_list_valid(bindings, "let") ||
+        !list_length_checked(body, NULL, "let")) {
+        show_error("let: invalid named let syntax");
+        tramp_error();
+        return true;
+    }
+
+    GC_GUARD;
+    gc_protect(&name);
+    gc_protect(&bindings);
+    gc_protect(&body);
+    gc_protect(&env);
+    gc_protect(&cont);
+
+    unsigned params = 0, params_tail = 0;
+    unsigned args = 0, args_tail = 0;
+    gc_protect(&params);
+    gc_protect(&params_tail);
+    gc_protect(&args);
+    gc_protect(&args_tail);
+
+    FORLIST(b, bindings) {
+        unsigned binding = car(b);
+        list_append(&params, &params_tail, car(binding));
+        list_append(&args, &args_tail, cadr(binding));
+    }
+
+    unsigned name_cell = 0, val_cell = 0, new_env = 0;
+    gc_protect(&name_cell);
+    gc_protect(&val_cell);
+    gc_protect(&new_env);
+    name_cell = alloc_cons(name, 0);
+    val_cell = alloc_cons(0, 0);
+    new_env = extend_env(name_cell, val_cell, env);
+
+    gc_protect(&params);
+    gc_protect(&body);
+    gc_protect(&new_env);
+    unsigned body_env = alloc_cons(body, new_env);
+    unsigned fn = make_typed_cell(BT_FUNCTION, params, body_env);
+    gc_protect(&fn);
+    cell_set_car(val_cell, fn);
+
+    if (!args) {
+        apply_function(fn, 0, env, cont);
+        return true;
+    }
+
+    unsigned first_arg = car(args);
+    unsigned rest_args = cdr(args);
+    gc_protect(&first_arg);
+    gc_protect(&rest_args);
+    unsigned inner = 0, data = 0;
+    gc_protect(&inner);
+    gc_protect(&data);
+    inner = alloc_cons(0, rest_args);
+    data = alloc_cons(fn, inner);
+    unsigned k = make_cont(CONT_EVAL_ARGS, data, env, cont);
+    tramp_eval(first_arg, env, k);
+    return true;
+}
+
 /**
  * Handle let: (let ((var1 expr1) (var2 expr2) ...) body...)
+ * or named let: (let name ((var1 expr1) ...) body...)
  *
  * Parallel binding: all expressions evaluated in outer environment,
  * then all bindings made simultaneously in a new environment.
@@ -364,6 +438,9 @@ bool handle_let(unsigned id, unsigned env, unsigned cont)
         return true;
     }
     unsigned bindings = cadr(id);
+    if (IS_ATOM(bindings))
+        return handle_named_let(id, env, cont);
+
     unsigned body = cddr(id);
     if (!binding_list_valid(bindings, "let") ||
         !list_length_checked(body, NULL, "let")) {
@@ -371,7 +448,12 @@ bool handle_let(unsigned id, unsigned env, unsigned cont)
         return true;
     }
     if (!bindings) {
-        eval_body(body, env, cont);
+        GC_GUARD;
+        gc_protect(&body);
+        gc_protect(&env);
+        gc_protect(&cont);
+        unsigned new_env = extend_env_empty(env);
+        eval_body(body, new_env, cont);
         return true;
     }
     GC_GUARD;
@@ -463,7 +545,12 @@ bool handle_letrec(unsigned id, unsigned env, unsigned cont)
     }
 
     if (!bindings) {
-        eval_body(body, env, cont);
+        GC_GUARD;
+        gc_protect(&body);
+        gc_protect(&env);
+        gc_protect(&cont);
+        unsigned new_env = extend_env_empty(env);
+        eval_body(body, new_env, cont);
         return true;
     }
 
@@ -565,7 +652,7 @@ bool handle_define_macro(unsigned id, unsigned env, unsigned cont)
     unsigned name = car(sig);
     unsigned params = cdr(sig);
     unsigned mbody = cddr(id);
-    if (!IS_ATOM(name) || !mbody ||
+    if (!identifier_valid(name) || !mbody ||
         !list_length_checked(mbody, NULL, "define-macro") ||
         !lambda_params_valid(params)) {
         show_error("define-macro: invalid syntax");
@@ -595,7 +682,7 @@ bool handle_define_syntax(unsigned id, unsigned env, unsigned cont)
     }
     unsigned name = cadr(id);
     unsigned transformer_form = caddr(id);
-    if (!IS_ATOM(name)) {
+    if (!identifier_valid(name)) {
         show_error("define-syntax: expected name");
         tramp_error();
         return true;
@@ -634,9 +721,13 @@ bool handle_let_syntax(unsigned id, unsigned env, unsigned cont)
         tramp_error();
         return true;
     }
-    // If no bindings, use outer env directly (transparent for internal defines)
     if (!bindings) {
-        eval_body(body, env, cont);
+        GC_GUARD;
+        gc_protect(&body);
+        gc_protect(&env);
+        gc_protect(&cont);
+        unsigned new_env = extend_env_empty(env);
+        eval_body(body, new_env, cont);
         return true;
     }
     GC_GUARD;
@@ -667,9 +758,13 @@ bool handle_letrec_syntax(unsigned id, unsigned env, unsigned cont)
         tramp_error();
         return true;
     }
-    // If no bindings, use outer env directly (transparent for internal defines)
     if (!bindings) {
-        eval_body(body, env, cont);
+        GC_GUARD;
+        gc_protect(&body);
+        gc_protect(&env);
+        gc_protect(&cont);
+        unsigned new_env = extend_env_empty(env);
+        eval_body(body, new_env, cont);
         return true;
     }
     GC_GUARD;
@@ -700,23 +795,39 @@ typedef struct {
 
 bool dispatch_special_form(int64_t kw, unsigned id, unsigned env, unsigned cont)
 {
-    // Check each special form
-    // quote can be shadowed by local bindings (R5RS allows this)
-    if (kw == ctx.kw_quote) {
-        if (is_keyword_shadowed(kw, env))
-            return false; // Fall through to procedure call
-        return handle_quote(id, env, cont);
+    unsigned binding = lookup_silent(kw, env);
+    if (binding != TOK_ERROR) {
+        if (IS_SYNTAX(binding)) {
+            GC_GUARD;
+            gc_protect(&id);
+            gc_protect(&env);
+            gc_protect(&cont);
+            gc_protect(&binding);
+            if (!eval_note_macro_expansion()) {
+                tramp_error();
+                return true;
+            }
+            unsigned expanded = apply_syntax(binding, id, env);
+            if (expanded == TOK_ERROR) {
+                tramp_error();
+                return true;
+            }
+            tramp_eval(expanded, env, cont);
+            return true;
+        }
+        return false;
     }
+
+    // Check each special form
+    eval_reset_macro_expansion_depth();
+    if (kw == ctx.kw_quote)
+        return handle_quote(id, env, cont);
     if (kw == ctx.kw_lambda)
         return handle_lambda(id, env, cont);
     if (kw == ctx.kw_if)
         return handle_if(id, env, cont);
-    // begin can be shadowed by local bindings (R5RS allows this)
-    if (kw == ctx.kw_begin) {
-        if (is_keyword_shadowed(kw, env))
-            return false; // Fall through to procedure call
+    if (kw == ctx.kw_begin)
         return handle_begin(id, env, cont);
-    }
     if (kw == ctx.kw_set)
         return handle_set(id, env, cont);
     if (kw == ctx.kw_define)
@@ -727,28 +838,6 @@ bool dispatch_special_form(int64_t kw, unsigned id, unsigned env, unsigned cont)
         return handle_or(id, env, cont);
     if (kw == ctx.kw_cond)
         return handle_cond(id, env, cont);
-
-    // Check for macro overrides on let/let*/letrec
-    if (kw == ctx.kw_let || kw == ctx.kw_letstar || kw == ctx.kw_letrec) {
-        unsigned mac = lookup_silent(kw, env);
-        if (mac != TOK_ERROR && IS_SYNTAX(mac)) {
-            // Protect all values that might be in nursery before macro
-            // expansion
-            gc_protect(&id);
-            gc_protect(&env);
-            gc_protect(&cont);
-            gc_protect(&mac);
-            unsigned expanded = apply_syntax(mac, id, env);
-            gc_unprotect(4);
-            if (expanded == TOK_ERROR) {
-                tramp_error();
-                return true;
-            }
-            tramp_eval(expanded, env, cont);
-            return true;
-        }
-    }
-
     if (kw == ctx.kw_let)
         return handle_let(id, env, cont);
     if (kw == ctx.kw_letstar)

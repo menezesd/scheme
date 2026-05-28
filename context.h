@@ -285,6 +285,9 @@ bool list_length_checked(unsigned lst, unsigned *len_out, const char *name);
 bool syntax_arity_checked(unsigned form, unsigned min_args, unsigned max_args,
                           const char *name);
 
+// Validate that a datum is an identifier usable as a binding name.
+bool identifier_valid(unsigned x);
+
 // Validate lambda formal parameter syntax.
 bool lambda_params_valid(unsigned params);
 
@@ -292,7 +295,7 @@ bool lambda_params_valid(unsigned params);
 bool binding_list_valid(unsigned bindings, const char *name);
 
 // Validate cond clause syntax.
-bool cond_clauses_valid(unsigned clauses, const char *name);
+bool cond_clauses_valid(unsigned clauses, const char *name, unsigned env);
 
 // Find last cons cell in a proper list (returns 0 for empty list)
 static inline unsigned list_last(unsigned lst)

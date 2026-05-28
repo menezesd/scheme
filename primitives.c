@@ -818,13 +818,9 @@ unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
                        (long long)version);
             return TOK_ERROR;
         }
-        // Return environment with only syntax bindings (no procedures)
-        // Need to include #t for boolean values
-        GC_GUARD;
-        unsigned env = empty_environment();
-        gc_protect(&env);
-        defvar(ctx.atom_true, ctx.atom_true, env);
-        return env;
+        // Return environment with only syntax bindings (no procedures). Boolean
+        // literals are self-evaluating and do not need environment bindings.
+        return empty_environment();
     }
 
     // Special cases handled elsewhere

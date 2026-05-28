@@ -9,6 +9,7 @@
 #include "writer.h"
 #include <stdint.h>
 #include <string.h>
+#include <unistd.h>
 
 // Embedded standard library
 #include "stdlib_data.h"
@@ -112,6 +113,11 @@ static bool load_from_port(FILE *f, unsigned *env, bool warn_on_error,
         }
         if (is_eof_object(expr))
             break;
+        if (expr == TOK_CLOSE || expr == TOK_DOT) {
+            show_error("unexpected reader token at top level");
+            restore_reader_context(old_filename);
+            return false;
+        }
 
         gc_protect(&expr);
         list_append(&all_exprs, &all_tail, expr);
@@ -305,7 +311,9 @@ int main(int argc, char **argv)
             print_usage(argv[0]);
             return 0;
         } else if (strcmp(argv[i], "--") == 0) {
-            // Stop processing options; remaining args are for the script
+            // Stop processing options; remaining args are for the script.
+            if (i + 1 < argc)
+                file_arg = i + 1;
             break;
         } else if (argv[i][0] == '-') {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
@@ -313,6 +321,7 @@ int main(int argc, char **argv)
             return 1;
         } else {
             file_arg = i;
+            break;
         }
     }
 
@@ -359,6 +368,7 @@ int main(int argc, char **argv)
 
     // REPL with error recovery
     reader_set_filename("<stdin>");
+    bool interactive = isatty(fileno(stdin));
     panic_jmp_set = true;
     if (setjmp(panic_jmp) != 0) {
         // Recovered from a fatal error - reset and continue
@@ -367,14 +377,22 @@ int main(int argc, char **argv)
     }
 
     for (;;) {
-        printf("]=> ");
-        fflush(stdout);
+        if (interactive) {
+            printf("]=> ");
+            fflush(stdout);
+        }
 
         reader_reset_labels();
         reader_reset_position(); // Reset line/col for each REPL input
         unsigned expr = read_obj();
+        if (is_eof_object(expr))
+            break;
         if (expr == TOK_ERROR)
             continue;
+        if (expr == TOK_CLOSE || expr == TOK_DOT) {
+            show_error("unexpected reader token at top level");
+            continue;
+        }
         unsigned x = eval_expr(expr, env);
         printf("\n;Value: ");
         write_obj(x);

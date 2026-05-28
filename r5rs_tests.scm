@@ -370,6 +370,12 @@
       (let ((sum 0))
         (for-each (lambda (x) (set! sum (+ sum x))) '(1 2 3))
         sum))
+(test "for-each multiple stops at shortest" '(5 7)
+      (let ((seen '()))
+        (for-each (lambda (x y) (set! seen (cons (+ x y) seen)))
+                  '(1 2 3)
+                  '(4 5))
+        (reverse seen)))
 
 (test "call/cc escape" 'return-value
       (call-with-current-continuation
@@ -429,6 +435,13 @@
 (test "cond two clauses" 'greater (cond ((> 3 2) 'greater) ((< 3 2) 'less)))
 (test "cond else" 'equal (cond ((> 3 3) 'greater) ((< 3 3) 'less) (else 'equal)))
 (test "case composite" 'composite (case (* 2 3) ((2 3 5 7) 'prime) ((1 4 6 8 9) 'composite)))
+(test "case evaluates key once" 1
+    (let ((count 0))
+      (case (begin (set! count (+ count 1)) 'c)
+        ((a) 'a)
+        ((b) 'b)
+        ((c) count)
+        (else 'other))))
 (test "case else" 'consonant
     (case (car '(c d))
       ((a e i o u) 'vowel)

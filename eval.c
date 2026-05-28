@@ -38,13 +38,34 @@
 #include "bytecode.h"
 #include "eval_internal.h"
 #include "writer.h"
+#include <stdlib.h>
 
 // ============================================================================
 // Forward Declarations
 // ============================================================================
 
+#define MAX_EVAL_MACRO_EXPANSION_DEPTH 1000
+
 static void eval_step(void);
 static void apply_cont_step(void);
+
+static unsigned eval_macro_expansion_depth = 0;
+
+bool eval_note_macro_expansion(void)
+{
+    if (eval_macro_expansion_depth >= MAX_EVAL_MACRO_EXPANSION_DEPTH) {
+        show_error("macro expansion exceeded maximum depth");
+        return false;
+    }
+
+    eval_macro_expansion_depth++;
+    return true;
+}
+
+void eval_reset_macro_expansion_depth(void)
+{
+    eval_macro_expansion_depth = 0;
+}
 
 static bool is_eof_object(unsigned expr)
 {
@@ -55,6 +76,54 @@ static bool is_eof_object(unsigned expr)
 // ============================================================================
 // Quasiquote Expansion
 // ============================================================================
+
+static bool qq_syntax_valid(unsigned x, unsigned env, int depth)
+{
+    if (IS_VECTOR(x)) {
+        unsigned len = vector_len(x);
+        for (unsigned i = 0; i < len; i++) {
+            if (!qq_syntax_valid(vector_data_ptr(x)[i], env, depth))
+                return false;
+        }
+        return true;
+    }
+
+    if (!IS_PAIR(x))
+        return true;
+
+    unsigned head = car(x);
+    if (IS_KEYWORD(head, ctx.kw_unquote) &&
+        !is_keyword_shadowed(ctx.kw_unquote, env)) {
+        if (!syntax_arity_checked(x, 1, 1, "unquote"))
+            return false;
+        if (depth == 1)
+            return true;
+        return qq_syntax_valid(cadr(x), env, depth - 1);
+    }
+    if (IS_KEYWORD(head, ctx.kw_unquote_splicing) &&
+        !is_keyword_shadowed(ctx.kw_unquote_splicing, env)) {
+        if (!syntax_arity_checked(x, 1, 1, "unquote-splicing"))
+            return false;
+        if (depth == 1)
+            return true;
+        return qq_syntax_valid(cadr(x), env, depth - 1);
+    }
+    if (IS_KEYWORD(head, ctx.kw_quasiquote) &&
+        !is_keyword_shadowed(ctx.kw_quasiquote, env)) {
+        return syntax_arity_checked(x, 1, 1, "quasiquote") &&
+               qq_syntax_valid(cadr(x), env, depth + 1);
+    }
+
+    unsigned l = x;
+    for (; IS_PAIR(l); l = cdr(l)) {
+        if (!qq_syntax_valid(car(l), env, depth))
+            return false;
+    }
+    if (l && !qq_syntax_valid(l, env, depth))
+        return false;
+
+    return true;
+}
 
 // Helper for nested quasiquote expansion with depth tracking
 static unsigned qq_expand_depth(unsigned x, unsigned env, int depth)
@@ -163,6 +232,10 @@ static unsigned qq_expand_depth(unsigned x, unsigned env, int depth)
                 for (; IS_PAIR(spliced); spliced = cdr(spliced)) {
                     list_append(&result, &tail, car(spliced));
                 }
+                if (spliced) {
+                    show_error("unquote-splicing: expected proper list");
+                    return TOK_ERROR;
+                }
                 gc_unprotect(1); // spliced - per-iteration cleanup
             } else {
                 // Keep but expand inside
@@ -199,6 +272,8 @@ static unsigned qq_expand_depth(unsigned x, unsigned env, int depth)
 
 unsigned qq_expand_cps(unsigned x, unsigned env)
 {
+    if (!qq_syntax_valid(x, env, 1))
+        return TOK_ERROR;
     return qq_expand_depth(x, env, 1);
 }
 
@@ -213,10 +288,12 @@ static void eval_step(void)
     unsigned cont = tramp.cont;
 
     if (!id) {
+        eval_reset_macro_expansion_depth();
         tramp_apply(0, cont);
         return;
     }
     if (IS_FIXNUM(id)) {
+        eval_reset_macro_expansion_depth();
         tramp_apply(id, cont);
         return;
     }
@@ -238,10 +315,18 @@ static void eval_step(void)
     case BT_BUILTIN:
     case BT_CONT:
         // Self-evaluating
+        eval_reset_macro_expansion_depth();
         tramp_apply(id, cont);
         return;
 
     case BT_ATOM: {
+        if (id == ctx.atom_true || id == ctx.atom_false) {
+            eval_reset_macro_expansion_depth();
+            tramp_apply(id, cont);
+            return;
+        }
+
+        eval_reset_macro_expansion_depth();
         unsigned val = lookup(CELL_ID(id), env);
         if (val == TOK_ERROR) {
             tramp_error();
@@ -263,6 +348,7 @@ static void eval_step(void)
         }
 
         // Not a special form - evaluate function position first
+        eval_reset_macro_expansion_depth();
         // Protect head, arg_exprs, env and cont - use pointer version for GC
         // safety
         GC_GUARD;
@@ -466,13 +552,22 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
             }
             const char *filename = GET_STRING_PTR(filename_arg);
             const char *old_filename = reader_get_filename();
-            FILE *f = fopen(filename, "r");
-            if (!f) {
-                show_error("load: cannot open file: %s", filename);
+            size_t filename_len = strlen(filename);
+            char *filename_copy = malloc(filename_len + 1);
+            if (!filename_copy) {
+                show_error("load: out of memory");
                 tramp_error();
                 return;
             }
-            reader_set_filename(filename);
+            memcpy(filename_copy, filename, filename_len + 1);
+            FILE *f = fopen(filename, "r");
+            if (!f) {
+                show_error("load: cannot open file: %s", filename);
+                free(filename_copy);
+                tramp_error();
+                return;
+            }
+            reader_set_filename(filename_copy);
             reader_reset_position();
 
             unsigned exprs = 0, exprs_tail = 0;
@@ -488,6 +583,11 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
                 }
                 if (is_eof_object(expr))
                     break;
+                if (expr == TOK_CLOSE || expr == TOK_DOT) {
+                    show_error("load: unexpected reader token");
+                    load_failed = true;
+                    break;
+                }
                 list_append(&exprs, &exprs_tail, expr);
             }
             reader_forget_port(f);
@@ -497,6 +597,7 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
             }
             reader_set_filename(old_filename);
             reader_reset_position();
+            free(filename_copy);
 
             if (load_failed) {
                 tramp_error();
@@ -616,6 +717,7 @@ unsigned eval_cps(unsigned expr, unsigned env)
     GC_GUARD;
     gc_protect(&expr);
     gc_protect(&env);
+    eval_reset_macro_expansion_depth();
     unsigned halt_k = make_halt_cont();
     tramp_eval(expr, env, halt_k);
 

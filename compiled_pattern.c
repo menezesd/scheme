@@ -285,6 +285,25 @@ static void update_match_state_roots(pat_match_state *state,
     }
     for (unsigned i = 0; i < state->choice_sp; i++) {
         state->choices[i].input = update(state->choices[i].input);
+        state->choices[i].vec_iter_vec = update(state->choices[i].vec_iter_vec);
+        unsigned n = state->pattern ? state->pattern->var_count : 0;
+        for (unsigned j = 0; j < n; j++) {
+            if (state->choices[i].bindings)
+                state->choices[i].bindings[j] =
+                    update(state->choices[i].bindings[j]);
+            if (state->choices[i].ellipsis_lists)
+                state->choices[i].ellipsis_lists[j] =
+                    update(state->choices[i].ellipsis_lists[j]);
+            if (state->choices[i].ellipsis_tails)
+                state->choices[i].ellipsis_tails[j] =
+                    update(state->choices[i].ellipsis_tails[j]);
+            if (state->choices[i].inner_lists)
+                state->choices[i].inner_lists[j] =
+                    update(state->choices[i].inner_lists[j]);
+            if (state->choices[i].inner_tails)
+                state->choices[i].inner_tails[j] =
+                    update(state->choices[i].inner_tails[j]);
+        }
     }
 
     unsigned n = state->pattern ? state->pattern->var_count : 0;
@@ -539,6 +558,9 @@ static void compile_pattern_node(unsigned pattern, pattern_compile_ctx *pctx)
         if (is_literal(sym, pctx->literals)) {
             // Must match exact symbol
             pattern_emit(pctx->pattern, PAT_MATCH_ATOM_ID, (unsigned)sym);
+        } else if (!identifier_valid(pattern)) {
+            // Self-evaluating atom literal, such as #t or #f.
+            pattern_emit(pctx->pattern, PAT_MATCH_ATOM_ID, (unsigned)sym);
         } else {
             // Pattern variable: bind it
             unsigned slot = pattern_add_var(pctx->pattern, pattern,
@@ -646,7 +668,8 @@ static void compile_pattern_node(unsigned pattern, pattern_compile_ctx *pctx)
     // Pair: check for ellipsis
     if (IS_PAIR(pattern)) {
         // Check for ellipsis: (elem ... rest)
-        if (cdr(pattern) && is_ellipsis(cadr(pattern), pctx->ellipsis_id)) {
+        if (IS_PAIR(cdr(pattern)) &&
+            is_ellipsis(cadr(pattern), pctx->ellipsis_id)) {
             compile_ellipsis(pattern, pctx);
             return;
         }
@@ -745,6 +768,13 @@ static bool init_match_state(pat_match_state *state, compiled_pattern *pat,
 // Cleanup match state
 static void cleanup_match_state(pat_match_state *state)
 {
+    for (unsigned i = 0; i < state->choice_sp; i++) {
+        free(state->choices[i].bindings);
+        free(state->choices[i].ellipsis_lists);
+        free(state->choices[i].ellipsis_tails);
+        free(state->choices[i].inner_lists);
+        free(state->choices[i].inner_tails);
+    }
     free(state->input_stack);
     free(state->bindings);
     free(state->ellipsis_lists);
@@ -779,6 +809,31 @@ static unsigned pop_input(pat_match_state *state)
     return state->input_stack[--state->input_sp];
 }
 
+static unsigned *copy_choice_array(unsigned *src, unsigned len)
+{
+    if (!src || len == 0)
+        return NULL;
+    unsigned *copy = malloc_array(len, sizeof(unsigned));
+    if (!copy)
+        lisp_panic("pattern choice snapshot: allocation failed");
+    memcpy(copy, src, len * sizeof(unsigned));
+    return copy;
+}
+
+static void free_choice_snapshot(pat_choice_point *cp)
+{
+    free(cp->bindings);
+    free(cp->ellipsis_lists);
+    free(cp->ellipsis_tails);
+    free(cp->inner_lists);
+    free(cp->inner_tails);
+    cp->bindings = NULL;
+    cp->ellipsis_lists = NULL;
+    cp->ellipsis_tails = NULL;
+    cp->inner_lists = NULL;
+    cp->inner_tails = NULL;
+}
+
 // Push choice point
 static void push_choice(pat_match_state *state, unsigned retry_ip)
 {
@@ -796,13 +851,18 @@ static void push_choice(pat_match_state *state, unsigned retry_ip)
     pat_choice_point *cp = &state->choices[state->choice_sp++];
     cp->input = state->input;
     cp->ip = retry_ip;
-    // Save ellipsis accumulator lengths
-    // Note: Accumulator save/restore for backtracking is not implemented.
-    // The current greedy ellipsis strategy only backtracks when rest-pattern
-    // fails, not when element-pattern fails mid-accumulation. This works
-    // correctly for non-nested ellipsis. Nested ellipsis (e.g., ((x ...) ...))
-    // would require per-depth accumulator tracking which is not yet supported.
-    cp->accum_len = 0;
+    cp->input_sp = state->input_sp;
+    cp->vec_iter_vec = state->vec_iter_vec;
+    cp->vec_iter_idx = state->vec_iter_idx;
+    cp->vec_iter_count = state->vec_iter_count;
+    cp->vec_iter_pre = state->vec_iter_pre;
+
+    unsigned n = state->pattern ? state->pattern->var_count : 0;
+    cp->bindings = copy_choice_array(state->bindings, n);
+    cp->ellipsis_lists = copy_choice_array(state->ellipsis_lists, n);
+    cp->ellipsis_tails = copy_choice_array(state->ellipsis_tails, n);
+    cp->inner_lists = copy_choice_array(state->inner_lists, n);
+    cp->inner_tails = copy_choice_array(state->inner_tails, n);
 }
 
 // Backtrack to previous choice point
@@ -815,8 +875,23 @@ static bool backtrack(pat_match_state *state)
     pat_choice_point *cp = &state->choices[--state->choice_sp];
     state->input = cp->input;
     state->ip = cp->ip;
-    // Note: Ellipsis accumulators are not restored on backtrack.
-    // See push_choice() comment for explanation.
+    state->input_sp = cp->input_sp;
+    state->vec_iter_vec = cp->vec_iter_vec;
+    state->vec_iter_idx = cp->vec_iter_idx;
+    state->vec_iter_count = cp->vec_iter_count;
+    state->vec_iter_pre = cp->vec_iter_pre;
+
+    unsigned n = state->pattern ? state->pattern->var_count : 0;
+    if (n) {
+        memcpy(state->bindings, cp->bindings, n * sizeof(unsigned));
+        memcpy(state->ellipsis_lists, cp->ellipsis_lists,
+               n * sizeof(unsigned));
+        memcpy(state->ellipsis_tails, cp->ellipsis_tails,
+               n * sizeof(unsigned));
+        memcpy(state->inner_lists, cp->inner_lists, n * sizeof(unsigned));
+        memcpy(state->inner_tails, cp->inner_tails, n * sizeof(unsigned));
+    }
+    free_choice_snapshot(cp);
 
     return true;
 }
@@ -981,6 +1056,7 @@ unsigned execute_pattern(compiled_pattern *pat, unsigned input)
 
         case PAT_COMMIT:
             if (state.choice_sp > 0) {
+                free_choice_snapshot(&state.choices[state.choice_sp - 1]);
                 state.choice_sp--;
             }
             break;

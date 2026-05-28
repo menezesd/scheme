@@ -408,6 +408,13 @@ TEST(read_datum_label_rejects_missing_datum)
     PASS();
 }
 
+TEST(read_datum_label_rejects_special_tokens)
+{
+    ASSERT(read_from_string("#0=)") == TOK_ERROR);
+    ASSERT(read_from_string("#0=.") == TOK_ERROR);
+    PASS();
+}
+
 // ============================================================================
 // Reader Tests - Quotes
 // ============================================================================
@@ -452,6 +459,17 @@ TEST(read_prefix_rejects_missing_datum)
     ASSERT(read_from_string("`") == TOK_ERROR);
     ASSERT(read_from_string(",") == TOK_ERROR);
     ASSERT(read_from_string(",@") == TOK_ERROR);
+    PASS();
+}
+
+TEST(read_prefix_rejects_special_tokens)
+{
+    ASSERT(read_from_string("')") == TOK_ERROR);
+    ASSERT(read_from_string("'.") == TOK_ERROR);
+    ASSERT(read_from_string("`)") == TOK_ERROR);
+    ASSERT(read_from_string("`,)") == TOK_ERROR);
+    ASSERT(read_from_string(",)") == TOK_ERROR);
+    ASSERT(read_from_string(",@)") == TOK_ERROR);
     PASS();
 }
 
@@ -584,6 +602,7 @@ int main(void)
     RUN_TEST(read_datum_label_number);
     RUN_TEST(read_datum_label_empty_list);
     RUN_TEST(read_datum_label_rejects_missing_datum);
+    RUN_TEST(read_datum_label_rejects_special_tokens);
 
     // Quotes
     RUN_TEST(read_quote);
@@ -591,6 +610,7 @@ int main(void)
     RUN_TEST(read_unquote);
     RUN_TEST(read_unquote_splicing);
     RUN_TEST(read_prefix_rejects_missing_datum);
+    RUN_TEST(read_prefix_rejects_special_tokens);
 
     // Comments
     RUN_TEST(read_skip_comment);

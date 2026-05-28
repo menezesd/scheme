@@ -110,45 +110,156 @@ static inline bool syntax_pattern_valid(unsigned pattern, int64_t ellipsis_id,
     return true;
 }
 
-static inline bool syntax_pattern_var_under_ellipsis(unsigned pattern,
+static inline bool syntax_pattern_atom_is_variable(unsigned x, unsigned literals,
+                                                   int64_t ellipsis_id)
+{
+    if (!identifier_valid(x) || syntax_ellipsis_atom(x, ellipsis_id) ||
+        IS_KEYWORD(x, ctx.kw_underscore))
+        return false;
+
+    FORLIST(lit, literals) {
+        if (IS_ATOM(car(lit)) && CELL_ID(car(lit)) == CELL_ID(x))
+            return false;
+    }
+
+    return true;
+}
+
+static inline unsigned syntax_pattern_var_count(unsigned pattern,
+                                                unsigned literals,
+                                                int64_t ellipsis_id,
+                                                int64_t id)
+{
+    if (!pattern || syntax_ellipsis_atom(pattern, ellipsis_id))
+        return 0;
+    if (IS_ATOM(pattern))
+        return syntax_pattern_atom_is_variable(pattern, literals,
+                                               ellipsis_id) &&
+                       CELL_ID(pattern) == id
+                   ? 1
+                   : 0;
+    if (IS_PAIR(pattern)) {
+        return syntax_pattern_var_count(car(pattern), literals, ellipsis_id,
+                                        id) +
+               syntax_pattern_var_count(cdr(pattern), literals, ellipsis_id,
+                                        id);
+    }
+    if (IS_VECTOR(pattern)) {
+        unsigned count = 0;
+        unsigned len = vector_len(pattern);
+        unsigned *data = vector_data_ptr(pattern);
+        for (unsigned i = 0; i < len; i++) {
+            count += syntax_pattern_var_count(data[i], literals, ellipsis_id,
+                                              id);
+        }
+        return count;
+    }
+    return 0;
+}
+
+static inline bool syntax_pattern_vars_distinct_from(unsigned pattern,
+                                                     unsigned whole_pattern,
                                                      unsigned literals,
                                                      int64_t ellipsis_id,
-                                                     bool under_ellipsis,
-                                                     int64_t id)
+                                                     const char *context)
 {
-    if (!pattern)
-        return false;
-    if (syntax_ellipsis_atom(pattern, ellipsis_id))
-        return false;
+    if (!pattern || syntax_ellipsis_atom(pattern, ellipsis_id))
+        return true;
     if (IS_ATOM(pattern)) {
-        if (IS_KEYWORD(pattern, ctx.kw_underscore))
+        if (syntax_pattern_atom_is_variable(pattern, literals, ellipsis_id) &&
+            syntax_pattern_var_count(whole_pattern, literals, ellipsis_id,
+                                     CELL_ID(pattern)) > 1) {
+            show_error("%s: duplicate pattern variable", context);
             return false;
-        FORLIST(lit, literals) {
-            if (IS_ATOM(car(lit)) && CELL_ID(car(lit)) == CELL_ID(pattern))
+        }
+        return true;
+    }
+    if (IS_PAIR(pattern)) {
+        return syntax_pattern_vars_distinct_from(car(pattern), whole_pattern,
+                                                 literals, ellipsis_id,
+                                                 context) &&
+               syntax_pattern_vars_distinct_from(cdr(pattern), whole_pattern,
+                                                 literals, ellipsis_id,
+                                                 context);
+    }
+    if (IS_VECTOR(pattern)) {
+        unsigned len = vector_len(pattern);
+        unsigned *data = vector_data_ptr(pattern);
+        for (unsigned i = 0; i < len; i++) {
+            if (!syntax_pattern_vars_distinct_from(data[i], whole_pattern,
+                                                   literals, ellipsis_id,
+                                                   context))
                 return false;
         }
-        return under_ellipsis && CELL_ID(pattern) == id;
+    }
+    return true;
+}
+
+static inline bool syntax_pattern_vars_distinct(unsigned pattern,
+                                                unsigned literals,
+                                                int64_t ellipsis_id,
+                                                const char *context)
+{
+    return syntax_pattern_vars_distinct_from(pattern, pattern, literals,
+                                             ellipsis_id, context);
+}
+
+static inline bool syntax_literals_valid(unsigned literals, int64_t ellipsis_id,
+                                         const char *context)
+{
+    FORLIST(lit, literals) {
+        unsigned literal = car(lit);
+        if (!identifier_valid(literal) ||
+            syntax_ellipsis_atom(literal, ellipsis_id)) {
+            show_error("%s: invalid literal", context);
+            return false;
+        }
+        for (unsigned rest = cdr(lit); rest; rest = cdr(rest)) {
+            if (IS_ATOM(car(rest)) &&
+                CELL_ID(car(rest)) == CELL_ID(literal)) {
+                show_error("%s: duplicate literal", context);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static inline bool syntax_pattern_var_depth_from(unsigned pattern,
+                                                 unsigned literals,
+                                                 int64_t ellipsis_id,
+                                                 int64_t id, unsigned depth,
+                                                 unsigned *depth_out)
+{
+    if (!pattern || syntax_ellipsis_atom(pattern, ellipsis_id))
+        return false;
+    if (IS_ATOM(pattern)) {
+        if (syntax_pattern_atom_is_variable(pattern, literals, ellipsis_id) &&
+            CELL_ID(pattern) == id) {
+            *depth_out = depth;
+            return true;
+        }
+        return false;
     }
     if (IS_PAIR(pattern)) {
         unsigned it = pattern;
         while (IS_PAIR(it)) {
             unsigned elem = car(it);
             unsigned rest = cdr(it);
-            bool elem_under_ellipsis =
-                under_ellipsis &&
-                !(IS_PAIR(rest) && syntax_ellipsis_atom(car(rest), ellipsis_id));
-            if (IS_PAIR(rest) && syntax_ellipsis_atom(car(rest), ellipsis_id)) {
-                elem_under_ellipsis = true;
+            unsigned elem_depth = depth;
+            if (IS_PAIR(rest) && syntax_ellipsis_atom(car(rest),
+                                                      ellipsis_id)) {
+                elem_depth++;
                 it = cdr(rest);
             } else {
                 it = rest;
             }
-            if (syntax_pattern_var_under_ellipsis(elem, literals, ellipsis_id,
-                                                  elem_under_ellipsis, id))
+            if (syntax_pattern_var_depth_from(elem, literals, ellipsis_id, id,
+                                              elem_depth, depth_out))
                 return true;
         }
-        return syntax_pattern_var_under_ellipsis(it, literals, ellipsis_id,
-                                                 under_ellipsis, id);
+        return syntax_pattern_var_depth_from(it, literals, ellipsis_id, id,
+                                             depth, depth_out);
     }
     if (IS_VECTOR(pattern)) {
         unsigned len = vector_len(pattern);
@@ -156,58 +267,81 @@ static inline bool syntax_pattern_var_under_ellipsis(unsigned pattern,
         for (unsigned i = 0; i < len; i++) {
             if (syntax_ellipsis_atom(data[i], ellipsis_id))
                 continue;
-            bool elem_under_ellipsis =
-                under_ellipsis ||
-                (i + 1 < len && syntax_ellipsis_atom(data[i + 1], ellipsis_id));
-            if (syntax_pattern_var_under_ellipsis(data[i], literals, ellipsis_id,
-                                                  elem_under_ellipsis, id))
+            unsigned elem_depth = depth;
+            if (i + 1 < len && syntax_ellipsis_atom(data[i + 1],
+                                                    ellipsis_id))
+                elem_depth++;
+            if (syntax_pattern_var_depth_from(data[i], literals, ellipsis_id,
+                                              id, elem_depth, depth_out))
                 return true;
         }
     }
     return false;
 }
 
-static inline bool syntax_template_has_ellipsis_var(unsigned tmpl,
-                                                    unsigned pattern,
-                                                    unsigned literals,
-                                                    int64_t ellipsis_id)
+static inline bool syntax_pattern_var_depth(unsigned pattern, unsigned literals,
+                                            int64_t ellipsis_id, int64_t id,
+                                            unsigned *depth_out)
+{
+    return syntax_pattern_var_depth_from(pattern, literals, ellipsis_id, id, 0,
+                                         depth_out);
+}
+
+static inline bool syntax_template_has_depth_var(unsigned tmpl,
+                                                unsigned pattern,
+                                                unsigned literals,
+                                                int64_t ellipsis_id,
+                                                unsigned template_depth)
 {
     if (!tmpl || syntax_ellipsis_atom(tmpl, ellipsis_id))
         return false;
     if (IS_ATOM(tmpl)) {
-        return syntax_pattern_var_under_ellipsis(
-            pattern, literals, ellipsis_id, false, CELL_ID(tmpl));
+        unsigned pattern_depth = 0;
+        return syntax_pattern_var_depth(pattern, literals, ellipsis_id,
+                                        CELL_ID(tmpl), &pattern_depth) &&
+               pattern_depth >= template_depth;
     }
     if (IS_PAIR(tmpl)) {
         unsigned it = tmpl;
         for (; IS_PAIR(it); it = cdr(it)) {
-            if (syntax_template_has_ellipsis_var(car(it), pattern, literals,
-                                                 ellipsis_id))
+            if (syntax_template_has_depth_var(car(it), pattern, literals,
+                                              ellipsis_id, template_depth))
                 return true;
         }
-        return syntax_template_has_ellipsis_var(it, pattern, literals,
-                                                ellipsis_id);
+        return syntax_template_has_depth_var(it, pattern, literals,
+                                             ellipsis_id, template_depth);
     }
     if (IS_VECTOR(tmpl)) {
         unsigned len = vector_len(tmpl);
         unsigned *data = vector_data_ptr(tmpl);
         for (unsigned i = 0; i < len; i++) {
-            if (syntax_template_has_ellipsis_var(data[i], pattern, literals,
-                                                 ellipsis_id))
+            if (syntax_template_has_depth_var(data[i], pattern, literals,
+                                              ellipsis_id, template_depth))
                 return true;
         }
     }
     return false;
 }
 
-static inline bool syntax_template_valid(unsigned tmpl, unsigned pattern,
-                                         unsigned literals,
-                                         int64_t ellipsis_id,
-                                         const char *context)
+static inline bool syntax_template_valid_at(unsigned tmpl, unsigned pattern,
+                                            unsigned literals,
+                                            int64_t ellipsis_id,
+                                            const char *context,
+                                            unsigned template_depth)
 {
     if (syntax_ellipsis_atom(tmpl, ellipsis_id)) {
         show_error("%s: invalid ellipsis in template", context);
         return false;
+    }
+    if (IS_ATOM(tmpl)) {
+        unsigned pattern_depth = 0;
+        if (syntax_pattern_var_depth(pattern, literals, ellipsis_id,
+                                     CELL_ID(tmpl), &pattern_depth) &&
+            pattern_depth != template_depth) {
+            show_error("%s: invalid ellipsis in template", context);
+            return false;
+        }
+        return true;
     }
     if (IS_PAIR(tmpl)) {
         unsigned it = tmpl;
@@ -219,24 +353,26 @@ static inline bool syntax_template_valid(unsigned tmpl, unsigned pattern,
                 return false;
             }
             if (IS_PAIR(rest) && syntax_ellipsis_atom(car(rest), ellipsis_id)) {
-                if (!syntax_template_valid(elem, pattern, literals,
-                                           ellipsis_id, context))
+                if (!syntax_template_valid_at(elem, pattern, literals,
+                                              ellipsis_id, context,
+                                              template_depth + 1))
                     return false;
-                if (!syntax_template_has_ellipsis_var(elem, pattern, literals,
-                                                      ellipsis_id)) {
+                if (!syntax_template_has_depth_var(elem, pattern, literals,
+                                                   ellipsis_id,
+                                                   template_depth + 1)) {
                     show_error("%s: invalid ellipsis in template", context);
                     return false;
                 }
                 it = cdr(rest);
                 continue;
             }
-            if (!syntax_template_valid(elem, pattern, literals, ellipsis_id,
-                                       context))
+            if (!syntax_template_valid_at(elem, pattern, literals, ellipsis_id,
+                                          context, template_depth))
                 return false;
             it = rest;
         }
-        if (it && !syntax_template_valid(it, pattern, literals, ellipsis_id,
-                                         context))
+        if (it && !syntax_template_valid_at(it, pattern, literals, ellipsis_id,
+                                            context, template_depth))
             return false;
     } else if (IS_VECTOR(tmpl)) {
         unsigned len = vector_len(tmpl);
@@ -248,20 +384,34 @@ static inline bool syntax_template_valid(unsigned tmpl, unsigned pattern,
                     show_error("%s: invalid ellipsis in template", context);
                     return false;
                 }
-                if (!syntax_template_has_ellipsis_var(data[i - 1], pattern,
-                                                      literals, ellipsis_id)) {
+                if (!syntax_template_has_depth_var(data[i - 1], pattern,
+                                                   literals, ellipsis_id,
+                                                   template_depth + 1)) {
                     show_error("%s: invalid ellipsis in template", context);
                     return false;
                 }
                 saw_ellipsis = true;
                 continue;
             }
-            if (!syntax_template_valid(data[i], pattern, literals, ellipsis_id,
-                                       context))
+            unsigned elem_depth = template_depth;
+            if (i + 1 < len && syntax_ellipsis_atom(data[i + 1],
+                                                    ellipsis_id))
+                elem_depth++;
+            if (!syntax_template_valid_at(data[i], pattern, literals,
+                                          ellipsis_id, context, elem_depth))
                 return false;
         }
     }
     return true;
+}
+
+static inline bool syntax_template_valid(unsigned tmpl, unsigned pattern,
+                                         unsigned literals,
+                                         int64_t ellipsis_id,
+                                         const char *context)
+{
+    return syntax_template_valid_at(tmpl, pattern, literals, ellipsis_id,
+                                    context, 0);
 }
 
 static inline bool syntax_rules_valid(unsigned transformer_form,
@@ -282,7 +432,12 @@ static inline bool syntax_rules_valid(unsigned transformer_form,
     }
 
     unsigned second = cadr(transformer_form);
-    if (IS_ATOM(second) && len < 2) {
+    if (IS_ATOM(second)) {
+        if (len < 3 || !identifier_valid(second)) {
+            show_error("%s: invalid syntax-rules", context);
+            return false;
+        }
+    } else if (len < 2) {
         show_error("%s: invalid syntax-rules", context);
         return false;
     }
@@ -294,12 +449,8 @@ static inline bool syntax_rules_valid(unsigned transformer_form,
 
     if (!list_length_checked(literals, NULL, context))
         return false;
-    FORLIST(lit, literals) {
-        if (!IS_ATOM(car(lit))) {
-            show_error("%s: invalid literal", context);
-            return false;
-        }
-    }
+    if (!syntax_literals_valid(literals, ellipsis_id, context))
+        return false;
 
     if (!list_length_checked(rules, NULL, context))
         return false;
@@ -311,9 +462,17 @@ static inline bool syntax_rules_valid(unsigned transformer_form,
             show_error("%s: invalid syntax rule", context);
             return false;
         }
-        unsigned pattern = cdr(car(rule));
+        unsigned rule_pattern = car(rule);
+        if (!identifier_valid(car(rule_pattern)) ||
+            syntax_ellipsis_atom(car(rule_pattern), ellipsis_id)) {
+            show_error("%s: invalid syntax rule", context);
+            return false;
+        }
+        unsigned pattern = cdr(rule_pattern);
         unsigned tmpl = cadr(rule);
         if (!syntax_pattern_valid(pattern, ellipsis_id, context) ||
+            !syntax_pattern_vars_distinct(pattern, literals, ellipsis_id,
+                                          context) ||
             !syntax_template_valid(tmpl, pattern, literals, ellipsis_id,
                                    context))
             return false;
@@ -427,12 +586,16 @@ static inline unsigned make_syntax_transformer_with_default_ellipsis(
         CELL_TYPE(cpat_cell) = BT_COMPILED_PATTERN;
         CELL_PTR(cpat_cell) = cpat;
 
-        // Build compiled rule: (cpat_cell . template)
+        // Build compiled rule: ((cpat_cell . pattern) . template). The source
+        // pattern is retained so apply_syntax can validate literal identifiers
+        // by lexical binding after the fast structural matcher succeeds.
         gc_protect(&cpat_cell);
-        unsigned new_rule = alloc_cons(cpat_cell, tmpl);
+        unsigned compiled_pattern_pair = alloc_cons(cpat_cell, pattern);
+        gc_protect(&compiled_pattern_pair);
+        unsigned new_rule = alloc_cons(compiled_pattern_pair, tmpl);
         gc_protect(&new_rule);
         unsigned new_node = alloc_cons(new_rule, 0);
-        gc_unprotect(3);
+        gc_unprotect(4);
 
         if (!compiled_rules) {
             compiled_rules = new_node;
@@ -526,6 +689,8 @@ bool handle_letrec_syntax(unsigned id, unsigned env, unsigned cont);
 // Returns true if handled, false if not a special form
 bool dispatch_special_form(int64_t kw, unsigned id, unsigned env,
                            unsigned cont);
+bool eval_note_macro_expansion(void);
+void eval_reset_macro_expansion_depth(void);
 
 // ============================================================================
 // Continuation Handlers (defined in eval_cont.c)

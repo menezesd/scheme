@@ -1290,16 +1290,25 @@ bool syntax_arity_checked(unsigned form, unsigned min_args, unsigned max_args,
     return true;
 }
 
+bool identifier_valid(unsigned x)
+{
+    return IS_ATOM(x) && x != ctx.atom_true && x != ctx.atom_false;
+}
+
 bool lambda_params_valid(unsigned params)
 {
     GC_GUARD;
-    if (IS_ATOM(params))
+    if (!params)
         return true;
+    if (identifier_valid(params))
+        return true;
+    if (!IS_PAIR(params))
+        return false;
 
     unsigned seen = 0;
     gc_protect(&seen);
     while (params) {
-        if (IS_ATOM(params)) {
+        if (identifier_valid(params)) {
             FORLIST(p, seen) {
                 if (CELL_ID(car(p)) == CELL_ID(params)) {
                     gc_unprotect(1);
@@ -1309,12 +1318,16 @@ bool lambda_params_valid(unsigned params)
             gc_unprotect(1);
             return true;
         }
+        if (IS_ATOM(params)) {
+            gc_unprotect(1);
+            return false;
+        }
         if (!IS_PAIR(params)) {
             gc_unprotect(1);
             return false;
         }
         unsigned param = car(params);
-        if (!IS_ATOM(param)) {
+        if (!identifier_valid(param)) {
             gc_unprotect(1);
             return false;
         }
@@ -1340,18 +1353,31 @@ bool binding_list_valid(unsigned bindings, const char *name)
         unsigned len = 0;
         if (!IS_PAIR(binding) ||
             !list_length_checked(binding, &len, name) || len != 2 ||
-            !IS_ATOM(car(binding))) {
+            !identifier_valid(car(binding))) {
             show_error("%s: invalid binding syntax", name);
             return false;
+        }
+        if (strcmp(name, "let*") != 0) {
+            int64_t id = CELL_ID(car(binding));
+            for (unsigned rest = cdr(b); rest; rest = cdr(rest)) {
+                unsigned other = car(rest);
+                if (IS_PAIR(other) && IS_ATOM(car(other)) &&
+                    CELL_ID(car(other)) == id) {
+                    show_error("%s: duplicate binding", name);
+                    return false;
+                }
+            }
         }
     }
     return true;
 }
 
-bool cond_clauses_valid(unsigned clauses, const char *name)
+bool cond_clauses_valid(unsigned clauses, const char *name, unsigned env)
 {
     if (!list_length_checked(clauses, NULL, name))
         return false;
+    bool else_unbound = env_find_binding_cell(ctx.kw_else, env) == 0;
+    bool arrow_unbound = env_find_binding_cell(ctx.kw_arrow, env) == 0;
     FORLIST(c, clauses) {
         unsigned clause = car(c);
         unsigned len = 0;
@@ -1362,11 +1388,12 @@ bool cond_clauses_valid(unsigned clauses, const char *name)
         }
         unsigned test = car(clause);
         unsigned conseq = cdr(clause);
-        if (IS_KEYWORD(test, ctx.kw_else) && cdr(c)) {
+        if (else_unbound && IS_KEYWORD(test, ctx.kw_else) && cdr(c)) {
             show_error("%s: else clause must be last", name);
             return false;
         }
-        if (conseq && IS_KEYWORD(car(conseq), ctx.kw_arrow) && len != 3) {
+        if (arrow_unbound && conseq && IS_KEYWORD(car(conseq), ctx.kw_arrow) &&
+            len != 3) {
             show_error("%s: invalid => clause", name);
             return false;
         }
@@ -1705,7 +1732,7 @@ unsigned gc(unsigned root)
         enum lisp_type t = CELL_TYPE(scan);
         if (t == BT_CONS || t == BT_FUNCTION || t == BT_MACRO ||
             t == BT_SYNTAX || t == BT_CONT || t == BT_RATIONAL ||
-            t == BT_COMPLEX) {
+            t == BT_COMPLEX || t == BT_BINDING_REF) {
             CELL_CAR(scan) = collect(CELL_CAR(scan));
             CELL_CDR(scan) = collect(CELL_CDR(scan));
         }
@@ -1971,7 +1998,7 @@ unsigned minor_gc(unsigned root)
                 enum lisp_type t = CELL_TYPE(cell);
                 if (t == BT_CONS || t == BT_FUNCTION || t == BT_MACRO ||
                     t == BT_SYNTAX || t == BT_CONT || t == BT_RATIONAL ||
-                    t == BT_COMPLEX) {
+                    t == BT_COMPLEX || t == BT_BINDING_REF) {
                     // CPS continuations (BT_CONT) use CAR/CDR for structure
                     CELL_CAR(cell) = collect_to_old(CELL_CAR(cell));
                     CELL_CDR(cell) = collect_to_old(CELL_CDR(cell));
@@ -1996,7 +2023,7 @@ unsigned minor_gc(unsigned root)
         enum lisp_type t = CELL_TYPE(scan);
         if (t == BT_CONS || t == BT_FUNCTION || t == BT_MACRO ||
             t == BT_SYNTAX || t == BT_CONT || t == BT_RATIONAL ||
-            t == BT_COMPLEX) {
+            t == BT_COMPLEX || t == BT_BINDING_REF) {
             // CPS continuations (BT_CONT) use CAR/CDR for structure
             CELL_CAR(scan) = collect_to_old(CELL_CAR(scan));
             CELL_CDR(scan) = collect_to_old(CELL_CDR(scan));

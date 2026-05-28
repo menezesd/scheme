@@ -785,6 +785,10 @@ unsigned read_token(void)
                         show_error("unexpected end of file after datum label");
                         return TOK_ERROR;
                     }
+                    if (datum == TOK_CLOSE || datum == TOK_DOT) {
+                        show_error("datum label must be followed by an object");
+                        return TOK_ERROR;
+                    }
                     if (!IS_CELL(datum)) {
                         datum_labels[idx].value = datum;
                         return datum;
@@ -906,11 +910,11 @@ static unsigned read_obj_inner(void)
         tok = read_obj();
         switch (tok) {
         case TOK_CLOSE:
-            show_warning("ignoring quote before close parenthesis");
-            return tok;
+            show_error("quote must be followed by an object");
+            return TOK_ERROR;
         case TOK_DOT:
-            show_warning("ignoring quote before dot");
-            return tok;
+            show_error("quote must be followed by an object");
+            return TOK_ERROR;
         case TOK_ERROR:
             return tok;
         case TOK_EOF:
@@ -931,8 +935,8 @@ static unsigned read_obj_inner(void)
             return TOK_ERROR;
         }
         if (tok == TOK_CLOSE || tok == TOK_DOT || tok == TOK_ERROR) {
-            show_warning("ignoring quasiquote before special token");
-            return tok;
+            show_error("quasiquote must be followed by an object");
+            return TOK_ERROR;
         }
         {
             GC_GUARD;
@@ -948,8 +952,8 @@ static unsigned read_obj_inner(void)
             return TOK_ERROR;
         }
         if (tok == TOK_CLOSE || tok == TOK_DOT || tok == TOK_ERROR) {
-            show_warning("ignoring unquote before special token");
-            return tok;
+            show_error("unquote must be followed by an object");
+            return TOK_ERROR;
         }
         {
             GC_GUARD;
@@ -965,8 +969,8 @@ static unsigned read_obj_inner(void)
             return TOK_ERROR;
         }
         if (tok == TOK_CLOSE || tok == TOK_DOT || tok == TOK_ERROR) {
-            show_warning("ignoring unquote-splicing before special token");
-            return tok;
+            show_error("unquote-splicing must be followed by an object");
+            return TOK_ERROR;
         }
         {
             GC_GUARD;

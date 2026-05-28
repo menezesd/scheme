@@ -64,6 +64,35 @@ void env_invalidate_cache(void)
     invalidate_lookup_cache();
 }
 
+static unsigned deref_binding_value(unsigned val)
+{
+    if (IS_BINDING_REF(val))
+        return car(CELL_CAR(val));
+    return val;
+}
+
+static unsigned set_binding_value(unsigned val_cell, unsigned aval)
+{
+    unsigned old = car(val_cell);
+    if (IS_BINDING_REF(old)) {
+        unsigned target_val_cell = CELL_CAR(old);
+        unsigned target_old = car(target_val_cell);
+        cell_set_car(target_val_cell, aval);
+        return deref_binding_value(target_old);
+    }
+    cell_set_car(val_cell, aval);
+    return old;
+}
+
+static unsigned make_binding_ref(unsigned target_var, unsigned target_val_cell)
+{
+    unsigned ref = alloc();
+    CELL_TYPE(ref) = BT_BINDING_REF;
+    CELL_CAR(ref) = target_val_cell;
+    CELL_CDR(ref) = target_var;
+    return ref;
+}
+
 // ============================================================================
 // Environment Structure
 // ============================================================================
@@ -145,6 +174,42 @@ unsigned defvar(unsigned var, unsigned aval, unsigned env)
     return var;
 }
 
+unsigned defvar_alias(unsigned var, unsigned target_var, unsigned target_val_cell,
+                      unsigned env)
+{
+    GC_GUARD;
+    gc_protect(&var);
+    gc_protect(&target_var);
+    gc_protect(&target_val_cell);
+    gc_protect(&env);
+    unsigned ref = make_binding_ref(target_var, target_val_cell);
+    return defvar(var, ref, env);
+}
+
+unsigned env_find_binding_cell(int64_t var, unsigned env)
+{
+    while (env) {
+        unsigned frame = car(env);
+        unsigned vars = car(frame);
+        unsigned vals = cdr(frame);
+
+        while (vars) {
+            if (CELL_TYPE(vars) == BT_ATOM) {
+                if (CELL_ID(vars) == var)
+                    return vals;
+                break;
+            }
+            if (CELL_ID(car(vars)) == var)
+                return vals;
+            vars = cdr(vars);
+            vals = cdr(vals);
+        }
+        env = cdr(env);
+    }
+
+    return 0;
+}
+
 unsigned setvar(int64_t var, unsigned aval, unsigned env)
 {
     while (env) {
@@ -155,17 +220,13 @@ unsigned setvar(int64_t var, unsigned aval, unsigned env)
         while (vars) {
             if (CELL_TYPE(vars) == BT_ATOM) {
                 if (CELL_ID(vars) == var) {
-                    unsigned oid = car(vals);
-                    cell_set_car(vals, aval);
-                    return oid;
+                    return set_binding_value(vals, aval);
                 } else {
                     break;
                 }
             }
             if (CELL_ID(car(vars)) == var) {
-                unsigned oid = car(vals);
-                cell_set_car(vals, aval);
-                return oid;
+                return set_binding_value(vals, aval);
             }
             vars = cdr(vars);
             vals = cdr(vals);
@@ -214,7 +275,7 @@ static unsigned lookup_internal(int64_t var, unsigned env)
         if (lookup_cache[i].var == var && lookup_cache[i].env == env) {
             // Move to front on hit (LRU approximation)
             cache_move_to_front(i);
-            return car(lookup_cache[0].val_cell);
+            return deref_binding_value(car(lookup_cache[0].val_cell));
         }
     }
 
@@ -227,7 +288,7 @@ static unsigned lookup_internal(int64_t var, unsigned env)
                 if (CELL_ID(vars) == var) {
                     // Insert at front on miss
                     cache_insert_front(var, orig_env, vals);
-                    return car(vals);
+                    return deref_binding_value(car(vals));
                 } else {
                     break;
                 }
@@ -236,7 +297,7 @@ static unsigned lookup_internal(int64_t var, unsigned env)
             if (CELL_ID(car(vars)) == var) {
                 // Insert at front on miss
                 cache_insert_front(var, orig_env, vals);
-                return car(vals);
+                return deref_binding_value(car(vals));
             }
         }
         env = cdr(env);

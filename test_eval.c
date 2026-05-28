@@ -7,6 +7,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "context.h"
 #include "bytecode.h"
+#include "compile_internal.h"
 #include "env.h"
 #include "eval.h"
 #include "macros.h"
@@ -69,8 +70,53 @@ static unsigned compiled_eval_string(const char *src, unsigned env)
     vm_init(&vm);
     unsigned result = vm_run(&vm, code, env);
     vm_free(&vm);
-    code_free(code);
+    gc_sweep_code_objects();
     return result;
+}
+
+static unsigned read_expr_from_string(const char *src)
+{
+    FILE *old_stdin = stdin;
+    FILE *f = fmemopen((void *)src, strlen(src), "r");
+    if (!f) {
+        fprintf(stderr, "fmemopen failed\n");
+        return TOK_ERROR;
+    }
+    stdin = f;
+    reader_reset_labels();
+    unsigned expr = read_obj();
+    fclose(f);
+    stdin = old_stdin;
+    return expr;
+}
+
+static bool code_contains_opcode(code_object *code, unsigned opcode)
+{
+    for (unsigned i = 0; i < code->code_len;) {
+        unsigned op = code->code[i];
+        if (op == opcode)
+            return true;
+        i += instruction_size(op);
+    }
+    for (unsigned i = 0; i < code->children_len; i++) {
+        if (code_contains_opcode(code->children[i], opcode))
+            return true;
+    }
+    return false;
+}
+
+static unsigned code_count_opcode(code_object *code, unsigned opcode)
+{
+    unsigned count = 0;
+    for (unsigned i = 0; i < code->code_len;) {
+        unsigned op = code->code[i];
+        if (op == opcode)
+            count++;
+        i += instruction_size(op);
+    }
+    for (unsigned i = 0; i < code->children_len; i++)
+        count += code_count_opcode(code->children[i], opcode);
+    return count;
 }
 
 // Helper: evaluate with env pointer (for GC tests where env may be updated)
@@ -157,6 +203,16 @@ TEST(compiled_direct_fixnum_expression)
     PASS();
 }
 
+TEST(compiled_booleans_are_self_evaluating)
+{
+    unsigned env = default_environment();
+    unsigned result = compiled_eval_string("#t", env);
+    ASSERT(result == ctx.atom_true);
+    result = compiled_eval_string("#f", env);
+    ASSERT(result == ctx.atom_false);
+    PASS();
+}
+
 TEST(eval_negative_integer)
 {
     unsigned env = default_environment();
@@ -178,6 +234,28 @@ TEST(eval_false)
     unsigned env = default_environment();
     unsigned result = eval_string("#f", env);
     ASSERT(result == ctx.atom_false);
+    PASS();
+}
+
+TEST(eval_rejects_boolean_binding_names)
+{
+    unsigned env = default_environment();
+    ASSERT(eval_string("(let ((#t 1)) #t)", env) == TOK_ERROR);
+    ASSERT(eval_string("(let ((#f 1)) #f)", env) == TOK_ERROR);
+    ASSERT(eval_string("((lambda (#t) #t) 1)", env) == TOK_ERROR);
+    ASSERT(eval_string("(define #t 1)", env) == TOK_ERROR);
+    ASSERT(eval_string("(set! #f 1)", env) == TOK_ERROR);
+    PASS();
+}
+
+TEST(compiled_rejects_boolean_binding_names)
+{
+    unsigned env = default_environment();
+    ASSERT(compiled_eval_string("(let ((#t 1)) #t)", env) == TOK_ERROR);
+    ASSERT(compiled_eval_string("(let ((#f 1)) #f)", env) == TOK_ERROR);
+    ASSERT(compiled_eval_string("((lambda (#t) #t) 1)", env) == TOK_ERROR);
+    ASSERT(compiled_eval_string("(define #t 1)", env) == TOK_ERROR);
+    ASSERT(compiled_eval_string("(set! #f 1)", env) == TOK_ERROR);
     PASS();
 }
 
@@ -371,6 +449,28 @@ TEST(eval_cond_else)
     unsigned env = default_environment();
     unsigned result = eval_string("(cond (#f 1) (else 2))", env);
     ASSERT(is_int(result, 2));
+
+    result = eval_string("(let ((else #f)) (cond (else 1) (#t 2)))", env);
+    ASSERT(is_int(result, 2));
+    result = compiled_eval_string(
+        "(let ((else #f)) (cond (else 1) (#t 2)))", env);
+    ASSERT(is_int(result, 2));
+    result = eval_string(
+        "(let () (define else #f) (cond (else 1) (#t 2)))", env);
+    ASSERT(is_int(result, 2));
+    result = compiled_eval_string(
+        "(let () (define else #f) (cond (else 1) (#t 2)))", env);
+    ASSERT(is_int(result, 2));
+
+    result = eval_string("(let ((=> #f)) (cond (#t => 1 2)))", env);
+    ASSERT(is_int(result, 2));
+    result = compiled_eval_string("(let ((=> #f)) (cond (#t => 1 2)))", env);
+    ASSERT(is_int(result, 2));
+    result = eval_string("(let () (define => #f) (cond (#t => 1 2)))", env);
+    ASSERT(is_int(result, 2));
+    result = compiled_eval_string(
+        "(let () (define => #f) (cond (#t => 1 2)))", env);
+    ASSERT(is_int(result, 2));
     PASS();
 }
 
@@ -434,6 +534,45 @@ TEST(eval_rejects_malformed_special_forms)
     ASSERT(eval_string("(if #t)", env) == TOK_ERROR);
     ASSERT(eval_string("(if #t 1 2 3)", env) == TOK_ERROR);
     ASSERT(eval_string("(begin . 1)", env) == TOK_ERROR);
+    ASSERT(eval_string("(let-syntax ((m (syntax-rules () "
+                       "((m) (begin 1 . 2))))) (m))",
+                       env) == TOK_ERROR);
+    ASSERT(eval_string("(let-syntax ((m (syntax-rules () "
+                       "((m) (let ((x 1) . y) x))))) (m))",
+                       env) == TOK_ERROR);
+    ASSERT(eval_string("(let-syntax ((m (syntax-rules () "
+                       "((m) (let ((x 1 2)) x))))) (m))",
+                       env) == TOK_ERROR);
+    ASSERT(eval_string("(let-syntax ((m (syntax-rules () "
+                       "((m) (let loop ((x 1) . y) x))))) (m))",
+                       env) == TOK_ERROR);
+    ASSERT(eval_string("(let-syntax ((m (syntax-rules () "
+                       "((m) (let loop ((x 1 2)) x))))) (m))",
+                       env) == TOK_ERROR);
+    ASSERT(eval_string("(let-syntax ((m (syntax-rules () "
+                       "((m) (let* ((x 1) . y) x))))) (m))",
+                       env) == TOK_ERROR);
+    ASSERT(eval_string("(let-syntax ((m (syntax-rules () "
+                       "((m) (let* ((x 1 2)) x))))) (m))",
+                       env) == TOK_ERROR);
+    ASSERT(eval_string("(let-syntax ((m (syntax-rules () "
+                       "((m) (letrec ((x 1 2)) x))))) (m))",
+                       env) == TOK_ERROR);
+    ASSERT(eval_string("(let-syntax ((m (syntax-rules () "
+                       "((m) (lambda . 1))))) (m))",
+                       env) == TOK_ERROR);
+    ASSERT(eval_string("(let-syntax ((m (syntax-rules () "
+                       "((m) (define . 1))))) (m))",
+                       env) == TOK_ERROR);
+    ASSERT(eval_string("(let-syntax ((m (syntax-rules () "
+                       "((m) (set! x . 1))))) (m))",
+                       env) == TOK_ERROR);
+    ASSERT(eval_string("(let-syntax ((m (syntax-rules () "
+                       "((m) (define x . 1))))) (m))",
+                       env) == TOK_ERROR);
+    ASSERT(eval_string("(let-syntax ((m (syntax-rules () "
+                       "((m) (let-syntax . 1))))) (m))",
+                       env) == TOK_ERROR);
     ASSERT(eval_string("(and . 1)", env) == TOK_ERROR);
     ASSERT(eval_string("(or . 1)", env) == TOK_ERROR);
     ASSERT(eval_string("(cond . 1)", env) == TOK_ERROR);
@@ -453,8 +592,24 @@ TEST(eval_rejects_malformed_special_forms)
            TOK_ERROR);
     ASSERT(eval_string("(define-syntax m (syntax-rules () 1))", env) ==
            TOK_ERROR);
+    ASSERT(eval_string("(define-syntax m (syntax-rules ::: ()))", env) ==
+           TOK_ERROR);
+    ASSERT(eval_string("(define-syntax m (syntax-rules (... ) ((m) 1)))",
+                       env) == TOK_ERROR);
+    ASSERT(eval_string("(define-syntax m (syntax-rules (x x) ((m x) 1)))",
+                       env) == TOK_ERROR);
     ASSERT(eval_string("(define-syntax m (syntax-rules () (m 1)))", env) ==
            TOK_ERROR);
+    ASSERT(eval_string("(define-syntax m (syntax-rules () ((#t) 1)))", env) ==
+           TOK_ERROR);
+    ASSERT(eval_string("(define-syntax m (syntax-rules () ((1 x) x)))",
+                       env) == TOK_ERROR);
+    ASSERT(eval_string("(define-syntax m (syntax-rules () (((a) x) x)))",
+                       env) == TOK_ERROR);
+    ASSERT(eval_string("(define-syntax m (syntax-rules () ((#(a) x) x)))",
+                       env) == TOK_ERROR);
+    ASSERT(eval_string("(define-syntax m (syntax-rules () ((... x) x)))",
+                       env) == TOK_ERROR);
     ASSERT(eval_string("(define-syntax m (syntax-rules () ((m) ...)))", env) ==
            TOK_ERROR);
     ASSERT(eval_string("(define-syntax m (syntax-rules () ((m) (...))))",
@@ -464,6 +619,11 @@ TEST(eval_rejects_malformed_special_forms)
                        env) == TOK_ERROR);
     ASSERT(eval_string("(define-syntax m (syntax-rules () "
                        "((m x) (quote (x ...)))))",
+                       env) == TOK_ERROR);
+    ASSERT(eval_string("(define-syntax m (syntax-rules () ((m x ...) x)))",
+                       env) == TOK_ERROR);
+    ASSERT(eval_string("(define-syntax m (syntax-rules () "
+                       "((m (x ...) ...) (list x ...))))",
                        env) == TOK_ERROR);
     ASSERT(eval_string("(define-syntax m (syntax-rules () ((m) #(... x))))",
                        env) == TOK_ERROR);
@@ -475,12 +635,40 @@ TEST(eval_rejects_malformed_special_forms)
                        env) == TOK_ERROR);
     ASSERT(eval_string("(define-syntax m (syntax-rules () ((m ...) 1)))",
                        env) == TOK_ERROR);
+    ASSERT(eval_string("(define-syntax m (syntax-rules () ((m x x) x)))",
+                       env) == TOK_ERROR);
+    ASSERT(eval_string("(define-syntax m (syntax-rules () "
+                       "((m (x ...) x) x)))",
+                       env) == TOK_ERROR);
+    ASSERT(eval_string("(define-syntax m (syntax-rules () ((m #(x x)) x)))",
+                       env) == TOK_ERROR);
+    ASSERT(eval_string("(let ((x 1) (x 2)) x)", env) == TOK_ERROR);
+    ASSERT(eval_string("(let ((x . 1)) x)", env) == TOK_ERROR);
+    ASSERT(eval_string("(let ((x 1 . 2)) x)", env) == TOK_ERROR);
+    ASSERT(eval_string("(let ((x 1) . y) x)", env) == TOK_ERROR);
+    ASSERT(eval_string("(let loop ((x 1) . y) x)", env) == TOK_ERROR);
+    ASSERT(eval_string("(let* ((x . 1)) x)", env) == TOK_ERROR);
+    ASSERT(eval_string("(let* ((x 1 . 2)) x)", env) == TOK_ERROR);
+    ASSERT(eval_string("(let* ((x 1) . y) x)", env) == TOK_ERROR);
     ASSERT(eval_string("(letrec ((x)) x)", env) == TOK_ERROR);
     ASSERT(eval_string("(letrec ((1 2)) 1)", env) == TOK_ERROR);
+    ASSERT(eval_string("(letrec ((x 1) (x 2)) x)", env) == TOK_ERROR);
     ASSERT(eval_string("(let-syntax . 1)", env) == TOK_ERROR);
     ASSERT(eval_string("(let-syntax ((m (syntax-rules))) 1)", env) ==
            TOK_ERROR);
+    ASSERT(eval_string("(let-syntax ((m (syntax-rules ::: ()))) 1)", env) ==
+           TOK_ERROR);
+    ASSERT(eval_string("(let-syntax "
+                       "((m (syntax-rules () ((m) 1))) "
+                       " (m (syntax-rules () ((m) 2)))) "
+                       "(m))",
+                       env) == TOK_ERROR);
     ASSERT(eval_string("(letrec-syntax . 1)", env) == TOK_ERROR);
+    ASSERT(eval_string("(letrec-syntax "
+                       "((m (syntax-rules () ((m) 1))) "
+                       " (m (syntax-rules () ((m) 2)))) "
+                       "(m))",
+                       env) == TOK_ERROR);
     PASS();
 }
 
@@ -514,6 +702,22 @@ TEST(eval_load_reads_file_with_port_reader)
         eval_string("(load \"/tmp/vesper-load-port-reader-test.scm\")", env);
     remove(path);
     ASSERT(is_int(result, 42));
+    PASS();
+}
+
+TEST(eval_load_rejects_reader_token_sentinel)
+{
+    const char *path = "/tmp/vesper-load-reader-token-test.scm";
+    FILE *f = fopen(path, "wb");
+    ASSERT(f != NULL);
+    ASSERT(fwrite(")", 1, 1, f) == 1);
+    fclose(f);
+
+    unsigned env = default_environment();
+    unsigned result =
+        eval_string("(load \"/tmp/vesper-load-reader-token-test.scm\")", env);
+    remove(path);
+    ASSERT(result == TOK_ERROR);
     PASS();
 }
 
@@ -560,6 +764,73 @@ TEST(eval_let_simple)
     PASS();
 }
 
+TEST(eval_named_let)
+{
+    unsigned env = default_environment();
+    unsigned result = eval_string(
+        "(let loop ((n 5) (acc 1)) "
+        "  (if (= n 0) acc (loop (- n 1) (* acc n))))",
+        env);
+    ASSERT(is_int(result, 120));
+
+    result = eval_string(
+        "(let ((loop 99)) "
+        "  (let loop ((n 0)) "
+        "    (if (= n 0) loop (loop (- n 1)))))",
+        env);
+    ASSERT(IS_FUNCTION(result));
+
+    result = eval_string(
+        "(let ((loop (lambda (x) (+ x 1)))) "
+        "  (let loop ((n (loop 1))) n))",
+        env);
+    ASSERT(is_int(result, 2));
+    PASS();
+}
+
+TEST(compiled_named_let)
+{
+    unsigned env = default_environment();
+    unsigned result = compiled_eval_string(
+        "(let loop ((n 5) (acc 1)) "
+        "  (if (= n 0) acc (loop (- n 1) (* acc n))))",
+        env);
+    ASSERT(is_int(result, 120));
+
+    result = compiled_eval_string(
+        "(let ((loop 99)) "
+        "  (let loop ((n 0)) "
+        "    (if (= n 0) loop (loop (- n 1)))))",
+        env);
+    ASSERT(IS_PAIR(result) && IS_CELL(car(result)) &&
+           CELL_TYPE(car(result)) == BT_CLOSURE);
+
+    result = compiled_eval_string(
+        "(let ((loop (lambda (x) (+ x 1)))) "
+        "  (let loop ((n (loop 1))) n))",
+        env);
+    ASSERT(is_int(result, 2));
+    PASS();
+}
+
+TEST(eval_let_accepts_quoted_cyclic_data)
+{
+    unsigned env = default_environment();
+    unsigned result =
+        eval_string("(let ((x '#0=(1 . #0#))) (list? x))", env);
+    ASSERT(result == ctx.atom_false);
+    PASS();
+}
+
+TEST(compiled_let_accepts_quoted_cyclic_data)
+{
+    unsigned env = default_environment();
+    unsigned result =
+        compiled_eval_string("(let ((x '#0=(1 . #0#))) (list? x))", env);
+    ASSERT(result == ctx.atom_false);
+    PASS();
+}
+
 TEST(eval_let_nested)
 {
     unsigned env = default_environment();
@@ -568,11 +839,135 @@ TEST(eval_let_nested)
     PASS();
 }
 
+TEST(eval_empty_let_forms_do_not_leak_internal_defines)
+{
+    unsigned env = default_environment();
+    unsigned result = eval_string(
+        "(let () (define eval-empty-let-leak 1) eval-empty-let-leak)",
+        env);
+    ASSERT(is_int(result, 1));
+    ASSERT(eval_string("eval-empty-let-leak", env) == TOK_ERROR);
+
+    result = eval_string(
+        "(letrec () (define eval-empty-letrec-leak 1) "
+        "eval-empty-letrec-leak)",
+        env);
+    ASSERT(is_int(result, 1));
+    ASSERT(eval_string("eval-empty-letrec-leak", env) == TOK_ERROR);
+    PASS();
+}
+
+TEST(compiled_empty_let_forms_do_not_leak_internal_defines)
+{
+    unsigned env = default_environment();
+    unsigned result = compiled_eval_string(
+        "(let () (define compiled-empty-let-leak 1) "
+        "compiled-empty-let-leak)",
+        env);
+    ASSERT(is_int(result, 1));
+    ASSERT(compiled_eval_string("compiled-empty-let-leak", env) == TOK_ERROR);
+
+    result = compiled_eval_string(
+        "(letrec () (define compiled-empty-letrec-leak 1) "
+        "compiled-empty-letrec-leak)",
+        env);
+    ASSERT(is_int(result, 1));
+    ASSERT(compiled_eval_string("compiled-empty-letrec-leak", env) ==
+           TOK_ERROR);
+    PASS();
+}
+
+TEST(eval_empty_syntax_binding_forms_do_not_leak_internal_defines)
+{
+    unsigned env = default_environment();
+    unsigned result = eval_string(
+        "(let-syntax () "
+        "  (define eval-empty-let-syntax-leak 1) "
+        "  eval-empty-let-syntax-leak)",
+        env);
+    ASSERT(is_int(result, 1));
+    ASSERT(eval_string("eval-empty-let-syntax-leak", env) == TOK_ERROR);
+
+    result = eval_string(
+        "(letrec-syntax () "
+        "  (define eval-empty-letrec-syntax-leak 1) "
+        "  eval-empty-letrec-syntax-leak)",
+        env);
+    ASSERT(is_int(result, 1));
+    ASSERT(eval_string("eval-empty-letrec-syntax-leak", env) == TOK_ERROR);
+
+    ASSERT(eval_string(
+               "(begin "
+               "  (let-syntax () "
+               "    (define-syntax eval-empty-let-syntax-macro "
+               "      (syntax-rules () "
+               "        ((eval-empty-let-syntax-macro) 1))) "
+               "    0) "
+               "  (eval-empty-let-syntax-macro))",
+               env) == TOK_ERROR);
+    ASSERT(eval_string(
+               "(begin "
+               "  (letrec-syntax () "
+               "    (define-syntax eval-empty-letrec-syntax-macro "
+               "      (syntax-rules () "
+               "        ((eval-empty-letrec-syntax-macro) 1))) "
+               "    0) "
+               "  (eval-empty-letrec-syntax-macro))",
+               env) == TOK_ERROR);
+    PASS();
+}
+
+TEST(compiled_empty_syntax_binding_forms_do_not_leak_internal_defines)
+{
+    unsigned env = default_environment();
+    unsigned result = compiled_eval_string(
+        "(let-syntax () "
+        "  (define compiled-empty-let-syntax-leak 1) "
+        "  compiled-empty-let-syntax-leak)",
+        env);
+    ASSERT(is_int(result, 1));
+    ASSERT(compiled_eval_string("compiled-empty-let-syntax-leak", env) ==
+           TOK_ERROR);
+
+    result = compiled_eval_string(
+        "(letrec-syntax () "
+        "  (define compiled-empty-letrec-syntax-leak 1) "
+        "  compiled-empty-letrec-syntax-leak)",
+        env);
+    ASSERT(is_int(result, 1));
+    ASSERT(compiled_eval_string("compiled-empty-letrec-syntax-leak", env) ==
+           TOK_ERROR);
+
+    ASSERT(compiled_eval_string(
+               "(begin "
+               "  (let-syntax () "
+               "    (define-syntax compiled-empty-let-syntax-macro "
+               "      (syntax-rules () "
+               "        ((compiled-empty-let-syntax-macro) 1))) "
+               "    0) "
+               "  (compiled-empty-let-syntax-macro))",
+               env) == TOK_ERROR);
+    ASSERT(compiled_eval_string(
+               "(begin "
+               "  (letrec-syntax () "
+               "    (define-syntax compiled-empty-letrec-syntax-macro "
+               "      (syntax-rules () "
+               "        ((compiled-empty-letrec-syntax-macro) 1))) "
+               "    0) "
+               "  (compiled-empty-letrec-syntax-macro))",
+               env) == TOK_ERROR);
+    PASS();
+}
+
 TEST(eval_letstar)
 {
     unsigned env = default_environment();
     unsigned result = eval_string("(let* ((x 1) (y (+ x 1))) (+ x y))", env);
     ASSERT(is_int(result, 3));
+    result = eval_string("(let* ((x 1) (x (+ x 1))) x)", env);
+    ASSERT(is_int(result, 2));
+    result = compiled_eval_string("(let* ((x 1) (x (+ x 1))) x)", env);
+    ASSERT(is_int(result, 2));
     PASS();
 }
 
@@ -874,6 +1269,24 @@ TEST(eval_read_file_port_preserves_unread_delimiter)
     PASS();
 }
 
+TEST(eval_read_rejects_reader_token_sentinels)
+{
+    unsigned env = default_environment();
+    ASSERT(eval_string("(read (open-input-string \")\"))", env) == TOK_ERROR);
+    ASSERT(eval_string("(read (open-input-string \".\"))", env) == TOK_ERROR);
+    PASS();
+}
+
+TEST(compiled_read_rejects_reader_token_sentinels)
+{
+    unsigned env = default_environment();
+    ASSERT(compiled_eval_string("(read (open-input-string \")\"))", env) ==
+           TOK_ERROR);
+    ASSERT(compiled_eval_string("(read (open-input-string \".\"))", env) ==
+           TOK_ERROR);
+    PASS();
+}
+
 TEST(eval_read_bytevector_preserves_unread_delimiter)
 {
     const char *path = "/tmp/vesper-read-bytevector-delimiter-test.bin";
@@ -1118,11 +1531,130 @@ TEST(eval_rejects_improper_application)
     PASS();
 }
 
+TEST(eval_special_form_keywords_respect_lexical_bindings)
+{
+    unsigned env = default_environment();
+    unsigned result = eval_string(
+        "(equal? "
+        "  (list "
+        "    (let ((if list)) (if 1 2)) "
+        "    (let ((lambda list)) (lambda 1 2)) "
+        "    (let ((set! list)) (set! 1 2)) "
+        "    (let ((define list)) (define 1 2)) "
+        "    (let ((and list)) (and 1 2)) "
+        "    (let ((or list)) (or 1 2)) "
+        "    (let ((cond list)) (cond 1 2)) "
+        "    (let ((let list)) (let 1 2)) "
+        "    (let ((let* list)) (let* 1 2)) "
+        "    (let ((letrec list)) (letrec 1 2)) "
+        "    (let ((begin list)) (begin 1 2)) "
+        "    (let ((quote list)) (quote 1 2)) "
+        "    (let ((quasiquote list)) (quasiquote 1 2)) "
+        "    (let-syntax ((if (syntax-rules () "
+        "                       ((if x y) (list x y))))) "
+        "      (if 1 2))) "
+        "  '((1 2) (1 2) (1 2) (1 2) (1 2) (1 2) (1 2) "
+        "    (1 2) (1 2) (1 2) (1 2) (1 2) (1 2) (1 2)))",
+        env);
+    ASSERT(result == ctx.atom_true);
+    PASS();
+}
+
 TEST(eval_quasiquote_unquotes_vector_element)
 {
     unsigned env = default_environment();
     unsigned result = eval_string("(vector-ref `#(a ,(+ 1 2)) 1)", env);
     ASSERT(is_int(result, 3));
+    PASS();
+}
+
+TEST(eval_quasiquote_respects_shadowed_keywords)
+{
+    unsigned env = default_environment();
+    unsigned result = eval_string(
+        "(equal? (let ((unquote 10)) `(a (unquote 1))) "
+        "        '(a (unquote 1)))",
+        env);
+    ASSERT(result == ctx.atom_true);
+
+    result = eval_string(
+        "(equal? (let ((unquote-splicing 10)) "
+        "          `(a (unquote-splicing 1))) "
+        "        '(a (unquote-splicing 1)))",
+        env);
+    ASSERT(result == ctx.atom_true);
+
+    result = eval_string(
+        "(let ((quasiquote (lambda (x) x))) (quasiquote 7))", env);
+    ASSERT(is_int(result, 7));
+    PASS();
+}
+
+TEST(eval_quasiquote_rejects_top_level_splicing)
+{
+    unsigned env = default_environment();
+    unsigned result = eval_string("`(unquote-splicing)", env);
+    ASSERT(result == TOK_ERROR);
+    PASS();
+}
+
+TEST(eval_quasiquote_splicing_preserves_dotted_tail)
+{
+    unsigned env = default_environment();
+    unsigned result = eval_string(
+        "(equal? `(a ,@(list 1 2) . tail) '(a 1 2 . tail))", env);
+    ASSERT(result == ctx.atom_true);
+    PASS();
+}
+
+TEST(eval_quasiquote_rejects_improper_splice_value)
+{
+    unsigned env = default_environment();
+    unsigned result = eval_string("`(,@(cons 1 2) x)", env);
+    ASSERT(result == TOK_ERROR);
+    PASS();
+}
+
+TEST(eval_quasiquote_rejects_malformed_subforms)
+{
+    unsigned env = default_environment();
+    ASSERT(eval_string("`(unquote)", env) == TOK_ERROR);
+    ASSERT(eval_string("`(unquote 1 2)", env) == TOK_ERROR);
+    ASSERT(eval_string("`(unquote-splicing)", env) == TOK_ERROR);
+    ASSERT(eval_string("`(unquote-splicing (list 1) extra)", env) ==
+           TOK_ERROR);
+    ASSERT(eval_string("`(quasiquote)", env) == TOK_ERROR);
+    ASSERT(eval_string("`(quasiquote a b)", env) == TOK_ERROR);
+    ASSERT(eval_string("`(a . #((unquote)))", env) == TOK_ERROR);
+    ASSERT(eval_string("`(a . #((unquote 1 2)))", env) == TOK_ERROR);
+    ASSERT(eval_string(
+               "(let-syntax ((m (syntax-rules () "
+               "                 ((m) `(unquote 1 2))))) "
+               "  (m))",
+               env) == TOK_ERROR);
+    ASSERT(eval_string(
+               "(let-syntax ((m (syntax-rules () "
+               "                 ((m) `(quasiquote a b))))) "
+               "  (m))",
+               env) == TOK_ERROR);
+    ASSERT(eval_string("(let ((unquote 10)) `(unquote))", env) != TOK_ERROR);
+    PASS();
+}
+
+TEST(eval_quasiquote_allows_data_in_unquote_expression)
+{
+    unsigned env = default_environment();
+    unsigned result = eval_string(
+        "(equal? `(a ,(quote (unquote 1 2))) "
+        "        '(a (unquote 1 2)))",
+        env);
+    ASSERT(result == ctx.atom_true);
+
+    result = eval_string(
+        "(equal? `(a ,(list (quote (quasiquote a b)))) "
+        "        '(a ((quasiquote a b))))",
+        env);
+    ASSERT(result == ctx.atom_true);
     PASS();
 }
 
@@ -1262,6 +1794,24 @@ TEST(eval_environment_rejects_non_integer_version)
 
     result = eval_string("(null-environment 'r5rs)", env);
     ASSERT(result == TOK_ERROR);
+    PASS();
+}
+
+TEST(eval_null_environment_booleans_are_self_evaluating)
+{
+    unsigned env = default_environment();
+    unsigned null_env = eval_string("(null-environment 5)", env);
+    ASSERT(null_env != TOK_ERROR);
+
+    unsigned result = eval_string("#t", null_env);
+    ASSERT(result == ctx.atom_true);
+    result = eval_string("#f", null_env);
+    ASSERT(result == ctx.atom_false);
+
+    result = compiled_eval_string("#t", null_env);
+    ASSERT(result == ctx.atom_true);
+    result = compiled_eval_string("#f", null_env);
+    ASSERT(result == ctx.atom_false);
     PASS();
 }
 
@@ -1863,6 +2413,44 @@ TEST(compiled_letrec_tail_call_many_args)
     PASS();
 }
 
+TEST(compiled_let_forms_preserve_enclosing_tail_context)
+{
+    unsigned env = default_environment();
+    unsigned result = compiled_eval_string(
+        "(let ((x 0)) "
+        "  (let ((ignore (let ((y 1)) (set! x 1)))) x) "
+        "  x)",
+        env);
+    ASSERT(is_int(result, 1));
+
+    result = compiled_eval_string(
+        "(let ((x 0)) "
+        "  (let ((ignore (let* ((y 1)) (set! x y)))) x) "
+        "  x)",
+        env);
+    ASSERT(is_int(result, 1));
+    PASS();
+}
+
+TEST(compiled_cond_arrow_preserves_tail_context)
+{
+    unsigned env = default_environment();
+    unsigned expr = read_expr_from_string(
+        "(lambda (receiver g) "
+        "  (cond (1 => (g)) "
+        "        (else 0)))");
+    ASSERT(expr != TOK_ERROR);
+
+    GC_GUARD;
+    gc_protect(&expr);
+    gc_protect(&env);
+    code_object *code = compile_toplevel(expr, env);
+    ASSERT(code != NULL);
+    ASSERT(code_contains_opcode(code, OP_TAILCALL));
+    ASSERT_EQ(code_count_opcode(code, OP_TAILCALL), 1);
+    PASS();
+}
+
 TEST(compiled_string_to_list_allocates_fresh_result)
 {
     unsigned env = default_environment();
@@ -2143,6 +2731,90 @@ TEST(compiled_rejects_improper_application)
     PASS();
 }
 
+TEST(compiled_special_form_keywords_respect_lexical_bindings)
+{
+    unsigned env = default_environment();
+    unsigned result = compiled_eval_string(
+        "(equal? "
+        "  (list "
+        "    (let ((if list)) (if 1 2)) "
+        "    (let ((lambda list)) (lambda 1 2)) "
+        "    (let ((set! list)) (set! 1 2)) "
+        "    (let ((define list)) (define 1 2)) "
+        "    (let ((and list)) (and 1 2)) "
+        "    (let ((or list)) (or 1 2)) "
+        "    (let ((cond list)) (cond 1 2)) "
+        "    (let ((let list)) (let 1 2)) "
+        "    (let ((let* list)) (let* 1 2)) "
+        "    (let ((letrec list)) (letrec 1 2)) "
+        "    (let ((begin list)) (begin 1 2)) "
+        "    (let ((quote list)) (quote 1 2)) "
+        "    (let ((quasiquote list)) (quasiquote 1 2)) "
+        "    (let-syntax ((if (syntax-rules () "
+        "                       ((if x y) (list x y))))) "
+        "      (if 1 2))) "
+        "  '((1 2) (1 2) (1 2) (1 2) (1 2) (1 2) (1 2) "
+        "    (1 2) (1 2) (1 2) (1 2) (1 2) (1 2) (1 2)))",
+        env);
+    ASSERT(result == ctx.atom_true);
+    PASS();
+}
+
+TEST(compiled_lambda_optimizations_respect_syntax_binding)
+{
+    unsigned env = default_environment();
+    const char *program =
+        "(let-syntax ((lambda (syntax-rules () "
+        "                       ((lambda formals body ...) "
+        "                        (quote macro-lambda))))) "
+        "  (let ((f (lambda (x) x))) "
+        "    (f 1)))";
+
+    ASSERT(eval_string(program, env) == TOK_ERROR);
+    ASSERT(compiled_eval_string(program, env) == TOK_ERROR);
+
+    program =
+        "(let-syntax ((lambda (syntax-rules () "
+        "                       ((lambda formals body ...) "
+        "                        (quote macro-lambda))))) "
+        "  ((lambda (x) x) 1))";
+
+    ASSERT(eval_string(program, env) == TOK_ERROR);
+    ASSERT(compiled_eval_string(program, env) == TOK_ERROR);
+    PASS();
+}
+
+TEST(eval_macro_expansion_rejects_recursive_expansion)
+{
+    unsigned env = default_environment();
+    ASSERT(eval_string(
+               "(begin "
+               "  (define-syntax loop "
+               "    (syntax-rules () ((loop) (loop)))) "
+               "  (loop))",
+               env) == TOK_ERROR);
+    ASSERT(compiled_eval_string(
+               "(begin "
+               "  (define-syntax loop "
+               "    (syntax-rules () ((loop) (loop)))) "
+               "  (loop))",
+               env) == TOK_ERROR);
+
+    ASSERT(eval_string(
+               "(let-syntax "
+               "    ((quote (syntax-rules () "
+               "              ((quote x) 'macro-quote)))) "
+               "  (quote a))",
+               env) == TOK_ERROR);
+    ASSERT(compiled_eval_string(
+               "(let-syntax "
+               "    ((quote (syntax-rules () "
+               "              ((quote x) 'macro-quote)))) "
+               "  (quote a))",
+               env) == TOK_ERROR);
+    PASS();
+}
+
 TEST(compiled_rejects_malformed_lambda)
 {
     unsigned env = default_environment();
@@ -2166,6 +2838,21 @@ TEST(compiled_lambda_rejects_wrong_arity)
     PASS();
 }
 
+TEST(compiled_let_lambda_handles_dotted_formals_in_self_reference_check)
+{
+    unsigned env = default_environment();
+    unsigned result = compiled_eval_string(
+        "(let ((f (lambda (x . rest) x))) (f 1 2 3))", env);
+    ASSERT(is_int(result, 1));
+
+    result = compiled_eval_string(
+        "(let ((f (lambda (x . rest) rest))) (f 1 2 3))", env);
+    ASSERT(IS_PAIR(result));
+    ASSERT(is_int(car(result), 2));
+    ASSERT(is_int(cadr(result), 3));
+    PASS();
+}
+
 TEST(compiled_rejects_malformed_special_forms)
 {
     unsigned env = default_environment();
@@ -2174,6 +2861,45 @@ TEST(compiled_rejects_malformed_special_forms)
     ASSERT(compiled_eval_string("(if #t)", env) == TOK_ERROR);
     ASSERT(compiled_eval_string("(if #t 1 2 3)", env) == TOK_ERROR);
     ASSERT(compiled_eval_string("(begin . 1)", env) == TOK_ERROR);
+    ASSERT(compiled_eval_string("(let-syntax ((m (syntax-rules () "
+                                "((m) (begin 1 . 2))))) (m))",
+                                env) == TOK_ERROR);
+    ASSERT(compiled_eval_string("(let-syntax ((m (syntax-rules () "
+                                "((m) (let ((x 1) . y) x))))) (m))",
+                                env) == TOK_ERROR);
+    ASSERT(compiled_eval_string("(let-syntax ((m (syntax-rules () "
+                                "((m) (let ((x 1 2)) x))))) (m))",
+                                env) == TOK_ERROR);
+    ASSERT(compiled_eval_string("(let-syntax ((m (syntax-rules () "
+                                "((m) (let loop ((x 1) . y) x))))) (m))",
+                                env) == TOK_ERROR);
+    ASSERT(compiled_eval_string("(let-syntax ((m (syntax-rules () "
+                                "((m) (let loop ((x 1 2)) x))))) (m))",
+                                env) == TOK_ERROR);
+    ASSERT(compiled_eval_string("(let-syntax ((m (syntax-rules () "
+                                "((m) (let* ((x 1) . y) x))))) (m))",
+                                env) == TOK_ERROR);
+    ASSERT(compiled_eval_string("(let-syntax ((m (syntax-rules () "
+                                "((m) (let* ((x 1 2)) x))))) (m))",
+                                env) == TOK_ERROR);
+    ASSERT(compiled_eval_string("(let-syntax ((m (syntax-rules () "
+                                "((m) (letrec ((x 1 2)) x))))) (m))",
+                                env) == TOK_ERROR);
+    ASSERT(compiled_eval_string("(let-syntax ((m (syntax-rules () "
+                                "((m) (lambda . 1))))) (m))",
+                                env) == TOK_ERROR);
+    ASSERT(compiled_eval_string("(let-syntax ((m (syntax-rules () "
+                                "((m) (define . 1))))) (m))",
+                                env) == TOK_ERROR);
+    ASSERT(compiled_eval_string("(let-syntax ((m (syntax-rules () "
+                                "((m) (set! x . 1))))) (m))",
+                                env) == TOK_ERROR);
+    ASSERT(compiled_eval_string("(let-syntax ((m (syntax-rules () "
+                                "((m) (define x . 1))))) (m))",
+                                env) == TOK_ERROR);
+    ASSERT(compiled_eval_string("(let-syntax ((m (syntax-rules () "
+                                "((m) (let-syntax . 1))))) (m))",
+                                env) == TOK_ERROR);
     ASSERT(compiled_eval_string("(and . 1)", env) == TOK_ERROR);
     ASSERT(compiled_eval_string("(or . 1)", env) == TOK_ERROR);
     ASSERT(compiled_eval_string("(cond . 1)", env) == TOK_ERROR);
@@ -2195,8 +2921,31 @@ TEST(compiled_rejects_malformed_special_forms)
            TOK_ERROR);
     ASSERT(compiled_eval_string("(define-syntax m (syntax-rules () 1))", env) ==
            TOK_ERROR);
+    ASSERT(compiled_eval_string("(define-syntax m (syntax-rules ::: ()))",
+                                env) == TOK_ERROR);
+    ASSERT(compiled_eval_string(
+               "(define-syntax m (syntax-rules (... ) ((m) 1)))",
+               env) == TOK_ERROR);
+    ASSERT(compiled_eval_string(
+               "(define-syntax m (syntax-rules (x x) ((m x) 1)))",
+               env) == TOK_ERROR);
     ASSERT(compiled_eval_string("(define-syntax m (syntax-rules () (m 1)))",
                                 env) == TOK_ERROR);
+    ASSERT(compiled_eval_string(
+               "(define-syntax m (syntax-rules () ((#t) 1)))",
+               env) == TOK_ERROR);
+    ASSERT(compiled_eval_string(
+               "(define-syntax m (syntax-rules () ((1 x) x)))",
+               env) == TOK_ERROR);
+    ASSERT(compiled_eval_string(
+               "(define-syntax m (syntax-rules () (((a) x) x)))",
+               env) == TOK_ERROR);
+    ASSERT(compiled_eval_string(
+               "(define-syntax m (syntax-rules () ((#(a) x) x)))",
+               env) == TOK_ERROR);
+    ASSERT(compiled_eval_string(
+               "(define-syntax m (syntax-rules () ((... x) x)))",
+               env) == TOK_ERROR);
     ASSERT(compiled_eval_string("(define-syntax m (syntax-rules () ((m) ...)))",
                                 env) == TOK_ERROR);
     ASSERT(compiled_eval_string(
@@ -2207,6 +2956,13 @@ TEST(compiled_rejects_malformed_special_forms)
                env) == TOK_ERROR);
     ASSERT(compiled_eval_string(
                "(define-syntax m (syntax-rules () ((m x) (quote (x ...)))))",
+               env) == TOK_ERROR);
+    ASSERT(compiled_eval_string(
+               "(define-syntax m (syntax-rules () ((m x ...) x)))",
+               env) == TOK_ERROR);
+    ASSERT(compiled_eval_string(
+               "(define-syntax m (syntax-rules () "
+               "((m (x ...) ...) (list x ...))))",
                env) == TOK_ERROR);
     ASSERT(compiled_eval_string(
                "(define-syntax m (syntax-rules () ((m) #(... x))))",
@@ -2220,12 +2976,47 @@ TEST(compiled_rejects_malformed_special_forms)
     ASSERT(compiled_eval_string(
                "(define-syntax m (syntax-rules () ((m ...) 1)))",
                env) == TOK_ERROR);
+    ASSERT(compiled_eval_string(
+               "(define-syntax m (syntax-rules () ((m x x) x)))",
+               env) == TOK_ERROR);
+    ASSERT(compiled_eval_string(
+               "(define-syntax m (syntax-rules () ((m (x ...) x) x)))",
+               env) == TOK_ERROR);
+    ASSERT(compiled_eval_string(
+               "(define-syntax m (syntax-rules () ((m #(x x)) x)))",
+               env) == TOK_ERROR);
+    ASSERT(compiled_eval_string("(let ((x 1) (x 2)) x)", env) == TOK_ERROR);
+    ASSERT(compiled_eval_string("(let ((x . 1)) x)", env) == TOK_ERROR);
+    ASSERT(compiled_eval_string("(let ((x 1 . 2)) x)", env) == TOK_ERROR);
+    ASSERT(compiled_eval_string("(let ((x 1) . y) x)", env) == TOK_ERROR);
+    ASSERT(compiled_eval_string("(let loop ((x 1) . y) x)", env) ==
+           TOK_ERROR);
+    ASSERT(compiled_eval_string("(let* ((x . 1)) x)", env) == TOK_ERROR);
+    ASSERT(compiled_eval_string("(let* ((x 1 . 2)) x)", env) == TOK_ERROR);
+    ASSERT(compiled_eval_string("(let* ((x 1) . y) x)", env) == TOK_ERROR);
     ASSERT(compiled_eval_string("(letrec ((x)) x)", env) == TOK_ERROR);
     ASSERT(compiled_eval_string("(letrec ((1 2)) 1)", env) == TOK_ERROR);
+    ASSERT(compiled_eval_string("(letrec ((x 1) (x 2)) x)", env) ==
+           TOK_ERROR);
     ASSERT(compiled_eval_string("(let-syntax . 1)", env) == TOK_ERROR);
     ASSERT(compiled_eval_string("(let-syntax ((m (syntax-rules))) 1)", env) ==
            TOK_ERROR);
+    ASSERT(compiled_eval_string(
+               "(let-syntax ((m (syntax-rules ::: ()))) 1)",
+               env) == TOK_ERROR);
+    ASSERT(compiled_eval_string(
+               "(let-syntax "
+               "((m (syntax-rules () ((m) 1))) "
+               " (m (syntax-rules () ((m) 2)))) "
+               "(m))",
+               env) == TOK_ERROR);
     ASSERT(compiled_eval_string("(letrec-syntax . 1)", env) == TOK_ERROR);
+    ASSERT(compiled_eval_string(
+               "(letrec-syntax "
+               "((m (syntax-rules () ((m) 1))) "
+               " (m (syntax-rules () ((m) 2)))) "
+               "(m))",
+               env) == TOK_ERROR);
     PASS();
 }
 
@@ -2234,6 +3025,97 @@ TEST(compiled_quasiquote_unquotes_vector_element)
     unsigned env = default_environment();
     unsigned result = compiled_eval_string("(vector-ref `#(a ,(+ 1 2)) 1)", env);
     ASSERT(is_int(result, 3));
+    PASS();
+}
+
+TEST(compiled_quasiquote_respects_shadowed_keywords)
+{
+    unsigned env = default_environment();
+    unsigned result = compiled_eval_string(
+        "(equal? (let ((unquote 10)) `(a (unquote 1))) "
+        "        '(a (unquote 1)))",
+        env);
+    ASSERT(result == ctx.atom_true);
+
+    result = compiled_eval_string(
+        "(equal? (let ((unquote-splicing 10)) "
+        "          `(a (unquote-splicing 1))) "
+        "        '(a (unquote-splicing 1)))",
+        env);
+    ASSERT(result == ctx.atom_true);
+
+    result = compiled_eval_string(
+        "(let ((quasiquote (lambda (x) x))) (quasiquote 7))", env);
+    ASSERT(is_int(result, 7));
+    PASS();
+}
+
+TEST(compiled_quasiquote_rejects_top_level_splicing)
+{
+    unsigned env = default_environment();
+    unsigned result = compiled_eval_string("`(unquote-splicing)", env);
+    ASSERT(result == TOK_ERROR);
+    PASS();
+}
+
+TEST(compiled_quasiquote_splicing_preserves_dotted_tail)
+{
+    unsigned env = default_environment();
+    unsigned result = compiled_eval_string(
+        "(equal? `(a ,@(list 1 2) . tail) '(a 1 2 . tail))", env);
+    ASSERT(result == ctx.atom_true);
+    PASS();
+}
+
+TEST(compiled_quasiquote_rejects_improper_splice_value)
+{
+    unsigned env = default_environment();
+    unsigned result = compiled_eval_string("`(,@(cons 1 2) x)", env);
+    ASSERT(result == TOK_ERROR);
+    PASS();
+}
+
+TEST(compiled_quasiquote_rejects_malformed_subforms)
+{
+    unsigned env = default_environment();
+    ASSERT(compiled_eval_string("`(unquote)", env) == TOK_ERROR);
+    ASSERT(compiled_eval_string("`(unquote 1 2)", env) == TOK_ERROR);
+    ASSERT(compiled_eval_string("`(unquote-splicing)", env) == TOK_ERROR);
+    ASSERT(compiled_eval_string("`(unquote-splicing (list 1) extra)", env) ==
+           TOK_ERROR);
+    ASSERT(compiled_eval_string("`(quasiquote)", env) == TOK_ERROR);
+    ASSERT(compiled_eval_string("`(quasiquote a b)", env) == TOK_ERROR);
+    ASSERT(compiled_eval_string("`(a . #((unquote)))", env) == TOK_ERROR);
+    ASSERT(compiled_eval_string("`(a . #((unquote 1 2)))", env) == TOK_ERROR);
+    ASSERT(compiled_eval_string(
+               "(let-syntax ((m (syntax-rules () "
+               "                 ((m) `(unquote 1 2))))) "
+               "  (m))",
+               env) == TOK_ERROR);
+    ASSERT(compiled_eval_string(
+               "(let-syntax ((m (syntax-rules () "
+               "                 ((m) `(quasiquote a b))))) "
+               "  (m))",
+               env) == TOK_ERROR);
+    ASSERT(compiled_eval_string("(let ((unquote 10)) `(unquote))", env) !=
+           TOK_ERROR);
+    PASS();
+}
+
+TEST(compiled_quasiquote_allows_data_in_unquote_expression)
+{
+    unsigned env = default_environment();
+    unsigned result = compiled_eval_string(
+        "(equal? `(a ,(quote (unquote 1 2))) "
+        "        '(a (unquote 1 2)))",
+        env);
+    ASSERT(result == ctx.atom_true);
+
+    result = compiled_eval_string(
+        "(equal? `(a ,(list (quote (quasiquote a b)))) "
+        "        '(a ((quasiquote a b))))",
+        env);
+    ASSERT(result == ctx.atom_true);
     PASS();
 }
 
@@ -2292,6 +3174,170 @@ TEST(compiled_define_syntax_preserves_custom_ellipsis)
     PASS();
 }
 
+TEST(compiled_begin_define_syntax_is_visible_to_later_forms)
+{
+    unsigned env = default_environment();
+    unsigned result = compiled_eval_string(
+        "(begin "
+        "  (define-syntax a (syntax-rules () ((a) (b)))) "
+        "  (define-syntax b (syntax-rules () ((b) 42))) "
+        "  (a))",
+        env);
+    ASSERT(is_int(result, 42));
+
+    result = compiled_eval_string(
+        "(begin "
+        "  (if #f (define-syntax hidden "
+        "           (syntax-rules () ((hidden) 99))) "
+        "      0) "
+        "  (let ((hidden 7)) hidden))",
+        env);
+    ASSERT(is_int(result, 7));
+
+    result = compiled_eval_string(
+        "(begin "
+        "  (if #t (define-syntax visible "
+        "           (syntax-rules () ((visible) 99))) "
+        "      0) "
+        "  (visible))",
+        env);
+    ASSERT(is_int(result, 99));
+
+    result = compiled_eval_string(
+        "(begin "
+        "  (if #f 0 "
+        "      (define-syntax visible "
+        "        (syntax-rules () ((visible) 100)))) "
+        "  (visible))",
+        env);
+    ASSERT(is_int(result, 100));
+
+    result = compiled_eval_string(
+        "(let ((flag #f)) "
+        "  (if flag "
+        "      (begin "
+        "        (define-syntax hidden "
+        "          (syntax-rules () ((hidden) 99))) "
+        "        0) "
+        "      (hidden)))",
+        env);
+    ASSERT(result == TOK_ERROR);
+
+    result = compiled_eval_string(
+        "(if (begin "
+        "      (define-syntax visible "
+        "        (syntax-rules () ((visible) 13))) "
+        "      #f) "
+        "    (visible) "
+        "    (visible))",
+        env);
+    ASSERT(is_int(result, 13));
+
+    result = compiled_eval_string(
+        "((lambda (x y) y) "
+        "  (begin "
+        "    (define-syntax m "
+        "      (syntax-rules () ((m) 12))) "
+        "    0) "
+        "  (m))",
+        env);
+    ASSERT(is_int(result, 12));
+
+    result = compiled_eval_string(
+        "(let* ((x (begin "
+        "             (define-syntax m "
+        "               (syntax-rules () ((m) 14))) "
+        "             0)) "
+        "       (y (m))) "
+        "  y)",
+        env);
+    ASSERT(is_int(result, 14));
+
+    result = compiled_eval_string(
+        "(and (begin "
+        "       (define-syntax m "
+        "         (syntax-rules () ((m) 21))) "
+        "       #t) "
+        "     (m))",
+        env);
+    ASSERT(is_int(result, 21));
+
+    result = compiled_eval_string(
+        "(begin "
+        "  (and #f "
+        "       (begin "
+        "         (define-syntax hidden "
+        "           (syntax-rules () ((hidden) 23))) "
+        "         #t)) "
+        "  (hidden))",
+        env);
+    ASSERT(result == TOK_ERROR);
+
+    result = compiled_eval_string(
+        "(or (begin "
+        "      (define-syntax m "
+        "        (syntax-rules () ((m) 22))) "
+        "      #f) "
+        "    (m))",
+        env);
+    ASSERT(is_int(result, 22));
+
+    result = compiled_eval_string(
+        "(begin "
+        "  (or #t "
+        "      (begin "
+        "        (define-syntax hidden "
+        "          (syntax-rules () ((hidden) 24))) "
+        "        #f)) "
+        "  (hidden))",
+        env);
+    ASSERT(result == TOK_ERROR);
+
+    result = compiled_eval_string(
+        "(begin "
+        "  (cond (#t 1) "
+        "        (#t "
+        "         (define-syntax hidden "
+        "           (syntax-rules () ((hidden) 31))) "
+        "         2)) "
+        "  (hidden))",
+        env);
+    ASSERT(result == TOK_ERROR);
+
+    result = compiled_eval_string(
+        "(cond ((begin "
+        "          (define-syntax m "
+        "            (syntax-rules () ((m) 32))) "
+        "          #f) "
+        "       0) "
+        "      (#t (m)))",
+        env);
+    ASSERT(is_int(result, 32));
+
+    result = compiled_eval_string(
+        "(begin "
+        "  (cond (#f 0) "
+        "        (else "
+        "         (define-syntax m "
+        "           (syntax-rules () ((m) 33))) "
+        "         0)) "
+        "  (m))",
+        env);
+    ASSERT(is_int(result, 33));
+
+    result = compiled_eval_string(
+        "(begin "
+        "  (cond (#t "
+        "         (define-syntax m "
+        "           (syntax-rules () ((m) 34))) "
+        "         0) "
+        "        (else 0)) "
+        "  (m))",
+        env);
+    ASSERT(is_int(result, 34));
+    PASS();
+}
+
 TEST(compiled_let_syntax_preserves_custom_ellipsis)
 {
     unsigned env = default_environment();
@@ -2337,6 +3383,1136 @@ TEST(compiled_syntax_rules_respects_shadowed_ellipsis)
     PASS();
 }
 
+TEST(eval_macro_hygiene_preserves_quoted_introduced_names)
+{
+    unsigned env = default_environment();
+    unsigned result = eval_string(
+        "(let-syntax "
+        "    ((m (syntax-rules () "
+        "          ((m) "
+        "           (list (let ((x 1)) 'x) "
+        "                 ((lambda (x) 'x) 1) "
+        "                 (letrec ((x (lambda () 'x))) (x))))))) "
+        "  (m))",
+        env);
+    ASSERT(IS_PAIR(result));
+    ASSERT(IS_ATOM(car(result)));
+    ASSERT_STR_EQ(ctx.atom_table[CELL_ID(car(result))], "x");
+    ASSERT(IS_PAIR(cdr(result)));
+    ASSERT(IS_ATOM(cadr(result)));
+    ASSERT_STR_EQ(ctx.atom_table[CELL_ID(cadr(result))], "x");
+    ASSERT(IS_PAIR(cddr(result)));
+    ASSERT(IS_ATOM(caddr(result)));
+    ASSERT_STR_EQ(ctx.atom_table[CELL_ID(caddr(result))], "x");
+    PASS();
+}
+
+TEST(compiled_macro_hygiene_preserves_quoted_introduced_names)
+{
+    unsigned env = default_environment();
+    unsigned result = compiled_eval_string(
+        "(let-syntax "
+        "    ((m (syntax-rules () "
+        "          ((m) "
+        "           (list (let ((x 1)) 'x) "
+        "                 ((lambda (x) 'x) 1) "
+        "                 (letrec ((x (lambda () 'x))) (x))))))) "
+        "  (m))",
+        env);
+    ASSERT(IS_PAIR(result));
+    ASSERT(IS_ATOM(car(result)));
+    ASSERT_STR_EQ(ctx.atom_table[CELL_ID(car(result))], "x");
+    ASSERT(IS_PAIR(cdr(result)));
+    ASSERT(IS_ATOM(cadr(result)));
+    ASSERT_STR_EQ(ctx.atom_table[CELL_ID(cadr(result))], "x");
+    ASSERT(IS_PAIR(cddr(result)));
+    ASSERT(IS_ATOM(caddr(result)));
+    ASSERT_STR_EQ(ctx.atom_table[CELL_ID(caddr(result))], "x");
+    PASS();
+}
+
+TEST(eval_macro_hygiene_prevents_use_site_capture)
+{
+    unsigned env = default_environment();
+    ASSERT(eval_string(
+               "(let-syntax ((m (syntax-rules () ((m) x)))) "
+               "  (let ((x 1)) (m)))",
+               env) == TOK_ERROR);
+    ASSERT(eval_string(
+               "(let-syntax ((m (syntax-rules () ((m) g0)))) "
+               "  (let ((g0 1)) (m)))",
+               env) == TOK_ERROR);
+    ASSERT(eval_string(
+               "(let-syntax ((m (syntax-rules () ((m) g123)))) "
+               "  (let ((g123 1)) (m)))",
+               env) == TOK_ERROR);
+    ASSERT(eval_string(
+               "(let-syntax "
+               "    ((m (syntax-rules () ((m) (n)))) "
+               "     (n (syntax-rules () ((n) 9)))) "
+               "  (m))",
+               env) == TOK_ERROR);
+
+    unsigned result = eval_string(
+        "(letrec-syntax "
+        "    ((m (syntax-rules () ((m) (n)))) "
+        "     (n (syntax-rules () ((n) 9)))) "
+        "  (m))",
+        env);
+    ASSERT(is_int(result, 9));
+    PASS();
+}
+
+TEST(compiled_macro_hygiene_prevents_use_site_capture)
+{
+    unsigned env = default_environment();
+    ASSERT(compiled_eval_string(
+               "(let-syntax ((m (syntax-rules () ((m) x)))) "
+               "  (let ((x 1)) (m)))",
+               env) == TOK_ERROR);
+    ASSERT(compiled_eval_string(
+               "(let-syntax ((m (syntax-rules () ((m) g0)))) "
+               "  (let ((g0 1)) (m)))",
+               env) == TOK_ERROR);
+    ASSERT(compiled_eval_string(
+               "(let-syntax ((m (syntax-rules () ((m) g123)))) "
+               "  (let ((g123 1)) (m)))",
+               env) == TOK_ERROR);
+    ASSERT(compiled_eval_string(
+               "(let-syntax "
+               "    ((m (syntax-rules () ((m) (n)))) "
+               "     (n (syntax-rules () ((n) 9)))) "
+               "  (m))",
+               env) == TOK_ERROR);
+
+    unsigned result = compiled_eval_string(
+        "(letrec-syntax "
+        "    ((m (syntax-rules () ((m) (n)))) "
+        "     (n (syntax-rules () ((n) 9)))) "
+        "  (m))",
+        env);
+    ASSERT(is_int(result, 9));
+    PASS();
+}
+
+TEST(eval_macro_hygiene_respects_shadowed_quote_in_templates)
+{
+    unsigned env = default_environment();
+    unsigned result = eval_string(
+        "(equal? "
+        "  (let ((x 1)) "
+        "    (let-syntax "
+        "        ((m (syntax-rules () "
+        "              ((m) (let ((quote list)) (quote x)))))) "
+        "      (let ((x 2)) (m)))) "
+        "  '(1))",
+        env);
+    ASSERT(result == ctx.atom_true);
+
+    result = eval_string(
+        "(equal? "
+        "  (let ((x 1)) "
+        "    (let-syntax "
+        "        ((m (syntax-rules () "
+        "              ((m) "
+        "               (let ((quote list)) "
+        "                 (let ((x 2)) (quote x))))))) "
+        "      (m))) "
+        "  '(2))",
+        env);
+    ASSERT(result == ctx.atom_true);
+
+    result = eval_string(
+        "(equal? "
+        "  (let ((x 1)) "
+        "    (let-syntax "
+        "        ((m (syntax-rules () "
+        "              ((m) (let ((quasiquote list)) (quasiquote x)))))) "
+        "      (let ((x 2)) (m)))) "
+        "  '(1))",
+        env);
+    ASSERT(result == ctx.atom_true);
+
+    result = eval_string(
+        "(equal? "
+        "  (let ((x 1)) "
+        "    (let-syntax "
+        "        ((m (syntax-rules () "
+        "              ((m) "
+        "               (let ((quasiquote list)) "
+        "                 (let ((x 2)) (quasiquote x))))))) "
+        "      (m))) "
+        "  '(2))",
+        env);
+    ASSERT(result == ctx.atom_true);
+    PASS();
+}
+
+TEST(compiled_macro_hygiene_respects_shadowed_quote_in_templates)
+{
+    unsigned env = default_environment();
+    unsigned result = compiled_eval_string(
+        "(equal? "
+        "  (let ((x 1)) "
+        "    (let-syntax "
+        "        ((m (syntax-rules () "
+        "              ((m) (let ((quote list)) (quote x)))))) "
+        "      (let ((x 2)) (m)))) "
+        "  '(1))",
+        env);
+    ASSERT(result == ctx.atom_true);
+
+    result = compiled_eval_string(
+        "(equal? "
+        "  (let ((x 1)) "
+        "    (let-syntax "
+        "        ((m (syntax-rules () "
+        "              ((m) "
+        "               (let ((quote list)) "
+        "                 (let ((x 2)) (quote x))))))) "
+        "      (m))) "
+        "  '(2))",
+        env);
+    ASSERT(result == ctx.atom_true);
+
+    result = compiled_eval_string(
+        "(equal? "
+        "  (let ((x 1)) "
+        "    (let-syntax "
+        "        ((m (syntax-rules () "
+        "              ((m) (let ((quasiquote list)) (quasiquote x)))))) "
+        "      (let ((x 2)) (m)))) "
+        "  '(1))",
+        env);
+    ASSERT(result == ctx.atom_true);
+
+    result = compiled_eval_string(
+        "(equal? "
+        "  (let ((x 1)) "
+        "    (let-syntax "
+        "        ((m (syntax-rules () "
+        "              ((m) "
+        "               (let ((quasiquote list)) "
+        "                 (let ((x 2)) (quasiquote x))))))) "
+        "      (m))) "
+        "  '(2))",
+        env);
+    ASSERT(result == ctx.atom_true);
+    PASS();
+}
+
+TEST(eval_macro_hygiene_preserves_definition_site_keyword_bindings)
+{
+    unsigned env = default_environment();
+    unsigned result = eval_string(
+        "(equal? "
+        "  (let ((if list) (x 1)) "
+        "    (let-syntax "
+        "        ((m (syntax-rules () ((m) (if x))))) "
+        "      (let ((if (lambda args 'bad)) (x 2)) (m)))) "
+        "  '(1))",
+        env);
+    ASSERT(result == ctx.atom_true);
+
+    result = eval_string(
+        "(equal? "
+        "  (let ((begin list) (x 1)) "
+        "    (let-syntax "
+        "        ((m (syntax-rules () ((m) (begin x))))) "
+        "      (let ((begin (lambda args 'bad)) (x 2)) (m)))) "
+        "  '(1))",
+        env);
+    ASSERT(result == ctx.atom_true);
+
+    result = eval_string(
+        "(equal? "
+        "  (let ((syntax-rules list) (x 1)) "
+        "    (let-syntax "
+        "        ((m (syntax-rules () ((m) (syntax-rules x))))) "
+        "      (let ((syntax-rules (lambda args 'bad)) (x 2)) (m)))) "
+        "  '(1))",
+        env);
+    ASSERT(result == ctx.atom_true);
+
+    result = eval_string(
+        "(equal? "
+        "  (let ((quote list) (x 1)) "
+        "    (let-syntax "
+        "        ((m (syntax-rules () ((m) (quote x))))) "
+        "      (let ((quote list) (x 2)) (m)))) "
+        "  '(1))",
+        env);
+    ASSERT(result == ctx.atom_true);
+
+    result = eval_string(
+        "(equal? "
+        "  (let ((quote list) (x 1) (y 2)) "
+        "    (let-syntax "
+        "        ((m (syntax-rules () ((m) (quote x y))))) "
+        "      (let ((quote list) (x 3) (y 4)) (m)))) "
+        "  '(1 2))",
+        env);
+    ASSERT(result == ctx.atom_true);
+
+    result = eval_string(
+        "(equal? "
+        "  (let ((define list) (x 1)) "
+        "    (let-syntax "
+        "        ((m (syntax-rules () ((m) (define x))))) "
+        "      (let ((define (lambda args 'bad)) (x 2)) (m)))) "
+        "  '(1))",
+        env);
+    ASSERT(result == ctx.atom_true);
+
+    result = eval_string(
+        "(equal? "
+        "  (let ((set! list) (x 1)) "
+        "    (let-syntax "
+        "        ((m (syntax-rules () ((m) (set! x))))) "
+        "      (let ((set! (lambda args 'bad)) (x 2)) (m)))) "
+        "  '(1))",
+        env);
+    ASSERT(result == ctx.atom_true);
+    PASS();
+}
+
+TEST(compiled_macro_hygiene_preserves_definition_site_keyword_bindings)
+{
+    unsigned env = default_environment();
+    unsigned result = compiled_eval_string(
+        "(equal? "
+        "  (let ((if list) (x 1)) "
+        "    (let-syntax "
+        "        ((m (syntax-rules () ((m) (if x))))) "
+        "      (let ((if (lambda args 'bad)) (x 2)) (m)))) "
+        "  '(1))",
+        env);
+    ASSERT(result == ctx.atom_true);
+
+    result = compiled_eval_string(
+        "(equal? "
+        "  (let ((begin list) (x 1)) "
+        "    (let-syntax "
+        "        ((m (syntax-rules () ((m) (begin x))))) "
+        "      (let ((begin (lambda args 'bad)) (x 2)) (m)))) "
+        "  '(1))",
+        env);
+    ASSERT(result == ctx.atom_true);
+
+    result = compiled_eval_string(
+        "(equal? "
+        "  (let ((syntax-rules list) (x 1)) "
+        "    (let-syntax "
+        "        ((m (syntax-rules () ((m) (syntax-rules x))))) "
+        "      (let ((syntax-rules (lambda args 'bad)) (x 2)) (m)))) "
+        "  '(1))",
+        env);
+    ASSERT(result == ctx.atom_true);
+
+    result = compiled_eval_string(
+        "(equal? "
+        "  (let ((quote list) (x 1)) "
+        "    (let-syntax "
+        "        ((m (syntax-rules () ((m) (quote x))))) "
+        "      (let ((quote list) (x 2)) (m)))) "
+        "  '(1))",
+        env);
+    ASSERT(result == ctx.atom_true);
+
+    result = compiled_eval_string(
+        "(equal? "
+        "  (let ((quote list) (x 1) (y 2)) "
+        "    (let-syntax "
+        "        ((m (syntax-rules () ((m) (quote x y))))) "
+        "      (let ((quote list) (x 3) (y 4)) (m)))) "
+        "  '(1 2))",
+        env);
+    ASSERT(result == ctx.atom_true);
+
+    result = compiled_eval_string(
+        "(equal? "
+        "  (let ((define list) (x 1)) "
+        "    (let-syntax "
+        "        ((m (syntax-rules () ((m) (define x))))) "
+        "      (let ((define (lambda args 'bad)) (x 2)) (m)))) "
+        "  '(1))",
+        env);
+    ASSERT(result == ctx.atom_true);
+
+    result = compiled_eval_string(
+        "(equal? "
+        "  (let ((set! list) (x 1)) "
+        "    (let-syntax "
+        "        ((m (syntax-rules () ((m) (set! x))))) "
+        "      (let ((set! (lambda args 'bad)) (x 2)) (m)))) "
+        "  '(1))",
+        env);
+    ASSERT(result == ctx.atom_true);
+    PASS();
+}
+
+TEST(eval_syntax_rules_unwraps_pattern_vars_in_quoted_templates)
+{
+    unsigned env = default_environment();
+    unsigned result = eval_string(
+        "(let-syntax ((m (syntax-rules () "
+        "                  ((m x) (quote (a . x)))))) "
+        "  (m b))",
+        env);
+    ASSERT(IS_PAIR(result));
+    ASSERT(IS_ATOM(car(result)));
+    ASSERT_STR_EQ(ctx.atom_table[CELL_ID(car(result))], "a");
+    ASSERT(IS_ATOM(cdr(result)));
+    ASSERT_STR_EQ(ctx.atom_table[CELL_ID(cdr(result))], "b");
+
+    result = eval_string(
+        "(let-syntax ((m (syntax-rules () "
+        "                  ((m x) (quote (x . b)))))) "
+        "  (m a))",
+        env);
+    ASSERT(IS_PAIR(result));
+    ASSERT(IS_ATOM(car(result)));
+    ASSERT_STR_EQ(ctx.atom_table[CELL_ID(car(result))], "a");
+    ASSERT(IS_ATOM(cdr(result)));
+    ASSERT_STR_EQ(ctx.atom_table[CELL_ID(cdr(result))], "b");
+    PASS();
+}
+
+TEST(compiled_syntax_rules_unwraps_pattern_vars_in_quoted_templates)
+{
+    unsigned env = default_environment();
+    unsigned result = compiled_eval_string(
+        "(let-syntax ((m (syntax-rules () "
+        "                  ((m x) (quote (a . x)))))) "
+        "  (m b))",
+        env);
+    ASSERT(IS_PAIR(result));
+    ASSERT(IS_ATOM(car(result)));
+    ASSERT_STR_EQ(ctx.atom_table[CELL_ID(car(result))], "a");
+    ASSERT(IS_ATOM(cdr(result)));
+    ASSERT_STR_EQ(ctx.atom_table[CELL_ID(cdr(result))], "b");
+
+    result = compiled_eval_string(
+        "(let-syntax ((m (syntax-rules () "
+        "                  ((m x) (quote (x . b)))))) "
+        "  (m a))",
+        env);
+    ASSERT(IS_PAIR(result));
+    ASSERT(IS_ATOM(car(result)));
+    ASSERT_STR_EQ(ctx.atom_table[CELL_ID(car(result))], "a");
+    ASSERT(IS_ATOM(cdr(result)));
+    ASSERT_STR_EQ(ctx.atom_table[CELL_ID(cdr(result))], "b");
+    PASS();
+}
+
+TEST(eval_macro_hygiene_preserves_quasiquote_data)
+{
+    unsigned env = default_environment();
+    unsigned result = eval_string(
+        "(equal? "
+        "  (let-syntax "
+        "      ((m (syntax-rules () "
+        "            ((m) "
+        "             (list (let ((x 1)) `x) "
+        "                   (let ((x 1)) `(a ,x)) "
+        "                   `(+ 1 2)))))) "
+        "    (m)) "
+        "  '(x (a 1) (+ 1 2)))",
+        env);
+    ASSERT(result == ctx.atom_true);
+    PASS();
+}
+
+TEST(compiled_macro_hygiene_preserves_quasiquote_data)
+{
+    unsigned env = default_environment();
+    unsigned result = compiled_eval_string(
+        "(equal? "
+        "  (let-syntax "
+        "      ((m (syntax-rules () "
+        "            ((m) "
+        "             (list (let ((x 1)) `x) "
+        "                   (let ((x 1)) `(a ,x)) "
+        "                   `(+ 1 2)))))) "
+        "    (m)) "
+        "  '(x (a 1) (+ 1 2)))",
+        env);
+    ASSERT(result == ctx.atom_true);
+    PASS();
+}
+
+TEST(eval_syntax_rules_literals_compare_lexical_bindings)
+{
+    unsigned env = default_environment();
+    unsigned result = eval_string(
+        "(list "
+        "  (let-syntax "
+        "      ((m (syntax-rules (lit) "
+        "            ((m lit) 'literal) "
+        "            ((m x) 'variable)))) "
+        "    (let ((lit 1)) "
+        "      (m lit))) "
+        "  (let ((lit 1)) "
+        "    (let-syntax "
+        "        ((m (syntax-rules (lit) "
+        "              ((m lit) 'literal) "
+        "              ((m x) 'variable)))) "
+        "      (m lit))) "
+        "  (let ((lit 1)) "
+        "    (let-syntax "
+        "        ((m (syntax-rules (lit) "
+        "              ((m lit) 'literal) "
+        "              ((m x) 'variable)))) "
+        "      (let ((lit 2)) "
+        "        (m lit)))))",
+        env);
+    ASSERT(IS_PAIR(result));
+    ASSERT_STR_EQ(ctx.atom_table[CELL_ID(car(result))], "variable");
+    ASSERT_STR_EQ(ctx.atom_table[CELL_ID(cadr(result))], "literal");
+    ASSERT_STR_EQ(ctx.atom_table[CELL_ID(caddr(result))], "variable");
+    PASS();
+}
+
+TEST(compiled_syntax_rules_literals_compare_lexical_bindings)
+{
+    unsigned env = default_environment();
+    unsigned result = compiled_eval_string(
+        "(list "
+        "  (let-syntax "
+        "      ((m (syntax-rules (lit) "
+        "            ((m lit) 'literal) "
+        "            ((m x) 'variable)))) "
+        "    (let ((lit 1)) "
+        "      (m lit))) "
+        "  (let ((lit 1)) "
+        "    (let-syntax "
+        "        ((m (syntax-rules (lit) "
+        "              ((m lit) 'literal) "
+        "              ((m x) 'variable)))) "
+        "      (m lit))) "
+        "  (let ((lit 1)) "
+        "    (let-syntax "
+        "        ((m (syntax-rules (lit) "
+        "              ((m lit) 'literal) "
+        "              ((m x) 'variable)))) "
+        "      (let ((lit 2)) "
+        "        (m lit)))))",
+        env);
+    ASSERT(IS_PAIR(result));
+    ASSERT_STR_EQ(ctx.atom_table[CELL_ID(car(result))], "variable");
+    ASSERT_STR_EQ(ctx.atom_table[CELL_ID(cadr(result))], "literal");
+    ASSERT_STR_EQ(ctx.atom_table[CELL_ID(caddr(result))], "variable");
+    PASS();
+}
+
+TEST(eval_syntax_rules_underscore_literal_is_not_wildcard)
+{
+    unsigned env = default_environment();
+    unsigned result = eval_string(
+        "(equal? "
+        "  (list "
+        "    (let-syntax "
+        "        ((m (syntax-rules (_) "
+        "              ((m _) 'literal) "
+        "              ((m x) 'variable)))) "
+        "      (list (m _) (m a))) "
+        "    (let ((_ 1)) "
+        "      (let-syntax "
+        "          ((m (syntax-rules (_) "
+        "                ((m _) 'literal) "
+        "                ((m x) 'variable)))) "
+        "        (list (m _) (let ((_ 2)) (m _)))))) "
+        "  '((literal variable) (literal variable)))",
+        env);
+    ASSERT(result == ctx.atom_true);
+    PASS();
+}
+
+TEST(compiled_syntax_rules_underscore_literal_is_not_wildcard)
+{
+    unsigned env = default_environment();
+    unsigned result = compiled_eval_string(
+        "(equal? "
+        "  (list "
+        "    (let-syntax "
+        "        ((m (syntax-rules (_) "
+        "              ((m _) 'literal) "
+        "              ((m x) 'variable)))) "
+        "      (list (m _) (m a))) "
+        "    (let ((_ 1)) "
+        "      (let-syntax "
+        "          ((m (syntax-rules (_) "
+        "                ((m _) 'literal) "
+        "                ((m x) 'variable)))) "
+        "        (list (m _) (let ((_ 2)) (m _)))))) "
+        "  '((literal variable) (literal variable)))",
+        env);
+    ASSERT(result == ctx.atom_true);
+    PASS();
+}
+
+TEST(eval_syntax_rules_treats_booleans_as_literals)
+{
+    unsigned env = default_environment();
+    unsigned result = eval_string(
+        "(equal? "
+        "  (let-syntax "
+        "      ((m (syntax-rules () "
+        "            ((m #t) 'yes) "
+        "            ((m x) 'no)))) "
+        "    (list (m #t) (m #f) (m 1))) "
+        "  '(yes no no))",
+        env);
+    ASSERT(result == ctx.atom_true);
+
+    result = eval_string(
+        "(let-syntax ((m (syntax-rules () ((m x) #t)))) (m ignored))",
+        env);
+    ASSERT(result == ctx.atom_true);
+
+    ASSERT(eval_string(
+               "(let-syntax ((m (syntax-rules (#t) ((m #t) 'yes)))) "
+               "  (m #t))",
+               env) == TOK_ERROR);
+    ASSERT(eval_string(
+               "(let-syntax ((m (syntax-rules #t () ((m) 'yes)))) "
+               "  (m))",
+               env) == TOK_ERROR);
+    PASS();
+}
+
+TEST(compiled_syntax_rules_treats_booleans_as_literals)
+{
+    unsigned env = default_environment();
+    unsigned result = compiled_eval_string(
+        "(equal? "
+        "  (let-syntax "
+        "      ((m (syntax-rules () "
+        "            ((m #t) 'yes) "
+        "            ((m x) 'no)))) "
+        "    (list (m #t) (m #f) (m 1))) "
+        "  '(yes no no))",
+        env);
+    ASSERT(result == ctx.atom_true);
+
+    result = compiled_eval_string(
+        "(let-syntax ((m (syntax-rules () ((m x) #t)))) (m ignored))",
+        env);
+    ASSERT(result == ctx.atom_true);
+
+    ASSERT(compiled_eval_string(
+               "(let-syntax ((m (syntax-rules (#t) ((m #t) 'yes)))) "
+               "  (m #t))",
+               env) == TOK_ERROR);
+    ASSERT(compiled_eval_string(
+               "(let-syntax ((m (syntax-rules #t () ((m) 'yes)))) "
+               "  (m))",
+               env) == TOK_ERROR);
+    PASS();
+}
+
+TEST(eval_syntax_rules_ellipsis_allows_tail_patterns)
+{
+    unsigned env = default_environment();
+    unsigned result = eval_string(
+        "(let-syntax "
+        "    ((m (syntax-rules () "
+        "          ((m (x ... y z)) "
+        "           (list (list x ...) y z))))) "
+        "  (m (1 2 3)))",
+        env);
+    ASSERT(IS_PAIR(result));
+    ASSERT(IS_PAIR(car(result)));
+    ASSERT(is_int(caar(result), 1));
+    ASSERT(is_int(cadr(result), 2));
+    ASSERT(is_int(caddr(result), 3));
+
+    result = eval_string(
+        "(equal? "
+        "  (let-syntax "
+        "      ((m (syntax-rules () "
+        "            ((m #(x ... y z)) "
+        "             (list (list x ...) y z))))) "
+        "    (list (m #(1 2 3)) (m #(1 2)))) "
+        "  '(((1) 2 3) (() 1 2)))",
+        env);
+    ASSERT(result == ctx.atom_true);
+    PASS();
+}
+
+TEST(eval_syntax_rules_vector_template_repeats_compound_elements)
+{
+    unsigned env = default_environment();
+    unsigned result = eval_string(
+        "(let ((v (let-syntax "
+        "             ((m (syntax-rules () "
+        "                   ((m (x ...) (y ...)) "
+        "                    #((list x y) ...))))) "
+        "           (m (1 2) (3 4))))) "
+        "  (and (= (vector-length v) 2) "
+        "       (= (car (cdr (vector-ref v 0))) 1) "
+        "       (= (car (cdr (cdr (vector-ref v 0)))) 3) "
+        "       (= (car (cdr (vector-ref v 1))) 2) "
+        "       (= (car (cdr (cdr (vector-ref v 1)))) 4)))",
+        env);
+    ASSERT(result == ctx.atom_true);
+
+    result = eval_string(
+        "(let ((v (let-syntax "
+        "             ((m (syntax-rules () "
+        "                   ((m ((x y) ...)) "
+        "                    #((list x y) ...))))) "
+        "           (m ((1 2) (3 4)))))) "
+        "  (and (= (vector-length v) 2) "
+        "       (= (car (cdr (vector-ref v 0))) 1) "
+        "       (= (car (cdr (cdr (vector-ref v 0)))) 2) "
+        "       (= (car (cdr (vector-ref v 1))) 3) "
+        "       (= (car (cdr (cdr (vector-ref v 1)))) 4)))",
+        env);
+    ASSERT(result == ctx.atom_true);
+
+    ASSERT(eval_string(
+               "(let-syntax "
+               "    ((m (syntax-rules () "
+               "          ((m (x ...) (y ...)) "
+               "           (quote ((x y) ...)))))) "
+               "  (m (1 2 3) (4 5)))",
+               env) == TOK_ERROR);
+    ASSERT(eval_string(
+               "(let-syntax "
+               "    ((m (syntax-rules () "
+               "          ((m (x ...) (y ...)) "
+               "           #((x y) ...))))) "
+               "  (m (1 2 3) (4 5)))",
+               env) == TOK_ERROR);
+    PASS();
+}
+
+TEST(compiled_syntax_rules_ellipsis_allows_tail_patterns)
+{
+    unsigned env = default_environment();
+    unsigned result = compiled_eval_string(
+        "(let-syntax "
+        "    ((m (syntax-rules () "
+        "          ((m (x ... y z)) "
+        "           (list (list x ...) y z))))) "
+        "  (m (1 2 3)))",
+        env);
+    ASSERT(IS_PAIR(result));
+    ASSERT(IS_PAIR(car(result)));
+    ASSERT(is_int(caar(result), 1));
+    ASSERT(is_int(cadr(result), 2));
+    ASSERT(is_int(caddr(result), 3));
+
+    result = compiled_eval_string(
+        "(equal? "
+        "  (let-syntax "
+        "      ((m (syntax-rules () "
+        "            ((m #(x ... y z)) "
+        "             (list (list x ...) y z))))) "
+        "    (list (m #(1 2 3)) (m #(1 2)))) "
+        "  '(((1) 2 3) (() 1 2)))",
+        env);
+    ASSERT(result == ctx.atom_true);
+
+    ASSERT(compiled_eval_string(
+               "(let-syntax "
+               "    ((m (syntax-rules () "
+               "          ((m (x ...) (y ...)) "
+               "           (quote ((x y) ...)))))) "
+               "  (m (1 2 3) (4 5)))",
+               env) == TOK_ERROR);
+    ASSERT(compiled_eval_string(
+               "(let-syntax "
+               "    ((m (syntax-rules () "
+               "          ((m (x ...) (y ...)) "
+               "           #((x y) ...))))) "
+               "  (m (1 2 3) (4 5)))",
+               env) == TOK_ERROR);
+    PASS();
+}
+
+TEST(compiled_syntax_rules_vector_template_repeats_compound_elements)
+{
+    unsigned env = default_environment();
+    unsigned result = compiled_eval_string(
+        "(let ((v (let-syntax "
+        "             ((m (syntax-rules () "
+        "                   ((m (x ...) (y ...)) "
+        "                    #((list x y) ...))))) "
+        "           (m (1 2) (3 4))))) "
+        "  (and (= (vector-length v) 2) "
+        "       (= (car (cdr (vector-ref v 0))) 1) "
+        "       (= (car (cdr (cdr (vector-ref v 0)))) 3) "
+        "       (= (car (cdr (vector-ref v 1))) 2) "
+        "       (= (car (cdr (cdr (vector-ref v 1)))) 4)))",
+        env);
+    ASSERT(result == ctx.atom_true);
+
+    result = compiled_eval_string(
+        "(let ((v (let-syntax "
+        "             ((m (syntax-rules () "
+        "                   ((m ((x y) ...)) "
+        "                    #((list x y) ...))))) "
+        "           (m ((1 2) (3 4)))))) "
+        "  (and (= (vector-length v) 2) "
+        "       (= (car (cdr (vector-ref v 0))) 1) "
+        "       (= (car (cdr (cdr (vector-ref v 0)))) 2) "
+        "       (= (car (cdr (vector-ref v 1))) 3) "
+        "       (= (car (cdr (cdr (vector-ref v 1)))) 4)))",
+        env);
+    ASSERT(result == ctx.atom_true);
+    PASS();
+}
+
+TEST(eval_macro_set_target_is_referentially_transparent)
+{
+    unsigned env = default_environment();
+    unsigned result = eval_string(
+        "(let ((x 0)) "
+        "  (list "
+        "    (let-syntax "
+        "        ((m (syntax-rules () "
+        "              ((m) (set! x 1))))) "
+        "      (let ((x 2)) "
+        "        (m) "
+        "        x)) "
+        "    x))",
+        env);
+    ASSERT(IS_PAIR(result));
+    ASSERT(is_int(car(result), 2));
+    ASSERT(is_int(cadr(result), 1));
+
+    result = eval_string(
+        "(let ((x 0)) "
+        "  (let-syntax "
+        "      ((m (syntax-rules () "
+        "            ((m y) (set! y 1))))) "
+        "    (let ((x 2)) "
+        "      (m x) "
+        "      x)))",
+        env);
+    ASSERT(is_int(result, 1));
+    PASS();
+}
+
+TEST(compiled_macro_set_target_is_referentially_transparent)
+{
+    unsigned env = default_environment();
+    unsigned result = compiled_eval_string(
+        "(let ((x 0)) "
+        "  (list "
+        "    (let-syntax "
+        "        ((m (syntax-rules () "
+        "              ((m) (set! x 1))))) "
+        "      (let ((x 2)) "
+        "        (m) "
+        "        x)) "
+        "    x))",
+        env);
+    ASSERT(IS_PAIR(result));
+    ASSERT(is_int(car(result), 2));
+    ASSERT(is_int(cadr(result), 1));
+
+    result = compiled_eval_string(
+        "(let ((x 0)) "
+        "  (let-syntax "
+        "      ((m (syntax-rules () "
+        "            ((m y) (set! y 1))))) "
+        "    (let ((x 2)) "
+        "      (m x) "
+        "      x)))",
+        env);
+    ASSERT(is_int(result, 1));
+    PASS();
+}
+
+TEST(eval_macro_hygiene_renames_nested_syntax_rules_templates)
+{
+    unsigned env = default_environment();
+    unsigned result = eval_string(
+        "(let ((x 0)) "
+        "  (let-syntax "
+        "      ((m (syntax-rules () "
+        "            ((m) "
+        "             (let ((x 1)) "
+        "               (let-syntax "
+        "                   ((n (syntax-rules () ((n) x)))) "
+        "                 (let ((x 2)) (n)))))))) "
+        "    (m)))",
+        env);
+    ASSERT(is_int(result, 1));
+
+    result = eval_string(
+        "(let ((x 0)) "
+        "  (let-syntax "
+        "      ((m (syntax-rules () "
+        "            ((m) "
+        "             (let ((x 1)) "
+        "               (let-syntax "
+        "                   ((n (syntax-rules () ((n x) x)))) "
+        "                 (n 9))))))) "
+        "    (m)))",
+        env);
+    ASSERT(is_int(result, 9));
+
+    ASSERT(eval_string(
+               "(define-syntax let "
+               "  (syntax-rules () "
+               "    ((let name ((var init) ...) body ...) "
+               "     (letrec ((name (lambda (var ...) body ...))) "
+               "       (name init ...))) "
+               "    ((let ((var init) ...) body ...) "
+               "     ((lambda (var ...) body ...) init ...))))",
+               env) != TOK_ERROR);
+    result = eval_string(
+        "(let ((x 0)) "
+        "  (let-syntax "
+        "      ((m (syntax-rules () "
+        "            ((m) "
+        "             (let loop ((x 1)) "
+        "               (let-syntax "
+        "                   ((n (syntax-rules () ((n) x)))) "
+        "                 (let ((x 2)) (n)))))))) "
+        "    (m)))",
+        env);
+    ASSERT(is_int(result, 1));
+    PASS();
+}
+
+TEST(compiled_macro_hygiene_renames_nested_syntax_rules_templates)
+{
+    unsigned env = default_environment();
+    unsigned result = compiled_eval_string(
+        "(let ((x 0)) "
+        "  (let-syntax "
+        "      ((m (syntax-rules () "
+        "            ((m) "
+        "             (let ((x 1)) "
+        "               (let-syntax "
+        "                   ((n (syntax-rules () ((n) x)))) "
+        "                 (let ((x 2)) (n)))))))) "
+        "    (m)))",
+        env);
+    ASSERT(is_int(result, 1));
+
+    result = compiled_eval_string(
+        "(let ((x 0)) "
+        "  (let-syntax "
+        "      ((m (syntax-rules () "
+        "            ((m) "
+        "             (let ((x 1)) "
+        "               (let-syntax "
+        "                   ((n (syntax-rules () ((n x) x)))) "
+        "                 (n 9))))))) "
+        "    (m)))",
+        env);
+    ASSERT(is_int(result, 9));
+
+    ASSERT(eval_string(
+               "(define-syntax let "
+               "  (syntax-rules () "
+               "    ((let name ((var init) ...) body ...) "
+               "     (letrec ((name (lambda (var ...) body ...))) "
+               "       (name init ...))) "
+               "    ((let ((var init) ...) body ...) "
+               "     ((lambda (var ...) body ...) init ...))))",
+               env) != TOK_ERROR);
+    result = compiled_eval_string(
+        "(let ((x 0)) "
+        "  (let-syntax "
+        "      ((m (syntax-rules () "
+        "            ((m) "
+        "             (let loop ((x 1)) "
+        "               (let-syntax "
+        "                   ((n (syntax-rules () ((n) x)))) "
+        "                 (let ((x 2)) (n)))))))) "
+        "    (m)))",
+        env);
+    ASSERT(is_int(result, 1));
+
+    result = compiled_eval_string(
+        "(let-syntax ((k (syntax-rules () ((k) 1)))) "
+        "  (let-syntax "
+        "      ((outer (syntax-rules () "
+        "                ((outer) "
+        "                 (let-syntax "
+        "                     ((inner (syntax-rules () ((inner) k)))) "
+        "                   0))))) "
+        "    (outer)))",
+        env);
+    ASSERT(is_int(result, 0));
+
+    result = compiled_eval_string(
+        "(let-syntax ((k (syntax-rules () ((k) 1)))) "
+        "  (let-syntax "
+        "      ((outer (syntax-rules () "
+        "                ((outer) "
+        "                 (let-syntax "
+        "                     ((inner (syntax-rules () ((inner) (k))))) "
+        "                   (inner)))))) "
+        "    (outer)))",
+        env);
+    ASSERT(is_int(result, 1));
+
+    result = compiled_eval_string(
+        "(letrec-syntax "
+        "    ((m (syntax-rules () ((m) (n)))) "
+        "     (n (syntax-rules () ((n) 7)))) "
+        "  (m))",
+        env);
+    ASSERT(is_int(result, 7));
+
+    result = compiled_eval_string(
+        "(let-syntax ((n (syntax-rules () ((n) 1)))) "
+        "  (letrec-syntax "
+        "      ((m (syntax-rules () ((m) (n)))) "
+        "       (n (syntax-rules () ((n) 7)))) "
+        "    (m)))",
+        env);
+    ASSERT(is_int(result, 7));
+
+    PASS();
+}
+
+TEST(eval_macro_define_target_is_hygienic)
+{
+    unsigned env = default_environment();
+    unsigned result = eval_string(
+        "(let ((x 0)) "
+        "  (let-syntax "
+        "      ((m (syntax-rules () "
+        "            ((m) (define x 1))))) "
+        "    (m) "
+        "    x))",
+        env);
+    ASSERT(is_int(result, 0));
+
+    result = eval_string(
+        "(let ((x 0)) "
+        "  (let-syntax "
+        "      ((m (syntax-rules () "
+        "            ((m) (begin (define x 1) x))))) "
+        "    (m)))",
+        env);
+    ASSERT(is_int(result, 1));
+
+    result = eval_string(
+        "(let ((x 10)) "
+        "  (let-syntax "
+        "      ((m (syntax-rules () "
+        "            ((m y) (begin (define (f x) y) (f 1)))))) "
+        "    (m x)))",
+        env);
+    ASSERT(is_int(result, 10));
+
+    result = eval_string(
+        "(let ((x 0)) "
+        "  (let-syntax "
+        "      ((m (syntax-rules () "
+        "            ((m) (let () (define x 1) x))))) "
+        "    (m)))",
+        env);
+    ASSERT(is_int(result, 1));
+
+    result = eval_string(
+        "(let ((x 0)) "
+        "  (let-syntax "
+        "      ((m (syntax-rules () "
+        "            ((m) (let* () (define x 1) x))))) "
+        "    (m)))",
+        env);
+    ASSERT(is_int(result, 1));
+
+    ASSERT(eval_string(
+               "(define-syntax let "
+               "  (syntax-rules () "
+               "    ((let name ((var init) ...) body ...) "
+               "     (letrec ((name (lambda (var ...) body ...))) "
+               "       (name init ...))) "
+               "    ((let ((var init) ...) body ...) "
+               "     ((lambda (var ...) body ...) init ...))))",
+               env) != TOK_ERROR);
+    result = eval_string(
+        "(let ((x 0)) "
+        "  (let-syntax "
+        "      ((m (syntax-rules () "
+        "            ((m) (let loop () (define x 1) x))))) "
+        "    (m)))",
+        env);
+    ASSERT(is_int(result, 1));
+    PASS();
+}
+
+TEST(compiled_macro_define_target_is_hygienic)
+{
+    unsigned env = default_environment();
+    unsigned result = compiled_eval_string(
+        "(let ((x 0)) "
+        "  (let-syntax "
+        "      ((m (syntax-rules () "
+        "            ((m) (define x 1))))) "
+        "    (m) "
+        "    x))",
+        env);
+    ASSERT(is_int(result, 0));
+
+    result = compiled_eval_string(
+        "(let ((x 0)) "
+        "  (let-syntax "
+        "      ((m (syntax-rules () "
+        "            ((m) (begin (define x 1) x))))) "
+        "    (m)))",
+        env);
+    ASSERT(is_int(result, 1));
+
+    result = compiled_eval_string(
+        "(let ((x 10)) "
+        "  (let-syntax "
+        "      ((m (syntax-rules () "
+        "            ((m y) (begin (define (f x) y) (f 1)))))) "
+        "    (m x)))",
+        env);
+    ASSERT(is_int(result, 10));
+
+    result = compiled_eval_string(
+        "(let ((x 0)) "
+        "  (let-syntax "
+        "      ((m (syntax-rules () "
+        "            ((m) (let () (define x 1) x))))) "
+        "    (m)))",
+        env);
+    ASSERT(is_int(result, 1));
+
+    result = compiled_eval_string(
+        "(let ((x 0)) "
+        "  (let-syntax "
+        "      ((m (syntax-rules () "
+        "            ((m) (let* () (define x 1) x))))) "
+        "    (m)))",
+        env);
+    ASSERT(is_int(result, 1));
+
+    ASSERT(eval_string(
+               "(define-syntax let "
+               "  (syntax-rules () "
+               "    ((let name ((var init) ...) body ...) "
+               "     (letrec ((name (lambda (var ...) body ...))) "
+               "       (name init ...))) "
+               "    ((let ((var init) ...) body ...) "
+               "     ((lambda (var ...) body ...) init ...))))",
+               env) != TOK_ERROR);
+    result = compiled_eval_string(
+        "(let ((x 0)) "
+        "  (let-syntax "
+        "      ((m (syntax-rules () "
+        "            ((m) (let loop () (define x 1) x))))) "
+        "    (m)))",
+        env);
+    ASSERT(is_int(result, 1));
+    PASS();
+}
+
 TEST(compiled_macro_thunk_captures_stack_local)
 {
     unsigned env = default_environment();
@@ -2352,6 +4528,51 @@ TEST(compiled_macro_thunk_captures_stack_local)
         "  ((lambda (k) (call-thunk (k #t))) (lambda (x) x)))",
         env);
     ASSERT(result == ctx.atom_true);
+    PASS();
+}
+
+TEST(compiled_binding_initializer_closures_capture_stack_locals)
+{
+    unsigned env = default_environment();
+    ASSERT(is_int(
+        compiled_eval_string(
+            "(begin "
+            "  (define make-let-capture "
+            "    (lambda (x) (let ((f (lambda () x))) f))) "
+            "  ((make-let-capture 42)))",
+            env),
+        42));
+
+    ASSERT(is_int(
+        compiled_eval_string(
+            "(begin "
+            "  (define make-letstar-capture "
+            "    (lambda (x) (let* ((f (lambda () x))) f))) "
+            "  ((make-letstar-capture 43)))",
+            env),
+        43));
+
+    ASSERT(is_int(
+        compiled_eval_string(
+            "(begin "
+            "  (define make-letrec-capture "
+            "    (lambda (x) (letrec ((f (lambda () x))) f))) "
+            "  ((make-letrec-capture 44)))",
+            env),
+        44));
+
+    unsigned shadowed_quote_result = compiled_eval_string(
+        "(begin "
+        "  (define make-shadowed-quote-capture "
+        "    (lambda (x) "
+        "      (let ((quote list)) "
+        "        (lambda () (quote x))))) "
+        "  ((make-shadowed-quote-capture 45)))",
+        env);
+    ASSERT(IS_PAIR(shadowed_quote_result));
+    ASSERT(is_int(car(shadowed_quote_result), 45));
+    ASSERT(cdr(shadowed_quote_result) == 0);
+
     PASS();
 }
 
@@ -2400,9 +4621,12 @@ int main(void)
     RUN_TEST(eval_integer);
     RUN_TEST(eval_direct_fixnum_expression);
     RUN_TEST(compiled_direct_fixnum_expression);
+    RUN_TEST(compiled_booleans_are_self_evaluating);
     RUN_TEST(eval_negative_integer);
     RUN_TEST(eval_true);
     RUN_TEST(eval_false);
+    RUN_TEST(eval_rejects_boolean_binding_names);
+    RUN_TEST(compiled_rejects_boolean_binding_names);
     RUN_TEST(eval_quote);
 
     // Arithmetic
@@ -2440,6 +4664,7 @@ int main(void)
     RUN_TEST(eval_load_rejects_non_string);
     RUN_TEST(compiled_load_rejects_non_string);
     RUN_TEST(eval_load_reads_file_with_port_reader);
+    RUN_TEST(eval_load_rejects_reader_token_sentinel);
 
     // Define
     RUN_TEST(eval_define_variable);
@@ -2448,7 +4673,15 @@ int main(void)
 
     // Let
     RUN_TEST(eval_let_simple);
+    RUN_TEST(eval_named_let);
+    RUN_TEST(compiled_named_let);
+    RUN_TEST(eval_let_accepts_quoted_cyclic_data);
+    RUN_TEST(compiled_let_accepts_quoted_cyclic_data);
     RUN_TEST(eval_let_nested);
+    RUN_TEST(eval_empty_let_forms_do_not_leak_internal_defines);
+    RUN_TEST(compiled_empty_let_forms_do_not_leak_internal_defines);
+    RUN_TEST(eval_empty_syntax_binding_forms_do_not_leak_internal_defines);
+    RUN_TEST(compiled_empty_syntax_binding_forms_do_not_leak_internal_defines);
     RUN_TEST(eval_letstar);
     RUN_TEST(eval_letrec);
 
@@ -2484,6 +4717,8 @@ int main(void)
     RUN_TEST(gc_preserves_current_input_string_port);
     RUN_TEST(eval_read_string_port_preserves_unread_delimiter);
     RUN_TEST(eval_read_file_port_preserves_unread_delimiter);
+    RUN_TEST(eval_read_rejects_reader_token_sentinels);
+    RUN_TEST(compiled_read_rejects_reader_token_sentinels);
     RUN_TEST(eval_read_bytevector_preserves_unread_delimiter);
     RUN_TEST(gc_preserves_current_output_string_port);
     RUN_TEST(eval_newline_rejects_closed_current_output_port);
@@ -2502,7 +4737,14 @@ int main(void)
     RUN_TEST(eval_apply_simple);
     RUN_TEST(eval_apply_lambda);
     RUN_TEST(eval_rejects_improper_application);
+    RUN_TEST(eval_special_form_keywords_respect_lexical_bindings);
     RUN_TEST(eval_quasiquote_unquotes_vector_element);
+    RUN_TEST(eval_quasiquote_respects_shadowed_keywords);
+    RUN_TEST(eval_quasiquote_rejects_top_level_splicing);
+    RUN_TEST(eval_quasiquote_splicing_preserves_dotted_tail);
+    RUN_TEST(eval_quasiquote_rejects_improper_splice_value);
+    RUN_TEST(eval_quasiquote_rejects_malformed_subforms);
+    RUN_TEST(eval_quasiquote_allows_data_in_unquote_expression);
 
     // List operations
     RUN_TEST(eval_cons);
@@ -2514,6 +4756,7 @@ int main(void)
     RUN_TEST(eval_gc_stats_shape);
     RUN_TEST(eval_string_to_symbol_preserves_numeric_text);
     RUN_TEST(eval_environment_rejects_non_integer_version);
+    RUN_TEST(eval_null_environment_booleans_are_self_evaluating);
 
     // Bytevectors
     RUN_TEST(eval_bytevector_rejects_out_of_range_constructor);
@@ -2563,6 +4806,8 @@ int main(void)
     RUN_TEST(compiled_div_int64_min_by_negative_one);
     RUN_TEST(compiled_modulo_int64_min_by_negative_one);
     RUN_TEST(compiled_letrec_tail_call_many_args);
+    RUN_TEST(compiled_let_forms_preserve_enclosing_tail_context);
+    RUN_TEST(compiled_cond_arrow_preserves_tail_context);
     RUN_TEST(compiled_string_to_list_allocates_fresh_result);
     RUN_TEST(compiled_begin_preserves_unbound_lookup_error);
     RUN_TEST(compiled_multiply_by_zero_preserves_side_effects);
@@ -2589,19 +4834,59 @@ int main(void)
     RUN_TEST(compiled_vector_ref_rejects_non_vector);
     RUN_TEST(compiled_call_rejects_fixnum_operator);
     RUN_TEST(compiled_rejects_improper_application);
+    RUN_TEST(compiled_special_form_keywords_respect_lexical_bindings);
+    RUN_TEST(compiled_lambda_optimizations_respect_syntax_binding);
+    RUN_TEST(eval_macro_expansion_rejects_recursive_expansion);
     RUN_TEST(compiled_rejects_malformed_lambda);
     RUN_TEST(compiled_lambda_rejects_wrong_arity);
+    RUN_TEST(compiled_let_lambda_handles_dotted_formals_in_self_reference_check);
     RUN_TEST(compiled_rejects_malformed_special_forms);
     RUN_TEST(compiled_quasiquote_unquotes_vector_element);
+    RUN_TEST(compiled_quasiquote_respects_shadowed_keywords);
+    RUN_TEST(compiled_quasiquote_rejects_top_level_splicing);
+    RUN_TEST(compiled_quasiquote_splicing_preserves_dotted_tail);
+    RUN_TEST(compiled_quasiquote_rejects_improper_splice_value);
+    RUN_TEST(compiled_quasiquote_rejects_malformed_subforms);
+    RUN_TEST(compiled_quasiquote_allows_data_in_unquote_expression);
     RUN_TEST(compiled_local_set_returns_assigned_value);
     RUN_TEST(compiled_call_with_values_accepts_zero_values);
     RUN_TEST(compiled_call_with_values_zero_values_to_list);
     RUN_TEST(compiled_call_with_values_rejects_non_producer);
     RUN_TEST(compiled_define_syntax_preserves_custom_ellipsis);
+    RUN_TEST(compiled_begin_define_syntax_is_visible_to_later_forms);
     RUN_TEST(compiled_let_syntax_preserves_custom_ellipsis);
     RUN_TEST(eval_syntax_rules_respects_shadowed_ellipsis);
     RUN_TEST(compiled_syntax_rules_respects_shadowed_ellipsis);
+    RUN_TEST(eval_macro_hygiene_preserves_quoted_introduced_names);
+    RUN_TEST(compiled_macro_hygiene_preserves_quoted_introduced_names);
+    RUN_TEST(eval_macro_hygiene_prevents_use_site_capture);
+    RUN_TEST(compiled_macro_hygiene_prevents_use_site_capture);
+    RUN_TEST(eval_macro_hygiene_respects_shadowed_quote_in_templates);
+    RUN_TEST(compiled_macro_hygiene_respects_shadowed_quote_in_templates);
+    RUN_TEST(eval_macro_hygiene_preserves_definition_site_keyword_bindings);
+    RUN_TEST(compiled_macro_hygiene_preserves_definition_site_keyword_bindings);
+    RUN_TEST(eval_syntax_rules_unwraps_pattern_vars_in_quoted_templates);
+    RUN_TEST(compiled_syntax_rules_unwraps_pattern_vars_in_quoted_templates);
+    RUN_TEST(eval_macro_hygiene_preserves_quasiquote_data);
+    RUN_TEST(compiled_macro_hygiene_preserves_quasiquote_data);
+    RUN_TEST(eval_syntax_rules_literals_compare_lexical_bindings);
+    RUN_TEST(compiled_syntax_rules_literals_compare_lexical_bindings);
+    RUN_TEST(eval_syntax_rules_underscore_literal_is_not_wildcard);
+    RUN_TEST(compiled_syntax_rules_underscore_literal_is_not_wildcard);
+    RUN_TEST(eval_syntax_rules_treats_booleans_as_literals);
+    RUN_TEST(compiled_syntax_rules_treats_booleans_as_literals);
+    RUN_TEST(eval_syntax_rules_ellipsis_allows_tail_patterns);
+    RUN_TEST(compiled_syntax_rules_ellipsis_allows_tail_patterns);
+    RUN_TEST(eval_syntax_rules_vector_template_repeats_compound_elements);
+    RUN_TEST(compiled_syntax_rules_vector_template_repeats_compound_elements);
+    RUN_TEST(eval_macro_set_target_is_referentially_transparent);
+    RUN_TEST(compiled_macro_set_target_is_referentially_transparent);
+    RUN_TEST(eval_macro_hygiene_renames_nested_syntax_rules_templates);
+    RUN_TEST(compiled_macro_hygiene_renames_nested_syntax_rules_templates);
+    RUN_TEST(eval_macro_define_target_is_hygienic);
+    RUN_TEST(compiled_macro_define_target_is_hygienic);
     RUN_TEST(compiled_macro_thunk_captures_stack_local);
+    RUN_TEST(compiled_binding_initializer_closures_capture_stack_locals);
     RUN_TEST(eval_calls_bytecode_closure_with_stack_locals);
 
     TEST_SUMMARY("evaluator");

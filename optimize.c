@@ -83,6 +83,8 @@ unsigned instruction_size(unsigned op)
     case OP_DEFSYNTAX:
     case OP_LETREC_MARK:
         return 2; // opcode + 1 operand
+    case OP_DEFINE_ALIAS:
+        return 3; // opcode + alias + target
     case OP_PRIM:
         return 3; // opcode + 2 operands
     default:
@@ -428,28 +430,32 @@ void peephole_optimize(code_object *code)
         // ================================================================
 
         // Pattern: CONST x, POP -> nothing (dead code)
-        if (op == OP_CONST && i + 2 < len && c[i + 2] == OP_POP) {
+        if (op == OP_CONST && i + 2 < len && c[i + 2] == OP_POP &&
+            !is_jump_target[i] && !is_jump_target[i + 2]) {
             remove[i] = remove[i + 1] = remove[i + 2] = true;
             i += 3;
             continue;
         }
 
         // Pattern: DUP, POP -> nothing
-        if (op == OP_DUP && i + 1 < len && c[i + 1] == OP_POP) {
+        if (op == OP_DUP && i + 1 < len && c[i + 1] == OP_POP &&
+            !is_jump_target[i] && !is_jump_target[i + 1]) {
             remove[i] = remove[i + 1] = true;
             i += 2;
             continue;
         }
 
         // Pattern: SWAP, SWAP -> nothing (identity)
-        if (op == OP_SWAP && i + 1 < len && c[i + 1] == OP_SWAP) {
+        if (op == OP_SWAP && i + 1 < len && c[i + 1] == OP_SWAP &&
+            !is_jump_target[i] && !is_jump_target[i + 1]) {
             remove[i] = remove[i + 1] = true;
             i += 2;
             continue;
         }
 
         // Pattern: NOT, JUMPIFNOT -> JUMPIF (remove NOT, change jump type)
-        if (op == OP_NOT && i + 1 < len && c[i + 1] == OP_JUMPIFNOT) {
+        if (op == OP_NOT && i + 1 < len && c[i + 1] == OP_JUMPIFNOT &&
+            !is_jump_target[i] && !is_jump_target[i + 1]) {
             remove[i] = true;
             c[i + 1] = OP_JUMPIF;
             i += 1; // Continue from JUMPIF
@@ -457,7 +463,8 @@ void peephole_optimize(code_object *code)
         }
 
         // Pattern: NOT, JUMPIF -> JUMPIFNOT (remove NOT, change jump type)
-        if (op == OP_NOT && i + 1 < len && c[i + 1] == OP_JUMPIF) {
+        if (op == OP_NOT && i + 1 < len && c[i + 1] == OP_JUMPIF &&
+            !is_jump_target[i] && !is_jump_target[i + 1]) {
             remove[i] = true;
             c[i + 1] = OP_JUMPIFNOT;
             i += 1;
@@ -547,7 +554,9 @@ void peephole_optimize(code_object *code)
 
         // Pattern: PAIRP, NOT -> use directly in conditional
         if (op == OP_PAIRP && i + 1 < len && c[i + 1] == OP_NOT &&
-            i + 2 < len && c[i + 2] == OP_JUMPIFNOT) {
+            i + 2 < len && c[i + 2] == OP_JUMPIFNOT &&
+            !is_jump_target[i] && !is_jump_target[i + 1] &&
+            !is_jump_target[i + 2]) {
             // PAIRP, NOT, JUMPIFNOT -> PAIRP, JUMPIF
             remove[i + 1] = true;
             c[i + 2] = OP_JUMPIF;
@@ -757,6 +766,7 @@ static const char *opcode_names[] = {
     [OP_SWAP] = "SWAP",
     [OP_LOOKUP] = "LOOKUP",
     [OP_DEFINE] = "DEFINE",
+    [OP_DEFINE_ALIAS] = "DEFINE_ALIAS",
     [OP_SET] = "SET",
     [OP_CLOSURE] = "CLOSURE",
     [OP_CALL] = "CALL",
@@ -903,6 +913,11 @@ void disassemble(code_object *code, const char *name)
         case OP_SET_VOID:
         case OP_DEFSYNTAX:
             printf(" %s", ctx.atom_table[code->code[ip++]]);
+            break;
+        case OP_DEFINE_ALIAS:
+            printf(" %s %s", ctx.atom_table[code->code[ip]],
+                   ctx.atom_table[code->code[ip + 1]]);
+            ip += 2;
             break;
         case OP_CALL:
         case OP_TAILCALL:

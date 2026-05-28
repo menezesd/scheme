@@ -237,6 +237,12 @@
 (test "map" '(2 4 6) (map (lambda (x) (* x 2)) '(1 2 3)))
 (test "apply" 6 (apply + '(1 2 3)))
 (test "for-each" 6 (let ((sum 0)) (for-each (lambda (x) (set! sum (+ sum x))) '(1 2 3)) sum))
+(test "for-each multiple stops at shortest" '(5 7)
+      (let ((seen '()))
+        (for-each (lambda (x y) (set! seen (cons (+ x y) seen)))
+                  '(1 2 3)
+                  '(4 5))
+        (reverse seen)))
 
 ;;; ============================================================================
 ;;; String ports
@@ -332,6 +338,13 @@
       (case (* 2 3) ((2 3 5 7) 'prime) ((1 4 6 8 9) 'composite)))
 (test "case else" 'other
       (case 10 ((1 2) 'small) ((3 4) 'medium) (else 'other)))
+(test "case evaluates key once" 1
+      (let ((count 0))
+        (case (begin (set! count (+ count 1)) 'c)
+          ((a) 'a)
+          ((b) 'b)
+          ((c) count)
+          (else 'other))))
 (test "do loop" 15
       (do ((i 0 (+ i 1)) (sum 0 (+ sum i))) ((= i 5) (+ sum i))))
 
@@ -388,6 +401,20 @@
 (test "fold-right" '(1 2 3 4 5) (fold-right cons '() '(1 2 3 4 5)))
 (test "take" '(1 2 3) (take 3 '(1 2 3 4 5)))
 (test "drop" '(4 5) (drop 3 '(1 2 3 4 5)))
+(test "take-right beyond length" '(1 2 3) (take-right '(1 2 3) 5))
+(test "drop-right beyond length" '() (drop-right '(1 2 3) 5))
+(test "split-at beyond length" '((1 2 3) ())
+      (call-with-values
+        (lambda () (split-at '(1 2 3) 5))
+        list))
+(test "split-at! beyond length" '((1 2 3) ())
+      (let ((lst (list 1 2 3)))
+        (call-with-values
+          (lambda () (split-at! lst 5))
+          list)))
+(test "take! beyond length" '(1 2 3)
+      (let ((lst (list 1 2 3)))
+        (take! lst 5)))
 (test "partition" '((2 4 6) (1 3 5)) (partition even? '(1 2 3 4 5 6)))
 (test "zip" '((1 a) (2 b) (3 c)) (zip '(1 2 3) '(a b c)))
 (test "flatten" '(1 2 3 4 5) (flatten '(1 (2 (3 4) 5))))

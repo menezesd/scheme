@@ -30,6 +30,8 @@
 // Forward declaration from eval.c
 unsigned qq_expand_cps(unsigned x, unsigned env);
 
+#define MAX_COMPILE_MACRO_EXPANSION_DEPTH 1000
+
 static void *malloc_array(unsigned count, size_t elem_size)
 {
     if (elem_size != 0 && (size_t)count > SIZE_MAX / elem_size)
@@ -40,10 +42,78 @@ static void *malloc_array(unsigned count, size_t elem_size)
 // Forward declaration for helper
 static void emit_gensym_definitions(compile_ctx *cctx, unsigned old_gensym,
                                     unsigned new_gensym);
+static void emit(compile_ctx *cctx, unsigned op);
 static void emit2(compile_ctx *cctx, unsigned op, unsigned arg);
 static void emit3(compile_ctx *cctx, unsigned op, unsigned arg1,
                   unsigned arg2);
 
+static int find_stack_local_slot(compile_ctx *cctx, int64_t var_id)
+{
+    if (cctx->num_locals <= 0)
+        return -1;
+
+    for (int i = 0; i < cctx->num_locals; i++) {
+        if (cctx->local_ids[i] == var_id)
+            return i;
+    }
+
+    return -1;
+}
+
+static void emit_local_get_slot(compile_ctx *cctx, int slot)
+{
+    if (slot < 4)
+        emit(cctx, OP_LOCAL_GET0 + slot);
+    else
+        emit2(cctx, OP_LOCAL_GET, (unsigned)slot);
+}
+
+static bool proper_list_silent(unsigned x)
+{
+    while (IS_PAIR(x))
+        x = cdr(x);
+    return x == 0;
+}
+
+static bool let_binding_has_value(unsigned binding)
+{
+    return IS_PAIR(binding) && IS_PAIR(cdr(binding)) && !cddr(binding);
+}
+
+static bool builtin_keyword_unbound(int64_t kw, unsigned env)
+{
+    return lookup_silent(kw, env) == TOK_ERROR;
+}
+
+static bool install_compile_time_define_syntax(unsigned expr, compile_ctx *cctx)
+{
+    if (!IS_PAIR(expr) || !IS_KEYWORD(car(expr), ctx.kw_define_syntax) ||
+        lookup_silent(ctx.kw_define_syntax, cctx->env) != TOK_ERROR ||
+        !proper_list_silent(cdr(expr)) || !IS_PAIR(cdr(expr)) ||
+        !IS_PAIR(cddr(expr)) || cdddr(expr)) {
+        return false;
+    }
+
+    unsigned name = cadr(expr);
+    unsigned transformer_form = caddr(expr);
+    int64_t ellipsis_id = syntax_default_ellipsis_id(cctx->env);
+    if (!identifier_valid(name) ||
+        !syntax_rules_valid(transformer_form, ellipsis_id, "define-syntax")) {
+        return false;
+    }
+
+    GC_GUARD;
+    gc_protect(&name);
+    gc_protect(&transformer_form);
+    gc_protect(&cctx->env);
+    unsigned transformer = make_syntax_transformer_with_default_ellipsis(
+        transformer_form, cctx->env, ellipsis_id);
+    if (transformer == TOK_ERROR)
+        return false;
+    gc_protect(&transformer);
+    defvar(name, transformer, cctx->env);
+    return true;
+}
 
 // ============================================================================
 // Compile Result - tracks constant propagation
@@ -105,28 +175,19 @@ static bool captured_by_inner_lambda(unsigned expr, int64_t var_id, unsigned env
                captured_by_inner_lambda(cdr(expr), var_id, env);
 
     int64_t kw = CELL_ID(car(expr));
-    if (kw == ctx.kw_quote)
+    if (kw == ctx.kw_quote && builtin_keyword_unbound(ctx.kw_quote, env))
         return false;
-    // lambda always captures
-    if (kw == ctx.kw_lambda)
-        return contains_reference(cdr(expr), var_id);
-    // let/let*/letrec expand to lambdas — check the BODY for capture
-    // (the binding init expressions are evaluated in the outer scope,
-    // so references there don't count as capture)
-    if (kw == ctx.kw_let || kw == ctx.kw_letstar || kw == ctx.kw_letrec) {
-        // For (let bindings body...), body is cddr(expr)
-        // But named let (let name bindings body...) has body at cdddr
-        unsigned second = cadr(expr);
-        unsigned body_start;
-        if (IS_ATOM(second)) {
-            // Named let: (let name ((v i) ...) body...)
-            body_start = cdddr(expr);
-        } else {
-            // Regular: (let ((v i) ...) body...)
-            body_start = cddr(expr);
-        }
-        return contains_reference(body_start, var_id);
-    }
+    // A nested lambda captures this variable if its body refers to the
+    // outer binding. Check the full lambda form so shadowing parameters are
+    // handled by contains_reference.
+    if (kw == ctx.kw_lambda && builtin_keyword_unbound(ctx.kw_lambda, env))
+        return contains_reference(expr, var_id);
+    // let/let*/letrec binding initializers may create closures over this
+    // variable, so scan the whole form for nested lambdas. Direct references
+    // do not count as captures because atoms return false above.
+    if ((kw == ctx.kw_let || kw == ctx.kw_letstar || kw == ctx.kw_letrec) &&
+        builtin_keyword_unbound(kw, env))
+        return captured_by_inner_lambda(cdr(expr), var_id, env);
     unsigned binding = lookup_silent(kw, env);
     if (binding != TOK_ERROR && IS_SYNTAX(binding))
         return contains_reference(expr, var_id);
@@ -144,10 +205,6 @@ static bool contains_reference(unsigned expr, int64_t var_id)
     if (!IS_PAIR(expr))
         return false;
 
-    // Skip quoted expressions
-    if (IS_ATOM(car(expr)) && CELL_ID(car(expr)) == ctx.kw_quote)
-        return false;
-
     // Check lambda - don't descend if var_id is shadowed by a parameter
     if (IS_ATOM(car(expr)) && CELL_ID(car(expr)) == ctx.kw_lambda) {
         unsigned params = cadr(expr);
@@ -155,11 +212,13 @@ static bool contains_reference(unsigned expr, int64_t var_id)
         if (IS_ATOM(params) && CELL_ID(params) == var_id)
             return false; // Shadowed by rest param
         if (IS_PAIR(params)) {
-            for (unsigned p = params; p; p = cdr(p)) {
+            for (unsigned p = params; p; p = IS_PAIR(p) ? cdr(p) : 0) {
                 if (IS_ATOM(p) && CELL_ID(p) == var_id)
                     return false; // Shadowed by rest param
                 if (IS_PAIR(p) && IS_ATOM(car(p)) && CELL_ID(car(p)) == var_id)
                     return false; // Shadowed by regular param
+                if (!IS_PAIR(p))
+                    break;
             }
         }
         // Check body
@@ -287,6 +346,7 @@ static compile_ctx *cctx_new(compile_ctx *parent, unsigned env)
     cctx->num_locals = -1;
     // Inherit known_lambdas from parent (they're still in scope)
     cctx->known_lambdas = parent ? parent->known_lambdas : 0;
+    cctx->macro_expansion_depth = parent ? parent->macro_expansion_depth : 0;
     // Protect env and known_lambdas so they're updated if GC runs
     gc_protect(&cctx->env);
     gc_protect(&cctx->known_lambdas);
@@ -364,14 +424,239 @@ static void patch_jump(compile_ctx *cctx, unsigned pos)
 
 // Forward declarations for template helpers
 static unsigned collect_template_free_vars(unsigned tmpl, unsigned pattern_vars,
-                                           unsigned collected, int64_t ellipsis);
+                                           unsigned collected, int64_t ellipsis,
+                                           unsigned env);
 static unsigned rename_template_vars(unsigned tmpl, unsigned rename_map);
+
+static unsigned add_template_bound_var(unsigned pattern_vars, unsigned var)
+{
+    if (!IS_ATOM(var))
+        return pattern_vars;
+
+    GC_GUARD;
+    gc_protect(&pattern_vars);
+    gc_protect(&var);
+    return alloc_cons(var, pattern_vars);
+}
+
+static bool template_id_bound(unsigned pattern_vars, int64_t id)
+{
+    for (unsigned p = pattern_vars; p; p = cdr(p)) {
+        if (IS_ATOM(car(p)) && CELL_ID(car(p)) == id)
+            return true;
+    }
+    return false;
+}
+
+static bool syntax_rules_form_like(unsigned expr)
+{
+    return IS_PAIR(expr) && IS_ATOM(car(expr)) &&
+           CELL_ID(car(expr)) == ctx.kw_syntax_rules &&
+           IS_PAIR(cdr(expr)) && IS_PAIR(cddr(expr));
+}
+
+static bool template_keyword_bound_as_value(int64_t id, unsigned env)
+{
+    if (!is_special_form(id))
+        return false;
+    unsigned value = lookup_silent(id, env);
+    return value != TOK_ERROR && !IS_SYNTAX(value) && !IS_MACRO(value);
+}
+
+static unsigned add_template_lambda_bounds(unsigned pattern_vars,
+                                           unsigned params)
+{
+    GC_GUARD;
+    gc_protect(&pattern_vars);
+    gc_protect(&params);
+
+    for (unsigned p = params; p; p = IS_PAIR(p) ? cdr(p) : 0) {
+        unsigned param = IS_PAIR(p) ? car(p) : p;
+        pattern_vars = add_template_bound_var(pattern_vars, param);
+        if (!IS_PAIR(p))
+            break;
+    }
+
+    return pattern_vars;
+}
+
+static unsigned add_template_let_bounds(unsigned pattern_vars,
+                                        unsigned binding_list)
+{
+    GC_GUARD;
+    gc_protect(&pattern_vars);
+    gc_protect(&binding_list);
+
+    for (unsigned bl = binding_list; IS_PAIR(bl); bl = cdr(bl)) {
+        unsigned binding = car(bl);
+        if (let_binding_has_value(binding))
+            pattern_vars = add_template_bound_var(pattern_vars, car(binding));
+    }
+
+    return pattern_vars;
+}
+
+static unsigned add_template_syntax_bounds(unsigned pattern_vars,
+                                           unsigned bindings)
+{
+    GC_GUARD;
+    gc_protect(&pattern_vars);
+    gc_protect(&bindings);
+
+    for (unsigned b = bindings; IS_PAIR(b); b = cdr(b)) {
+        unsigned binding = car(b);
+        if (IS_PAIR(binding))
+            pattern_vars = add_template_bound_var(pattern_vars, car(binding));
+    }
+
+    return pattern_vars;
+}
+
+static unsigned collect_template_free_vars_let(unsigned tmpl,
+                                               unsigned pattern_vars,
+                                               unsigned collected,
+                                               int64_t ellipsis,
+                                               bool is_letstar,
+                                               bool is_letrec,
+                                               unsigned env)
+{
+    unsigned binding_list = cadr(tmpl);
+    unsigned body = cddr(tmpl);
+
+    GC_GUARD;
+    gc_protect(&binding_list);
+    gc_protect(&body);
+    gc_protect(&pattern_vars);
+    gc_protect(&collected);
+
+    if (!proper_list_silent(binding_list))
+        return collect_template_free_vars(body, pattern_vars, collected,
+                                          ellipsis, env);
+
+    unsigned body_vars = pattern_vars;
+    gc_protect(&body_vars);
+    if (is_letrec)
+        body_vars = add_template_let_bounds(body_vars, binding_list);
+
+    for (unsigned bl = binding_list; IS_PAIR(bl); bl = cdr(bl)) {
+        unsigned binding = car(bl);
+        if (!let_binding_has_value(binding))
+            continue;
+
+        unsigned val_vars = (is_letstar || is_letrec) ? body_vars : pattern_vars;
+        collected =
+            collect_template_free_vars(cadr(binding), val_vars, collected,
+                                       ellipsis, env);
+
+        if (is_letstar && !is_letrec)
+            body_vars = add_template_bound_var(body_vars, car(binding));
+    }
+
+    if (!is_letstar && !is_letrec)
+        body_vars = add_template_let_bounds(body_vars, binding_list);
+
+    return collect_template_free_vars(body, body_vars, collected, ellipsis,
+                                      env);
+}
+
+static unsigned collect_template_free_vars_named_let(unsigned tmpl,
+                                                     unsigned pattern_vars,
+                                                     unsigned collected,
+                                                     int64_t ellipsis,
+                                                     unsigned env)
+{
+    unsigned name = cadr(tmpl);
+    unsigned binding_list = caddr(tmpl);
+    unsigned body = cdddr(tmpl);
+
+    GC_GUARD;
+    gc_protect(&name);
+    gc_protect(&binding_list);
+    gc_protect(&body);
+    gc_protect(&pattern_vars);
+    gc_protect(&collected);
+
+    if (!proper_list_silent(binding_list))
+        return collect_template_free_vars(body, pattern_vars, collected,
+                                          ellipsis, env);
+
+    for (unsigned bl = binding_list; IS_PAIR(bl); bl = cdr(bl)) {
+        unsigned binding = car(bl);
+        if (!let_binding_has_value(binding))
+            continue;
+        collected = collect_template_free_vars(cadr(binding), pattern_vars,
+                                               collected, ellipsis, env);
+    }
+
+    unsigned body_vars = add_template_bound_var(pattern_vars, name);
+    gc_protect(&body_vars);
+    body_vars = add_template_let_bounds(body_vars, binding_list);
+    return collect_template_free_vars(body, body_vars, collected, ellipsis,
+                                      env);
+}
+
+static unsigned collect_template_free_vars_quasiquote(unsigned tmpl,
+                                                      unsigned pattern_vars,
+                                                      unsigned collected,
+                                                      int64_t ellipsis,
+                                                      unsigned depth,
+                                                      unsigned env)
+{
+    if (!tmpl)
+        return collected;
+
+    GC_GUARD;
+    gc_protect(&tmpl);
+    gc_protect(&pattern_vars);
+    gc_protect(&collected);
+
+    if (IS_PAIR(tmpl)) {
+        unsigned head = car(tmpl);
+        if (IS_ATOM(head)) {
+            int64_t head_id = CELL_ID(head);
+            if ((head_id == ctx.kw_unquote ||
+                 head_id == ctx.kw_unquote_splicing) &&
+                IS_PAIR(cdr(tmpl))) {
+                unsigned body = cadr(tmpl);
+                if (depth == 1) {
+                    return collect_template_free_vars(
+                        body, pattern_vars, collected, ellipsis, env);
+                }
+                return collect_template_free_vars_quasiquote(
+                    body, pattern_vars, collected, ellipsis, depth - 1, env);
+            }
+            if (head_id == ctx.kw_quasiquote && IS_PAIR(cdr(tmpl))) {
+                return collect_template_free_vars_quasiquote(
+                    cadr(tmpl), pattern_vars, collected, ellipsis, depth + 1,
+                    env);
+            }
+        }
+
+        collected = collect_template_free_vars_quasiquote(
+            car(tmpl), pattern_vars, collected, ellipsis, depth, env);
+        gc_protect(&collected);
+        return collect_template_free_vars_quasiquote(
+            cdr(tmpl), pattern_vars, collected, ellipsis, depth, env);
+    }
+
+    if (IS_VECTOR(tmpl)) {
+        unsigned len = vector_len(tmpl);
+        for (unsigned i = 0; i < len; i++) {
+            unsigned *data = vector_data_ptr(tmpl);
+            collected = collect_template_free_vars_quasiquote(
+                data[i], pattern_vars, collected, ellipsis, depth, env);
+        }
+    }
+
+    return collected;
+}
 
 // Collect free variables from a syntax-rules template
 // pattern_vars: list of pattern variable atoms
 // Returns: list of free variable atoms
 static unsigned collect_template_free_vars(unsigned tmpl, unsigned pattern_vars,
-                                           unsigned collected, int64_t ellipsis)
+                                           unsigned collected, int64_t ellipsis,
+                                           unsigned env)
 {
     if (!tmpl)
         return collected;
@@ -394,19 +679,61 @@ static unsigned collect_template_free_vars(unsigned tmpl, unsigned pattern_vars,
             if (IS_ATOM(car(c)) && CELL_ID(car(c)) == id)
                 return collected;
         }
-        // Skip special forms
-        if (is_special_form(id))
-            return collected;
+        // Core keyword names are still collected here. If they are unbound
+        // core syntax, the later definition-site lookup will not alias them;
+        // if they are lexically rebound, syntax-rules must preserve that
+        // definition-site binding.
         return alloc_cons(tmpl, collected);
     }
 
     if (IS_PAIR(tmpl)) {
         // Skip quote's contents
-        if (IS_ATOM(car(tmpl)) && CELL_ID(car(tmpl)) == ctx.kw_quote)
+        if (IS_ATOM(car(tmpl)) && CELL_ID(car(tmpl)) == ctx.kw_quote &&
+            !template_id_bound(pattern_vars, ctx.kw_quote) &&
+            !template_keyword_bound_as_value(ctx.kw_quote, env))
             return collected;
+        if (syntax_rules_form_like(tmpl) &&
+            !template_id_bound(pattern_vars, ctx.kw_syntax_rules) &&
+            !template_keyword_bound_as_value(ctx.kw_syntax_rules, env))
+            return collected;
+        if (IS_ATOM(car(tmpl)) && CELL_ID(car(tmpl)) == ctx.kw_quasiquote &&
+            !template_id_bound(pattern_vars, ctx.kw_quasiquote) &&
+            !template_keyword_bound_as_value(ctx.kw_quasiquote, env) &&
+            IS_PAIR(cdr(tmpl))) {
+            return collect_template_free_vars_quasiquote(
+                cadr(tmpl), pattern_vars, collected, ellipsis, 1, env);
+        }
+        if (IS_ATOM(car(tmpl)) && CELL_ID(car(tmpl)) == ctx.kw_lambda &&
+            !template_id_bound(pattern_vars, ctx.kw_lambda) &&
+            !template_keyword_bound_as_value(ctx.kw_lambda, env) &&
+            IS_PAIR(cdr(tmpl)) && IS_PAIR(cddr(tmpl))) {
+            unsigned body_vars =
+                add_template_lambda_bounds(pattern_vars, cadr(tmpl));
+            gc_protect(&body_vars);
+            return collect_template_free_vars(cddr(tmpl), body_vars,
+                                              collected, ellipsis, env);
+        }
+        if (IS_ATOM(car(tmpl)) &&
+            (CELL_ID(car(tmpl)) == ctx.kw_let ||
+             CELL_ID(car(tmpl)) == ctx.kw_letstar ||
+             CELL_ID(car(tmpl)) == ctx.kw_letrec) &&
+            !template_id_bound(pattern_vars, CELL_ID(car(tmpl))) &&
+            !template_keyword_bound_as_value(CELL_ID(car(tmpl)), env) &&
+            IS_PAIR(cdr(tmpl)) && IS_PAIR(cddr(tmpl))) {
+            int64_t head_id = CELL_ID(car(tmpl));
+            if (head_id == ctx.kw_let && IS_ATOM(cadr(tmpl))) {
+                return collect_template_free_vars_named_let(
+                    tmpl, pattern_vars, collected, ellipsis, env);
+            }
+            return collect_template_free_vars_let(
+                tmpl, pattern_vars, collected, ellipsis,
+                head_id == ctx.kw_letstar, head_id == ctx.kw_letrec, env);
+        }
         collected =
-            collect_template_free_vars(car(tmpl), pattern_vars, collected, ellipsis);
-        return collect_template_free_vars(cdr(tmpl), pattern_vars, collected, ellipsis);
+            collect_template_free_vars(car(tmpl), pattern_vars, collected,
+                                       ellipsis, env);
+        return collect_template_free_vars(cdr(tmpl), pattern_vars, collected,
+                                          ellipsis, env);
     }
 
     if (IS_VECTOR(tmpl)) {
@@ -415,7 +742,8 @@ static unsigned collect_template_free_vars(unsigned tmpl, unsigned pattern_vars,
             // Refresh data pointer each iteration - GC may have moved tmpl
             unsigned *data = vector_data_ptr(tmpl);
             collected = collect_template_free_vars(data[i],
-                                                   pattern_vars, collected, ellipsis);
+                                                   pattern_vars, collected,
+                                                   ellipsis, env);
         }
         return collected;
     }
@@ -425,6 +753,379 @@ static unsigned collect_template_free_vars(unsigned tmpl, unsigned pattern_vars,
 
 // Rename free variables in template according to rename_map
 // rename_map: list of (orig_atom . gensym_atom)
+static unsigned rename_template_vars_quasiquote(unsigned tmpl,
+                                                unsigned rename_map,
+                                                unsigned depth)
+{
+    if (!tmpl || !rename_map)
+        return tmpl;
+
+    if (IS_PAIR(tmpl)) {
+        unsigned head = car(tmpl);
+        if (IS_ATOM(head)) {
+            int64_t head_id = CELL_ID(head);
+            if ((head_id == ctx.kw_unquote ||
+                 head_id == ctx.kw_unquote_splicing) &&
+                IS_PAIR(cdr(tmpl))) {
+                unsigned body = cadr(tmpl);
+                unsigned new_body;
+                if (depth == 1)
+                    new_body = rename_template_vars(body, rename_map);
+                else
+                    new_body = rename_template_vars_quasiquote(
+                        body, rename_map, depth - 1);
+                if (new_body == TOK_ERROR)
+                    return TOK_ERROR;
+                gc_protect(&new_body);
+                unsigned result_tail = alloc_cons(new_body, cddr(tmpl));
+                gc_protect(&result_tail);
+                unsigned result = alloc_cons(head, result_tail);
+                gc_unprotect(2);
+                return result;
+            }
+            if (head_id == ctx.kw_quasiquote && IS_PAIR(cdr(tmpl))) {
+                unsigned new_body = rename_template_vars_quasiquote(
+                    cadr(tmpl), rename_map, depth + 1);
+                if (new_body == TOK_ERROR)
+                    return TOK_ERROR;
+                gc_protect(&new_body);
+                unsigned result_tail = alloc_cons(new_body, cddr(tmpl));
+                gc_protect(&result_tail);
+                unsigned result = alloc_cons(head, result_tail);
+                gc_unprotect(2);
+                return result;
+            }
+        }
+
+        gc_protect(&tmpl);
+        gc_protect(&rename_map);
+        unsigned new_car =
+            rename_template_vars_quasiquote(car(tmpl), rename_map, depth);
+        if (new_car == TOK_ERROR) {
+            gc_unprotect(2);
+            return TOK_ERROR;
+        }
+        gc_protect(&new_car);
+        unsigned new_cdr =
+            rename_template_vars_quasiquote(cdr(tmpl), rename_map, depth);
+        if (new_cdr == TOK_ERROR) {
+            gc_unprotect(3);
+            return TOK_ERROR;
+        }
+        gc_protect(&new_cdr);
+        if (new_car == car(tmpl) && new_cdr == cdr(tmpl)) {
+            gc_unprotect(4);
+            return tmpl;
+        }
+        unsigned result = alloc_cons(new_car, new_cdr);
+        gc_unprotect(4);
+        return result;
+    }
+
+    if (IS_VECTOR(tmpl)) {
+        unsigned len = vector_len(tmpl);
+        gc_protect(&tmpl);
+        gc_protect(&rename_map);
+        unsigned new_vec = make_vector(len, 0);
+        if (new_vec == TOK_ERROR) {
+            gc_unprotect(2);
+            return TOK_ERROR;
+        }
+        gc_protect(&new_vec);
+        bool changed = false;
+        for (unsigned i = 0; i < len; i++) {
+            unsigned old_elem = vector_data_ptr(tmpl)[i];
+            gc_protect(&old_elem);
+            unsigned new_elem =
+                rename_template_vars_quasiquote(old_elem, rename_map, depth);
+            if (new_elem == TOK_ERROR) {
+                gc_unprotect(4);
+                return TOK_ERROR;
+            }
+            vector_set_elem(new_vec, i, new_elem);
+            if (new_elem != old_elem)
+                changed = true;
+            gc_unprotect(1);
+        }
+        gc_unprotect(3);
+        return changed ? new_vec : tmpl;
+    }
+
+    return tmpl;
+}
+
+static unsigned rename_map_without_id(unsigned rename_map, int64_t id)
+{
+    if (!rename_map)
+        return 0;
+
+    GC_GUARD;
+    gc_protect(&rename_map);
+
+    unsigned filtered = 0;
+    unsigned tail = 0;
+    gc_protect(&filtered);
+    gc_protect(&tail);
+    bool changed = false;
+
+    for (unsigned m = rename_map; m; m = cdr(m)) {
+        unsigned entry = car(m);
+        if (IS_ATOM(car(entry)) && CELL_ID(car(entry)) == id) {
+            changed = true;
+            continue;
+        }
+        list_append(&filtered, &tail, entry);
+    }
+
+    return changed ? filtered : rename_map;
+}
+
+static bool rename_map_has_id(unsigned rename_map, int64_t id)
+{
+    for (unsigned m = rename_map; m; m = cdr(m)) {
+        unsigned entry = car(m);
+        if (IS_PAIR(entry) && IS_ATOM(car(entry)) && CELL_ID(car(entry)) == id)
+            return true;
+    }
+    return false;
+}
+
+static unsigned rename_map_without_atom(unsigned rename_map, unsigned var)
+{
+    if (!IS_ATOM(var))
+        return rename_map;
+    return rename_map_without_id(rename_map, CELL_ID(var));
+}
+
+static unsigned rename_map_without_lambda_bounds(unsigned rename_map,
+                                                 unsigned params)
+{
+    GC_GUARD;
+    gc_protect(&rename_map);
+    gc_protect(&params);
+
+    for (unsigned p = params; p; p = IS_PAIR(p) ? cdr(p) : 0) {
+        unsigned param = IS_PAIR(p) ? car(p) : p;
+        rename_map = rename_map_without_atom(rename_map, param);
+        if (!IS_PAIR(p))
+            break;
+    }
+
+    return rename_map;
+}
+
+static unsigned rename_map_without_let_bounds(unsigned rename_map,
+                                              unsigned binding_list)
+{
+    GC_GUARD;
+    gc_protect(&rename_map);
+    gc_protect(&binding_list);
+
+    for (unsigned bl = binding_list; IS_PAIR(bl); bl = cdr(bl)) {
+        unsigned binding = car(bl);
+        if (let_binding_has_value(binding))
+            rename_map = rename_map_without_atom(rename_map, car(binding));
+    }
+
+    return rename_map;
+}
+
+static bool template_binding_list_binds_id(unsigned binding_list, int64_t id)
+{
+    for (unsigned bl = binding_list; IS_PAIR(bl); bl = cdr(bl)) {
+        unsigned binding = car(bl);
+        if (let_binding_has_value(binding) && IS_ATOM(car(binding)) &&
+            CELL_ID(car(binding)) == id)
+            return true;
+    }
+    return false;
+}
+
+static unsigned rename_template_vars_shadowed_heads(unsigned tmpl,
+                                                    unsigned rename_map,
+                                                    bool quote_shadowed,
+                                                    bool quasiquote_shadowed);
+
+static unsigned rename_template_vars_lambda(unsigned tmpl, unsigned rename_map)
+{
+    unsigned keyword = car(tmpl);
+    unsigned params = cadr(tmpl);
+    unsigned body = cddr(tmpl);
+
+    GC_GUARD;
+    gc_protect(&keyword);
+    gc_protect(&params);
+    gc_protect(&body);
+    gc_protect(&rename_map);
+
+    unsigned body_map = rename_map_without_lambda_bounds(rename_map, params);
+    gc_protect(&body_map);
+    unsigned new_body = rename_template_vars(body, body_map);
+    if (new_body == TOK_ERROR)
+        return TOK_ERROR;
+    gc_protect(&new_body);
+
+    if (new_body == body)
+        return tmpl;
+    unsigned result_tail = alloc_cons(params, new_body);
+    gc_protect(&result_tail);
+    return alloc_cons(keyword, result_tail);
+}
+
+static unsigned rename_template_vars_let(unsigned tmpl, unsigned rename_map,
+                                         bool is_letstar, bool is_letrec)
+{
+    unsigned keyword = car(tmpl);
+    unsigned binding_list = cadr(tmpl);
+    unsigned body = cddr(tmpl);
+
+    GC_GUARD;
+    gc_protect(&keyword);
+    gc_protect(&binding_list);
+    gc_protect(&body);
+    gc_protect(&rename_map);
+
+    if (!proper_list_silent(binding_list))
+        return tmpl;
+
+    unsigned body_map = rename_map;
+    gc_protect(&body_map);
+    if (is_letrec)
+        body_map = rename_map_without_let_bounds(body_map, binding_list);
+
+    unsigned new_bindings = 0;
+    unsigned new_tail = 0;
+    gc_protect(&new_bindings);
+    gc_protect(&new_tail);
+    bool changed = false;
+
+    for (unsigned bl = binding_list; IS_PAIR(bl); bl = cdr(bl)) {
+        unsigned binding = car(bl);
+        if (!let_binding_has_value(binding)) {
+            list_append(&new_bindings, &new_tail, binding);
+            continue;
+        }
+
+        unsigned var = car(binding);
+        unsigned val = cadr(binding);
+        unsigned val_map = (is_letstar || is_letrec) ? body_map : rename_map;
+        gc_protect(&var);
+        gc_protect(&val);
+        gc_protect(&val_map);
+
+        unsigned new_val = rename_template_vars(val, val_map);
+        if (new_val == TOK_ERROR)
+            return TOK_ERROR;
+        gc_protect(&new_val);
+        unsigned bind_tail = alloc_cons(new_val, 0);
+        gc_protect(&bind_tail);
+        unsigned new_binding = alloc_cons(var, bind_tail);
+        gc_protect(&new_binding);
+        list_append(&new_bindings, &new_tail, new_binding);
+        if (new_val != val)
+            changed = true;
+        gc_unprotect(6);
+
+        if (is_letstar && !is_letrec)
+            body_map = rename_map_without_atom(body_map, var);
+    }
+
+    if (!is_letstar && !is_letrec)
+        body_map = rename_map_without_let_bounds(body_map, binding_list);
+
+    unsigned new_body;
+    bool quote_shadowed =
+        template_binding_list_binds_id(binding_list, ctx.kw_quote);
+    bool quasiquote_shadowed =
+        template_binding_list_binds_id(binding_list, ctx.kw_quasiquote);
+    if (quote_shadowed || quasiquote_shadowed) {
+        new_body = rename_template_vars_shadowed_heads(
+            body, body_map, quote_shadowed, quasiquote_shadowed);
+    }
+    else
+        new_body = rename_template_vars(body, body_map);
+    if (new_body == TOK_ERROR)
+        return TOK_ERROR;
+    gc_protect(&new_body);
+    if (new_body != body)
+        changed = true;
+
+    if (!changed)
+        return tmpl;
+    unsigned result_tail = alloc_cons(new_bindings, new_body);
+    gc_protect(&result_tail);
+    return alloc_cons(keyword, result_tail);
+}
+
+static unsigned rename_template_vars_named_let(unsigned tmpl,
+                                               unsigned rename_map)
+{
+    unsigned keyword = car(tmpl);
+    unsigned name = cadr(tmpl);
+    unsigned binding_list = caddr(tmpl);
+    unsigned body = cdddr(tmpl);
+
+    GC_GUARD;
+    gc_protect(&keyword);
+    gc_protect(&name);
+    gc_protect(&binding_list);
+    gc_protect(&body);
+    gc_protect(&rename_map);
+
+    if (!proper_list_silent(binding_list))
+        return tmpl;
+
+    unsigned new_bindings = 0;
+    unsigned new_tail = 0;
+    gc_protect(&new_bindings);
+    gc_protect(&new_tail);
+    bool changed = false;
+
+    for (unsigned bl = binding_list; IS_PAIR(bl); bl = cdr(bl)) {
+        unsigned binding = car(bl);
+        if (!let_binding_has_value(binding)) {
+            list_append(&new_bindings, &new_tail, binding);
+            continue;
+        }
+
+        unsigned var = car(binding);
+        unsigned val = cadr(binding);
+        gc_protect(&var);
+        gc_protect(&val);
+        unsigned new_val = rename_template_vars(val, rename_map);
+        if (new_val == TOK_ERROR)
+            return TOK_ERROR;
+        gc_protect(&new_val);
+        unsigned bind_tail = alloc_cons(new_val, 0);
+        gc_protect(&bind_tail);
+        unsigned new_binding = alloc_cons(var, bind_tail);
+        gc_protect(&new_binding);
+        list_append(&new_bindings, &new_tail, new_binding);
+        if (new_val != val)
+            changed = true;
+        gc_unprotect(5);
+    }
+
+    unsigned body_map = rename_map_without_atom(rename_map, name);
+    gc_protect(&body_map);
+    body_map = rename_map_without_let_bounds(body_map, binding_list);
+
+    unsigned new_body = rename_template_vars(body, body_map);
+    if (new_body == TOK_ERROR)
+        return TOK_ERROR;
+    gc_protect(&new_body);
+    if (new_body != body)
+        changed = true;
+
+    if (!changed)
+        return tmpl;
+    unsigned body_tail = alloc_cons(new_bindings, new_body);
+    gc_protect(&body_tail);
+    unsigned name_tail = alloc_cons(name, body_tail);
+    gc_protect(&name_tail);
+    return alloc_cons(keyword, name_tail);
+}
+
 static unsigned rename_template_vars(unsigned tmpl, unsigned rename_map)
 {
     if (!tmpl || !rename_map)
@@ -441,9 +1142,45 @@ static unsigned rename_template_vars(unsigned tmpl, unsigned rename_map)
     }
 
     if (IS_PAIR(tmpl)) {
+        bool head_is_alias = false;
+        if (IS_ATOM(car(tmpl)))
+            head_is_alias = rename_map_has_id(rename_map, CELL_ID(car(tmpl)));
         // Skip quote's contents
-        if (IS_ATOM(car(tmpl)) && CELL_ID(car(tmpl)) == ctx.kw_quote)
+        if (IS_ATOM(car(tmpl)) && CELL_ID(car(tmpl)) == ctx.kw_quote &&
+            !head_is_alias)
             return tmpl;
+        if (syntax_rules_form_like(tmpl) && !head_is_alias)
+            return tmpl;
+        if (IS_ATOM(car(tmpl)) && CELL_ID(car(tmpl)) == ctx.kw_quasiquote &&
+            IS_PAIR(cdr(tmpl)) && !head_is_alias) {
+            unsigned new_body =
+                rename_template_vars_quasiquote(cadr(tmpl), rename_map, 1);
+            if (new_body == TOK_ERROR)
+                return TOK_ERROR;
+            gc_protect(&new_body);
+            unsigned result_tail = alloc_cons(new_body, cddr(tmpl));
+            gc_protect(&result_tail);
+            unsigned result = alloc_cons(car(tmpl), result_tail);
+            gc_unprotect(2);
+            return result;
+        }
+        if (IS_ATOM(car(tmpl)) && CELL_ID(car(tmpl)) == ctx.kw_lambda &&
+            IS_PAIR(cdr(tmpl)) && IS_PAIR(cddr(tmpl)) && !head_is_alias) {
+            return rename_template_vars_lambda(tmpl, rename_map);
+        }
+        if (IS_ATOM(car(tmpl)) &&
+            (CELL_ID(car(tmpl)) == ctx.kw_let ||
+             CELL_ID(car(tmpl)) == ctx.kw_letstar ||
+             CELL_ID(car(tmpl)) == ctx.kw_letrec) &&
+            IS_PAIR(cdr(tmpl)) && IS_PAIR(cddr(tmpl)) && !head_is_alias) {
+            int64_t head_id = CELL_ID(car(tmpl));
+            if (head_id == ctx.kw_let && IS_ATOM(cadr(tmpl))) {
+                return rename_template_vars_named_let(tmpl, rename_map);
+            }
+            return rename_template_vars_let(tmpl, rename_map,
+                                            head_id == ctx.kw_letstar,
+                                            head_id == ctx.kw_letrec);
+        }
         gc_protect(&tmpl);
         gc_protect(&rename_map);
         unsigned new_car = rename_template_vars(car(tmpl), rename_map);
@@ -499,6 +1236,104 @@ static unsigned rename_template_vars(unsigned tmpl, unsigned rename_map)
     return tmpl;
 }
 
+static unsigned rename_template_vars_shadowed_heads(unsigned tmpl,
+                                                    unsigned rename_map,
+                                                    bool quote_shadowed,
+                                                    bool quasiquote_shadowed)
+{
+    if (!tmpl || !rename_map)
+        return tmpl;
+
+    if (IS_ATOM(tmpl)) {
+        int64_t id = CELL_ID(tmpl);
+        for (unsigned m = rename_map; m; m = cdr(m)) {
+            unsigned entry = car(m);
+            if (IS_ATOM(car(entry)) && CELL_ID(car(entry)) == id)
+                return cdr(entry);
+        }
+        return tmpl;
+    }
+
+    if (IS_PAIR(tmpl)) {
+        bool head_is_alias = false;
+        if (IS_ATOM(car(tmpl)))
+            head_is_alias = rename_map_has_id(rename_map, CELL_ID(car(tmpl)));
+        if (syntax_rules_form_like(tmpl) && !head_is_alias)
+            return tmpl;
+        if (IS_ATOM(car(tmpl)) && CELL_ID(car(tmpl)) == ctx.kw_quote &&
+            !quote_shadowed && !head_is_alias)
+            return tmpl;
+        if (IS_ATOM(car(tmpl)) && CELL_ID(car(tmpl)) == ctx.kw_quasiquote &&
+            IS_PAIR(cdr(tmpl)) && !quasiquote_shadowed && !head_is_alias) {
+            unsigned new_body =
+                rename_template_vars_quasiquote(cadr(tmpl), rename_map, 1);
+            if (new_body == TOK_ERROR)
+                return TOK_ERROR;
+            gc_protect(&new_body);
+            unsigned result_tail = alloc_cons(new_body, cddr(tmpl));
+            gc_protect(&result_tail);
+            unsigned result = alloc_cons(car(tmpl), result_tail);
+            gc_unprotect(2);
+            return result;
+        }
+
+        gc_protect(&tmpl);
+        gc_protect(&rename_map);
+        unsigned new_car = rename_template_vars_shadowed_heads(
+            car(tmpl), rename_map, quote_shadowed, quasiquote_shadowed);
+        if (new_car == TOK_ERROR) {
+            gc_unprotect(2);
+            return TOK_ERROR;
+        }
+        gc_protect(&new_car);
+        unsigned new_cdr = rename_template_vars_shadowed_heads(
+            cdr(tmpl), rename_map, quote_shadowed, quasiquote_shadowed);
+        if (new_cdr == TOK_ERROR) {
+            gc_unprotect(3);
+            return TOK_ERROR;
+        }
+        gc_protect(&new_cdr);
+        if (new_car == car(tmpl) && new_cdr == cdr(tmpl)) {
+            gc_unprotect(4);
+            return tmpl;
+        }
+        unsigned result = alloc_cons(new_car, new_cdr);
+        gc_unprotect(4);
+        return result;
+    }
+
+    if (IS_VECTOR(tmpl)) {
+        unsigned len = vector_len(tmpl);
+        gc_protect(&tmpl);
+        gc_protect(&rename_map);
+        unsigned new_vec = make_vector(len, 0);
+        if (new_vec == TOK_ERROR) {
+            gc_unprotect(2);
+            return TOK_ERROR;
+        }
+        gc_protect(&new_vec);
+        bool changed = false;
+        for (unsigned i = 0; i < len; i++) {
+            unsigned old_elem = vector_data_ptr(tmpl)[i];
+            gc_protect(&old_elem);
+            unsigned new_elem = rename_template_vars_shadowed_heads(
+                old_elem, rename_map, quote_shadowed, quasiquote_shadowed);
+            if (new_elem == TOK_ERROR) {
+                gc_unprotect(4);
+                return TOK_ERROR;
+            }
+            vector_set_elem(new_vec, i, new_elem);
+            if (new_elem != old_elem)
+                changed = true;
+            gc_unprotect(1);
+        }
+        gc_unprotect(3);
+        return changed ? new_vec : tmpl;
+    }
+
+    return tmpl;
+}
+
 // Extract pattern variables from a syntax-rules pattern
 static unsigned collect_pattern_vars(unsigned pattern, unsigned collected,
                                      int64_t ellipsis, unsigned literals)
@@ -514,7 +1349,8 @@ static unsigned collect_pattern_vars(unsigned pattern, unsigned collected,
     if (IS_ATOM(pattern)) {
         int64_t id = CELL_ID(pattern);
         // Skip ellipsis, underscore, literals
-        if (id == ellipsis || id == ctx.kw_underscore)
+        if (!identifier_valid(pattern) || id == ellipsis ||
+            id == ctx.kw_underscore)
             return collected;
         for (unsigned l = literals; l; l = cdr(l)) {
             if (IS_ATOM(car(l)) && CELL_ID(car(l)) == id)
@@ -554,9 +1390,39 @@ static void emit_gensym_definitions(compile_ctx *cctx, unsigned old_gensym,
 {
     for (unsigned g = old_gensym; g < new_gensym; g++) {
         char name[20];
-        snprintf(name, sizeof(name), "g%u", g);
+        snprintf(name, sizeof(name), "##gensym##%u", g);
         unsigned atom = atom_from_string(name);
         int64_t gensym_id = CELL_ID(atom);
+
+        unsigned binding_cell = env_find_binding_cell(gensym_id, cctx->env);
+        if (binding_cell && IS_BINDING_REF(car(binding_cell))) {
+            unsigned binding_ref = car(binding_cell);
+            unsigned target_cell = CELL_CAR(binding_ref);
+            unsigned target_val = car(target_cell);
+            unsigned target_var = cdr(binding_ref);
+            if (IS_SYNTAX(target_val) || IS_MACRO(target_val)) {
+                emit2(cctx, OP_CONST, code_add_const(cctx->code, target_val));
+                emit2(cctx, OP_DEFINE, gensym_id);
+                continue;
+            }
+            unsigned resolved_target =
+                lookup_silent(CELL_ID(target_var), cctx->env);
+            if (resolved_target != TOK_ERROR &&
+                (IS_SYNTAX(resolved_target) || IS_MACRO(resolved_target))) {
+                emit2(cctx, OP_CONST,
+                      code_add_const(cctx->code, resolved_target));
+                emit2(cctx, OP_DEFINE, gensym_id);
+                continue;
+            }
+            int local_slot = find_stack_local_slot(cctx, CELL_ID(target_var));
+            if (local_slot >= 0) {
+                emit_local_get_slot(cctx, local_slot);
+                emit2(cctx, OP_DEFINE, gensym_id);
+                continue;
+            }
+            emit3(cctx, OP_DEFINE_ALIAS, gensym_id, CELL_ID(target_var));
+            continue;
+        }
 
         // Look up the gensym value in the compile-time environment
         unsigned val = lookup_silent(gensym_id, cctx->env);
@@ -566,6 +1432,66 @@ static void emit_gensym_definitions(compile_ctx *cctx, unsigned old_gensym,
             emit2(cctx, OP_DEFINE, gensym_id);
         }
     }
+}
+
+static bool compile_macro_binding(unsigned mac, unsigned expr,
+                                  compile_ctx *cctx, compile_result *result)
+{
+    if (cctx->macro_expansion_depth >= MAX_COMPILE_MACRO_EXPANSION_DEPTH) {
+        show_error("macro expansion exceeded maximum depth");
+        *result =
+            emit_syntax_error(cctx, "macro expansion exceeded maximum depth");
+        return true;
+    }
+
+    cctx->macro_expansion_depth++;
+
+    if (IS_SYNTAX(mac)) {
+        unsigned old_gensym = gensym_counter;
+        unsigned expanded = apply_syntax(mac, expr, cctx->env);
+        if (expanded == TOK_ERROR) {
+            show_error("macro expansion failed");
+            *result = emit_syntax_error(cctx, "macro expansion failed");
+            cctx->macro_expansion_depth--;
+            return true;
+        }
+        emit_gensym_definitions(cctx, old_gensym, gensym_counter);
+        *result = compile_expr_internal(expanded, cctx);
+        cctx->macro_expansion_depth--;
+        return true;
+    }
+
+    if (IS_MACRO(mac)) {
+        GC_GUARD;
+        unsigned params = car(mac);
+        unsigned mbody = car(cdr(mac));
+        unsigned menv = cdr(cdr(mac));
+        gc_protect(&mbody);
+        gc_protect(&menv);
+        unsigned frame = bind_params(params, cdr(expr));
+        if (frame == TOK_ERROR) {
+            *result = emit_syntax_error(cctx, "macro expansion failed");
+            cctx->macro_expansion_depth--;
+            return true;
+        }
+        gc_protect(&frame);
+        unsigned new_env = alloc_cons(frame, menv);
+        gc_protect(&new_env);
+        unsigned expanded = eval_cps(mbody, new_env);
+        gc_protect(&expanded);
+        if (expanded == TOK_ERROR) {
+            show_error("macro expansion failed");
+            *result = emit_syntax_error(cctx, "macro expansion failed");
+            cctx->macro_expansion_depth--;
+            return true;
+        }
+        *result = compile_expr_internal(expanded, cctx);
+        cctx->macro_expansion_depth--;
+        return true;
+    }
+
+    cctx->macro_expansion_depth--;
+    return false;
 }
 
 // ============================================================================
@@ -606,18 +1532,17 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
         return const_result(expr);
 
     case BT_ATOM: {
+        if (expr == ctx.atom_true || expr == ctx.atom_false) {
+            emit2(cctx, OP_CONST, code_add_const(cctx->code, expr));
+            return const_result(expr);
+        }
+
         // Check if this variable is a stack local
         int64_t var_id = CELL_ID(expr);
-        if (cctx->num_locals > 0) {
-            for (int i = 0; i < cctx->num_locals; i++) {
-                if (cctx->local_ids[i] == var_id) {
-                    if (i < 4)
-                        emit(cctx, OP_LOCAL_GET0 + i);
-                    else
-                        emit2(cctx, OP_LOCAL_GET, i);
-                    return dynamic_result();
-                }
-            }
+        int local_slot = find_stack_local_slot(cctx, var_id);
+        if (local_slot >= 0) {
+            emit_local_get_slot(cctx, local_slot);
+            return dynamic_result();
         }
         // Fall back to environment lookup
         emit4(cctx, OP_LOOKUP, var_id, IC_UNCACHED, IC_UNCACHED);
@@ -630,65 +1555,55 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
         // Check for special forms
         if (IS_ATOM(head)) {
             int64_t kw = CELL_ID(head);
+            unsigned special_binding = lookup_silent(kw, cctx->env);
+            compile_result macro_result;
+            if (special_binding != TOK_ERROR &&
+                compile_macro_binding(special_binding, expr, cctx,
+                                      &macro_result))
+                return macro_result;
 
-            // quote can be shadowed by local bindings (R5RS allows this)
-            if (kw == ctx.kw_quote && !is_keyword_shadowed(kw, cctx->env)) {
+            if (special_binding == TOK_ERROR && kw == ctx.kw_quote) {
                 if (!syntax_arity_checked(expr, 1, 1, "quote"))
                     return emit_syntax_error(cctx, "quote: invalid syntax");
                 unsigned val = cadr(expr);
                 emit2(cctx, OP_CONST, code_add_const(cctx->code, val));
                 return const_result(val);
             }
-            if (kw == ctx.kw_if)
+            if (special_binding == TOK_ERROR && kw == ctx.kw_if)
                 return compile_if(expr, cctx);
-            if (kw == ctx.kw_lambda)
+            if (special_binding == TOK_ERROR && kw == ctx.kw_lambda)
                 return compile_lambda(expr, cctx);
-            // begin can be shadowed by local bindings (R5RS allows this)
-            if (kw == ctx.kw_begin && !is_keyword_shadowed(kw, cctx->env))
+            if (special_binding == TOK_ERROR && kw == ctx.kw_begin)
                 return compile_begin(cdr(expr), cctx);
-            // For let/let*/letrec, check for macro override first
-            // (e.g., stdlib defines let macro for named let)
-            if (kw == ctx.kw_let || kw == ctx.kw_letstar ||
-                kw == ctx.kw_letrec) {
-                unsigned mac = lookup_silent(kw, cctx->env);
-                if (mac != TOK_ERROR && IS_SYNTAX(mac)) {
-                    unsigned old_gensym = gensym_counter;
-                    unsigned expanded = apply_syntax(mac, expr, cctx->env);
-                    if (expanded == TOK_ERROR) {
-                        show_error("let macro expansion failed");
-                        emit(cctx, OP_HALT);
-                        return dynamic_result();
-                    }
-                    emit_gensym_definitions(cctx, old_gensym, gensym_counter);
-                    return compile_expr_internal(expanded, cctx);
-                }
-                // No macro override, use built-in compilation
+            if (special_binding == TOK_ERROR &&
+                (kw == ctx.kw_let || kw == ctx.kw_letstar ||
+                 kw == ctx.kw_letrec)) {
                 if (kw == ctx.kw_let)
                     return compile_let(expr, cctx);
                 if (kw == ctx.kw_letstar)
                     return compile_letstar(expr, cctx);
                 return compile_letrec(expr, cctx);
             }
-            if (kw == ctx.kw_and)
+            if (special_binding == TOK_ERROR && kw == ctx.kw_and)
                 return compile_and(expr, cctx);
-            if (kw == ctx.kw_or)
+            if (special_binding == TOK_ERROR && kw == ctx.kw_or)
                 return compile_or(expr, cctx);
-            if (kw == ctx.kw_cond)
+            if (special_binding == TOK_ERROR && kw == ctx.kw_cond)
                 return compile_cond(expr, cctx);
-            if (kw == ctx.kw_define)
+            if (special_binding == TOK_ERROR && kw == ctx.kw_define)
                 return compile_define(expr, cctx);
-            if (kw == ctx.kw_set)
+            if (special_binding == TOK_ERROR && kw == ctx.kw_set)
                 return compile_set(expr, cctx);
-            if (kw == ctx.kw_quasiquote)
+            if (special_binding == TOK_ERROR && kw == ctx.kw_quasiquote)
                 return compile_quasiquote(expr, cctx);
-            if (kw == ctx.kw_define_syntax) {
+            if (special_binding == TOK_ERROR && kw == ctx.kw_define_syntax) {
                 // (define-syntax name transformer)
                 if (!syntax_arity_checked(expr, 2, 2, "define-syntax"))
                     return emit_syntax_error(cctx,
                                              "define-syntax: invalid syntax");
                 unsigned name = cadr(expr);
                 unsigned transformer_form = caddr(expr);
-                if (!IS_ATOM(name) ||
+                if (!identifier_valid(name) ||
                     !syntax_rules_valid(
                         transformer_form,
                         syntax_default_ellipsis_id(cctx->env),
@@ -699,10 +1614,12 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
                       code_add_const(cctx->code, transformer_form));
                 emit2(cctx, OP_DEFSYNTAX, CELL_ID(name));
                 emit2(cctx, OP_CONST, code_add_const(cctx->code, name));
+                install_compile_time_define_syntax(expr, cctx);
                 return dynamic_result();
             }
 
-            if (kw == ctx.kw_let_syntax || kw == ctx.kw_letrec_syntax) {
+            if (special_binding == TOK_ERROR &&
+                (kw == ctx.kw_let_syntax || kw == ctx.kw_letrec_syntax)) {
                 // (let-syntax ((name transformer) ...) body ...)
                 // (letrec-syntax ((name transformer) ...) body ...)
                 const char *form_name = kw == ctx.kw_let_syntax
@@ -718,9 +1635,16 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
                     return emit_syntax_error(
                         cctx, "syntax binding: invalid syntax");
 
-                // If no bindings, just compile body in current env
                 if (!bindings) {
-                    return compile_begin(body, cctx);
+                    GC_GUARD;
+                    gc_protect(&body);
+                    unsigned saved_env = cctx->env;
+                    gc_protect(&saved_env);
+                    emit_pushenv(cctx);
+                    compile_begin(body, cctx);
+                    cctx->env = saved_env;
+                    emit_popenv(cctx);
+                    return dynamic_result();
                 }
 
                 GC_GUARD;
@@ -738,6 +1662,8 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
                 gc_protect(&rename_map);
                 unsigned gensym_bindings = 0; // List of (gensym . orig_var_id)
                 gc_protect(&gensym_bindings);
+                unsigned gensym_const_bindings = 0; // List of (gensym . value)
+                gc_protect(&gensym_const_bindings);
 
                 // First pass: create frame with placeholder values for letrec-syntax
                 if (kw == ctx.kw_letrec_syntax) {
@@ -784,10 +1710,14 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
                         unsigned pattern_vars =
                             collect_pattern_vars(pattern, 0, ellipsis_id, literals);
                         gc_protect(&pattern_vars);
+                        if (kw == ctx.kw_letrec_syntax)
+                            pattern_vars =
+                                add_template_syntax_bounds(pattern_vars,
+                                                           bindings);
 
                         // Collect free variables from template
                         unsigned free_vars = collect_template_free_vars(
-                            tmpl, pattern_vars, 0, ellipsis_id);
+                            tmpl, pattern_vars, 0, ellipsis_id, cctx->env);
                         gc_protect(&free_vars);
 
                         // For each free var, create gensym if bound in outer scope
@@ -815,9 +1745,11 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
                                 // Create gensym
                                 extern unsigned gensym_counter;
                                 char name[20];
-                                snprintf(name, sizeof(name), "g%u", gensym_counter++);
+                                snprintf(name, sizeof(name), "##gensym##%u",
+                                         gensym_counter++);
                                 unsigned gensym_atom = atom_from_string(name);
                                 gc_protect(&gensym_atom);
+                                gc_protect(&val);
 
                                 // Add to rename map: (var_atom . gensym_atom)
                                 unsigned entry = alloc_cons(var_atom, gensym_atom);
@@ -825,13 +1757,25 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
                                 rename_map = alloc_cons(entry, rename_map);
                                 gc_unprotect(1);
 
-                                // Record for runtime binding: (gensym_id . var_id)
-                                unsigned bind_entry = alloc_cons(gensym_atom, var_atom);
-                                gc_protect(&bind_entry);
-                                gensym_bindings = alloc_cons(bind_entry, gensym_bindings);
-                                gc_unprotect(1);
+                                if (IS_SYNTAX(val) || IS_MACRO(val)) {
+                                    unsigned const_entry =
+                                        alloc_cons(gensym_atom, val);
+                                    gc_protect(&const_entry);
+                                    gensym_const_bindings =
+                                        alloc_cons(const_entry,
+                                                   gensym_const_bindings);
+                                    gc_unprotect(1);
+                                } else {
+                                    unsigned bind_entry =
+                                        alloc_cons(gensym_atom, var_atom);
+                                    gc_protect(&bind_entry);
+                                    gensym_bindings =
+                                        alloc_cons(bind_entry,
+                                                   gensym_bindings);
+                                    gc_unprotect(1);
+                                }
 
-                                gc_unprotect(1);
+                                gc_unprotect(2);
                             }
 next_free_var:
                             gc_unprotect(1);
@@ -897,8 +1841,8 @@ next_free_var:
                             gc_protect(&pattern);
                             unsigned renamed_tmpl = rename_template_vars(tmpl, rename_map);
                             if (renamed_tmpl == TOK_ERROR) {
-                                emit(cctx, OP_HALT);
-                                return dynamic_result();
+                                return emit_syntax_error(
+                                    cctx, "syntax binding: invalid syntax");
                             }
                             gc_protect(&renamed_tmpl);
                             unsigned new_rule_tail = alloc_cons(renamed_tmpl, 0);
@@ -941,12 +1885,15 @@ next_free_var:
                     // Free vars are pre-renamed, but the default ellipsis
                     // decision still belongs to the transformer definition
                     // environment.
+                    unsigned transformer_closure_env =
+                        kw == ctx.kw_let_syntax ? cctx->env : new_env;
                     unsigned transformer =
                         make_syntax_transformer_with_default_ellipsis(
-                            renamed_form, 0, default_ellipsis_id);
+                            renamed_form, transformer_closure_env,
+                            default_ellipsis_id);
                     if (transformer == TOK_ERROR) {
-                        emit(cctx, OP_HALT);
-                        return dynamic_result();
+                        return emit_syntax_error(
+                            cctx, "syntax binding: invalid syntax");
                     }
 
                     // Add to frame
@@ -979,6 +1926,16 @@ next_free_var:
 
                 // Emit gensym bindings: look up original var, define gensym
                 // This happens at let-syntax entry, BEFORE any inner scopes
+                for (unsigned gb = gensym_const_bindings; gb; gb = cdr(gb)) {
+                    unsigned entry = car(gb);
+                    unsigned gensym_atom = car(entry);
+                    unsigned val = cdr(entry);
+                    int64_t gensym_id = CELL_ID(gensym_atom);
+
+                    emit2(cctx, OP_CONST, code_add_const(cctx->code, val));
+                    emit2(cctx, OP_DEFINE, gensym_id);
+                }
+
                 for (unsigned gb = gensym_bindings; gb; gb = cdr(gb)) {
                     unsigned entry = car(gb);
                     unsigned gensym_atom = car(entry);
@@ -986,15 +1943,33 @@ next_free_var:
                     int64_t gensym_id = CELL_ID(gensym_atom);
                     int64_t var_id = CELL_ID(var_atom);
 
-                    emit4(cctx, OP_LOOKUP, var_id, IC_UNCACHED, IC_UNCACHED);
-                    emit2(cctx, OP_DEFINE, gensym_id);
+                    int local_slot = find_stack_local_slot(cctx, var_id);
+                    if (local_slot >= 0) {
+                        emit_local_get_slot(cctx, local_slot);
+                        emit2(cctx, OP_DEFINE, gensym_id);
+                    } else {
+                        emit3(cctx, OP_DEFINE_ALIAS, gensym_id, var_id);
+                    }
                 }
 
                 // Add gensyms to compile-time env so they're visible in body
-                if (gensym_bindings) {
+                if (gensym_bindings || gensym_const_bindings) {
                     unsigned gensym_frame_vars = 0, gensym_frame_vals = 0;
                     gc_protect(&gensym_frame_vars);
                     gc_protect(&gensym_frame_vals);
+
+                    unsigned gcb = gensym_const_bindings;
+                    gc_protect(&gcb);
+                    while (gcb) {
+                        unsigned entry = car(gcb);
+                        unsigned gensym_atom = car(entry);
+                        unsigned val = cdr(entry);
+                        gensym_frame_vars =
+                            alloc_cons(gensym_atom, gensym_frame_vars);
+                        gensym_frame_vals = alloc_cons(val, gensym_frame_vals);
+                        gcb = cdr(gcb);
+                    }
+                    gc_unprotect(1);
 
                     unsigned gb = gensym_bindings;
                     gc_protect(&gb);
@@ -1030,41 +2005,10 @@ next_free_var:
             // Check for macro application (silent - don't warn if not found)
             unsigned mac = lookup_silent(kw, cctx->env);
             if (mac != TOK_ERROR) {
-                if (IS_SYNTAX(mac)) {
-                    unsigned old_gensym = gensym_counter;
-                    unsigned expanded = apply_syntax(mac, expr, cctx->env);
-                    if (expanded == TOK_ERROR) {
-                        show_error("macro expansion failed");
-                        emit(cctx, OP_HALT);
-                        return dynamic_result();
-                    }
-                    emit_gensym_definitions(cctx, old_gensym, gensym_counter);
-                    return compile_expr_internal(expanded, cctx);
-                }
-                if (IS_MACRO(mac)) {
-                    GC_GUARD;
-                    unsigned params = car(mac);
-                    unsigned mbody = car(cdr(mac));
-                    unsigned menv = cdr(cdr(mac));
-                    gc_protect(&mbody);
-                    gc_protect(&menv);
-                    unsigned frame = bind_params(params, cdr(expr));
-                    if (frame == TOK_ERROR) {
-                        emit(cctx, OP_HALT);
-                        return dynamic_result();
-                    }
-                    gc_protect(&frame);
-                    unsigned new_env = alloc_cons(frame, menv);
-                    gc_protect(&new_env);
-                    unsigned expanded = eval_cps(mbody, new_env);
-                    gc_protect(&expanded);
-                    if (expanded == TOK_ERROR) {
-                        show_error("macro expansion failed");
-                        emit(cctx, OP_HALT);
-                        return dynamic_result();
-                    }
-                    return compile_expr_internal(expanded, cctx);
-                }
+                compile_result application_macro_result;
+                if (compile_macro_binding(mac, expr, cctx,
+                                          &application_macro_result))
+                    return application_macro_result;
             }
         }
 
@@ -1121,11 +2065,14 @@ static compile_result compile_if(unsigned expr, compile_ctx *cctx)
 
     // Non-constant test - emit normal conditional
     // Jump to else if false
+    unsigned branch_env = cctx->env;
+    gc_protect(&branch_env);
     unsigned else_jump = emit_jump(cctx, OP_JUMPIFNOT);
 
     // Compile then branch
     cctx->tail_position = tail;
     compile_result then_result = compile_expr_internal(caddr(expr), cctx);
+    cctx->env = branch_env;
 
     // Jump over else
     unsigned end_jump = emit_jump(cctx, OP_JUMP);
@@ -1140,6 +2087,7 @@ static compile_result compile_if(unsigned expr, compile_ctx *cctx)
         emit2(cctx, OP_CONST, code_add_const(cctx->code, 0));
         else_result = const_result(0);
     }
+    cctx->env = branch_env;
 
     patch_jump(cctx, end_jump);
 
@@ -1227,7 +2175,7 @@ static compile_result compile_lambda(unsigned expr, compile_ctx *cctx)
     // Count parameters
     unsigned arity = 0;
     bool has_rest = false;
-    for (unsigned p = params; p; p = cdr(p)) {
+    for (unsigned p = params; p; p = IS_PAIR(p) ? cdr(p) : 0) {
         if (IS_ATOM(p)) {
             // Rest parameter
             has_rest = true;
@@ -1283,12 +2231,16 @@ static compile_result compile_lambda(unsigned expr, compile_ctx *cctx)
 
 // Helper to check if an expression is an internal define
 // Returns the variable name if it's a define, 0 otherwise
-static unsigned is_internal_define(unsigned expr)
+static unsigned is_internal_define(unsigned expr, unsigned env)
 {
     if (!IS_PAIR(expr))
         return 0;
     unsigned kw = car(expr);
     if (!IS_KEYWORD(kw, ctx.kw_define))
+        return 0;
+    if (lookup_silent(ctx.kw_define, env) != TOK_ERROR)
+        return 0;
+    if (!IS_PAIR(cdr(expr)))
         return 0;
     unsigned second = cadr(expr);
     if (IS_PAIR(second)) {
@@ -1315,7 +2267,7 @@ static unsigned scan_internal_defines(unsigned body, unsigned env)
         gc_protect(&expr);
 
         // Check for direct define
-        unsigned name = is_internal_define(expr);
+        unsigned name = is_internal_define(expr, env);
         if (name) {
             gc_protect(&name);
             unsigned cell = alloc_cons(name, names);
@@ -1333,7 +2285,7 @@ static unsigned scan_internal_defines(unsigned body, unsigned env)
             unsigned begin_body = cdr(expr);
             while (begin_body) {
                 unsigned inner = car(begin_body);
-                unsigned inner_name = is_internal_define(inner);
+                unsigned inner_name = is_internal_define(inner, env);
                 if (inner_name) {
                     gc_protect(&inner_name);
                     unsigned cell = alloc_cons(inner_name, names);
@@ -1408,11 +2360,12 @@ static compile_result compile_begin(unsigned exprs, compile_ctx *cctx)
     unsigned internal_defs = scan_internal_defines(exprs, cctx->env);
     gc_protect(&internal_defs);
 
-    unsigned saved_env = cctx->env;
-    gc_protect(&saved_env);
     if (internal_defs) {
         cctx->env = extend_compile_env_with_names(cctx->env, internal_defs);
     }
+    unsigned syntax_frame = alloc_cons(0, 0);
+    gc_protect(&syntax_frame);
+    cctx->env = alloc_cons(syntax_frame, cctx->env);
 
     bool tail = cctx->tail_position;
     compile_result result = dynamic_result();
@@ -1423,6 +2376,7 @@ static compile_result compile_begin(unsigned exprs, compile_ctx *cctx)
         cctx->tail_position = tail && is_last;
 
         result = compile_expr_internal(car(exprs), cctx);
+        install_compile_time_define_syntax(car(exprs), cctx);
 
         if (!is_last) {
             emit(cctx, OP_POP); // Discard non-final values
@@ -1431,9 +2385,6 @@ static compile_result compile_begin(unsigned exprs, compile_ctx *cctx)
 
         exprs = cdr(exprs);
     }
-
-    // Restore compile-time environment
-    cctx->env = saved_env;
 
     // A multi-expression begin may contain effects before the final value.
     // Reporting the final value as a constant lets outer folds erase those
@@ -1469,6 +2420,80 @@ static unsigned extend_compile_env(unsigned env, unsigned bindings)
     return new_env;
 }
 
+static compile_result compile_named_let(unsigned expr, compile_ctx *cctx)
+{
+    if (!syntax_arity_checked(expr, 3, UINT_MAX, "let"))
+        return emit_syntax_error(cctx, "let: invalid syntax");
+
+    unsigned name = cadr(expr);
+    unsigned bindings = caddr(expr);
+    unsigned body = cdddr(expr);
+    if (!identifier_valid(name) || !binding_list_valid(bindings, "let") ||
+        !list_length_checked(body, NULL, "let"))
+        return emit_syntax_error(cctx, "let: invalid named let syntax");
+
+    GC_GUARD;
+    gc_protect(&name);
+    gc_protect(&bindings);
+    gc_protect(&body);
+
+    unsigned params = 0, params_tail = 0;
+    unsigned args = 0, args_tail = 0;
+    gc_protect(&params);
+    gc_protect(&params_tail);
+    gc_protect(&args);
+    gc_protect(&args_tail);
+
+    FORLIST(b, bindings) {
+        unsigned binding = car(b);
+        list_append(&params, &params_tail, car(binding));
+        list_append(&args, &args_tail, cadr(binding));
+    }
+
+    unsigned argc = list_length(args);
+    bool tail = cctx->tail_position;
+    cctx->tail_position = false;
+
+    unsigned a = args;
+    gc_protect(&a);
+    while (a) {
+        compile_expr_internal(car(a), cctx);
+        a = cdr(a);
+    }
+    gc_unprotect(1);
+
+    emit_pushenv(cctx);
+    emit2(cctx, OP_CONST, code_add_const(cctx->code, 0));
+    emit2(cctx, OP_DEFINE, CELL_ID(name));
+
+    unsigned saved_env = cctx->env;
+    gc_protect(&saved_env);
+
+    unsigned value_list = 0, binding = 0, binding_list = 0;
+    gc_protect(&value_list);
+    gc_protect(&binding);
+    gc_protect(&binding_list);
+    value_list = alloc_cons(0, 0);
+    binding = alloc_cons(name, value_list);
+    binding_list = alloc_cons(binding, 0);
+    cctx->env = extend_compile_env(cctx->env, binding_list);
+
+    unsigned lambda_tail = 0, lambda_expr = 0;
+    gc_protect(&lambda_tail);
+    gc_protect(&lambda_expr);
+    lambda_tail = alloc_cons(params, body);
+    lambda_expr = alloc_cons(atom_from_string("lambda"), lambda_tail);
+    compile_lambda(lambda_expr, cctx);
+    emit2(cctx, OP_SET, CELL_ID(name));
+    emit2(cctx, OP_CALL, argc);
+
+    cctx->env = saved_env;
+    cctx->tail_position = tail;
+    emit_popenv(cctx);
+
+    return dynamic_result();
+}
+
 // (let ((var val) ...) body...)
 static compile_result compile_let(unsigned expr, compile_ctx *cctx)
 {
@@ -1476,6 +2501,9 @@ static compile_result compile_let(unsigned expr, compile_ctx *cctx)
         return emit_syntax_error(cctx, "let: invalid syntax");
 
     unsigned bindings = cadr(expr);
+    if (IS_ATOM(bindings))
+        return compile_named_let(expr, cctx);
+
     unsigned body = cddr(expr);
     if (!binding_list_valid(bindings, "let") ||
         !list_length_checked(body, NULL, "let"))
@@ -1488,6 +2516,8 @@ static compile_result compile_let(unsigned expr, compile_ctx *cctx)
     // Count bindings
     unsigned count = 0;
     FORLIST(b, bindings) { count++; }
+
+    bool tail = cctx->tail_position;
 
     // Compile all values first (in current environment)
     cctx->tail_position = false;
@@ -1543,7 +2573,7 @@ static compile_result compile_let(unsigned expr, compile_ctx *cctx)
         // Check if value is a lambda expression
         if (IS_PAIR(val_expr) && IS_ATOM(car(val_expr)) &&
             CELL_ID(car(val_expr)) == ctx.kw_lambda &&
-            !is_keyword_shadowed(ctx.kw_lambda, cctx->env)) {
+            builtin_keyword_unbound(ctx.kw_lambda, cctx->env)) {
             // Only inline if the lambda doesn't reference the bound variable
             // (self-referential lambdas need letrec semantics to work)
             unsigned lambda_body = cddr(val_expr);
@@ -1557,8 +2587,8 @@ static compile_result compile_let(unsigned expr, compile_ctx *cctx)
         }
     }
 
-    // Compile body in tail position
-    cctx->tail_position = true;
+    // Compile body in the same tail context as the let expression.
+    cctx->tail_position = tail;
     compile_result result = compile_begin(body, cctx);
 
     // Restore compile-time environment and known_lambdas
@@ -1596,6 +2626,8 @@ static compile_result compile_letstar(unsigned expr, compile_ctx *cctx)
     unsigned saved_env = cctx->env;
     gc_protect(&saved_env);
 
+    bool tail = cctx->tail_position;
+
     // Compile and define each binding sequentially
     // Each binding extends the compile-time environment for subsequent bindings
     cctx->tail_position = false;
@@ -1612,8 +2644,8 @@ static compile_result compile_letstar(unsigned expr, compile_ctx *cctx)
         gc_unprotect(2);
     }
 
-    // Compile body in tail position (with all bindings visible)
-    cctx->tail_position = true;
+    // Compile body in the same tail context as the let* expression.
+    cctx->tail_position = tail;
     compile_begin(body, cctx);
 
     // Restore compile-time environment
@@ -1677,7 +2709,7 @@ static compile_result compile_letrec(unsigned expr, compile_ctx *cctx)
         unsigned val_expr = cadr(car(bindings));
         if (IS_ATOM(binding) && IS_PAIR(val_expr) && IS_ATOM(car(val_expr)) &&
             CELL_ID(car(val_expr)) == ctx.kw_lambda &&
-            !is_keyword_shadowed(ctx.kw_lambda, cctx->env)) {
+            builtin_keyword_unbound(ctx.kw_lambda, cctx->env)) {
             loop_var = CELL_ID(binding);
             loop_params = cadr(val_expr);
             // Count arity
@@ -1756,6 +2788,9 @@ static compile_result compile_and(unsigned expr, compile_ctx *cctx)
         return dynamic_result();
     }
     unsigned jump_count = 0;
+    unsigned merge_env = 0;
+    gc_protect(&merge_env);
+    bool has_short_circuit_path = false;
 
     while (args) {
         bool is_last = !cdr(args);
@@ -1792,6 +2827,10 @@ static compile_result compile_and(unsigned expr, compile_ctx *cctx)
             // Duplicate to test and preserve value
             emit(cctx, OP_DUP);
             false_jumps[jump_count++] = emit_jump(cctx, OP_JUMPIFNOT);
+            if (!has_short_circuit_path) {
+                merge_env = cctx->env;
+                has_short_circuit_path = true;
+            }
             emit(cctx, OP_POP); // Discard if continuing
         }
 
@@ -1804,6 +2843,8 @@ static compile_result compile_and(unsigned expr, compile_ctx *cctx)
     }
 
     free(false_jumps);
+    if (has_short_circuit_path)
+        cctx->env = merge_env;
     return dynamic_result();
 }
 
@@ -1838,6 +2879,9 @@ static compile_result compile_or(unsigned expr, compile_ctx *cctx)
         return dynamic_result();
     }
     unsigned jump_count = 0;
+    unsigned merge_env = 0;
+    gc_protect(&merge_env);
+    bool has_short_circuit_path = false;
 
     while (args) {
         bool is_last = !cdr(args);
@@ -1874,6 +2918,10 @@ static compile_result compile_or(unsigned expr, compile_ctx *cctx)
             // Duplicate to test and preserve value
             emit(cctx, OP_DUP);
             true_jumps[jump_count++] = emit_jump(cctx, OP_JUMPIF);
+            if (!has_short_circuit_path) {
+                merge_env = cctx->env;
+                has_short_circuit_path = true;
+            }
             emit(cctx, OP_POP); // Discard if continuing
         }
 
@@ -1886,6 +2934,8 @@ static compile_result compile_or(unsigned expr, compile_ctx *cctx)
     }
 
     free(true_jumps);
+    if (has_short_circuit_path)
+        cctx->env = merge_env;
     return dynamic_result();
 }
 
@@ -1893,7 +2943,7 @@ static compile_result compile_or(unsigned expr, compile_ctx *cctx)
 static compile_result compile_cond(unsigned expr, compile_ctx *cctx)
 {
     unsigned clauses = cdr(expr);
-    if (!cond_clauses_valid(clauses, "cond"))
+    if (!cond_clauses_valid(clauses, "cond", cctx->env))
         return emit_syntax_error(cctx, "cond: invalid syntax");
 
     GC_GUARD;
@@ -1919,6 +2969,9 @@ static compile_result compile_cond(unsigned expr, compile_ctx *cctx)
     }
     unsigned end_count = 0;
     bool found_else = false;
+    unsigned merge_env = 0;
+    gc_protect(&merge_env);
+    bool has_conditional_path = false;
 
     while (clauses) {
         unsigned clause = car(clauses);
@@ -1929,7 +2982,8 @@ static compile_result compile_cond(unsigned expr, compile_ctx *cctx)
         gc_protect(&conseq);
 
         // Check for else clause
-        if (IS_KEYWORD(test, ctx.kw_else)) {
+        if (IS_KEYWORD(test, ctx.kw_else) &&
+            env_find_binding_cell(ctx.kw_else, cctx->env) == 0) {
             cctx->tail_position = tail;
             if (conseq) {
                 compile_begin(conseq, cctx);
@@ -1944,11 +2998,45 @@ static compile_result compile_cond(unsigned expr, compile_ctx *cctx)
 
         // Compile test
         cctx->tail_position = false;
-        compile_expr_internal(test, cctx);
+        unsigned test_saved_pos = cctx->code->code_len;
+        compile_result test_result = compile_expr_internal(test, cctx);
+        if (test_result.is_const) {
+            cctx->code->code_len = test_saved_pos;
+            if (IS_FALSE(test_result.value)) {
+                clauses = cdr(clauses);
+                gc_unprotect(3);
+                continue;
+            }
+
+            cctx->tail_position = tail;
+            bool is_arrow = conseq && IS_KEYWORD(car(conseq), ctx.kw_arrow) &&
+                            env_find_binding_cell(ctx.kw_arrow, cctx->env) == 0;
+            if (is_arrow) {
+                emit2(cctx, OP_CONST,
+                      code_add_const(cctx->code, test_result.value));
+                unsigned receiver_expr = cadr(conseq);
+                gc_protect(&receiver_expr);
+                cctx->tail_position = false;
+                compile_expr_internal(receiver_expr, cctx);
+                cctx->tail_position = tail;
+                gc_unprotect(1);
+                emit2(cctx, tail ? OP_TAILCALL : OP_CALL, 1);
+            } else if (conseq) {
+                compile_begin(conseq, cctx);
+            } else {
+                emit2(cctx, OP_CONST,
+                      code_add_const(cctx->code, test_result.value));
+            }
+            found_else = true;
+            gc_unprotect(3);
+            break;
+        }
+        unsigned false_env = cctx->env;
+        gc_protect(&false_env);
 
         // Check if we need the test value (=> syntax or no consequent)
         bool is_arrow = conseq && IS_KEYWORD(car(conseq), ctx.kw_arrow) &&
-                        lookup_silent(ctx.kw_arrow, cctx->env) == TOK_ERROR;
+                        env_find_binding_cell(ctx.kw_arrow, cctx->env) == 0;
         bool need_test_value = is_arrow || !conseq;
 
         if (need_test_value) {
@@ -1957,6 +3045,10 @@ static compile_result compile_cond(unsigned expr, compile_ctx *cctx)
         }
 
         unsigned next_clause = emit_jump(cctx, OP_JUMPIFNOT);
+        if (!has_conditional_path) {
+            merge_env = false_env;
+            has_conditional_path = true;
+        }
 
         // Compile consequence
         cctx->tail_position = tail;
@@ -1965,11 +3057,13 @@ static compile_result compile_cond(unsigned expr, compile_ctx *cctx)
             // Stack has: test-value (from DUP)
             unsigned receiver_expr = cadr(conseq);
             gc_protect(&receiver_expr);
+            cctx->tail_position = false;
             compile_expr_internal(receiver_expr, cctx);
+            cctx->tail_position = tail;
             gc_unprotect(1);
             // Stack has: test-value receiver
             // CALL pops fn first, then args - already in correct order
-            emit2(cctx, OP_CALL, 1);
+            emit2(cctx, tail ? OP_TAILCALL : OP_CALL, 1);
         } else if (conseq) {
             // Normal consequent - compile expressions
             compile_begin(conseq, cctx);
@@ -1978,6 +3072,7 @@ static compile_result compile_cond(unsigned expr, compile_ctx *cctx)
 
         // Always jump to end after true branch
         end_jumps[end_count++] = emit_jump(cctx, OP_JUMP);
+        cctx->env = false_env;
 
         // Patch false branch entry point
         patch_jump(cctx, next_clause);
@@ -1988,7 +3083,7 @@ static compile_result compile_cond(unsigned expr, compile_ctx *cctx)
         }
 
         clauses = cdr(clauses);
-        gc_unprotect(3);
+        gc_unprotect(4);
     }
 
     // If no else clause was found, emit unspecified for fall-through
@@ -2002,6 +3097,8 @@ static compile_result compile_cond(unsigned expr, compile_ctx *cctx)
     }
 
     free(end_jumps);
+    if (has_conditional_path)
+        cctx->env = merge_env;
     return dynamic_result();
 }
 
@@ -2018,7 +3115,7 @@ static compile_result compile_define(unsigned expr, compile_ctx *cctx)
         unsigned name = car(second);
         unsigned params = cdr(second);
         unsigned body = cddr(expr);
-        if (!IS_ATOM(name) || !body ||
+        if (!identifier_valid(name) || !body ||
             !list_length_checked(body, NULL, "define") ||
             !lambda_params_valid(params))
             return emit_syntax_error(cctx, "define: invalid syntax");
@@ -2042,7 +3139,7 @@ static compile_result compile_define(unsigned expr, compile_ctx *cctx)
         // Return the name
         emit2(cctx, OP_CONST, code_add_const(cctx->code, name));
     } else {
-        if (!IS_ATOM(second) || cdddr(expr))
+        if (!identifier_valid(second) || cdddr(expr))
             return emit_syntax_error(cctx, "define: invalid syntax");
 
         // (define var expr)
@@ -2067,7 +3164,7 @@ static compile_result compile_set(unsigned expr, compile_ctx *cctx)
 
     unsigned var = cadr(expr);
     unsigned val_expr = caddr(expr);
-    if (!IS_ATOM(var))
+    if (!identifier_valid(var))
         return emit_syntax_error(cctx, "set!: expected variable");
 
     GC_GUARD;
@@ -2613,10 +3710,16 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
     // This avoids closure allocation and function call overhead
     if (IS_PAIR(fn_expr) && IS_ATOM(car(fn_expr)) &&
         CELL_ID(car(fn_expr)) == ctx.kw_lambda &&
-        !is_keyword_shadowed(ctx.kw_lambda, cctx->env)) {
+        builtin_keyword_unbound(ctx.kw_lambda, cctx->env)) {
+
+        if (!syntax_arity_checked(fn_expr, 2, UINT_MAX, "lambda"))
+            return emit_syntax_error(cctx, "lambda: invalid syntax");
 
         unsigned lambda_params = cadr(fn_expr);
         unsigned lambda_body = cddr(fn_expr);
+        if (!lambda_params_valid(lambda_params) ||
+            !list_length_checked(lambda_body, NULL, "lambda"))
+            return emit_syntax_error(cctx, "lambda: invalid syntax");
 
         // Count params and check for rest parameter
         // Handle two cases:
@@ -2633,7 +3736,7 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
             param_count = 0;
         } else {
             // Case 2: (lambda (x y ...) body) or (lambda (x y . rest) body)
-            for (unsigned p = lambda_params; p; p = cdr(p)) {
+            for (unsigned p = lambda_params; p; p = IS_PAIR(p) ? cdr(p) : 0) {
                 if (IS_ATOM(p)) {
                     // Found rest param at end of dotted list
                     has_rest = true;
@@ -2753,7 +3856,8 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
 
                 // Add fixed params (only if lambda_params is a list)
                 if (IS_PAIR(lambda_params)) {
-                    for (unsigned p = lambda_params; p; p = cdr(p)) {
+                    for (unsigned p = lambda_params; p;
+                         p = IS_PAIR(p) ? cdr(p) : 0) {
                         if (IS_ATOM(p))
                             break;
                         unsigned var = car(p);
@@ -2788,7 +3892,8 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
                 unsigned a = args;
                 gc_protect(&a);
                 if (IS_PAIR(lambda_params)) {
-                    for (unsigned p = lambda_params; p && a; p = cdr(p)) {
+                    for (unsigned p = lambda_params; p && a;
+                         p = IS_PAIR(p) ? cdr(p) : 0) {
                         if (IS_ATOM(p))
                             break;
                         unsigned var = car(p);
@@ -2796,7 +3901,8 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
                         // Check if arg is a lambda that doesn't self-reference
                         if (IS_PAIR(val_expr) && IS_ATOM(car(val_expr)) &&
                             CELL_ID(car(val_expr)) == ctx.kw_lambda &&
-                            !is_keyword_shadowed(ctx.kw_lambda, cctx->env)) {
+                            builtin_keyword_unbound(ctx.kw_lambda,
+                                                    cctx->env)) {
                             unsigned arg_body = cddr(val_expr);
                             if (!contains_reference(arg_body, CELL_ID(var))) {
                                 unsigned pair = alloc_cons(var, val_expr);
@@ -2875,12 +3981,12 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
 }
 
 // Check if quasiquote contains unquote or unquote-splicing
-static bool qq_has_unquote(unsigned x, int depth)
+static bool qq_has_unquote(unsigned x, compile_ctx *cctx, int depth)
 {
     if (IS_VECTOR(x)) {
         unsigned len = vector_len(x);
         for (unsigned i = 0; i < len; i++) {
-            if (qq_has_unquote(vector_data_ptr(x)[i], depth))
+            if (qq_has_unquote(vector_data_ptr(x)[i], cctx, depth))
                 return true;
         }
         return false;
@@ -2892,29 +3998,92 @@ static bool qq_has_unquote(unsigned x, int depth)
     unsigned head = car(x);
 
     // Found unquote at depth 1
-    if (IS_KEYWORD(head, ctx.kw_unquote) && depth == 1)
+    if (IS_KEYWORD(head, ctx.kw_unquote) &&
+        !is_keyword_shadowed(ctx.kw_unquote, cctx->env) && depth == 1)
         return true;
-    if (IS_KEYWORD(head, ctx.kw_unquote_splicing) && depth == 1)
+    if (IS_KEYWORD(head, ctx.kw_unquote_splicing) &&
+        !is_keyword_shadowed(ctx.kw_unquote_splicing, cctx->env) &&
+        depth == 1)
         return true;
 
     // Nested quasiquote increases depth
-    if (IS_KEYWORD(head, ctx.kw_quasiquote))
-        return qq_has_unquote(cadr(x), depth + 1);
+    if (IS_KEYWORD(head, ctx.kw_quasiquote) &&
+        !is_keyword_shadowed(ctx.kw_quasiquote, cctx->env))
+        return qq_has_unquote(cadr(x), cctx, depth + 1);
 
     // Unquote decreases depth
-    if (IS_KEYWORD(head, ctx.kw_unquote) ||
-        IS_KEYWORD(head, ctx.kw_unquote_splicing))
-        return qq_has_unquote(cadr(x), depth - 1);
+    if ((IS_KEYWORD(head, ctx.kw_unquote) &&
+         !is_keyword_shadowed(ctx.kw_unquote, cctx->env)) ||
+        (IS_KEYWORD(head, ctx.kw_unquote_splicing) &&
+         !is_keyword_shadowed(ctx.kw_unquote_splicing, cctx->env)))
+        return qq_has_unquote(cadr(x), cctx, depth - 1);
 
     // Check all elements of list
     unsigned l = x;
     for (; IS_PAIR(l); l = cdr(l)) {
-        if (qq_has_unquote(car(l), depth))
+        if (qq_has_unquote(car(l), cctx, depth))
             return true;
     }
-    if (l && qq_has_unquote(l, depth))
+    if (l && qq_has_unquote(l, cctx, depth))
         return true;
     return false;
+}
+
+static bool qq_syntax_valid(unsigned x, compile_ctx *cctx, int depth)
+{
+    if (IS_VECTOR(x)) {
+        unsigned len = vector_len(x);
+        for (unsigned i = 0; i < len; i++) {
+            if (!qq_syntax_valid(vector_data_ptr(x)[i], cctx, depth))
+                return false;
+        }
+        return true;
+    }
+
+    if (!IS_PAIR(x))
+        return true;
+
+    unsigned head = car(x);
+    if (IS_KEYWORD(head, ctx.kw_unquote) &&
+        !is_keyword_shadowed(ctx.kw_unquote, cctx->env)) {
+        if (!syntax_arity_checked(x, 1, 1, "unquote"))
+            return false;
+        if (depth == 1)
+            return true;
+        return qq_syntax_valid(cadr(x), cctx, depth - 1);
+    }
+    if (IS_KEYWORD(head, ctx.kw_unquote_splicing) &&
+        !is_keyword_shadowed(ctx.kw_unquote_splicing, cctx->env)) {
+        if (!syntax_arity_checked(x, 1, 1, "unquote-splicing"))
+            return false;
+        if (depth == 1)
+            return true;
+        return qq_syntax_valid(cadr(x), cctx, depth - 1);
+    }
+    if (IS_KEYWORD(head, ctx.kw_quasiquote) &&
+        !is_keyword_shadowed(ctx.kw_quasiquote, cctx->env)) {
+        return syntax_arity_checked(x, 1, 1, "quasiquote") &&
+               qq_syntax_valid(cadr(x), cctx, depth + 1);
+    }
+
+    unsigned l = x;
+    for (; IS_PAIR(l); l = cdr(l)) {
+        if (!qq_syntax_valid(car(l), cctx, depth))
+            return false;
+    }
+    if (l && !qq_syntax_valid(l, cctx, depth))
+        return false;
+
+    return true;
+}
+
+static void compile_qq_error(compile_ctx *cctx, const char *message)
+{
+    unsigned msg = make_string_copy(message);
+    gc_protect(&msg);
+    emit2(cctx, OP_CONST, code_add_const(cctx->code, msg));
+    emit3(cctx, OP_PRIM, PERROR, 1);
+    gc_unprotect(1);
 }
 
 // Compile quasiquote recursively - generates runtime code
@@ -2938,13 +4107,22 @@ static void compile_qq_rec(unsigned x, compile_ctx *cctx, int depth)
     unsigned head = car(x);
 
     // (unquote expr) at depth 1: compile the expression
-    if (IS_KEYWORD(head, ctx.kw_unquote) && depth == 1) {
+    if (IS_KEYWORD(head, ctx.kw_unquote) &&
+        !is_keyword_shadowed(ctx.kw_unquote, cctx->env) && depth == 1) {
         compile_expr_internal(cadr(x), cctx);
         return;
     }
 
+    if (IS_KEYWORD(head, ctx.kw_unquote_splicing) &&
+        !is_keyword_shadowed(ctx.kw_unquote_splicing, cctx->env) &&
+        depth == 1) {
+        compile_qq_error(cctx, "unquote-splicing not inside list");
+        return;
+    }
+
     // (unquote expr) at depth > 1: decrement depth and wrap result
-    if (IS_KEYWORD(head, ctx.kw_unquote) && depth > 1) {
+    if (IS_KEYWORD(head, ctx.kw_unquote) &&
+        !is_keyword_shadowed(ctx.kw_unquote, cctx->env) && depth > 1) {
         compile_qq_rec(cadr(x), cctx, depth - 1);
         emit2(cctx, OP_CONST, code_add_const(cctx->code, ctx.atom_unquote));
         emit(cctx, OP_SWAP);
@@ -2954,7 +4132,9 @@ static void compile_qq_rec(unsigned x, compile_ctx *cctx, int depth)
     }
 
     // (unquote-splicing expr) at depth > 1: decrement depth and wrap result
-    if (IS_KEYWORD(head, ctx.kw_unquote_splicing) && depth > 1) {
+    if (IS_KEYWORD(head, ctx.kw_unquote_splicing) &&
+        !is_keyword_shadowed(ctx.kw_unquote_splicing, cctx->env) &&
+        depth > 1) {
         compile_qq_rec(cadr(x), cctx, depth - 1);
         emit2(cctx, OP_CONST,
               code_add_const(cctx->code, ctx.atom_unquote_splicing));
@@ -2965,7 +4145,8 @@ static void compile_qq_rec(unsigned x, compile_ctx *cctx, int depth)
     }
 
     // Nested quasiquote: keep structure but recurse with depth+1
-    if (IS_KEYWORD(head, ctx.kw_quasiquote)) {
+    if (IS_KEYWORD(head, ctx.kw_quasiquote) &&
+        !is_keyword_shadowed(ctx.kw_quasiquote, cctx->env)) {
         compile_qq_rec(cadr(x), cctx, depth + 1);
         emit2(cctx, OP_CONST, code_add_const(cctx->code, ctx.atom_quasiquote));
         emit(cctx, OP_SWAP);
@@ -2980,6 +4161,7 @@ static void compile_qq_rec(unsigned x, compile_ctx *cctx, int depth)
     for (unsigned l = x; IS_PAIR(l); l = cdr(l)) {
         unsigned elem = car(l);
         if (IS_PAIR(elem) && IS_KEYWORD(car(elem), ctx.kw_unquote_splicing) &&
+            !is_keyword_shadowed(ctx.kw_unquote_splicing, cctx->env) &&
             depth == 1) {
             has_splice = true;
             break;
@@ -2994,7 +4176,9 @@ static void compile_qq_rec(unsigned x, compile_ctx *cctx, int depth)
         for (unsigned l = x; IS_PAIR(l); l = cdr(l)) {
             unsigned elem = car(l);
             if (IS_PAIR(elem) &&
-                IS_KEYWORD(car(elem), ctx.kw_unquote_splicing) && depth == 1) {
+                IS_KEYWORD(car(elem), ctx.kw_unquote_splicing) &&
+                !is_keyword_shadowed(ctx.kw_unquote_splicing, cctx->env) &&
+                depth == 1) {
                 // ,@expr: compile expr and append
                 compile_expr_internal(cadr(elem), cctx);
                 emit3(cctx, OP_PRIM, PAPPEND, 2);
@@ -3004,6 +4188,14 @@ static void compile_qq_rec(unsigned x, compile_ctx *cctx, int depth)
                 emit(cctx, OP_LIST1);
                 emit3(cctx, OP_PRIM, PAPPEND, 2);
             }
+        }
+
+        unsigned tail = x;
+        while (IS_PAIR(tail))
+            tail = cdr(tail);
+        if (tail) {
+            compile_qq_rec(tail, cctx, depth);
+            emit3(cctx, OP_PRIM, PAPPEND, 2);
         }
     } else {
         // No splicing: build with cons from the end
@@ -3036,9 +4228,11 @@ static compile_result compile_quasiquote(unsigned expr, compile_ctx *cctx)
         return emit_syntax_error(cctx, "quasiquote: invalid syntax");
 
     unsigned tmpl = cadr(expr);
+    if (!qq_syntax_valid(tmpl, cctx, 1))
+        return emit_syntax_error(cctx, "quasiquote: invalid syntax");
 
     // Check if quasiquote has any unquotes that need runtime evaluation
-    if (!qq_has_unquote(tmpl, 1)) {
+    if (!qq_has_unquote(tmpl, cctx, 1)) {
         // No unquotes - can expand at compile time
         unsigned expanded = qq_expand_cps(tmpl, cctx->env);
         if (expanded == TOK_ERROR) {
@@ -3073,6 +4267,10 @@ void compile_sequence(unsigned exprs, compile_ctx *cctx, bool tail)
 
 code_object *compile_toplevel(unsigned expr, unsigned env)
 {
+    GC_GUARD;
+    gc_protect(&expr);
+    gc_protect(&env);
+
     compile_ctx *cctx = cctx_new(NULL, env);
     if (!cctx)
         return NULL;

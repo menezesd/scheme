@@ -44,6 +44,7 @@ enum opcode {
     OP_LOOKUP, // Variable lookup: LOOKUP sym_id -> push lookup(sym_id, env)
     OP_DEFINE, // Define variable: DEFINE sym_id -> pop val, defvar(sym_id, val)
     OP_SET,    // Set variable: SET sym_id -> pop val, setvar(sym_id, val)
+    OP_DEFINE_ALIAS, // Define alias: DEFINE_ALIAS alias_id target_id
 
     // Closures and functions
     OP_CLOSURE,  // Create closure: CLOSURE code_idx -> push closure(code[idx],
@@ -356,6 +357,7 @@ typedef struct compile_ctx {
     unsigned loop_params;       // Parameter list (cell index) for SET generation
     unsigned loop_arity;        // Number of fixed parameters
     unsigned env_depth;         // Number of PUSHENV frames since lambda entry
+    unsigned macro_expansion_depth; // Guard against recursive expansion
 } compile_ctx;
 
 // ============================================================================

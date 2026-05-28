@@ -78,6 +78,7 @@ enum lisp_type {
     BT_VMCONT = 101,    // VM continuation (distinct from CPS BT_CONT)
     BT_COMPILED_PATTERN = 102, // Compiled pattern: ptr = compiled_pattern*
     BT_BYTEVEC = 103,          // Bytevector: ptr = bytevec_data*
+    BT_BINDING_REF = 104,      // Alias to an environment value cell
     BT_BROKENHEART = -1 // GC forwarding pointer: car = new location
 };
 
@@ -627,6 +628,7 @@ static inline int32_t FIXNUM_VALUE(unsigned v)
 #define IS_CHAR(c) (IS_CELL(c) && CELL_TYPE(c) == BT_CHAR)
 #define IS_VECTOR(c) (IS_CELL(c) && CELL_TYPE(c) == BT_VECTOR)
 #define IS_BYTEVEC(c) (IS_CELL(c) && CELL_TYPE(c) == BT_BYTEVEC)
+#define IS_BINDING_REF(c) (IS_CELL(c) && CELL_TYPE(c) == BT_BINDING_REF)
 #define IS_NIL(c) ((c) == 0)
 #define IS_FALSE(c) ((c) == CELL_ATOM_FALSE)
 #define IS_TRUTHY(c) ((c) != CELL_ATOM_FALSE)
