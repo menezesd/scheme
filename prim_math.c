@@ -202,6 +202,118 @@ static unsigned log_value(unsigned arg, const char *name)
     return store_inexact(log(x));
 }
 
+static double sqrt1pm1_double(double x)
+{
+    if (x == 0.0)
+        return 0.0;
+    return x / (sqrt(1.0 + x) + 1.0);
+}
+
+static double log1pexp_double(double x)
+{
+    if (x <= -37.0)
+        return exp(x);
+    if (x <= 18.0)
+        return log1p(exp(x));
+    if (x <= 33.3)
+        return x + exp(-x);
+    return x;
+}
+
+static unsigned log1p_value(unsigned arg, const char *name)
+{
+    if (!require_number(arg, name))
+        return TOK_ERROR;
+    if (!IS_COMPLEX(arg)) {
+        double x = to_double(arg);
+        if (x < -1.0)
+            return make_complex_inexact(log(-(1.0 + x)), M_PI);
+        return store_inexact(log1p(x));
+    }
+
+    double real, imag;
+    get_complex_parts(arg, &real, &imag);
+    real += 1.0;
+    return make_complex_inexact(log(hypot(real, imag)), atan2(imag, real));
+}
+
+static unsigned expm1_value(unsigned arg, const char *name)
+{
+    if (!require_number(arg, name))
+        return TOK_ERROR;
+    if (!IS_COMPLEX(arg))
+        return store_inexact(expm1(to_double(arg)));
+
+    double real, imag;
+    get_complex_parts(arg, &real, &imag);
+    double exp_real = exp(real);
+    double out_real = expm1(real) * cos(imag) + (cos(imag) - 1.0);
+    double out_imag = exp_real * sin(imag);
+    return make_complex_inexact(out_real, out_imag);
+}
+
+static void complex_sqrt_inexact(double a, double b, double *out_real,
+                                 double *out_imag)
+{
+    double r = hypot(a, b);
+    *out_real = sqrt((r + a) / 2.0);
+    *out_imag = (b >= 0.0 ? 1.0 : -1.0) * sqrt((r - a) / 2.0);
+}
+
+static unsigned sqrt1pm1_value(unsigned arg, const char *name)
+{
+    if (!require_number(arg, name))
+        return TOK_ERROR;
+    if (!IS_COMPLEX(arg)) {
+        double x = to_double(arg);
+        if (x < -1.0)
+            return make_complex_inexact(-1.0, sqrt(-(1.0 + x)));
+        return store_inexact(sqrt1pm1_double(x));
+    }
+
+    double real, imag;
+    get_complex_parts(arg, &real, &imag);
+    double wr, wi;
+    complex_sqrt_inexact(real + 1.0, imag, &wr, &wi);
+
+    // z / (sqrt(1 + z) + 1)
+    double denom_real = wr + 1.0;
+    double denom_imag = wi;
+    double denom = denom_real * denom_real + denom_imag * denom_imag;
+    if (denom == 0.0)
+        return make_complex_inexact(wr - 1.0, wi);
+    double out_real = (real * denom_real + imag * denom_imag) / denom;
+    double out_imag = (imag * denom_real - real * denom_imag) / denom;
+    return make_complex_inexact(out_real, out_imag);
+}
+
+static unsigned log1pexp_value(unsigned arg, const char *name)
+{
+    if (!require_number(arg, name))
+        return TOK_ERROR;
+    if (!IS_COMPLEX(arg))
+        return store_inexact(log1pexp_double(to_double(arg)));
+
+    double real, imag;
+    get_complex_parts(arg, &real, &imag);
+    double cos_imag = cos(imag);
+    double sin_imag = sin(imag);
+    if (real > 0.0) {
+        double exp_neg_real = exp(-real);
+        double log_abs =
+            real + 0.5 * log1p(2.0 * exp_neg_real * cos_imag +
+                               exp_neg_real * exp_neg_real);
+        double angle = atan2(sin_imag, cos_imag + exp_neg_real);
+        return make_complex_inexact(log_abs, angle);
+    }
+
+    double exp_real = exp(real);
+    double one_plus_real = 1.0 + exp_real * cos_imag;
+    double one_plus_imag = exp_real * sin_imag;
+    return make_complex_inexact(log(hypot(one_plus_real, one_plus_imag)),
+                                atan2(one_plus_imag, one_plus_real));
+}
+
 static void complex_exp_parts(double real, double imag, double *out_real,
                               double *out_imag)
 {
@@ -722,6 +834,22 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned argc,
     case PLOG: {
         REQUIRE_ARGC(argc, 1, 1, "log");
         return log_value(argv[0], "log");
+    }
+    case PLOG1P: {
+        REQUIRE_ARGC(argc, 1, 1, "log1p");
+        return log1p_value(argv[0], "log1p");
+    }
+    case PEXPM1: {
+        REQUIRE_ARGC(argc, 1, 1, "expm1");
+        return expm1_value(argv[0], "expm1");
+    }
+    case PSQRT1PM1: {
+        REQUIRE_ARGC(argc, 1, 1, "sqrt1pm1");
+        return sqrt1pm1_value(argv[0], "sqrt1pm1");
+    }
+    case PLOG1PEXP: {
+        REQUIRE_ARGC(argc, 1, 1, "log1pexp");
+        return log1pexp_value(argv[0], "log1pexp");
     }
     // Random number generation (SRFI-27 style)
     case PRANDOMINTEGER: {

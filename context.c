@@ -31,6 +31,7 @@
 #include "reader.h"
 #include <ctype.h>
 #include <errno.h>
+#include <locale.h>
 #include <limits.h>
 #include <math.h>
 #include <string.h>
@@ -64,6 +65,7 @@ bool panic_jmp_set = false;
 
 void init_heap(void)
 {
+    setlocale(LC_CTYPE, "");
     // Allocate cons cells heap (includes nursery space at end of first
     // semispace)
     size_t heap_size = 2 * SEMISPACE_SIZE * sizeof(cons_cell);
@@ -1380,7 +1382,8 @@ bool feature_id_available(int64_t id)
     static const char *features[] = {
         "vesper", "r5rs", "r7rs-small-subset", "srfi-1", "srfi-2",
         "srfi-8", "srfi-9", "srfi-26", "srfi-27", "srfi-28",
-        "bytevectors", "exact-rationals", "complex", "full-unicode-absent",
+        "bytevectors", "exact-rationals", "complex", "unicode-normalization",
+        "unicode-case-folding", "unicode-character-properties", "full-unicode-absent",
         NULL};
 
     if (id < 0 || (unsigned)id >= ctx.atom_table_cap || !ctx.atom_table[id])

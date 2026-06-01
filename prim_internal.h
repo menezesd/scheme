@@ -1194,6 +1194,8 @@ unsigned prim_reverse(unsigned argc, unsigned *argv);
 // String operations (prim_string.c)
 unsigned prim_string_append(unsigned argc, unsigned *argv);
 unsigned prim_substring(unsigned argc, unsigned *argv);
+unsigned prim_string_normalize(unsigned prim_id, unsigned argc,
+                               unsigned *argv);
 
 // Type predicates (prim_type.c)
 unsigned apply_type_predicate(unsigned prim_id, unsigned argc,
@@ -1202,6 +1204,11 @@ unsigned apply_type_predicate(unsigned prim_id, unsigned argc,
 // Character operations (prim_char.c)
 unsigned apply_char_primitive(unsigned prim_id, unsigned argc,
                               unsigned *argv);
+uint32_t unicode_simple_foldcase(uint32_t code);
+uint32_t unicode_upcase(uint32_t code);
+uint32_t unicode_downcase(uint32_t code);
+bool unicode_full_foldcase(uint32_t code, const uint32_t **mapping,
+                           size_t *length);
 
 // Vector operations (prim_vector.c)
 unsigned apply_vector_primitive(unsigned prim_id, unsigned argc,

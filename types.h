@@ -438,6 +438,7 @@ enum primitive_id {
     // Character case
     PCHARUP,
     PCHARDOWN,
+    PCHARFOLD,
     // String operations
     PMAKESTR,
     PSTRSET,
@@ -454,6 +455,11 @@ enum primitive_id {
     PSTR2LIST,
     PLIST2STR,
     PSTRCOPY,
+    PSTRNFD,
+    PSTRNFC,
+    PSTRNFKD,
+    PSTRNFKC,
+    PSTRFOLD,
     // Vector
     PVECTOR,
     PVECFILL,
@@ -477,6 +483,10 @@ enum primitive_id {
     PATAN,
     PLOG,
     PEXP,
+    PLOG1P,
+    PEXPM1,
+    PSQRT1PM1,
+    PLOG1PEXP,
     PFLOOR,
     PCEILING,
     PTRUNCATE,

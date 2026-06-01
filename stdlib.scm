@@ -1619,12 +1619,55 @@
 ;;; ============================================================================
 
 ;; string-upcase - convert string to uppercase
+(define (unicode-upcase-piece ch)
+  (let ((code (char->integer ch)))
+    (cond
+      ((= code 223) "SS")
+      ((= code 64256) "FF")
+      ((= code 64257) "FI")
+      ((= code 64258) "FL")
+      ((= code 64259) "FFI")
+      ((= code 64260) "FFL")
+      ((= code 64261) "ST")
+      ((= code 64262) "ST")
+      (else (string (char-upcase ch))))))
+
 (define (string-upcase s)
-  (list->string (map char-upcase (string->list s))))
+  (apply string-append (map unicode-upcase-piece (string->list s))))
 
 ;; string-downcase - convert string to lowercase
 (define (string-downcase s)
   (list->string (map char-downcase (string->list s))))
+
+(define (unicode-char . codes)
+  (list->string (map integer->char codes)))
+
+(define (string-normalized-nfd? s)
+  (string=? s (string-normalize-nfd s)))
+
+(define (string-normalized-nfc? s)
+  (string=? s (string-normalize-nfc s)))
+
+(define (string-normalized-nfkd? s)
+  (string=? s (string-normalize-nfkd s)))
+
+(define (string-normalized-nfkc? s)
+  (string=? s (string-normalize-nfkc s)))
+
+(define (string-ci=? a b)
+  (string=? (string-foldcase a) (string-foldcase b)))
+
+(define (string-ci<? a b)
+  (string<? (string-foldcase a) (string-foldcase b)))
+
+(define (string-ci>? a b)
+  (string>? (string-foldcase a) (string-foldcase b)))
+
+(define (string-ci<=? a b)
+  (string<=? (string-foldcase a) (string-foldcase b)))
+
+(define (string-ci>=? a b)
+  (string>=? (string-foldcase a) (string-foldcase b)))
 
 ;; string-prefix? - check if s starts with prefix
 (define (string-prefix? prefix s)
@@ -2001,6 +2044,141 @@
          (error "string-builder: expected character, string, or command"
                 (car args)))))))
 
+(define string-slice substring)
+
+(define (keyword-arg args key default)
+  (let loop ((xs args))
+    (cond ((null? xs) default)
+          ((null? (cdr xs)) (error "keyword argument missing value" key))
+          ((eq? (car xs) key) (cadr xs))
+          (else (loop (cddr xs))))))
+
+(define (string-join strings . args)
+  (let ((infix (cond ((null? args) " ")
+                     ((= (length args) 1) (car args))
+                     (else (car args))))
+        (prefix (if (= (length args) 3) (cadr args) ""))
+        (suffix (if (= (length args) 3) (caddr args) "")))
+    (let loop ((xs strings) (first? #t) (out prefix))
+      (cond ((null? xs) (string-append out suffix))
+            (first?
+             (loop (cdr xs) #f (string-append out (car xs))))
+            (else
+             (loop (cdr xs) #f (string-append out infix (car xs))))))))
+
+(define (string-joiner . args)
+  (let ((infix (keyword-arg args 'infix ""))
+        (prefix (keyword-arg args 'prefix ""))
+        (suffix (keyword-arg args 'suffix "")))
+    (lambda strings
+      (string-join strings infix prefix suffix))))
+
+(define (string-joiner* . args)
+  (let ((joiner (apply string-joiner args)))
+    (lambda (strings)
+      (apply joiner strings))))
+
+(define (delimiter-procedure delimiter)
+  (cond ((procedure? delimiter) delimiter)
+        ((char? delimiter) (lambda (ch) (char=? ch delimiter)))
+        (else (error "string-splitter: unsupported delimiter" delimiter))))
+
+(define (string-splitter . args)
+  (let ((delimiter (delimiter-procedure
+                     (keyword-arg args 'delimiter char-whitespace?)))
+        (allow-runs? (keyword-arg args 'allow-runs? #t))
+        (copier (keyword-arg args 'copier substring)))
+    (lambda (str)
+      (let ((len (string-length str)))
+        (let loop ((i 0) (start 0) (parts '()))
+          (cond
+            ((>= i len)
+             (reverse (if (and allow-runs? (= start i))
+                          parts
+                          (cons (copier str start i) parts))))
+            ((delimiter (string-ref str i))
+             (let skip ((j (+ i 1)))
+               (if (and allow-runs?
+                        (< j len)
+                        (delimiter (string-ref str j)))
+                   (skip (+ j 1))
+                   (loop j j
+                         (if (and allow-runs? (= start i))
+                             parts
+                             (cons (copier str start i) parts))))))
+            (else
+             (loop (+ i 1) start parts))))))))
+
+(define (repeat-string piece count)
+  (let loop ((n count) (out ""))
+    (if (<= n 0)
+        out
+        (loop (- n 1) (string-append out piece)))))
+
+(define (string-padder . args)
+  (let ((where (keyword-arg args 'where 'leading))
+        (fill-with (keyword-arg args 'fill-with " "))
+        (clip? (keyword-arg args 'clip? #t)))
+    (lambda (str len)
+      (let ((n (string-length str)))
+        (cond
+          ((< n len)
+           (let ((padding (repeat-string fill-with (- len n))))
+             (if (eq? where 'trailing)
+                 (string-append str padding)
+                 (string-append padding str))))
+          ((and clip? (> n len))
+           (if (eq? where 'trailing)
+               (substring str 0 len)
+               (substring str (- n len) n)))
+          (else str))))))
+
+(define (string-pad-left str k . maybe-char)
+  ((string-padder 'where 'leading
+                  'fill-with (string (if (null? maybe-char)
+                                         #\space
+                                         (car maybe-char))))
+   str
+   k))
+
+(define (string-pad-right str k . maybe-char)
+  ((string-padder 'where 'trailing
+                  'fill-with (string (if (null? maybe-char)
+                                         #\space
+                                         (car maybe-char))))
+   str
+   k))
+
+(define (trim-procedure to-trim)
+  (cond ((procedure? to-trim) to-trim)
+        ((char? to-trim) (lambda (ch) (char=? ch to-trim)))
+        (else (error "string-trimmer: unsupported trim predicate" to-trim))))
+
+(define (string-trimmer . args)
+  (let ((where (keyword-arg args 'where 'both))
+        (to-trim (trim-procedure (keyword-arg args 'to-trim char-whitespace?)))
+        (copier (keyword-arg args 'copier substring)))
+    (lambda (str)
+      (let* ((len (string-length str))
+             (start (if (or (eq? where 'leading) (eq? where 'both))
+                        (let loop ((i 0))
+                          (if (and (< i len) (to-trim (string-ref str i)))
+                              (loop (+ i 1))
+                              i))
+                        0))
+             (end (if (or (eq? where 'trailing) (eq? where 'both))
+                      (let loop ((i (- len 1)))
+                        (if (and (>= i start) (to-trim (string-ref str i)))
+                            (loop (- i 1))
+                            (+ i 1)))
+                      len)))
+        (copier str start end)))))
+
+(define (string-replace str char1 char2)
+  (list->string
+    (map (lambda (ch) (if (char=? ch char1) char2 ch))
+         (string->list str))))
+
 (define (string-copy! to at from . rest)
   (let* ((start (if (pair? rest) (car rest) 0))
          (rest2 (if (pair? rest) (cdr rest) '()))
@@ -2202,19 +2380,19 @@
 (define (simplest-exact-rational x y)
   (exact (simplest-rational x y)))
 
-(define (log1p z) (log (+ 1 z)))
 (define logp1 log1p)
-(define (expm1 z) (- (exp z) 1))
 (define (exp2 z) (expt 2 z))
 (define (exp10 z) (expt 10 z))
-(define (exp2m1 z) (- (exp2 z) 1))
-(define (exp10m1 z) (- (exp10 z) 1))
+(define (exp2m1 z) (expm1 (* z (log 2))))
+(define (exp10m1 z) (expm1 (* z (log 10))))
 (define (log2 z) (/ (log z) (log 2)))
 (define (log10 z) (/ (log z) (log 10)))
-(define (log2p1 z) (log2 (+ 1 z)))
-(define (log10p1 z) (log10 (+ 1 z)))
-(define (log1mexp x) (log (- 1 (exp x))))
-(define (log1pexp x) (log (+ 1 (exp x))))
+(define (log2p1 z) (/ (log1p z) (log 2)))
+(define (log10p1 z) (/ (log1p z) (log 10)))
+(define (log1mexp x)
+  (if (<= x (- (log 2)))
+      (log1p (- (exp x)))
+      (log (- (expm1 x)))))
 
 (define (versin z) (- 1 (cos z)))
 (define (exsec z) (/ (versin z) (cos z)))
@@ -2263,9 +2441,8 @@
 (define (aexsec/pi x) (/ (aexsec x) pi))
 
 (define (rsqrt z) (/ 1 (sqrt z)))
-(define (sqrt1pm1 z) (- (sqrt (+ 1 z)) 1))
 (define (compound z1 z2) (expt (+ 1 z1) z2))
-(define (compoundm1 z1 z2) (- (compound z1 z2) 1))
+(define (compoundm1 z1 z2) (expm1 (* z2 (log1p z1))))
 (define (conjugate z)
   (make-rectangular (real-part z) (- (imag-part z))))
 
@@ -2278,13 +2455,41 @@
        (+ 10 (- n (char->integer #\A))))
       ((and (>= n (char->integer #\a)) (<= n (char->integer #\z)))
        (+ 10 (- n (char->integer #\a))))
+      ((and (>= n 1632) (<= n 1641)) (- n 1632))
+      ((and (>= n 1776) (<= n 1785)) (- n 1776))
+      ((and (>= n 2406) (<= n 2415)) (- n 2406))
+      ((and (>= n 2534) (<= n 2543)) (- n 2534))
+      ((and (>= n 2662) (<= n 2671)) (- n 2662))
+      ((and (>= n 2790) (<= n 2799)) (- n 2790))
+      ((and (>= n 2918) (<= n 2927)) (- n 2918))
+      ((and (>= n 3046) (<= n 3055)) (- n 3046))
+      ((and (>= n 3174) (<= n 3183)) (- n 3174))
+      ((and (>= n 3302) (<= n 3311)) (- n 3302))
+      ((and (>= n 3430) (<= n 3439)) (- n 3430))
+      ((and (>= n 3664) (<= n 3673)) (- n 3664))
+      ((and (>= n 3792) (<= n 3801)) (- n 3792))
+      ((and (>= n 3872) (<= n 3881)) (- n 3872))
+      ((and (>= n 4160) (<= n 4169)) (- n 4160))
+      ((and (>= n 6112) (<= n 6121)) (- n 6112))
+      ((and (>= n 6160) (<= n 6169)) (- n 6160))
+      ((and (>= n 6470) (<= n 6479)) (- n 6470))
+      ((and (>= n 6608) (<= n 6617)) (- n 6608))
+      ((and (>= n 6672) (<= n 6681)) (- n 6672))
+      ((and (>= n 6784) (<= n 6793)) (- n 6784))
+      ((and (>= n 6800) (<= n 6809)) (- n 6800))
+      ((and (>= n 6992) (<= n 7001)) (- n 6992))
+      ((and (>= n 7088) (<= n 7097)) (- n 7088))
+      ((and (>= n 7232) (<= n 7241)) (- n 7232))
+      ((and (>= n 7248) (<= n 7257)) (- n 7248))
+      ((and (>= n 42528) (<= n 42537)) (- n 42528))
+      ((and (>= n 43216) (<= n 43225)) (- n 43216))
+      ((and (>= n 43264) (<= n 43273)) (- n 43264))
+      ((and (>= n 43472) (<= n 43481)) (- n 43472))
+      ((and (>= n 43504) (<= n 43513)) (- n 43504))
+      ((and (>= n 43600) (<= n 43609)) (- n 43600))
+      ((and (>= n 44016) (<= n 44025)) (- n 44016))
+      ((and (>= n 65296) (<= n 65305)) (- n 65296))
       (else #f))))
-
-(define (char-foldcase ch)
-  (char-downcase ch))
-
-(define (string-foldcase s)
-  (string-downcase s))
 
 (define (utf8-continuation-byte? b)
   (and (>= b 128) (<= b 191)))

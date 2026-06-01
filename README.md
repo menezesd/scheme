@@ -14,6 +14,8 @@ compiler, semispace garbage collector, hygienic macros, and full numeric tower.
 - **First-Class Continuations**: Full `call/cc` with multi-shot continuation support
 - **SRFI Support**: SRFI-1 (lists), SRFI-9 (records), SRFI-26 (cut/cute)
 - **Ports**: File I/O and string ports with standard Scheme port operations
+- **Unicode Strings**: UTF-8 strings with table-driven normalization, case folding,
+  and character predicates from Unicode 15.1
 
 ## Building
 
@@ -107,10 +109,19 @@ delay     define-syntax        syntax-rules
 ; Strings
 "hello world"
 (string-append "foo" "bar")  ; => "foobar"
+(string-length "😉test")     ; => 5
+(string-normalize-nfc "é")  ; => "é"
+(string-foldcase "Straße")   ; => "strasse"
 
 ; Characters
 #\a #\space #\newline
 ```
+
+String length, indexing, slicing, and mapping operate on Unicode scalar values
+encoded as UTF-8. Normalization (`string-normalize-nfc`, `string-normalize-nfd`,
+`string-normalize-nfkc`, `string-normalize-nfkd`) and case folding are
+table-driven from Unicode 15.1. Ordering predicates such as `string<?` compare
+encoded/codepoint order; they are not locale-sensitive collation.
 
 ### Higher-Order Functions
 

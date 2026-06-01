@@ -7,6 +7,7 @@
 #include "reader.h"
 #include "types.h"
 #include "writer.h"
+#include <locale.h>
 #include <stdint.h>
 #include <string.h>
 #include <unistd.h>
@@ -291,6 +292,7 @@ static void print_usage(const char *prog)
 
 int main(int argc, char **argv)
 {
+    setlocale(LC_CTYPE, "");
     saved_argc = argc;
     saved_argv = argv;
 

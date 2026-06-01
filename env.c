@@ -504,6 +504,11 @@ static const struct {
     {"string->list", PSTR2LIST},
     {"list->string", PLIST2STR},
     {"string-fill!", PSTRFILL},
+    {"string-normalize-nfd", PSTRNFD},
+    {"string-normalize-nfc", PSTRNFC},
+    {"string-normalize-nfkd", PSTRNFKD},
+    {"string-normalize-nfkc", PSTRNFKC},
+    {"string-foldcase", PSTRFOLD},
 
     // String comparisons
     {"string=?", PSTREQ},
@@ -522,6 +527,7 @@ static const struct {
     {"integer->char", PCODECHAR},
     {"char-upcase", PCHARUP},
     {"char-downcase", PCHARDOWN},
+    {"char-foldcase", PCHARFOLD},
 
     // Character comparisons
     {"char=?", PCHAREQ},
@@ -563,6 +569,11 @@ static const struct {
     {"atan", PATAN},
     {"log", PLOG},
     {"exp", PEXP},
+    {"log1p", PLOG1P},
+    {"logp1", PLOG1P},
+    {"expm1", PEXPM1},
+    {"sqrt1pm1", PSQRT1PM1},
+    {"log1pexp", PLOG1PEXP},
     {"floor", PFLOOR},
     {"ceiling", PCEILING},
     {"truncate", PTRUNCATE},

@@ -3,6 +3,7 @@ CFLAGS ?= -Wall -Wextra -Wshadow -Wstrict-prototypes -Wmissing-prototypes \
           -Wold-style-definition -Wformat=2 -Wundef -Wdouble-promotion \
           -std=c11 -O2
 LDFLAGS = -lm
+UNICODE_VERSION = 15.1.0
 
 # Source files
 SRCS = main.c context.c reader.c writer.c env.c primitives.c macros.c eval.c bignum.c \
@@ -26,7 +27,7 @@ SAN_TARGET = vesper-asan
 SAN_CFLAGS = $(DEBUG_CFLAGS) -fsanitize=address,undefined
 SAN_LDFLAGS = $(LDFLAGS) -fsanitize=address,undefined
 
-.PHONY: all clean distclean debug sanitize test test-interpreter test-c test-prop test-all
+.PHONY: all clean distclean debug sanitize test test-interpreter test-c test-prop test-all unicode-tables
 
 all: $(TARGET)
 
@@ -41,6 +42,19 @@ stdlib_data.h: stdlib.scm
 		echo "static const size_t stdlib_scm_len = sizeof(stdlib_scm) - 1;"; \
 	} > $@
 
+unicode-tables:
+	@mkdir -p .unicode
+	curl -L https://www.unicode.org/Public/$(UNICODE_VERSION)/ucd/UnicodeData.txt -o .unicode/UnicodeData.txt
+	curl -L https://www.unicode.org/Public/$(UNICODE_VERSION)/ucd/CompositionExclusions.txt -o .unicode/CompositionExclusions.txt
+	curl -L https://www.unicode.org/Public/$(UNICODE_VERSION)/ucd/DerivedNormalizationProps.txt -o .unicode/DerivedNormalizationProps.txt
+	curl -L https://www.unicode.org/Public/$(UNICODE_VERSION)/ucd/DerivedCoreProperties.txt -o .unicode/DerivedCoreProperties.txt
+	curl -L https://www.unicode.org/Public/$(UNICODE_VERSION)/ucd/PropList.txt -o .unicode/PropList.txt
+	curl -L https://www.unicode.org/Public/$(UNICODE_VERSION)/ucd/CaseFolding.txt -o .unicode/CaseFolding.txt
+	curl -L https://www.unicode.org/Public/$(UNICODE_VERSION)/ucd/NormalizationTest.txt -o .unicode/NormalizationTest.txt
+	python3 tools/gen_unicode_norm.py .unicode/UnicodeData.txt .unicode/CompositionExclusions.txt .unicode/DerivedNormalizationProps.txt unicode_norm_tables.h
+	python3 tools/gen_unicode_char.py .unicode/UnicodeData.txt .unicode/DerivedCoreProperties.txt .unicode/PropList.txt .unicode/CaseFolding.txt unicode_char_tables.h
+	python3 tools/gen_unicode_norm_fixture.py .unicode/NormalizationTest.txt 1000 unicode_norm_test_data.h
+
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $(OBJS) $(LDFLAGS)
 
@@ -53,11 +67,11 @@ writer.o: writer.c writer.h context.h types.h
 env.o: env.c env.h context.h types.h
 primitives.o: primitives.c primitives.h prim_internal.h context.h reader.h writer.h types.h
 prim_numeric.o: prim_numeric.c prim_internal.h context.h types.h
-prim_compare.o: prim_compare.c prim_internal.h context.h types.h
+prim_compare.o: prim_compare.c prim_internal.h context.h types.h unicode_char_tables.h
 prim_list.o: prim_list.c prim_internal.h context.h types.h
-prim_string.o: prim_string.c prim_internal.h context.h types.h
+prim_string.o: prim_string.c prim_internal.h context.h types.h unicode_norm_tables.h unicode_char_tables.h
 prim_type.o: prim_type.c prim_internal.h context.h types.h
-prim_char.o: prim_char.c prim_internal.h context.h types.h
+prim_char.o: prim_char.c prim_internal.h context.h types.h unicode_char_tables.h
 prim_vector.o: prim_vector.c prim_internal.h context.h types.h
 prim_math.o: prim_math.c prim_internal.h context.h types.h
 prim_io.o: prim_io.c prim_internal.h context.h reader.h writer.h types.h
@@ -109,7 +123,7 @@ test-interpreter: $(TARGET)
 	@./$(TARGET) --interpreter < test.scm 2>&1 | grep -E '(^===|PASS|FAIL|^Tests:|passed|FAILED)'
 
 # C unit tests
-TEST_SRCS = test_bignum.c test_reader.c test_context.c test_macros.c test_eval.c test_pattern.c
+TEST_SRCS = test_bignum.c test_reader.c test_context.c test_macros.c test_eval.c test_pattern.c test_unicode_norm.c
 TEST_BINS = $(TEST_SRCS:.c=)
 
 # Object files needed for interpreter tests (excludes main.o)
@@ -138,6 +152,9 @@ test_eval: test_eval.c $(INTERP_OBJS)
 
 test_pattern: test_pattern.c $(INTERP_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+test_unicode_norm: test_unicode_norm.c $(INTERP_OBJS) unicode_norm_test_data.h
+	$(CC) $(CFLAGS) -o $@ test_unicode_norm.c $(INTERP_OBJS) $(LDFLAGS)
 
 # Run property tests
 test-prop: $(TARGET)

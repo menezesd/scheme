@@ -1404,6 +1404,12 @@ static unsigned apply_string_primitive(unsigned prim_id, unsigned argc,
     case PSTRFILL:
         REQUIRE_ARGC(argc, 2, 4, "string-fill!");
         return fill_string_range(argc, argv, "string-fill!");
+    case PSTRNFD:
+    case PSTRNFC:
+    case PSTRNFKD:
+    case PSTRNFKC:
+    case PSTRFOLD:
+        return prim_string_normalize(prim_id, argc, argv);
     case PSTRING:
         return make_string_from_chars(argc, argv, "string");
     case PSTREQ:
@@ -1767,7 +1773,8 @@ static unsigned make_features_list(void)
     static const char *features[] = {
         "vesper", "r5rs", "r7rs-small-subset", "srfi-1", "srfi-2",
         "srfi-8", "srfi-9", "srfi-26", "srfi-27", "srfi-28",
-        "bytevectors", "exact-rationals", "complex", "full-unicode-absent",
+        "bytevectors", "exact-rationals", "complex", "unicode-normalization",
+        "unicode-case-folding", "unicode-character-properties", "full-unicode-absent",
         NULL};
 
     GC_GUARD;
@@ -2495,6 +2502,11 @@ unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
     case PSTR2LIST:
     case PLIST2STR:
     case PSTRFILL:
+    case PSTRNFD:
+    case PSTRNFC:
+    case PSTRNFKD:
+    case PSTRNFKC:
+    case PSTRFOLD:
     case PSTRING:
     case PSTREQ:
     case PSTRLT:
@@ -2513,6 +2525,7 @@ unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
     case PCODECHAR:
     case PCHARUP:
     case PCHARDOWN:
+    case PCHARFOLD:
     case PCHAREQ:
     case PCHARLT:
     case PCHARGT:
@@ -2552,6 +2565,10 @@ unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
     case PATAN:
     case PLOG:
     case PEXP:
+    case PLOG1P:
+    case PEXPM1:
+    case PSQRT1PM1:
+    case PLOG1PEXP:
     case PFLOOR:
     case PCEILING:
     case PTRUNCATE:

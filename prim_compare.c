@@ -151,8 +151,8 @@ unsigned char_compare(unsigned argc, unsigned *argv, cmp_op op,
         !expect_char_value(argv[1], &c2, "char comparison"))
         return TOK_ERROR;
     if (case_insensitive) {
-        c1 = tolower(c1);
-        c2 = tolower(c2);
+        c1 = (int)unicode_simple_foldcase((uint32_t)c1);
+        c2 = (int)unicode_simple_foldcase((uint32_t)c2);
     }
     return scheme_bool(APPLY_CMP_OP(op, c1, c2));
 }

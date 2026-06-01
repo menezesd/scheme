@@ -992,9 +992,68 @@
 (test "floor->exact" #t (exact? (floor->exact 3.7)))
 (test "logistic" 0.5 (logistic 0))
 (test "conjugate" -2 (imag-part (conjugate (make-rectangular 1 2))))
+(test "stable log1p tiny" #t (< (abs (- (log1p 1e-20) 1e-20)) 1e-30))
+(test "stable expm1 tiny" #t (< (abs (- (expm1 1e-20) 1e-20)) 1e-30))
+(test "stable sqrt1pm1 tiny" #t (< (abs (- (sqrt1pm1 1e-20) 5e-21)) 1e-30))
+(test "stable log1pexp large" 1000.0 (log1pexp 1000.0))
+(test "complex stable numerical helpers" #t
+      (and (complex? (log1p 1+2i))
+           (complex? (expm1 1+2i))
+           (complex? (sqrt1pm1 1+2i))
+           (complex? (log1pexp 1+2i))))
+(test "log1p real branch cut" #t
+      (and (complex? (log1p -2))
+           (= (real-part (log1p -2)) 0.0)))
+(test "sqrt1pm1 real branch cut" #t
+      (and (complex? (sqrt1pm1 -2))
+           (= (real-part (sqrt1pm1 -2)) -1.0)
+           (= (imag-part (sqrt1pm1 -2)) 1.0)))
+(test "log1pexp large complex finite" #t
+      (let ((z (log1pexp 1000+1i)))
+        (and (finite? (real-part z))
+             (finite? (imag-part z))
+             (< (abs (- (real-part z) 1000.0)) 1e-12)
+             (< (abs (- (imag-part z) 1.0)) 1e-12))))
 (test "digit-value" 15 (digit-value #\f))
+(test "unicode digit-value" 5 (digit-value (integer->char #x0665)))
 (test "char-foldcase" #\a (char-foldcase #\A))
 (test "string-foldcase" "abc" (string-foldcase "AbC"))
+(test "unicode char predicates" #t
+      (and (char-alphabetic? (integer->char #x03bb))
+           (char-upper-case? (integer->char #x0391))
+           (char-lower-case? (integer->char #x03b1))
+           (char-whitespace? (integer->char #x2003))))
+(test "unicode char-foldcase final sigma" (integer->char #x03c3)
+      (char-foldcase (integer->char #x03c2)))
+(test "unicode string-upcase expands" "SSFFI" (string-upcase "ßﬃ"))
+(test "unicode string-foldcase expands" "ssi̇ksμσσσffi"
+      (string-foldcase "ẞİKſµΣςσﬃ"))
+(test "unicode string-ci uses full foldcase" #t
+      (and (string-ci=? "straße" "STRASSE")
+           (string-ci=? (unicode-char #x0399 #x03A0 #x03A0 #x039F #x03A3)
+                        (unicode-char #x03B9 #x03C0 #x03C0 #x03BF #x03C3))))
+(test "unicode normalize nfd decomposes latin accent"
+      (unicode-char 101 769)
+      (string-normalize-nfd (unicode-char 233)))
+(test "unicode normalize nfc composes latin accent"
+      (unicode-char 233)
+      (string-normalize-nfc (unicode-char 101 769)))
+(test "unicode normalize orders combining marks"
+      (unicode-char 97 807 769)
+      (string-normalize-nfd (unicode-char 97 769 807)))
+(test "unicode normalize nfkd expands ligature"
+      "ffi"
+      (string-normalize-nfkd (string (integer->char 64259))))
+(test "unicode normalize nfkc fullwidth"
+      "ABC123"
+      (string-normalize-nfkc (unicode-char 65313 65314 65315 65297 65298 65299)))
+(test "unicode normalized nfc predicate" #t
+      (and (string-normalized-nfc? (unicode-char 233))
+           (not (string-normalized-nfc? (unicode-char 101 769)))))
+(test "features contains unicode tables" #t
+      (and (not (not (memq 'unicode-normalization (features))))
+           (not (not (memq 'unicode-case-folding (features))))
+           (not (not (memq 'unicode-character-properties (features))))))
 (test "utf8 roundtrip" "abc" (utf8->string (string->utf8 "abc")))
 (test "utf8 encodes two-byte character" #u8(195 169)
       (string->utf8 (string (integer->char 233))))
@@ -1140,6 +1199,19 @@
 (test "string-builder value" "abé" (builder))
 (builder 'reset!)
 (test "string-builder empty" #t (builder 'empty?))
+(test "string-join default separator" "a b" (string-join '("a" "b")))
+(test "string-join explicit separator" "a,b" (string-join '("a" "b") ","))
+(test "string-join prefix suffix" "[a,b]" (string-join '("a" "b") "," "[" "]"))
+(test "string-joiner" "<a|b>" ((string-joiner 'infix "|" 'prefix "<" 'suffix ">") "a" "b"))
+(test "string-joiner*" "<a|b>" ((string-joiner* 'infix "|" 'prefix "<" 'suffix ">") '("a" "b")))
+(test "string-splitter runs" '("a" "b") ((string-splitter 'delimiter #\,) "a,,b"))
+(test "string-splitter no runs" '("a" "" "b")
+      ((string-splitter 'delimiter #\, 'allow-runs? #f) "a,,b"))
+(test "string-pad-left" "..abc" (string-pad-left "abc" 5 #\.))
+(test "string-pad-right" "abc.." (string-pad-right "abc" 5 #\.))
+(test "string-trimmer" "abc" ((string-trimmer) "  abc  "))
+(test "string-replace" "bonono" (string-replace "banana" #\a #\o))
+(test "string-slice" "é𝄞" (string-slice unicode-string 1 3))
 
 ;;; ============================================================================
 ;;; Summary
