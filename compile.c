@@ -32,13 +32,6 @@ unsigned qq_expand_cps(unsigned x, unsigned env);
 
 #define MAX_COMPILE_MACRO_EXPANSION_DEPTH 1000
 
-static void *malloc_array(unsigned count, size_t elem_size)
-{
-    if (elem_size != 0 && (size_t)count > SIZE_MAX / elem_size)
-        return NULL;
-    return malloc((size_t)count * elem_size);
-}
-
 // Forward declaration for helper
 static void emit_gensym_definitions(compile_ctx *cctx, unsigned old_gensym,
                                     unsigned new_gensym);
@@ -66,18 +59,6 @@ static void emit_local_get_slot(compile_ctx *cctx, int slot)
         emit(cctx, OP_LOCAL_GET0 + slot);
     else
         emit2(cctx, OP_LOCAL_GET, (unsigned)slot);
-}
-
-static bool proper_list_silent(unsigned x)
-{
-    while (IS_PAIR(x))
-        x = cdr(x);
-    return x == 0;
-}
-
-static bool let_binding_has_value(unsigned binding)
-{
-    return IS_PAIR(binding) && IS_PAIR(cdr(binding)) && !cddr(binding);
 }
 
 static bool builtin_keyword_unbound(int64_t kw, unsigned env)
@@ -244,6 +225,7 @@ static compile_result compile_letrec(unsigned expr, compile_ctx *cctx);
 static compile_result compile_and(unsigned expr, compile_ctx *cctx);
 static compile_result compile_or(unsigned expr, compile_ctx *cctx);
 static compile_result compile_cond(unsigned expr, compile_ctx *cctx);
+static compile_result compile_cond_expand(unsigned expr, compile_ctx *cctx);
 static compile_result compile_define(unsigned expr, compile_ctx *cctx);
 static compile_result compile_set(unsigned expr, compile_ctx *cctx);
 static compile_result compile_call(unsigned expr, compile_ctx *cctx);
@@ -328,7 +310,7 @@ static bool is_foldable_primitive(int64_t prim_id)
 
 static compile_ctx *cctx_new(compile_ctx *parent, unsigned env)
 {
-    compile_ctx *cctx = calloc(1, sizeof(compile_ctx));
+    compile_ctx *cctx = checked_calloc_array(1, sizeof(compile_ctx));
     if (!cctx) {
         show_error("compile: out of memory allocating context");
         return NULL;
@@ -446,13 +428,6 @@ static bool template_id_bound(unsigned pattern_vars, int64_t id)
             return true;
     }
     return false;
-}
-
-static bool syntax_rules_form_like(unsigned expr)
-{
-    return IS_PAIR(expr) && IS_ATOM(car(expr)) &&
-           CELL_ID(car(expr)) == ctx.kw_syntax_rules &&
-           IS_PAIR(cdr(expr)) && IS_PAIR(cddr(expr));
 }
 
 static bool template_keyword_bound_as_value(int64_t id, unsigned env)
@@ -880,16 +855,6 @@ static unsigned rename_map_without_id(unsigned rename_map, int64_t id)
     return changed ? filtered : rename_map;
 }
 
-static bool rename_map_has_id(unsigned rename_map, int64_t id)
-{
-    for (unsigned m = rename_map; m; m = cdr(m)) {
-        unsigned entry = car(m);
-        if (IS_PAIR(entry) && IS_ATOM(car(entry)) && CELL_ID(car(entry)) == id)
-            return true;
-    }
-    return false;
-}
-
 static unsigned rename_map_without_atom(unsigned rename_map, unsigned var)
 {
     if (!IS_ATOM(var))
@@ -928,17 +893,6 @@ static unsigned rename_map_without_let_bounds(unsigned rename_map,
     }
 
     return rename_map;
-}
-
-static bool template_binding_list_binds_id(unsigned binding_list, int64_t id)
-{
-    for (unsigned bl = binding_list; IS_PAIR(bl); bl = cdr(bl)) {
-        unsigned binding = car(bl);
-        if (let_binding_has_value(binding) && IS_ATOM(car(binding)) &&
-            CELL_ID(car(binding)) == id)
-            return true;
-    }
-    return false;
 }
 
 static unsigned rename_template_vars_shadowed_heads(unsigned tmpl,
@@ -1034,10 +988,9 @@ static unsigned rename_template_vars_let(unsigned tmpl, unsigned rename_map,
         body_map = rename_map_without_let_bounds(body_map, binding_list);
 
     unsigned new_body;
-    bool quote_shadowed =
-        template_binding_list_binds_id(binding_list, ctx.kw_quote);
+    bool quote_shadowed = binding_list_binds_id(binding_list, ctx.kw_quote);
     bool quasiquote_shadowed =
-        template_binding_list_binds_id(binding_list, ctx.kw_quasiquote);
+        binding_list_binds_id(binding_list, ctx.kw_quasiquote);
     if (quote_shadowed || quasiquote_shadowed) {
         new_body = rename_template_vars_shadowed_heads(
             body, body_map, quote_shadowed, quasiquote_shadowed);
@@ -1144,7 +1097,8 @@ static unsigned rename_template_vars(unsigned tmpl, unsigned rename_map)
     if (IS_PAIR(tmpl)) {
         bool head_is_alias = false;
         if (IS_ATOM(car(tmpl)))
-            head_is_alias = rename_map_has_id(rename_map, CELL_ID(car(tmpl)));
+            head_is_alias =
+                assoc_list_has_atom_key_id(rename_map, CELL_ID(car(tmpl)));
         // Skip quote's contents
         if (IS_ATOM(car(tmpl)) && CELL_ID(car(tmpl)) == ctx.kw_quote &&
             !head_is_alias)
@@ -1257,7 +1211,8 @@ static unsigned rename_template_vars_shadowed_heads(unsigned tmpl,
     if (IS_PAIR(tmpl)) {
         bool head_is_alias = false;
         if (IS_ATOM(car(tmpl)))
-            head_is_alias = rename_map_has_id(rename_map, CELL_ID(car(tmpl)));
+            head_is_alias =
+                assoc_list_has_atom_key_id(rename_map, CELL_ID(car(tmpl)));
         if (syntax_rules_form_like(tmpl) && !head_is_alias)
             return tmpl;
         if (IS_ATOM(car(tmpl)) && CELL_ID(car(tmpl)) == ctx.kw_quote &&
@@ -1590,6 +1545,8 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
                 return compile_or(expr, cctx);
             if (special_binding == TOK_ERROR && kw == ctx.kw_cond)
                 return compile_cond(expr, cctx);
+            if (special_binding == TOK_ERROR && kw == ctx.kw_cond_expand)
+                return compile_cond_expand(expr, cctx);
             if (special_binding == TOK_ERROR && kw == ctx.kw_define)
                 return compile_define(expr, cctx);
             if (special_binding == TOK_ERROR && kw == ctx.kw_set)
@@ -2535,7 +2492,7 @@ static compile_result compile_let(unsigned expr, compile_ctx *cctx)
     // Dynamically allocate variable array
     unsigned *vars = NULL;
     if (count > 0) {
-        vars = malloc_array(count, sizeof(unsigned));
+        vars = checked_malloc_array(count, sizeof(unsigned));
         if (!vars) {
             show_error("let: out of memory for bindings");
             emit(cctx, OP_HALT);
@@ -2781,7 +2738,7 @@ static compile_result compile_and(unsigned expr, compile_ctx *cctx)
     unsigned saved_pos = cctx->code->code_len;
 
     // Dynamically allocate jump array
-    unsigned *false_jumps = malloc_array(expr_count, sizeof(unsigned));
+    unsigned *false_jumps = checked_malloc_array(expr_count, sizeof(unsigned));
     if (!false_jumps) {
         show_error("and: out of memory");
         emit(cctx, OP_HALT);
@@ -2872,7 +2829,7 @@ static compile_result compile_or(unsigned expr, compile_ctx *cctx)
     unsigned saved_pos = cctx->code->code_len;
 
     // Dynamically allocate jump array
-    unsigned *true_jumps = malloc_array(expr_count, sizeof(unsigned));
+    unsigned *true_jumps = checked_malloc_array(expr_count, sizeof(unsigned));
     if (!true_jumps) {
         show_error("or: out of memory");
         emit(cctx, OP_HALT);
@@ -2940,6 +2897,30 @@ static compile_result compile_or(unsigned expr, compile_ctx *cctx)
 }
 
 // (cond (test expr ...) ... (else expr ...))
+static compile_result compile_cond_expand(unsigned expr, compile_ctx *cctx)
+{
+    unsigned clauses = cdr(expr);
+    if (!list_length_checked(clauses, NULL, "cond-expand"))
+        return emit_syntax_error(cctx, "cond-expand: invalid syntax");
+
+    FORLIST(c, clauses) {
+        unsigned clause = car(c);
+        if (!IS_PAIR(clause))
+            return emit_syntax_error(cctx, "cond-expand: invalid syntax");
+        unsigned requirement = car(clause);
+        unsigned body = cdr(clause);
+        if (!list_length_checked(body, NULL, "cond-expand"))
+            return emit_syntax_error(cctx, "cond-expand: invalid syntax");
+        bool is_else = IS_KEYWORD(requirement, ctx.kw_else) &&
+                       env_find_binding_cell(ctx.kw_else, cctx->env) == 0;
+        if (is_else || cond_expand_requirement_satisfied(requirement))
+            return compile_begin(body, cctx);
+    }
+
+    emit2(cctx, OP_CONST, code_add_const(cctx->code, 0));
+    return const_result(0);
+}
+
 static compile_result compile_cond(unsigned expr, compile_ctx *cctx)
 {
     unsigned clauses = cdr(expr);
@@ -2961,7 +2942,7 @@ static compile_result compile_cond(unsigned expr, compile_ctx *cctx)
     bool tail = cctx->tail_position;
 
     // Dynamically allocate end jump array
-    unsigned *end_jumps = malloc_array(clause_count, sizeof(unsigned));
+    unsigned *end_jumps = checked_malloc_array(clause_count, sizeof(unsigned));
     if (!end_jumps) {
         show_error("cond: out of memory");
         emit(cctx, OP_HALT);
@@ -3803,7 +3784,7 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
             // Dynamically allocate parameter ID array
             unsigned *param_ids = NULL;
             if (param_count > 0) {
-                param_ids = malloc_array(param_count, sizeof(unsigned));
+                param_ids = checked_malloc_array(param_count, sizeof(unsigned));
                 if (!param_ids) {
                     show_error("lambda: out of memory for parameters");
                     emit(cctx, OP_HALT);

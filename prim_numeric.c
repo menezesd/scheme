@@ -27,17 +27,129 @@
             return TOK_ERROR;                                                  \
     } while (0)
 
-static inline bool exact_int64_value(unsigned x, int64_t *out)
+static bool all_complex_args_exact(unsigned argc, unsigned *argv)
 {
-    if (IS_FIXNUM(x)) {
-        *out = FIXNUM_VALUE(x);
-        return true;
+    for (unsigned i = 0; i < argc; i++) {
+        if (!is_complex_exact(argv[i]))
+            return false;
     }
-    if (IS_NUM(x)) {
-        *out = CELL_ID(x);
+    return true;
+}
+
+static bool require_exact_integer_pair(unsigned xa, unsigned xb,
+                                       const char *name)
+{
+    if (IS_EXACT_INT(xa) && IS_EXACT_INT(xb))
         return true;
-    }
+
+    show_error("%s: expected exact integer", name);
     return false;
+}
+
+static bool bignum_division_operands(unsigned xa, unsigned xb, bignum **a_out,
+                                     bignum **b_out, const char *name)
+{
+    bignum *a = to_bignum(xa);
+    bignum *b = to_bignum(xb);
+    if (!a || !b) {
+        bn_free(a);
+        bn_free(b);
+        show_error("%s: out of memory", name);
+        return false;
+    }
+    if (bn_is_zero(b)) {
+        bn_free(a);
+        bn_free(b);
+        show_error("%s: division by zero", name);
+        return false;
+    }
+
+    *a_out = a;
+    *b_out = b;
+    return true;
+}
+
+static bool bignum_add_args_ip(bignum *result, unsigned argc, unsigned *argv,
+                               unsigned start, const char *name)
+{
+    for (unsigned i = start; i < argc; i++) {
+        bignum *operand = to_bignum(argv[i]);
+        if (!operand) {
+            show_error("%s: out of memory", name);
+            return false;
+        }
+        bn_add_ip(result, operand);
+        bn_free(operand);
+    }
+    return true;
+}
+
+static bignum *bignum_multiply_args(unsigned argc, unsigned *argv,
+                                    const char *name)
+{
+    bignum *result = bn_from_int(1);
+    if (!result) {
+        show_error("%s: out of memory", name);
+        return NULL;
+    }
+
+    for (unsigned i = 0; i < argc; i++) {
+        bignum *operand = to_bignum(argv[i]);
+        if (!operand) {
+            show_error("%s: out of memory", name);
+            bn_free(result);
+            return NULL;
+        }
+        bignum *tmp = bn_mul(result, operand);
+        bn_free(result);
+        bn_free(operand);
+        if (!tmp) {
+            show_error("%s: out of memory", name);
+            return NULL;
+        }
+        result = tmp;
+    }
+
+    return result;
+}
+
+static bool bignum_subtract_args_ip(bignum *result, unsigned argc,
+                                    unsigned *argv, unsigned start,
+                                    const char *name)
+{
+    for (unsigned i = start; i < argc; i++) {
+        bignum *operand = to_bignum(argv[i]);
+        if (!operand) {
+            show_error("%s: out of memory", name);
+            return false;
+        }
+        bn_sub_ip(result, operand);
+        bn_free(operand);
+    }
+    return true;
+}
+
+static unsigned inexact_complex_div_value(unsigned argc, unsigned *argv)
+{
+    double real, imag;
+    get_complex_parts(argv[0], &real, &imag);
+    if (argc == 1) {
+        double d = real * real + imag * imag;
+        CHECK_DIV_ZERO_DBL(d, "/");
+        return make_complex_inexact(real / d, -imag / d);
+    }
+
+    for (unsigned i = 1; i < argc; i++) {
+        double r, im;
+        get_complex_parts(argv[i], &r, &im);
+        double d = r * r + im * im;
+        CHECK_DIV_ZERO_DBL(d, "/");
+        double nr = (real * r + imag * im) / d;
+        double ni = (imag * r - real * im) / d;
+        real = nr;
+        imag = ni;
+    }
+    return make_complex_inexact(real, imag);
 }
 
 unsigned prim_plus(unsigned argc, unsigned *argv)
@@ -65,15 +177,7 @@ slow_path:;
 
     switch (level) {
     case NUM_COMPLEX: {
-        bool all_complex_exact = true;
-        for (unsigned i = 0; i < argc; i++) {
-            if (!is_complex_exact(argv[i])) {
-                all_complex_exact = false;
-                break;
-            }
-        }
-
-        if (all_complex_exact) {
+        if (all_complex_args_exact(argc, argv)) {
             GC_GUARD;
             unsigned real_sum = store(0);
             gc_protect(&real_sum);
@@ -140,15 +244,9 @@ slow_path:;
             show_error("+: out of memory");
             return TOK_ERROR;
         }
-        for (unsigned i = 0; i < argc; i++) {
-            bignum *operand = to_bignum(argv[i]);
-            if (!operand) {
-                bn_free(result);
-                show_error("+: out of memory");
-                return TOK_ERROR;
-            }
-            bn_add_ip(result, operand);
-            bn_free(operand);
+        if (!bignum_add_args_ip(result, argc, argv, 0, "+")) {
+            bn_free(result);
+            return TOK_ERROR;
         }
         return store_integer(result);
     }
@@ -172,15 +270,9 @@ slow_path:;
                 }
                 bn_add_ip(result, operand);
                 bn_free(operand);
-                for (unsigned j = i + 1; j < argc; j++) {
-                    operand = to_bignum(argv[j]);
-                    if (!operand) {
-                        bn_free(result);
-                        show_error("+: out of memory");
-                        return TOK_ERROR;
-                    }
-                    bn_add_ip(result, operand);
-                    bn_free(operand);
+                if (!bignum_add_args_ip(result, argc, argv, i + 1, "+")) {
+                    bn_free(result);
+                    return TOK_ERROR;
                 }
                 return store_integer(result);
             }
@@ -216,15 +308,7 @@ slow_path:;
 
     switch (level) {
     case NUM_COMPLEX: {
-        bool all_complex_exact = true;
-        for (unsigned i = 0; i < argc; i++) {
-            if (!is_complex_exact(argv[i])) {
-                all_complex_exact = false;
-                break;
-            }
-        }
-
-        if (all_complex_exact) {
+        if (all_complex_args_exact(argc, argv)) {
             GC_GUARD;
             unsigned real_prod = store(1);
             gc_protect(&real_prod);
@@ -298,27 +382,9 @@ slow_path:;
     }
     case NUM_BIGNUM:
     case NUM_INTEGER: {
-        bignum *result = bn_from_int(1);
-        if (!result) {
-            show_error("*: out of memory");
+        bignum *result = bignum_multiply_args(argc, argv, "*");
+        if (!result)
             return TOK_ERROR;
-        }
-        for (unsigned i = 0; i < argc; i++) {
-            bignum *operand = to_bignum(argv[i]);
-            if (!operand) {
-                show_error("*: out of memory");
-                bn_free(result);
-                return TOK_ERROR;
-            }
-            bignum *tmp = bn_mul(result, operand);
-            bn_free(result);
-            bn_free(operand);
-            if (!tmp) {
-                show_error("*: out of memory");
-                return TOK_ERROR;
-            }
-            result = tmp;
-        }
         return store_integer(result);
     }
     }
@@ -358,15 +424,7 @@ slow_path:;
 
     switch (level) {
     case NUM_COMPLEX: {
-        bool all_complex_exact = true;
-        for (unsigned i = 0; i < argc; i++) {
-            if (!is_complex_exact(argv[i])) {
-                all_complex_exact = false;
-                break;
-            }
-        }
-
-        if (all_complex_exact) {
+        if (all_complex_args_exact(argc, argv)) {
             GC_GUARD;
             unsigned real_res, imag_res;
             get_complex_cells(argv[0], &real_res, &imag_res);
@@ -460,15 +518,9 @@ slow_path:;
             bn_neg_ip(result);
             return store_integer(result);
         }
-        for (unsigned i = 1; i < argc; i++) {
-            bignum *operand = to_bignum(argv[i]);
-            if (!operand) {
-                bn_free(result);
-                show_error("-: out of memory");
-                return TOK_ERROR;
-            }
-            bn_sub_ip(result, operand);
-            bn_free(operand);
+        if (!bignum_subtract_args_ip(result, argc, argv, 1, "-")) {
+            bn_free(result);
+            return TOK_ERROR;
         }
         return store_integer(result);
     }
@@ -528,15 +580,7 @@ slow_path:;
 
     switch (level) {
     case NUM_COMPLEX: {
-        bool all_complex_exact = true;
-        for (unsigned i = 0; i < argc; i++) {
-            if (!is_complex_exact(argv[i])) {
-                all_complex_exact = false;
-                break;
-            }
-        }
-
-        if (all_complex_exact) {
+        if (all_complex_args_exact(argc, argv)) {
             GC_GUARD;
             unsigned real_res, imag_res;
             get_complex_cells(argv[0], &real_res, &imag_res);
@@ -612,26 +656,7 @@ slow_path:;
             return make_complex_exact(real_res, imag_res);
         }
 
-        double real, imag;
-        get_complex_parts(argv[0], &real, &imag);
-        if (argc == 1) {
-            double d = real * real + imag * imag;
-            CHECK_DIV_ZERO_DBL(d, "/");
-            real = real / d;
-            imag = -imag / d;
-        } else {
-            for (unsigned i = 1; i < argc; i++) {
-                double r, im;
-                get_complex_parts(argv[i], &r, &im);
-                double d = r * r + im * im;
-                CHECK_DIV_ZERO_DBL(d, "/");
-                double nr = (real * r + imag * im) / d;
-                double ni = (imag * r - real * im) / d;
-                real = nr;
-                imag = ni;
-            }
-        }
-        return make_complex_inexact(real, imag);
+        return inexact_complex_div_value(argc, argv);
     }
     case NUM_INEXACT: {
         double res = to_double(argv[0]);
@@ -683,20 +708,13 @@ unsigned prim_modulo(unsigned argc, unsigned *argv)
 {
     REQUIRE_ARGC(argc, 2, 2, "modulo");
     unsigned xa = argv[0], xb = argv[1];
-    if (!IS_EXACT_INT(xa) || !IS_EXACT_INT(xb)) {
-        show_error("modulo: expected exact integer");
+    if (!require_exact_integer_pair(xa, xb, "modulo"))
         return TOK_ERROR;
-    }
     // Handle bignums
     if (EITHER_BIGNUM(xa, xb)) {
-        bignum *a = to_bignum(xa);
-        bignum *b = to_bignum(xb);
-        if (bn_is_zero(b)) {
-            bn_free(a);
-            bn_free(b);
-            show_error("modulo: division by zero");
+        bignum *a, *b;
+        if (!bignum_division_operands(xa, xb, &a, &b, "modulo"))
             return TOK_ERROR;
-        }
         bignum *r = bn_mod(a, b);
         if (!r) {
             bn_free(a);
@@ -738,20 +756,13 @@ unsigned prim_remainder(unsigned argc, unsigned *argv)
 {
     REQUIRE_ARGC(argc, 2, 2, "remainder");
     unsigned xa = argv[0], xb = argv[1];
-    if (!IS_EXACT_INT(xa) || !IS_EXACT_INT(xb)) {
-        show_error("remainder: expected exact integer");
+    if (!require_exact_integer_pair(xa, xb, "remainder"))
         return TOK_ERROR;
-    }
     // Handle bignums
     if (EITHER_BIGNUM(xa, xb)) {
-        bignum *a = to_bignum(xa);
-        bignum *b = to_bignum(xb);
-        if (bn_is_zero(b)) {
-            bn_free(a);
-            bn_free(b);
-            show_error("remainder: division by zero");
+        bignum *a, *b;
+        if (!bignum_division_operands(xa, xb, &a, &b, "remainder"))
             return TOK_ERROR;
-        }
         bignum *r = bn_mod(a, b);
         if (!r) {
             bn_free(a);
@@ -776,20 +787,13 @@ unsigned prim_quotient(unsigned argc, unsigned *argv)
 {
     REQUIRE_ARGC(argc, 2, 2, "quotient");
     unsigned xa = argv[0], xb = argv[1];
-    if (!IS_EXACT_INT(xa) || !IS_EXACT_INT(xb)) {
-        show_error("quotient: expected exact integer");
+    if (!require_exact_integer_pair(xa, xb, "quotient"))
         return TOK_ERROR;
-    }
     // Handle bignums
     if (EITHER_BIGNUM(xa, xb)) {
-        bignum *a = to_bignum(xa);
-        bignum *b = to_bignum(xb);
-        if (bn_is_zero(b)) {
-            bn_free(a);
-            bn_free(b);
-            show_error("quotient: division by zero");
+        bignum *a, *b;
+        if (!bignum_division_operands(xa, xb, &a, &b, "quotient"))
             return TOK_ERROR;
-        }
         bignum *q = bn_div(a, b, NULL);
         if (!q) {
             bn_free(a);

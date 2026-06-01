@@ -21,23 +21,25 @@
 
 #include "primitives.h"
 #include "prim_internal.h"
+#include <dirent.h>
+#include <errno.h>
 #include <limits.h>
 #include <stdint.h>
 #include <time.h>
+#include <unistd.h>
+
+#define PRIM_FNV_OFFSET_BASIS 14695981039346656037ull
+#define PRIM_FNV_PRIME 1099511628211ull
+#define JIFFIES_PER_SECOND 1000000000LL
+
+extern char **environ;
 
 // Command line args (set by main.c, defaults for test binaries)
 int saved_argc __attribute__((weak)) = 0;
 char **saved_argv __attribute__((weak)) = NULL;
 
-static void *malloc_array(unsigned count, size_t elem_size)
-{
-    if (elem_size != 0 && (size_t)count > SIZE_MAX / elem_size)
-        return NULL;
-    return malloc((size_t)count * elem_size);
-}
-
 // ============================================================================
-// Main Dispatch Function
+// Local primitive helpers
 // ============================================================================
 
 static bool expect_u8(unsigned value, int64_t *out, const char *name)
@@ -78,26 +80,853 @@ static char *exact_integer_to_string(unsigned num, int radix)
                 *--p = '-';
             memmove(buf, p, buf + sizeof(buf) - p);
         }
-        return strdup(buf);
+        return checked_string_copy(buf);
     }
     if (IS_BIGNUM(num))
         return bn_to_string(get_bignum(num), radix);
     return NULL;
 }
 
-unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
+static char *rational_to_string(unsigned num, int radix, bool *too_large)
 {
-    if (argc > 0 && !argv) {
-        show_error("primitive: null argv");
+    *too_large = false;
+    char *numer = exact_integer_to_string(CELL_CAR(num), radix);
+    char *denom = exact_integer_to_string(CELL_CDR(num), radix);
+    if (!numer || !denom) {
+        free(numer);
+        free(denom);
+        return NULL;
+    }
+
+    size_t numer_len = strlen(numer);
+    size_t denom_len = strlen(denom);
+    if (numer_len > SIZE_MAX - denom_len - 2) {
+        free(numer);
+        free(denom);
+        *too_large = true;
+        return NULL;
+    }
+
+    char *s = checked_malloc_flex(0, numer_len + denom_len + 2, 1);
+    if (s) {
+        memcpy(s, numer, numer_len);
+        s[numer_len] = '/';
+        memcpy(s + numer_len + 1, denom, denom_len + 1);
+    }
+    free(numer);
+    free(denom);
+    return s;
+}
+
+static bool parse_optional_radix(unsigned argc, unsigned *argv,
+                                 const char *name, int *radix)
+{
+    *radix = 10;
+    if (argc > 1) {
+        int64_t radix64;
+        if (!expect_exact_int64(argv[1], &radix64, name))
+            return false;
+        *radix = (int)radix64;
+    }
+    if (*radix < 2 || *radix > 36) {
+        show_error("%s: radix must be between 2 and 36", name);
+        return false;
+    }
+    return true;
+}
+
+static bytevec_data *bytevector_data_new(unsigned len)
+{
+    bytevec_data *bv = checked_malloc_flex(sizeof(bytevec_data), len, 1);
+    if (bv)
+        bv->len = len;
+    return bv;
+}
+
+static unsigned make_bytevector_owned(bytevec_data *bv)
+{
+    unsigned cell = alloc();
+    CELL_TYPE(cell) = BT_BYTEVEC;
+    CELL_PTR(cell) = bv;
+    return cell;
+}
+
+static unsigned make_bytevector_copy(const uint8_t *data, unsigned len,
+                                     const char *name)
+{
+    bytevec_data *bv = bytevector_data_new(len);
+    if (!bv) {
+        show_error("%s: out of memory", name);
+        return TOK_ERROR;
+    }
+    if (len > 0)
+        memcpy(bv->data, data, len);
+    return make_bytevector_owned(bv);
+}
+
+static unsigned make_bytevector_from_u8_argv(unsigned argc, unsigned *argv,
+                                             const char *name)
+{
+    bytevec_data *bv = bytevector_data_new(argc);
+    if (!bv) {
+        show_error("%s: out of memory", name);
         return TOK_ERROR;
     }
 
-    GC_GUARD;
-    for (unsigned i = 0; i < argc; i++)
-        gc_protect(&argv[i]);
+    for (unsigned i = 0; i < argc; i++) {
+        int64_t val;
+        if (!expect_u8(argv[i], &val, name)) {
+            free(bv);
+            return TOK_ERROR;
+        }
+        bv->data[i] = (uint8_t)val;
+    }
+    return make_bytevector_owned(bv);
+}
 
+static unsigned make_bytevector_filled(unsigned len, uint8_t fill,
+                                       const char *name)
+{
+    bytevec_data *bv = bytevector_data_new(len);
+    if (!bv) {
+        show_error("%s: out of memory", name);
+        return TOK_ERROR;
+    }
+    memset(bv->data, fill, len);
+    return make_bytevector_owned(bv);
+}
+
+static bytevec_data *require_bytevector(unsigned value, const char *name);
+static bool bytevector_length_fits(uint64_t len, const char *name,
+                                   const char *noun);
+
+static unsigned make_bytevector_append(unsigned argc, unsigned *argv,
+                                       const char *name)
+{
+    unsigned total = 0;
+    for (unsigned i = 0; i < argc; i++) {
+        bytevec_data *src = require_bytevector(argv[i], name);
+        if (!src)
+            return TOK_ERROR;
+        if (src->len > UINT_MAX - total) {
+            show_error("%s: result too large", name);
+            return TOK_ERROR;
+        }
+        total += src->len;
+    }
+
+    bytevec_data *bv = bytevector_data_new(total);
+    if (!bv) {
+        show_error("%s: out of memory", name);
+        return TOK_ERROR;
+    }
+
+    unsigned pos = 0;
+    for (unsigned i = 0; i < argc; i++) {
+        bytevec_data *src = (bytevec_data *)CELL_PTR(argv[i]);
+        memcpy(bv->data + pos, src->data, src->len);
+        pos += src->len;
+    }
+    return make_bytevector_owned(bv);
+}
+
+static unsigned read_bytevector_from_port(unsigned count_arg,
+                                          unsigned port_arg,
+                                          const char *name)
+{
+    int64_t count;
+    if (!expect_nonneg_int64(count_arg, &count, name))
+        return TOK_ERROR;
+    if (!IS_INPORT(port_arg)) {
+        show_error("%s: not an input port", name);
+        return TOK_ERROR;
+    }
+    if (!bytevector_length_fits((uint64_t)count, name, "count"))
+        return TOK_ERROR;
+    FILE *f = GET_PORT_PTR(port_arg);
+    if (!f) {
+        show_error("%s: port is closed", name);
+        return TOK_ERROR;
+    }
+    if (count == 0)
+        return make_bytevector_copy(NULL, 0, name);
+
+    uint8_t *buf = checked_malloc_array((unsigned)count, 1);
+    if (!buf) {
+        show_error("%s: out of memory", name);
+        return TOK_ERROR;
+    }
+
+    size_t n = 0;
+    while (n < (size_t)count && reader_port_pending_bytes(f) > 0) {
+        int c = reader_port_getc(f);
+        if (c == EOF)
+            break;
+        buf[n++] = (uint8_t)c;
+    }
+    if (n < (size_t)count)
+        n += fread(buf + n, 1, (size_t)count - n, f);
+    if (ferror(f)) {
+        free(buf);
+        show_error("%s: read failed", name);
+        return TOK_ERROR;
+    }
+    if (n == 0) {
+        free(buf);
+        return atom_from_string("eof-object");
+    }
+
+    unsigned result = make_bytevector_copy(buf, (unsigned)n, name);
+    free(buf);
+    return result;
+}
+
+static bool bytevector_length_fits(uint64_t len, const char *name,
+                                   const char *noun)
+{
+    if (len <= UINT_MAX && len <= SIZE_MAX - sizeof(bytevec_data))
+        return true;
+    show_error("%s: %s too large", name, noun);
+    return false;
+}
+
+static char *string_buffer_new(uint64_t len, const char *name,
+                               const char *too_large_noun)
+{
+    if (len > SIZE_MAX - 1) {
+        show_error("%s: %s too large", name, too_large_noun);
+        return NULL;
+    }
+    size_t size = (size_t)len;
+    char *s = checked_malloc_flex(0, size + 1, 1);
+    if (!s)
+        show_error("%s: out of memory", name);
+    return s;
+}
+
+static unsigned list_cell_at(unsigned lst, int64_t idx, const char *name)
+{
+    for (int64_t i = 0; i < idx; i++) {
+        if (!IS_PAIR(lst)) {
+            show_error("%s: index out of bounds", name);
+            return TOK_ERROR;
+        }
+        lst = cdr(lst);
+    }
+    if (!IS_PAIR(lst)) {
+        show_error("%s: index out of bounds", name);
+        return TOK_ERROR;
+    }
+    return lst;
+}
+
+static bool char_list_length(unsigned lst, unsigned *len_out,
+                             const char *name)
+{
+    if (!list_length_checked(lst, len_out, name))
+        return false;
+    for (unsigned it = lst; it; it = cdr(it)) {
+        if (!IS_CHAR(car(it))) {
+            show_error("%s: list elements must be characters", name);
+            return false;
+        }
+    }
+    return true;
+}
+
+static unsigned make_char_list_from_string(unsigned str, const char *name)
+{
+    char *s = require_string_ptr(str, name);
+    if (!s)
+        return TOK_ERROR;
+    size_t len = strlen(s);
+    GC_GUARD;
+    gc_protect(&str);
+    unsigned result = 0;
+    gc_protect(&result);
+    for (size_t i = len; i > 0; i--) {
+        char *chars = GET_STRING_PTR(str);
+        unsigned ch = make_char(chars[i - 1]);
+        gc_protect(&ch);
+        result = alloc_cons(ch, result);
+        gc_unprotect(1);
+    }
+    return result;
+}
+
+static unsigned make_string_from_char_list(unsigned lst, const char *name)
+{
+    unsigned list_len = 0;
+    if (!char_list_length(lst, &list_len, name))
+        return TOK_ERROR;
+    size_t len = list_len;
+    char *s = string_buffer_new(len, name, "result");
+    if (!s)
+        return TOK_ERROR;
+    size_t i = 0;
+    for (; lst; lst = cdr(lst), i++)
+        s[i] = (char)CELL_ID(car(lst));
+    s[i] = '\0';
+    return make_string_owned(s);
+}
+
+static unsigned make_string_from_chars(unsigned argc, unsigned *argv,
+                                       const char *name)
+{
+    if (argc == UINT_MAX) {
+        show_error("%s: result too large", name);
+        return TOK_ERROR;
+    }
+    char *s = string_buffer_new(argc, name, "result");
+    if (!s)
+        return TOK_ERROR;
+    for (unsigned i = 0; i < argc; i++) {
+        if (!IS_CHAR(argv[i])) {
+            free(s);
+            show_error("%s: argument is not a character", name);
+            return TOK_ERROR;
+        }
+        s[i] = (char)CELL_ID(argv[i]);
+    }
+    s[argc] = '\0';
+    return make_string_owned(s);
+}
+
+static unsigned fill_string(unsigned str, unsigned fill, const char *name)
+{
+    char *s = require_string_ptr(str, name);
+    if (!s)
+        return TOK_ERROR;
+    int c;
+    if (!expect_char_value(fill, &c, name))
+        return TOK_ERROR;
+    size_t len = strlen(s);
+    for (size_t i = 0; i < len; i++)
+        s[i] = (char)c;
+    return 0;
+}
+
+static unsigned make_filled_string(unsigned len_arg, unsigned fill_arg,
+                                   bool has_fill, const char *name)
+{
+    int64_t len;
+    if (!expect_nonneg_int64(len_arg, &len, name))
+        return TOK_ERROR;
+    char fill = ' ';
+    if (has_fill) {
+        int c;
+        if (!expect_char_value(fill_arg, &c, name))
+            return TOK_ERROR;
+        fill = (char)c;
+    }
+    char *s = string_buffer_new((uint64_t)len, name, "length");
+    if (!s)
+        return TOK_ERROR;
+    memset(s, fill, len);
+    s[len] = '\0';
+    return make_string_owned(s);
+}
+
+static unsigned make_symbol_from_string(unsigned str, const char *name)
+{
+    char *s = require_string_ptr(str, name);
+    if (!s)
+        return TOK_ERROR;
+    int atom_id = intern(s);
+    unsigned result = alloc();
+    CELL_TYPE(result) = BT_ATOM;
+    CELL_ID(result) = atom_id;
+    return result;
+}
+
+static unsigned make_string_from_symbol(unsigned sym, const char *name)
+{
+    CHECK_SYMBOL(sym, name);
+    return make_string_copy(ctx.atom_table[CELL_ID(sym)]);
+}
+
+static unsigned length_value(unsigned value, const char *name)
+{
+    if (IS_STRING(value))
+        return store(strlen(GET_STRING_PTR(value)));
+    if (IS_VECTOR(value))
+        return store(vector_len(value));
+    unsigned len = 0;
+    if (!list_length_checked(value, &len, name))
+        return TOK_ERROR;
+    return store(len);
+}
+
+static unsigned eq_value(unsigned arg1, unsigned arg2)
+{
+    if (arg1 == arg2)
+        return ctx.atom_true;
+    if (IS_FIXNUM(arg1)) {
+        return scheme_bool(IS_NUM(arg2) &&
+                           CELL_ID(arg2) ==
+                               (int64_t)FIXNUM_VALUE(arg1));
+    }
+    if (IS_FIXNUM(arg2)) {
+        return scheme_bool(IS_NUM(arg1) &&
+                           CELL_ID(arg1) ==
+                               (int64_t)FIXNUM_VALUE(arg2));
+    }
+    if (!IS_CELL(arg1) || !IS_CELL(arg2))
+        return ctx.atom_false;
+    if (CELL_TYPE(arg1) != CELL_TYPE(arg2))
+        return ctx.atom_false;
+    switch (CELL_TYPE(arg1)) {
+    case BT_NUM:
+    case BT_FUNCTION:
+    case BT_BUILTIN:
+    case BT_ATOM:
+    case BT_CHAR:
+        return scheme_bool(CELL_ID(arg1) == CELL_ID(arg2));
+    default:
+        return scheme_bool(arg1 == arg2);
+    }
+}
+
+static unsigned pair_car(unsigned pair, const char *name)
+{
+    CHECK_PAIR(pair, name);
+    return car(pair);
+}
+
+static unsigned pair_cdr(unsigned pair, const char *name)
+{
+    CHECK_PAIR(pair, name);
+    return cdr(pair);
+}
+
+static unsigned set_pair_car(unsigned pair, unsigned value, const char *name)
+{
+    CHECK_PAIR(pair, name);
+    cell_set_car(pair, value);
+    return value;
+}
+
+static unsigned set_pair_cdr(unsigned pair, unsigned value, const char *name)
+{
+    CHECK_PAIR(pair, name);
+    cell_set_cdr(pair, value);
+    return value;
+}
+
+static unsigned make_list_from_argv(unsigned argc, unsigned *argv)
+{
+    if (argc == 0)
+        return 0;
+    GC_GUARD;
+    unsigned result = 0;
+    gc_protect(&result);
+    for (unsigned i = argc; i > 0; i--)
+        result = alloc_cons(argv[i - 1], result);
+    return result;
+}
+
+static unsigned last_pair(unsigned lst, const char *name)
+{
+    if (!IS_PAIR(lst)) {
+        show_error("%s: not a pair", name);
+        return TOK_ERROR;
+    }
+    for (;;) {
+        unsigned next = cdr(lst);
+        if (!next)
+            return lst;
+        if (!IS_PAIR(next)) {
+            show_error("%s: improper list", name);
+            return TOK_ERROR;
+        }
+        lst = next;
+    }
+}
+
+static unsigned string_length_value(unsigned str, const char *name)
+{
+    char *s = require_string_ptr(str, name);
+    if (!s)
+        return TOK_ERROR;
+    return store(strlen(s));
+}
+
+static unsigned string_ref_value(unsigned str, unsigned index,
+                                 const char *name)
+{
+    char *s = require_string_ptr(str, name);
+    if (!s)
+        return TOK_ERROR;
+    size_t len = strlen(s);
+    int64_t idx;
+    if (!expect_index(index, len, &idx, name))
+        return TOK_ERROR;
+    return make_char(s[idx]);
+}
+
+static unsigned string_set_value(unsigned str, unsigned index,
+                                 unsigned value, const char *name)
+{
+    char *s = require_string_ptr(str, name);
+    if (!s)
+        return TOK_ERROR;
+    size_t len = strlen(s);
+    int64_t idx;
+    if (!expect_nonneg_int64(index, &idx, name))
+        return TOK_ERROR;
+    int c;
+    if (!expect_char_value(value, &c, name))
+        return TOK_ERROR;
+    if (!index_in_bounds(idx, len, name))
+        return TOK_ERROR;
+    s[idx] = c;
+    return 0;
+}
+
+static unsigned string_copy_value(unsigned str, const char *name)
+{
+    char *s = require_string_ptr(str, name);
+    if (!s)
+        return TOK_ERROR;
+    return make_string_copy(s);
+}
+
+static bytevec_data *require_bytevector(unsigned value, const char *name)
+{
+    if (!IS_BYTEVEC(value)) {
+        show_error("%s: not a bytevector", name);
+        return NULL;
+    }
+    return (bytevec_data *)CELL_PTR(value);
+}
+
+static bool bytevector_index(unsigned value, const bytevec_data *bv,
+                             int64_t *idx, const char *name)
+{
+    return expect_index(value, bv->len, idx, name);
+}
+
+static bool bytevector_range(unsigned argc, unsigned *argv,
+                             unsigned start_arg, unsigned end_arg,
+                             unsigned default_end, int64_t *start,
+                             int64_t *end, const char *name)
+{
+    *start = 0;
+    *end = default_end;
+    if (argc > start_arg &&
+        !expect_nonneg_int64(argv[start_arg], start, name))
+        return false;
+    if (argc > end_arg && !expect_nonneg_int64(argv[end_arg], end, name))
+        return false;
+    if (*start > *end) {
+        show_error("%s: invalid range", name);
+        return false;
+    }
+    return true;
+}
+
+static bool bytevector_bounded_range(unsigned argc, unsigned *argv,
+                                     unsigned start_arg, unsigned end_arg,
+                                     unsigned default_end, int64_t *start,
+                                     int64_t *end, const char *name,
+                                     const char *bounds_error)
+{
+    if (!bytevector_range(argc, argv, start_arg, end_arg, default_end, start,
+                          end, name))
+        return false;
+    if ((uint64_t)*end > default_end) {
+        show_error("%s: %s", name, bounds_error);
+        return false;
+    }
+    return true;
+}
+
+static unsigned make_bytevector_from_args(unsigned argc, unsigned *argv,
+                                          const char *name)
+{
+    int64_t len;
+    if (!expect_nonneg_int64(argv[0], &len, name))
+        return TOK_ERROR;
+    if (!bytevector_length_fits((uint64_t)len, name, "length"))
+        return TOK_ERROR;
+    uint8_t fill = 0;
+    if (argc > 1) {
+        int64_t f;
+        if (!expect_u8(argv[1], &f, name))
+            return TOK_ERROR;
+        fill = (uint8_t)f;
+    }
+    return make_bytevector_filled((unsigned)len, fill, name);
+}
+
+static unsigned bytevector_ref_value(unsigned bv_arg, unsigned index_arg,
+                                     const char *name)
+{
+    bytevec_data *bv = require_bytevector(bv_arg, name);
+    if (!bv)
+        return TOK_ERROR;
+    int64_t idx;
+    if (!bytevector_index(index_arg, bv, &idx, name))
+        return TOK_ERROR;
+    return store(bv->data[idx]);
+}
+
+static unsigned bytevector_set_value(unsigned bv_arg, unsigned index_arg,
+                                     unsigned value_arg, const char *name)
+{
+    bytevec_data *bv = require_bytevector(bv_arg, name);
+    if (!bv)
+        return TOK_ERROR;
+    int64_t idx, val;
+    if (!bytevector_index(index_arg, bv, &idx, name) ||
+        !expect_u8(value_arg, &val, name))
+        return TOK_ERROR;
+    bv->data[idx] = (uint8_t)val;
+    return 0;
+}
+
+static unsigned bytevector_length_value(unsigned bv_arg, const char *name)
+{
+    bytevec_data *bv = require_bytevector(bv_arg, name);
+    if (!bv)
+        return TOK_ERROR;
+    return store(bv->len);
+}
+
+static unsigned bytevector_copy_value(unsigned argc, unsigned *argv,
+                                      const char *name)
+{
+    bytevec_data *src = require_bytevector(argv[0], name);
+    if (!src)
+        return TOK_ERROR;
+    int64_t start, end;
+    if (!bytevector_bounded_range(argc, argv, 1, 2, src->len, &start,
+                                  &end, name, "invalid range"))
+        return TOK_ERROR;
+    unsigned len = (unsigned)(end - start);
+    return make_bytevector_copy(src->data + start, len, name);
+}
+
+static unsigned bytevector_copy_to(unsigned argc, unsigned *argv,
+                                   const char *name)
+{
+    bytevec_data *dst = require_bytevector(argv[0], name);
+    if (!dst)
+        return TOK_ERROR;
+    bytevec_data *src = require_bytevector(argv[2], name);
+    if (!src)
+        return TOK_ERROR;
+    int64_t at, start, end;
+    if (!expect_nonneg_int64(argv[1], &at, name))
+        return TOK_ERROR;
+    if (!bytevector_bounded_range(argc, argv, 3, 4, src->len, &start,
+                                  &end, name, "out of bounds"))
+        return TOK_ERROR;
+    unsigned len = (unsigned)(end - start);
+    if ((uint64_t)at + len > dst->len) {
+        show_error("%s: out of bounds", name);
+        return TOK_ERROR;
+    }
+    memmove(dst->data + at, src->data + start, len);
+    return 0;
+}
+
+static unsigned apply_bytevector_primitive(unsigned prim_id, unsigned argc,
+                                           unsigned *argv)
+{
     switch (prim_id) {
-    // Arithmetic - delegated to prim_numeric.c
+    case PMAKEBYTEVEC:
+        REQUIRE_ARGC(argc, 1, 2, "make-bytevector");
+        return make_bytevector_from_args(argc, argv, "make-bytevector");
+    case PBYTEVECREF:
+        REQUIRE_ARGC(argc, 2, 2, "bytevector-u8-ref");
+        return bytevector_ref_value(argv[0], argv[1],
+                                    "bytevector-u8-ref");
+    case PBYTEVECSET:
+        REQUIRE_ARGC(argc, 3, 3, "bytevector-u8-set!");
+        return bytevector_set_value(argv[0], argv[1], argv[2],
+                                    "bytevector-u8-set!");
+    case PBYTEVECLEN:
+        REQUIRE_ARGC(argc, 1, 1, "bytevector-length");
+        return bytevector_length_value(argv[0], "bytevector-length");
+    case PBYTEVECUP:
+        REQUIRE_ARGC(argc, 1, 1, "bytevector?");
+        return scheme_bool(IS_BYTEVEC(argv[0]));
+    case PBYTEVEC:
+        return make_bytevector_from_u8_argv(argc, argv, "bytevector");
+    case PBYTEVECCOPY:
+        REQUIRE_ARGC(argc, 1, 3, "bytevector-copy");
+        return bytevector_copy_value(argc, argv, "bytevector-copy");
+    case PBYTEVECCOPYTO:
+        REQUIRE_ARGC(argc, 3, 5, "bytevector-copy!");
+        return bytevector_copy_to(argc, argv, "bytevector-copy!");
+    case PBYTEVECAPPEND:
+        return make_bytevector_append(argc, argv, "bytevector-append");
+    default:
+        show_error("bytevector primitive: unsupported id %u", prim_id);
+        return TOK_ERROR;
+    }
+}
+
+static char *object_to_string(unsigned value, const char *name)
+{
+    char *buf = NULL;
+    size_t buf_len = 0;
+    FILE *mem = open_memstream(&buf, &buf_len);
+    if (!mem) {
+        show_error("%s: out of memory", name);
+        return NULL;
+    }
+    write_obj_port(value, mem);
+    if (fclose(mem) != 0) {
+        free(buf);
+        show_error("%s: write failed", name);
+        return NULL;
+    }
+    return buf;
+}
+
+typedef enum {
+    BITWISE_AND,
+    BITWISE_IOR,
+    BITWISE_XOR,
+} bitwise_op;
+
+static unsigned bitwise_fold(unsigned argc, unsigned *argv, const char *name,
+                             bitwise_op op)
+{
+    int64_t result;
+    if (!expect_exact_int64(argv[0], &result, name))
+        return TOK_ERROR;
+    for (unsigned i = 1; i < argc; i++) {
+        int64_t b;
+        if (!expect_exact_int64(argv[i], &b, name))
+            return TOK_ERROR;
+        switch (op) {
+        case BITWISE_AND:
+            result &= b;
+            break;
+        case BITWISE_IOR:
+            result |= b;
+            break;
+        case BITWISE_XOR:
+            result ^= b;
+            break;
+        }
+    }
+    return store(result);
+}
+
+static unsigned bitwise_not_value(unsigned value, const char *name)
+{
+    int64_t a;
+    if (!expect_exact_int64(value, &a, name))
+        return TOK_ERROR;
+    return store(~a);
+}
+
+static unsigned arithmetic_shift_value(unsigned value_arg,
+                                       unsigned count_arg,
+                                       const char *name)
+{
+    int64_t val, count;
+    if (!expect_exact_int64(value_arg, &val, name) ||
+        !expect_exact_int64(count_arg, &count, name))
+        return TOK_ERROR;
+    if (count >= 0) {
+        if ((uint64_t)count > SIZE_MAX) {
+            show_error("%s: count too large", name);
+            return TOK_ERROR;
+        }
+        bignum *bn = bn_from_int(val);
+        bignum *shifted = bn ? bn_lshift(bn, (size_t)count) : NULL;
+        bn_free(bn);
+        if (!shifted) {
+            show_error("%s: out of memory", name);
+            return TOK_ERROR;
+        }
+        return store_integer(shifted);
+    } else {
+        uint64_t shift = -(uint64_t)count;
+        if (shift >= 63)
+            return store(val < 0 ? -1 : 0);
+        return store(val >> shift);
+    }
+}
+
+static unsigned number_to_string_value(unsigned num, int radix,
+                                       const char *name)
+{
+    if (IS_FIXNUM(num) || IS_NUM(num) || IS_BIGNUM(num)) {
+        char *s = exact_integer_to_string(num, radix);
+        if (!s) {
+            show_error("%s: out of memory", name);
+            return TOK_ERROR;
+        }
+        return make_string_owned(s);
+    } else if (IS_RATIONAL(num)) {
+        bool too_large;
+        char *s = rational_to_string(num, radix, &too_large);
+        if (!s) {
+            show_error("%s: %s", name,
+                       too_large ? "result too large" : "out of memory");
+            return TOK_ERROR;
+        }
+        return make_string_owned(s);
+    } else if (IS_INEXACT(num)) {
+        if (radix != 10) {
+            show_error("%s: inexact numbers require radix 10", name);
+            return TOK_ERROR;
+        }
+        double d = to_double(num);
+        char buf[NUMBER_BUF_SIZE];
+        snprintf(buf, sizeof(buf), "%g", d);
+        return make_string_copy(buf);
+    } else if (IS_COMPLEX(num)) {
+        if (radix != 10) {
+            show_error("%s: complex numbers require radix 10", name);
+            return TOK_ERROR;
+        }
+        char *buf = object_to_string(num, name);
+        if (!buf)
+            return TOK_ERROR;
+        return make_string_owned(buf);
+    } else {
+        show_error("%s: not a number", name);
+        return TOK_ERROR;
+    }
+}
+
+static unsigned string_to_number_value(unsigned str, int radix,
+                                       const char *name)
+{
+    char *s = require_string_ptr(str, name);
+    if (!s)
+        return TOK_ERROR;
+    if (radix == 10) {
+        char *copy = checked_string_copy(s);
+        if (!copy) {
+            show_error("%s: out of memory", name);
+            return TOK_ERROR;
+        }
+        unsigned parsed = atom_from_string(copy);
+        free(copy);
+        if (parsed == TOK_ERROR)
+            return TOK_ERROR;
+        if (is_numeric(parsed))
+            return parsed;
+        return ctx.atom_false;
+    }
+    bignum *bn = bn_from_string(s, radix);
+    if (!bn)
+        return ctx.atom_false;
+    return store_integer(bn);
+}
+
+static unsigned apply_arithmetic_primitive(unsigned prim_id, unsigned argc,
+                                           unsigned *argv)
+{
+    switch (prim_id) {
     case PPLUS:
         return prim_plus(argc, argv);
     case PMINUS:
@@ -114,8 +943,17 @@ unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
         return prim_quotient(argc, argv);
     case PABS:
         return prim_abs(argc, argv);
+    default:
+        show_error("arithmetic primitive: unsupported id %u", prim_id);
+        return TOK_ERROR;
+    }
+}
 
-    // Numeric comparison - delegated to prim_compare.c
+static unsigned apply_numeric_compare_primitive(unsigned prim_id,
+                                                unsigned argc,
+                                                unsigned *argv)
+{
+    switch (prim_id) {
     case PEQUAL:
         return numeric_compare(argc, argv, CMP_EQ);
     case PLT:
@@ -126,122 +964,1131 @@ unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
         return numeric_compare(argc, argv, CMP_LE);
     case PGEQ:
         return numeric_compare(argc, argv, CMP_GE);
+    default:
+        show_error("numeric comparison primitive: unsupported id %u",
+                   prim_id);
+        return TOK_ERROR;
+    }
+}
 
-    // Logic
+static unsigned apply_logic_primitive(unsigned prim_id, unsigned argc,
+                                      unsigned *argv)
+{
+    switch (prim_id) {
     case PNOT:
         REQUIRE_ARGC(argc, 1, 1, "not");
-        return IS_FALSE(argv[0]) ? ctx.atom_true : ctx.atom_false;
-    case PEQ: {
+        return scheme_bool(IS_FALSE(argv[0]));
+    case PEQ:
         REQUIRE_ARGC(argc, 2, 2, "eq?");
-        unsigned arg1 = argv[0];
-        unsigned arg2 = argv[1];
-        if (arg1 == arg2)
-            return ctx.atom_true;
-        if (IS_FIXNUM(arg1)) {
-            return IS_NUM(arg2) && CELL_ID(arg2) == (int64_t)FIXNUM_VALUE(arg1)
-                       ? ctx.atom_true
-                       : ctx.atom_false;
-        }
-        if (IS_FIXNUM(arg2)) {
-            return IS_NUM(arg1) && CELL_ID(arg1) == (int64_t)FIXNUM_VALUE(arg2)
-                       ? ctx.atom_true
-                       : ctx.atom_false;
-        }
-        if (!IS_CELL(arg1) || !IS_CELL(arg2))
-            return ctx.atom_false;
-        if (CELL_TYPE(arg1) != CELL_TYPE(arg2))
-            return ctx.atom_false;
-        switch (CELL_TYPE(arg1)) {
-        case BT_NUM:
-        case BT_FUNCTION:
-        case BT_BUILTIN:
-        case BT_ATOM:
-        case BT_CHAR:
-            return CELL_ID(arg1) == CELL_ID(arg2) ? ctx.atom_true
-                                                  : ctx.atom_false;
-        default:
-            return arg1 == arg2 ? ctx.atom_true : ctx.atom_false;
-        }
-    }
+        return eq_value(argv[0], argv[1]);
     case PEQUALP:
         REQUIRE_ARGC(argc, 2, 2, "equal?");
-        return deep_equal(argv[0], argv[1]) ? ctx.atom_true
-                                                 : ctx.atom_false;
+        return scheme_bool(deep_equal(argv[0], argv[1]));
+    default:
+        show_error("logic primitive: unsupported id %u", prim_id);
+        return TOK_ERROR;
+    }
+}
 
-    // List operations
+static unsigned apply_list_primitive(unsigned prim_id, unsigned argc,
+                                     unsigned *argv)
+{
+    switch (prim_id) {
     case PCONS:
         REQUIRE_ARGC(argc, 2, 2, "cons");
         return alloc_cons(argv[0], argv[1]);
     case PCAR:
         REQUIRE_ARGC(argc, 1, 1, "car");
-        CHECK_PAIR(argv[0], "car");
-        return car(argv[0]);
+        return pair_car(argv[0], "car");
     case PCDR:
         REQUIRE_ARGC(argc, 1, 1, "cdr");
-        CHECK_PAIR(argv[0], "cdr");
-        return cdr(argv[0]);
-    case PSETCAR: {
+        return pair_cdr(argv[0], "cdr");
+    case PSETCAR:
         REQUIRE_ARGC(argc, 2, 2, "set-car!");
-        unsigned arg1 = argv[0];
-        CHECK_PAIR(arg1, "set-car!");
-        unsigned arg2 = argv[1];
-        cell_set_car(arg1, arg2);
-        return arg2;
-    }
-    case PSETCDR: {
+        return set_pair_car(argv[0], argv[1], "set-car!");
+    case PSETCDR:
         REQUIRE_ARGC(argc, 2, 2, "set-cdr!");
-        unsigned arg1 = argv[0];
-        CHECK_PAIR(arg1, "set-cdr!");
-        unsigned arg2 = argv[1];
-        cell_set_cdr(arg1, arg2);
-        return arg2;
-    }
+        return set_pair_cdr(argv[0], argv[1], "set-cdr!");
     case PLIST:
-        if (argc == 0)
-            return 0;
-        {
-            GC_GUARD;
-            unsigned result = 0;
-            gc_protect(&result);
-            for (unsigned i = argc; i > 0; i--) {
-                result = alloc_cons(argv[i - 1], result);
-            }
-            return result;
-        }
-    case PLENGTH: {
+        return make_list_from_argv(argc, argv);
+    case PLENGTH:
         REQUIRE_ARGC(argc, 1, 1, "length");
-        unsigned lst = argv[0];
-        if (IS_STRING(lst))
-            return store(strlen(GET_STRING_PTR(lst)));
-        if (IS_VECTOR(lst))
-            return store(vector_len(lst));
-        unsigned len = 0;
-        if (!list_length_checked(lst, &len, "length"))
-            return TOK_ERROR;
-        return store(len);
-    }
+        return length_value(argv[0], "length");
     case PAPPEND:
         return prim_append(argc, argv);
     case PREVERSE:
         return prim_reverse(argc, argv);
-    case PLASTPAIR: {
+    case PLASTPAIR:
         REQUIRE_ARGC(argc, 1, 1, "last-pair");
-        unsigned lst = argv[0];
-        if (!IS_PAIR(lst)) {
-            show_error("last-pair: not a pair");
+        return last_pair(argv[0], "last-pair");
+    default:
+        show_error("list primitive: unsupported id %u", prim_id);
+        return TOK_ERROR;
+    }
+}
+
+static unsigned apply_string_primitive(unsigned prim_id, unsigned argc,
+                                       unsigned *argv)
+{
+    switch (prim_id) {
+    case PSTRLEN:
+        REQUIRE_ARGC(argc, 1, 1, "string-length");
+        return string_length_value(argv[0], "string-length");
+    case PSTRREF:
+        REQUIRE_ARGC(argc, 2, 2, "string-ref");
+        return string_ref_value(argv[0], argv[1], "string-ref");
+    case PSTRSET:
+        REQUIRE_ARGC(argc, 3, 3, "string-set!");
+        return string_set_value(argv[0], argv[1], argv[2], "string-set!");
+    case PSTRAPP:
+        return prim_string_append(argc, argv);
+    case PSUBSTR:
+        return prim_substring(argc, argv);
+    case PSTR2SYM:
+        REQUIRE_ARGC(argc, 1, 1, "string->symbol");
+        return make_symbol_from_string(argv[0], "string->symbol");
+    case PSYM2STR:
+        REQUIRE_ARGC(argc, 1, 1, "symbol->string");
+        return make_string_from_symbol(argv[0], "symbol->string");
+    case PNUM2STR: {
+        REQUIRE_ARGC(argc, 1, 2, "number->string");
+        int radix;
+        if (!parse_optional_radix(argc, argv, "number->string", &radix))
+            return TOK_ERROR;
+        return number_to_string_value(argv[0], radix, "number->string");
+    }
+    case PSTR2NUM: {
+        REQUIRE_ARGC(argc, 1, 2, "string->number");
+        int radix;
+        if (!parse_optional_radix(argc, argv, "string->number", &radix))
+            return TOK_ERROR;
+        return string_to_number_value(argv[0], radix, "string->number");
+    }
+    case PMAKESTR:
+        REQUIRE_ARGC(argc, 1, 2, "make-string");
+        return make_filled_string(argv[0], argc > 1 ? argv[1] : 0,
+                                  argc > 1, "make-string");
+    case PSTRCOPY:
+        REQUIRE_ARGC(argc, 1, 1, "string-copy");
+        return string_copy_value(argv[0], "string-copy");
+    case PSTR2LIST:
+        REQUIRE_ARGC(argc, 1, 1, "string->list");
+        return make_char_list_from_string(argv[0], "string->list");
+    case PLIST2STR:
+        REQUIRE_ARGC(argc, 1, 1, "list->string");
+        return make_string_from_char_list(argv[0], "list->string");
+    case PSTRFILL:
+        REQUIRE_ARGC(argc, 2, 2, "string-fill!");
+        return fill_string(argv[0], argv[1], "string-fill!");
+    case PSTRING:
+        return make_string_from_chars(argc, argv, "string");
+    case PSTREQ:
+    case PSTRLT:
+    case PSTRGT:
+    case PSTRLE:
+    case PSTRGE:
+    case PSTREQI:
+    case PSTRLTI:
+    case PSTRGTI:
+    case PSTRLEI:
+    case PSTRGEI: {
+        unsigned offset = prim_id - PSTREQ;
+        return string_compare(argc, argv, (cmp_op)(offset % 5), offset >= 5);
+    }
+    default:
+        show_error("string primitive: unsupported id %u", prim_id);
+        return TOK_ERROR;
+    }
+}
+
+static unsigned apply_bitwise_primitive(unsigned prim_id, unsigned argc,
+                                        unsigned *argv)
+{
+    switch (prim_id) {
+    case PBITWISEAND:
+        REQUIRE_ARGC(argc, 1, 999, "bitwise-and");
+        return bitwise_fold(argc, argv, "bitwise-and", BITWISE_AND);
+    case PBITWISEIOR:
+        REQUIRE_ARGC(argc, 1, 999, "bitwise-ior");
+        return bitwise_fold(argc, argv, "bitwise-ior", BITWISE_IOR);
+    case PBITWISEXOR:
+        REQUIRE_ARGC(argc, 1, 999, "bitwise-xor");
+        return bitwise_fold(argc, argv, "bitwise-xor", BITWISE_XOR);
+    case PBITWISENOT:
+        REQUIRE_ARGC(argc, 1, 1, "bitwise-not");
+        return bitwise_not_value(argv[0], "bitwise-not");
+    case PARITHSHIFT:
+        REQUIRE_ARGC(argc, 2, 2, "arithmetic-shift");
+        return arithmetic_shift_value(argv[0], argv[1], "arithmetic-shift");
+    default:
+        show_error("bitwise primitive: unsupported id %u", prim_id);
+        return TOK_ERROR;
+    }
+}
+
+static unsigned current_second_value(void)
+{
+    time_t now = time(NULL);
+    return store_inexact((double)now);
+}
+
+static unsigned current_jiffy_value(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
+        show_error("current-jiffy: clock_gettime failed");
+        return TOK_ERROR;
+    }
+    return store((int64_t)ts.tv_sec * JIFFIES_PER_SECOND + ts.tv_nsec);
+}
+
+static unsigned list_ref_value(unsigned lst, unsigned index_arg,
+                               const char *name)
+{
+    int64_t idx;
+    if (!expect_nonneg_int64(index_arg, &idx, name))
+        return TOK_ERROR;
+    unsigned cell = list_cell_at(lst, idx, name);
+    if (cell == TOK_ERROR)
+        return TOK_ERROR;
+    return car(cell);
+}
+
+static void prepend_stat_entry(unsigned *result, const char *key_name,
+                               unsigned value)
+{
+    unsigned key = atom_from_string(key_name);
+    gc_protect(&key);
+    unsigned entry = alloc_cons(key, value);
+    gc_protect(&entry);
+    *result = alloc_cons(entry, *result);
+    gc_unprotect(2);
+}
+
+static unsigned make_gc_stats_list(void)
+{
+    GC_GUARD;
+    unsigned minor = store(ctx.minor_gc_count);
+    gc_protect(&minor);
+    unsigned major = store(ctx.major_gc_count);
+    gc_protect(&major);
+    unsigned heap_used = store(ctx.hptr - ctx.mmin);
+    gc_protect(&heap_used);
+    unsigned nursery_used = store(ctx.nursery_ptr - ctx.nursery_start);
+    gc_protect(&nursery_used);
+    unsigned result = 0;
+    gc_protect(&result);
+
+    prepend_stat_entry(&result, "nursery", nursery_used);
+    prepend_stat_entry(&result, "old-gen", heap_used);
+    prepend_stat_entry(&result, "major-gc", major);
+    prepend_stat_entry(&result, "minor-gc", minor);
+
+    return result;
+}
+
+static bool expect_r5rs_environment_version(unsigned value, const char *name)
+{
+    int64_t version;
+    if (!expect_exact_int64(value, &version, name))
+        return false;
+    if (version != 5) {
+        show_error("%s: unsupported version %lld", name,
+                   (long long)version);
+        return false;
+    }
+    return true;
+}
+
+static unsigned scheme_environment(unsigned version_arg, const char *name)
+{
+    if (!expect_r5rs_environment_version(version_arg, name))
+        return TOK_ERROR;
+    return default_environment();
+}
+
+static unsigned null_environment(unsigned version_arg, const char *name)
+{
+    if (!expect_r5rs_environment_version(version_arg, name))
+        return TOK_ERROR;
+    return empty_environment();
+}
+
+static unsigned make_command_line_list(void)
+{
+    GC_GUARD;
+    unsigned result = 0;
+    gc_protect(&result);
+    for (int i = saved_argc - 1; i >= 0; i--) {
+        unsigned s = make_string_copy(saved_argv[i]);
+        if (s == TOK_ERROR)
+            return TOK_ERROR;
+        gc_protect(&s);
+        result = alloc_cons(s, result);
+        gc_unprotect(1);
+    }
+    return result;
+}
+
+static unsigned file_exists_p(unsigned filename_arg, const char *name)
+{
+    char *filename = require_string_ptr(filename_arg, name);
+    if (!filename)
+        return TOK_ERROR;
+    FILE *f = fopen(filename, "r");
+    bool exists = f != NULL;
+    if (f)
+        fclose(f);
+    return scheme_bool(exists);
+}
+
+static unsigned delete_file_value(unsigned filename_arg, const char *name)
+{
+    char *filename = require_string_ptr(filename_arg, name);
+    if (!filename)
+        return TOK_ERROR;
+    if (remove(filename) != 0) {
+        show_error("%s: cannot delete %s", name, filename);
+        return TOK_ERROR;
+    }
+    return 0;
+}
+
+static unsigned rename_file_value(unsigned old_arg, unsigned new_arg,
+                                  const char *name)
+{
+    char *old_name = require_string_ptr(old_arg, name);
+    char *new_name = require_string_ptr(new_arg, name);
+    if (!old_name || !new_name)
+        return TOK_ERROR;
+    if (rename(old_name, new_name) != 0) {
+        show_error("%s: cannot rename file", name);
+        return TOK_ERROR;
+    }
+    return 0;
+}
+
+static unsigned current_directory_value(unsigned argc, unsigned *argv,
+                                        const char *name)
+{
+    if (argc == 0) {
+        char *cwd = getcwd(NULL, 0);
+        if (!cwd) {
+            show_error("%s: cannot read current directory", name);
             return TOK_ERROR;
         }
-        for (;;) {
-            unsigned next = cdr(lst);
-            if (!next)
-                return lst;
-            if (!IS_PAIR(next)) {
-                show_error("last-pair: improper list");
-                return TOK_ERROR;
-            }
-            lst = next;
+        return make_string_owned(cwd);
+    }
+
+    char *path = require_string_ptr(argv[0], name);
+    if (!path)
+        return TOK_ERROR;
+    if (chdir(path) != 0) {
+        show_error("%s: cannot change directory to %s", name, path);
+        return TOK_ERROR;
+    }
+    return 0;
+}
+
+static unsigned directory_files_value(unsigned dirname_arg, const char *name)
+{
+    char *dirname = require_string_ptr(dirname_arg, name);
+    if (!dirname)
+        return TOK_ERROR;
+    DIR *dir = opendir(dirname);
+    if (!dir) {
+        show_error("%s: cannot open directory %s", name, dirname);
+        return TOK_ERROR;
+    }
+
+    GC_GUARD;
+    unsigned result = 0;
+    gc_protect(&result);
+    errno = 0;
+    for (struct dirent *ent = readdir(dir); ent; ent = readdir(dir)) {
+        unsigned s = make_string_copy(ent->d_name);
+        if (s == TOK_ERROR) {
+            closedir(dir);
+            return TOK_ERROR;
+        }
+        gc_protect(&s);
+        result = alloc_cons(s, result);
+        gc_unprotect(1);
+        errno = 0;
+    }
+    if (errno != 0) {
+        closedir(dir);
+        show_error("%s: directory read failed", name);
+        return TOK_ERROR;
+    }
+    if (closedir(dir) != 0) {
+        show_error("%s: directory close failed", name);
+        return TOK_ERROR;
+    }
+    return result;
+}
+
+static unsigned getenv_value(unsigned name_arg, const char *proc_name)
+{
+    char *var = require_string_ptr(name_arg, proc_name);
+    if (!var)
+        return TOK_ERROR;
+    const char *value = getenv(var);
+    if (!value)
+        return ctx.atom_false;
+    return make_string_copy(value);
+}
+
+static unsigned get_environment_variables_value(void)
+{
+    GC_GUARD;
+    unsigned result = 0;
+    gc_protect(&result);
+    for (char **entry = environ; entry && *entry; entry++) {
+        char *equals = strchr(*entry, '=');
+        if (!equals)
+            continue;
+        unsigned name =
+            make_string_owned(checked_string_copy_len(*entry, equals - *entry));
+        if (name == TOK_ERROR)
+            return TOK_ERROR;
+        gc_protect(&name);
+        unsigned value = make_string_copy(equals + 1);
+        if (value == TOK_ERROR)
+            return TOK_ERROR;
+        gc_protect(&value);
+        unsigned pair = alloc_cons(name, value);
+        gc_protect(&pair);
+        result = alloc_cons(pair, result);
+        gc_unprotect(3);
+    }
+    return result;
+}
+
+static unsigned write_to_string_value(unsigned value, const char *name)
+{
+    char *buf = object_to_string(value, name);
+    if (!buf)
+        return TOK_ERROR;
+    return make_string_owned(buf);
+}
+
+static unsigned open_binary_input_file(unsigned filename_arg,
+                                       const char *name)
+{
+    const char *fname = require_string_ptr(filename_arg, name);
+    if (!fname)
+        return TOK_ERROR;
+    return open_file_port(fname, "rb", BT_INPORT, name);
+}
+
+static unsigned open_binary_output_file(unsigned filename_arg,
+                                        const char *name)
+{
+    const char *fname = require_string_ptr(filename_arg, name);
+    if (!fname)
+        return TOK_ERROR;
+    return open_file_port(fname, "wb", BT_OUTPORT, name);
+}
+
+static unsigned write_bytevector_to_port(unsigned bv_arg, unsigned port_arg,
+                                         const char *name)
+{
+    bytevec_data *bv = require_bytevector(bv_arg, name);
+    if (!bv)
+        return TOK_ERROR;
+    if (!IS_OUTPORT(port_arg)) {
+        show_error("%s: not an output port", name);
+        return TOK_ERROR;
+    }
+    FILE *f = GET_PORT_PTR(port_arg);
+    if (!f) {
+        show_error("%s: port is closed", name);
+        return TOK_ERROR;
+    }
+    if (bv->len > 0 && fwrite(bv->data, 1, bv->len, f) != bv->len) {
+        show_error("%s: write failed", name);
+        return TOK_ERROR;
+    }
+    return 0;
+}
+
+static unsigned read_bytevector_into(unsigned bv_arg, unsigned port_arg,
+                                     const char *name)
+{
+    bytevec_data *bv = require_bytevector(bv_arg, name);
+    if (!bv)
+        return TOK_ERROR;
+    if (!IS_INPORT(port_arg)) {
+        show_error("%s: not an input port", name);
+        return TOK_ERROR;
+    }
+    FILE *f = GET_PORT_PTR(port_arg);
+    if (!f) {
+        show_error("%s: port is closed", name);
+        return TOK_ERROR;
+    }
+    size_t n = fread(bv->data, 1, bv->len, f);
+    if (ferror(f)) {
+        show_error("%s: read failed", name);
+        return TOK_ERROR;
+    }
+    if (n == 0)
+        return atom_from_string("eof-object");
+    return store((int64_t)n);
+}
+
+static unsigned make_features_list(void)
+{
+    static const char *features[] = {
+        "vesper", "r5rs", "r7rs-small-subset", "srfi-1", "srfi-2",
+        "srfi-8", "srfi-9", "srfi-26", "srfi-27", "srfi-28",
+        "bytevectors", "exact-rationals", "complex", "full-unicode-absent",
+        NULL};
+
+    GC_GUARD;
+    unsigned result = 0;
+    gc_protect(&result);
+    for (int i = 0; features[i]; i++) {
+        unsigned sym = atom_from_string(features[i]);
+        gc_protect(&sym);
+        result = alloc_cons(sym, result);
+        gc_unprotect(1);
+    }
+    return result;
+}
+
+static uint64_t hash_string_bytes(const char *s)
+{
+    uint64_t h = PRIM_FNV_OFFSET_BASIS;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        h ^= *p;
+        h *= PRIM_FNV_PRIME;
+    }
+    return h;
+}
+
+static uint64_t scheme_hash(unsigned key)
+{
+    if (IS_FIXNUM(key))
+        return (uint64_t)FIXNUM_VALUE(key) * PRIM_FNV_PRIME;
+    if (!IS_CELL(key))
+        return key;
+    switch (CELL_TYPE(key)) {
+    case BT_ATOM:
+        return hash_string_bytes(ctx.atom_table[CELL_ID(key)]);
+    case BT_NUM:
+    case BT_CHAR:
+        return (uint64_t)CELL_ID(key) * PRIM_FNV_PRIME;
+    case BT_STRING:
+        return hash_string_bytes(GET_STRING_PTR(key));
+    default:
+        return (uint64_t)key * PRIM_FNV_PRIME;
+    }
+}
+
+static uint64_t hash_combine(uint64_t a, uint64_t b)
+{
+    return (a ^ (b + 0x9e3779b97f4a7c15ull + (a << 6) + (a >> 2)));
+}
+
+static uint64_t hash_key_for_table(hash_table_data *ht, unsigned key)
+{
+    if (ht->equiv == HASH_EQ)
+        return (IS_FIXNUM(key) || IS_ATOM(key) || IS_NUM(key) || IS_CHAR(key))
+                   ? scheme_hash(key)
+                   : (uint64_t)key * PRIM_FNV_PRIME;
+    if (ht->equiv == HASH_EQV && !is_numeric(key))
+        return (IS_FIXNUM(key) || IS_ATOM(key) || IS_CHAR(key))
+                   ? scheme_hash(key)
+                   : (uint64_t)key * PRIM_FNV_PRIME;
+
+    if (IS_FIXNUM(key) || !IS_CELL(key))
+        return scheme_hash(key);
+    switch (CELL_TYPE(key)) {
+    case BT_RATIONAL:
+    case BT_COMPLEX:
+    case BT_CONS:
+        return hash_combine(hash_key_for_table(ht, car(key)),
+                            hash_key_for_table(ht, cdr(key)));
+    case BT_VECTOR: {
+        uint64_t h = PRIM_FNV_OFFSET_BASIS;
+        unsigned len = vector_len(key);
+        unsigned *data = vector_data_ptr(key);
+        for (unsigned i = 0; i < len; i++)
+            h = hash_combine(h, hash_key_for_table(ht, data[i]));
+        return h;
+    }
+    case BT_BYTEVEC: {
+        bytevec_data *bv = (bytevec_data *)CELL_PTR(key);
+        uint64_t h = PRIM_FNV_OFFSET_BASIS;
+        for (unsigned i = 0; i < bv->len; i++) {
+            h ^= bv->data[i];
+            h *= PRIM_FNV_PRIME;
+        }
+        return h;
+    }
+    case BT_BIGNUM: {
+        char *s = bn_to_string(get_bignum(key), 10);
+        if (!s)
+            return (uint64_t)key * PRIM_FNV_PRIME;
+        uint64_t h = hash_string_bytes(s);
+        free(s);
+        return h;
+    }
+    default:
+        return scheme_hash(key);
+    }
+}
+
+static bool hash_key_equal(hash_table_data *ht, unsigned a, unsigned b)
+{
+    switch (ht->equiv) {
+    case HASH_EQ:
+        return IS_TRUTHY(eq_value(a, b));
+    case HASH_EQV:
+        if (is_numeric(a) && is_numeric(b))
+            return deep_equal(a, b);
+        return IS_TRUTHY(eq_value(a, b));
+    case HASH_EQUAL:
+        return deep_equal(a, b);
+    }
+    return false;
+}
+
+static unsigned hash_table_capacity_for_size(uint64_t initial_size)
+{
+    unsigned cap = 16;
+    uint64_t needed = initial_size == 0 ? 16 : initial_size;
+    while (cap < UINT_MAX / 2 && (uint64_t)cap * 3 / 4 < needed)
+        cap *= 2;
+    return cap;
+}
+
+static bool parse_hash_table_initial_size(unsigned argc, unsigned *argv,
+                                          const char *name,
+                                          uint64_t *initial_size)
+{
+    *initial_size = 0;
+    if (argc == 0 || IS_FALSE(argv[0]))
+        return true;
+    int64_t size;
+    if (!expect_nonneg_int64(argv[0], &size, name))
+        return false;
+    *initial_size = (uint64_t)size;
+    return true;
+}
+
+static hash_table_data *require_hash_table(unsigned value, const char *name)
+{
+    if (!IS_HASHTABLE(value)) {
+        show_error("%s: not a hash table", name);
+        return NULL;
+    }
+    return GET_HASHTABLE_PTR(value);
+}
+
+static unsigned make_hash_table_value(hash_equiv equiv, unsigned argc,
+                                      unsigned *argv, const char *name)
+{
+    uint64_t initial_size;
+    if (!parse_hash_table_initial_size(argc, argv, name, &initial_size))
+        return TOK_ERROR;
+    hash_table_data *ht = checked_malloc_size(sizeof(hash_table_data));
+    if (!ht) {
+        show_error("%s: out of memory", name);
+        return TOK_ERROR;
+    }
+    ht->capacity = hash_table_capacity_for_size(initial_size);
+    ht->size = 0;
+    ht->equiv = equiv;
+    ht->buckets = checked_calloc_array(ht->capacity, sizeof(hash_entry *));
+    if (!ht->buckets) {
+        free(ht);
+        show_error("%s: out of memory", name);
+        return TOK_ERROR;
+    }
+    return make_pointer_cell(BT_HASHTABLE, ht);
+}
+
+static hash_entry **hash_entry_slot(hash_table_data *ht, unsigned key)
+{
+    unsigned bucket = (unsigned)(hash_key_for_table(ht, key) % ht->capacity);
+    hash_entry **slot = &ht->buckets[bucket];
+    while (*slot && !hash_key_equal(ht, (*slot)->key, key))
+        slot = &(*slot)->next;
+    return slot;
+}
+
+static bool hash_table_resize(hash_table_data *ht, unsigned new_capacity,
+                              const char *name)
+{
+    hash_entry **new_buckets =
+        checked_calloc_array(new_capacity, sizeof(hash_entry *));
+    if (!new_buckets) {
+        show_error("%s: out of memory", name);
+        return false;
+    }
+
+    for (unsigned i = 0; i < ht->capacity; i++) {
+        hash_entry *entry = ht->buckets[i];
+        while (entry) {
+            hash_entry *next = entry->next;
+            unsigned bucket =
+                (unsigned)(hash_key_for_table(ht, entry->key) % new_capacity);
+            entry->next = new_buckets[bucket];
+            new_buckets[bucket] = entry;
+            entry = next;
         }
     }
+    free(ht->buckets);
+    ht->buckets = new_buckets;
+    ht->capacity = new_capacity;
+    return true;
+}
+
+static bool hash_table_grow_if_needed(hash_table_data *ht, const char *name)
+{
+    if ((uint64_t)(ht->size + 1) * 4 <= (uint64_t)ht->capacity * 3)
+        return true;
+    if (ht->capacity > UINT_MAX / 2) {
+        show_error("%s: hash table too large", name);
+        return false;
+    }
+    return hash_table_resize(ht, ht->capacity * 2, name);
+}
+
+static unsigned hash_table_ref_value(unsigned argc, unsigned *argv,
+                                     const char *name)
+{
+    hash_table_data *ht = require_hash_table(argv[0], name);
+    if (!ht)
+        return TOK_ERROR;
+    hash_entry **slot = hash_entry_slot(ht, argv[1]);
+    if (*slot)
+        return (*slot)->value;
+    if (argc == 3)
+        return argv[2];
+    show_error("%s: key not found", name);
+    return TOK_ERROR;
+}
+
+static unsigned hash_table_set_value(unsigned table_arg, unsigned key,
+                                     unsigned value, const char *name)
+{
+    hash_table_data *ht = require_hash_table(table_arg, name);
+    if (!ht)
+        return TOK_ERROR;
+    hash_entry **slot = hash_entry_slot(ht, key);
+    write_barrier(table_arg, key);
+    write_barrier(table_arg, value);
+    if (*slot) {
+        (*slot)->value = value;
+        return 0;
+    }
+    if (!hash_table_grow_if_needed(ht, name))
+        return TOK_ERROR;
+    slot = hash_entry_slot(ht, key);
+    hash_entry *entry = checked_malloc_size(sizeof(hash_entry));
+    if (!entry) {
+        show_error("%s: out of memory", name);
+        return TOK_ERROR;
+    }
+    entry->key = key;
+    entry->value = value;
+    entry->next = NULL;
+    *slot = entry;
+    ht->size++;
+    return 0;
+}
+
+static unsigned hash_table_delete_value(unsigned table_arg, unsigned key,
+                                        const char *name)
+{
+    hash_table_data *ht = require_hash_table(table_arg, name);
+    if (!ht)
+        return TOK_ERROR;
+    hash_entry **slot = hash_entry_slot(ht, key);
+    if (*slot) {
+        hash_entry *entry = *slot;
+        *slot = entry->next;
+        free(entry);
+        ht->size--;
+    }
+    return 0;
+}
+
+static unsigned hash_table_exists_value(unsigned table_arg, unsigned key,
+                                        const char *name)
+{
+    hash_table_data *ht = require_hash_table(table_arg, name);
+    if (!ht)
+        return TOK_ERROR;
+    return scheme_bool(*hash_entry_slot(ht, key) != NULL);
+}
+
+static unsigned hash_table_clear_value(unsigned table_arg, const char *name)
+{
+    hash_table_data *ht = require_hash_table(table_arg, name);
+    if (!ht)
+        return TOK_ERROR;
+    for (unsigned i = 0; i < ht->capacity; i++) {
+        hash_entry *entry = ht->buckets[i];
+        while (entry) {
+            hash_entry *next = entry->next;
+            free(entry);
+            entry = next;
+        }
+        ht->buckets[i] = NULL;
+    }
+    ht->size = 0;
+    return 0;
+}
+
+static unsigned hash_table_entries_list(unsigned table_arg, const char *name,
+                                        int mode)
+{
+    hash_table_data *ht = require_hash_table(table_arg, name);
+    if (!ht)
+        return TOK_ERROR;
+    GC_GUARD;
+    unsigned result = 0;
+    gc_protect(&result);
+    for (unsigned i = 0; i < ht->capacity; i++) {
+        for (hash_entry *entry = ht->buckets[i]; entry; entry = entry->next) {
+            unsigned item = 0;
+            gc_protect(&item);
+            if (mode == 0) {
+                item = entry->key;
+            } else if (mode == 1) {
+                item = entry->value;
+            } else {
+                unsigned key = entry->key;
+                unsigned value = entry->value;
+                gc_protect(&key);
+                gc_protect(&value);
+                item = alloc_cons(key, value);
+                gc_unprotect(2);
+            }
+            result = alloc_cons(item, result);
+            gc_unprotect(1);
+        }
+    }
+    return result;
+}
+
+static unsigned make_public_gensym(void)
+{
+    char buf[32];
+    snprintf(buf, sizeof(buf), "g%u", gensym_counter++);
+    return atom_from_string(buf);
+}
+
+static unsigned transcript_on(unsigned filename_arg, const char *name)
+{
+    char *filename = require_string_ptr(filename_arg, name);
+    if (!filename)
+        return TOK_ERROR;
+    if (ctx.transcript) {
+        show_error("%s: transcript already active", name);
+        return TOK_ERROR;
+    }
+    ctx.transcript = fopen(filename, "w");
+    if (!ctx.transcript) {
+        show_error("%s: cannot open %s", name, filename);
+        return TOK_ERROR;
+    }
+    return 0;
+}
+
+static unsigned transcript_off(const char *name)
+{
+    if (!ctx.transcript) {
+        show_error("%s: no transcript active", name);
+        return TOK_ERROR;
+    }
+    if (fclose(ctx.transcript) != 0) {
+        ctx.transcript = NULL;
+        show_error("%s: close failed", name);
+        return TOK_ERROR;
+    }
+    ctx.transcript = NULL;
+    return 0;
+}
+
+static unsigned apply_transcript_primitive(unsigned prim_id, unsigned argc,
+                                           unsigned *argv)
+{
+    switch (prim_id) {
+    case PTRANSCRIPTON:
+        REQUIRE_ARGC(argc, 1, 1, "transcript-on");
+        return transcript_on(argv[0], "transcript-on");
+    case PTRANSCRIPTOFF:
+        REQUIRE_ARGC(argc, 0, 0, "transcript-off");
+        return transcript_off("transcript-off");
+    default:
+        show_error("transcript primitive: unsupported id %u", prim_id);
+        return TOK_ERROR;
+    }
+}
+
+static unsigned report_error_primitive(unsigned argc, unsigned *argv)
+{
+    fprintf(stderr, "error: ");
+    for (unsigned i = 0; i < argc; i++) {
+        display_obj_port(argv[i], stderr);
+        if (i + 1 < argc)
+            fprintf(stderr, " ");
+    }
+    fprintf(stderr, "\n");
+    return TOK_ERROR;
+}
+
+static unsigned apply_environment_primitive(unsigned prim_id, unsigned argc,
+                                            unsigned *argv)
+{
+    switch (prim_id) {
+    case PSCHEMEENV:
+        REQUIRE_ARGC(argc, 1, 1, "scheme-report-environment");
+        return scheme_environment(argv[0], "scheme-report-environment");
+    case PNULLENV:
+        REQUIRE_ARGC(argc, 1, 1, "null-environment");
+        return null_environment(argv[0], "null-environment");
+    default:
+        show_error("environment primitive: unsupported id %u", prim_id);
+        return TOK_ERROR;
+    }
+}
+
+static unsigned apply_misc_primitive(unsigned prim_id, unsigned argc,
+                                     unsigned *argv)
+{
+    switch (prim_id) {
+    case PCURRENTSECOND:
+        REQUIRE_ARGC(argc, 0, 0, "current-second");
+        return current_second_value();
+    case PCURRENTJIFFY:
+        REQUIRE_ARGC(argc, 0, 0, "current-jiffy");
+        return current_jiffy_value();
+    case PJIFFIESPERSECOND:
+        REQUIRE_ARGC(argc, 0, 0, "jiffies-per-second");
+        return store(JIFFIES_PER_SECOND);
+    case PEMERGENCYEXIT: {
+        REQUIRE_ARGC(argc, 0, 1, "emergency-exit");
+        int code = 0;
+        if (argc == 1) {
+            int64_t code64;
+            if (!expect_exact_int64(argv[0], &code64, "emergency-exit"))
+                return TOK_ERROR;
+            code = (int)code64;
+        }
+        _Exit(code);
+    }
+    case PERROR:
+        return report_error_primitive(argc, argv);
+    case PGENSYM:
+        REQUIRE_ARGC(argc, 0, 0, "gensym");
+        return make_public_gensym();
+    case PGCSTATS:
+        REQUIRE_ARGC(argc, 0, 0, "gc-stats");
+        return make_gc_stats_list();
+    case PVALUES:
+        return values_from_argv(argc, argv);
+    case PCOMMANDLINE:
+        REQUIRE_ARGC(argc, 0, 0, "command-line");
+        return make_command_line_list();
+    case PWRITETOSTRING:
+        REQUIRE_ARGC(argc, 1, 1, "write-to-string");
+        return write_to_string_value(argv[0], "write-to-string");
+    case PLISTREF:
+        REQUIRE_ARGC(argc, 2, 2, "list-ref");
+        return list_ref_value(argv[0], argv[1], "list-ref");
+    case POPENBINARYINPUT:
+        REQUIRE_ARGC(argc, 1, 1, "open-binary-input-file");
+        return open_binary_input_file(argv[0], "open-binary-input-file");
+    case PREADBYTEVEC:
+        REQUIRE_ARGC(argc, 2, 2, "read-bytevector");
+        return read_bytevector_from_port(argv[0], argv[1],
+                                         "read-bytevector");
+    case PFILEEXISTS:
+        REQUIRE_ARGC(argc, 1, 1, "file-exists?");
+        return file_exists_p(argv[0], "file-exists?");
+    case PDELETEFILE:
+        REQUIRE_ARGC(argc, 1, 1, "delete-file");
+        return delete_file_value(argv[0], "delete-file");
+    case PRENAMEFILE:
+        REQUIRE_ARGC(argc, 2, 2, "rename-file");
+        return rename_file_value(argv[0], argv[1], "rename-file");
+    case PCURRENTDIRECTORY:
+        REQUIRE_ARGC(argc, 0, 1, "current-directory");
+        return current_directory_value(argc, argv, "current-directory");
+    case PDIRECTORYFILES:
+        REQUIRE_ARGC(argc, 1, 1, "directory-files");
+        return directory_files_value(argv[0], "directory-files");
+    case PGETENV:
+        REQUIRE_ARGC(argc, 1, 1, "get-environment-variable");
+        return getenv_value(argv[0], "get-environment-variable");
+    case PGETENVS:
+        REQUIRE_ARGC(argc, 0, 0, "get-environment-variables");
+        return get_environment_variables_value();
+    case POPENBINARYOUTPUT:
+        REQUIRE_ARGC(argc, 1, 1, "open-binary-output-file");
+        return open_binary_output_file(argv[0], "open-binary-output-file");
+    case PWRITEBYTEVEC:
+        REQUIRE_ARGC(argc, 2, 2, "write-bytevector");
+        return write_bytevector_to_port(argv[0], argv[1], "write-bytevector");
+    case PREADBYTEVECINTO:
+        REQUIRE_ARGC(argc, 2, 2, "read-bytevector!");
+        return read_bytevector_into(argv[0], argv[1], "read-bytevector!");
+    case PFEATURES:
+        REQUIRE_ARGC(argc, 0, 0, "features");
+        return make_features_list();
+    case PMAKEHASHTABLE:
+        REQUIRE_ARGC(argc, 0, 1, "make-hash-table");
+        return make_hash_table_value(HASH_EQUAL, argc, argv,
+                                     "make-hash-table");
+    case PMAKESTRONGEQHASHTABLE:
+        REQUIRE_ARGC(argc, 0, 1, "make-strong-eq-hash-table");
+        return make_hash_table_value(HASH_EQ, argc, argv,
+                                     "make-strong-eq-hash-table");
+    case PMAKEEQHASHTABLE:
+        REQUIRE_ARGC(argc, 0, 1, "make-eq-hash-table");
+        return make_hash_table_value(HASH_EQ, argc, argv,
+                                     "make-eq-hash-table");
+    case PMAKESTRONGEQVHASHTABLE:
+        REQUIRE_ARGC(argc, 0, 1, "make-strong-eqv-hash-table");
+        return make_hash_table_value(HASH_EQV, argc, argv,
+                                     "make-strong-eqv-hash-table");
+    case PMAKEEQVHASHTABLE:
+        REQUIRE_ARGC(argc, 0, 1, "make-eqv-hash-table");
+        return make_hash_table_value(HASH_EQV, argc, argv,
+                                     "make-eqv-hash-table");
+    case PMAKEEQUALHASHTABLE:
+        REQUIRE_ARGC(argc, 0, 1, "make-equal-hash-table");
+        return make_hash_table_value(HASH_EQUAL, argc, argv,
+                                     "make-equal-hash-table");
+    case PHASHTABLEP:
+        REQUIRE_ARGC(argc, 1, 1, "hash-table?");
+        return scheme_bool(IS_HASHTABLE(argv[0]));
+    case PHASHTABLEREF:
+        REQUIRE_ARGC(argc, 2, 3, "hash-table-ref");
+        return hash_table_ref_value(argc, argv, "hash-table-ref");
+    case PHASHTABLESET:
+        REQUIRE_ARGC(argc, 3, 3, "hash-table-set!");
+        return hash_table_set_value(argv[0], argv[1], argv[2],
+                                    "hash-table-set!");
+    case PHASHTABLEDELETE:
+        REQUIRE_ARGC(argc, 2, 2, "hash-table-delete!");
+        return hash_table_delete_value(argv[0], argv[1],
+                                       "hash-table-delete!");
+    case PHASHTABLEEXISTS:
+        REQUIRE_ARGC(argc, 2, 2, "hash-table-exists?");
+        return hash_table_exists_value(argv[0], argv[1],
+                                       "hash-table-exists?");
+    case PHASHTABLESIZE: {
+        REQUIRE_ARGC(argc, 1, 1, "hash-table-size");
+        hash_table_data *ht = require_hash_table(argv[0], "hash-table-size");
+        return ht ? store(ht->size) : TOK_ERROR;
+    }
+    case PHASHTABLECLEAR:
+        REQUIRE_ARGC(argc, 1, 1, "hash-table-clear!");
+        return hash_table_clear_value(argv[0], "hash-table-clear!");
+    case PHASHTABLEKEYS:
+        REQUIRE_ARGC(argc, 1, 1, "hash-table-keys");
+        return hash_table_entries_list(argv[0], "hash-table-keys", 0);
+    case PHASHTABLEVALUES:
+        REQUIRE_ARGC(argc, 1, 1, "hash-table-values");
+        return hash_table_entries_list(argv[0], "hash-table-values", 1);
+    case PHASHTABLEALIST:
+        REQUIRE_ARGC(argc, 1, 1, "hash-table->alist");
+        return hash_table_entries_list(argv[0], "hash-table->alist", 2);
+    default:
+        show_error("misc primitive: unsupported id %u", prim_id);
+        return TOK_ERROR;
+    }
+}
+
+static unsigned unsupported_special_primitive(unsigned prim_id)
+{
+    const char *message = NULL;
+    switch (prim_id) {
+    case PAPPLY:
+        message = "apply: internal error - should be handled in apply_function";
+        break;
+    case PLOAD:
+        message = "load: internal error - should be handled in apply_function";
+        break;
+    case PCALLCC:
+        message = "call/cc must be called as a function, not a primitive";
+        break;
+    case PCALLWITHVALUES:
+        message = "call-with-values: internal error - should be handled in "
+                  "apply_function";
+        break;
+    case PEVAL:
+        message = "eval: internal error - should be handled in apply_function";
+        break;
+    case PINTERACTIONENV:
+        message = "interaction-environment: internal error - should be "
+                  "handled in apply_function";
+        break;
+    default:
+        message = "primitive: unsupported special primitive";
+        break;
+    }
+    show_error("%s", message);
+    return TOK_ERROR;
+}
+
+unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
+{
+    if (argc > 0 && !argv) {
+        show_error("primitive: null argv");
+        return TOK_ERROR;
+    }
+
+    GC_GUARD;
+    for (unsigned i = 0; i < argc; i++)
+        gc_protect(&argv[i]);
+
+    switch (prim_id) {
+    // Arithmetic - delegated to prim_numeric.c
+    case PPLUS:
+    case PMINUS:
+    case PTIMES:
+    case PDIV:
+    case PMOD:
+    case PREMAINDER:
+    case PQUOTIENT:
+    case PABS:
+        return apply_arithmetic_primitive(prim_id, argc, argv);
+
+    // Numeric comparison - delegated to prim_compare.c
+    case PEQUAL:
+    case PLT:
+    case PGT:
+    case PLEQ:
+    case PGEQ:
+        return apply_numeric_compare_primitive(prim_id, argc, argv);
+
+    // Logic
+    case PNOT:
+    case PEQ:
+    case PEQUALP:
+        return apply_logic_primitive(prim_id, argc, argv);
+
+    // List operations
+    case PCONS:
+    case PCAR:
+    case PCDR:
+    case PSETCAR:
+    case PSETCDR:
+    case PLIST:
+    case PLENGTH:
+    case PAPPEND:
+    case PREVERSE:
+    case PLASTPAIR:
+        return apply_list_primitive(prim_id, argc, argv);
 
     // Type predicates - delegated to prim_type.c
     case PSYMP:
@@ -273,7 +2120,10 @@ unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
     case PWRITECHAR:
     case PEOF:
     case PCHARREADY:
+    case PU8READY:
     case PREADLINE:
+    case PREADSTRING:
+    case PWRITESTRING:
     case PEXIT:
         return apply_io_primitive(prim_id, argc, argv);
 
@@ -286,291 +2136,38 @@ unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
     case POUTPUTPORTP:
     case PCURRENTINPUT:
     case PCURRENTOUTPUT:
+    case PCURRENTERROR:
     case POPENOUTPUTSTRING:
     case PGETOUTPUTSTRING:
     case POPENINPUTSTRING:
     case PSTRINGPORTP:
     case PSETCURRENTINPUT:
     case PSETCURRENTOUTPUT:
+    case PSETCURRENTERROR:
     case PFLUSHOUTPUT:
+    case PPORTOPENP:
+    case PINPUTPORTOPENP:
+    case POUTPUTPORTOPENP:
+    case PTEXTUALPORTP:
+    case PBINARYPORTP:
         return apply_port_primitive(prim_id, argc, argv);
 
-    // Time
-    case PCURRENTSECOND: {
-        REQUIRE_ARGC(argc, 0, 0, "current-second");
-        time_t now = time(NULL);
-        // Return as inexact for sub-second precision compatibility
-        return store_inexact((double)now);
-    }
-
     // String operations
-    case PSTRLEN: {
-        REQUIRE_ARGC(argc, 1, 1, "string-length");
-        CHECK_STRING(argv[0], "string-length");
-        char *s = GET_STRING_PTR(argv[0]);
-        return store(strlen(s));
-    }
-    case PSTRREF: {
-        REQUIRE_ARGC(argc, 2, 2, "string-ref");
-        CHECK_STRING(argv[0], "string-ref");
-        char *s = GET_STRING_PTR(argv[0]);
-        size_t len = strlen(s);
-        int64_t idx;
-        if (!expect_nonneg_int64(argv[1], &idx, "string-ref"))
-            return TOK_ERROR;
-        if (idx < 0 || (size_t)idx >= len) {
-            show_error("string-ref: index out of bounds");
-            return TOK_ERROR;
-        }
-        return make_char(s[idx]);
-    }
-    case PSTRSET: {
-        REQUIRE_ARGC(argc, 3, 3, "string-set!");
-        CHECK_STRING(argv[0], "string-set!");
-        char *s = GET_STRING_PTR(argv[0]);
-        size_t len = strlen(s);
-        int64_t idx;
-        if (!expect_nonneg_int64(argv[1], &idx, "string-set!"))
-            return TOK_ERROR;
-        CHECK_CHAR(argv[2], "string-set!");
-        char c = (char)CELL_ID(argv[2]);
-        if (idx < 0 || (size_t)idx >= len) {
-            show_error("string-set!: index out of bounds");
-            return TOK_ERROR;
-        }
-        s[idx] = c;
-        return 0;
-    }
+    case PSTRLEN:
+    case PSTRREF:
+    case PSTRSET:
     case PSTRAPP:
-        return prim_string_append(argc, argv);
     case PSUBSTR:
-        return prim_substring(argc, argv);
-    case PSTR2SYM: {
-        REQUIRE_ARGC(argc, 1, 1, "string->symbol");
-        CHECK_STRING(argv[0], "string->symbol");
-        int atom_id = intern(GET_STRING_PTR(argv[0]));
-        unsigned result = alloc();
-        CELL_TYPE(result) = BT_ATOM;
-        CELL_ID(result) = atom_id;
-        return result;
-    }
-    case PSYM2STR: {
-        REQUIRE_ARGC(argc, 1, 1, "symbol->string");
-        CHECK_SYMBOL(argv[0], "symbol->string");
-        const char *s = ctx.atom_table[CELL_ID(argv[0])];
-        return make_string_copy(s);
-    }
-    case PNUM2STR: {
-        REQUIRE_ARGC(argc, 1, 2, "number->string");
-        unsigned num = argv[0];
-        int radix = 10;
-        if (argc > 1) {
-            int64_t radix64;
-            if (!expect_exact_int64(argv[1], &radix64, "number->string"))
-                return TOK_ERROR;
-            radix = (int)radix64;
-        }
-        if (radix < 2 || radix > 36) {
-            show_error("number->string: radix must be between 2 and 36");
-            return TOK_ERROR;
-        }
-        if (IS_FIXNUM(num) || IS_NUM(num) || IS_BIGNUM(num)) {
-            char *s = exact_integer_to_string(num, radix);
-            if (!s) {
-                show_error("number->string: out of memory");
-                return TOK_ERROR;
-            }
-            return make_string_owned(s);
-        } else if (IS_RATIONAL(num)) {
-            char *numer = exact_integer_to_string(CELL_CAR(num), radix);
-            char *denom = exact_integer_to_string(CELL_CDR(num), radix);
-            if (!numer || !denom) {
-                free(numer);
-                free(denom);
-                show_error("number->string: out of memory");
-                return TOK_ERROR;
-            }
-            size_t numer_len = strlen(numer);
-            size_t denom_len = strlen(denom);
-            if (numer_len > SIZE_MAX - denom_len - 2) {
-                free(numer);
-                free(denom);
-                show_error("number->string: result too large");
-                return TOK_ERROR;
-            }
-            char *s = malloc(numer_len + denom_len + 2);
-            if (!s) {
-                free(numer);
-                free(denom);
-                show_error("number->string: out of memory");
-                return TOK_ERROR;
-            }
-            memcpy(s, numer, numer_len);
-            s[numer_len] = '/';
-            memcpy(s + numer_len + 1, denom, denom_len + 1);
-            free(numer);
-            free(denom);
-            return make_string_owned(s);
-        } else if (IS_INEXACT(num)) {
-            if (radix != 10) {
-                show_error("number->string: inexact numbers require radix 10");
-                return TOK_ERROR;
-            }
-            double d = to_double(num);
-            char buf[NUMBER_BUF_SIZE];
-            snprintf(buf, sizeof(buf), "%g", d);
-            return make_string_copy(buf);
-        } else if (IS_COMPLEX(num)) {
-            if (radix != 10) {
-                show_error("number->string: complex numbers require radix 10");
-                return TOK_ERROR;
-            }
-            char *buf = NULL;
-            size_t buf_len = 0;
-            FILE *mem = open_memstream(&buf, &buf_len);
-            if (!mem) {
-                show_error("number->string: out of memory");
-                return TOK_ERROR;
-            }
-            write_obj_port(num, mem);
-            if (fclose(mem) != 0) {
-                free(buf);
-                show_error("number->string: write failed");
-                return TOK_ERROR;
-            }
-            return make_string_owned(buf);
-        } else {
-            show_error("number->string: not a number");
-            return TOK_ERROR;
-        }
-    }
-    case PSTR2NUM: {
-        REQUIRE_ARGC(argc, 1, 2, "string->number");
-        CHECK_STRING(argv[0], "string->number");
-        char *s = GET_STRING_PTR(argv[0]);
-        int radix = 10;
-        if (argc > 1) {
-            int64_t radix64;
-            if (!expect_exact_int64(argv[1], &radix64, "string->number"))
-                return TOK_ERROR;
-            radix = (int)radix64;
-        }
-        if (radix < 2 || radix > 36) {
-            show_error("string->number: radix must be between 2 and 36");
-            return TOK_ERROR;
-        }
-        if (radix == 10) {
-            // Use standard parsing which handles floats
-            char *copy = strdup(s);
-            if (!copy) {
-                show_error("string->number: out of memory");
-                return TOK_ERROR;
-            }
-            unsigned parsed = atom_from_string(copy);
-            free(copy);
-            if (parsed == TOK_ERROR)
-                return TOK_ERROR;
-            if (is_numeric(parsed)) {
-                return parsed;
-            }
-            return ctx.atom_false;
-        }
-        // Parse integer in specified radix
-        bignum *bn = bn_from_string(s, radix);
-        if (!bn) {
-            return ctx.atom_false; // Return #f for invalid number
-        }
-        return store_integer(bn);
-    }
-    case PMAKESTR: {
-        REQUIRE_ARGC(argc, 1, 2, "make-string");
-        int64_t len;
-        if (!expect_nonneg_int64(argv[0], &len, "make-string"))
-            return TOK_ERROR;
-        if ((uint64_t)len > SIZE_MAX - 1) {
-            show_error("make-string: length too large");
-            return TOK_ERROR;
-        }
-        char fill = ' ';
-        if (argc > 1) {
-            CHECK_CHAR(argv[1], "make-string");
-            fill = (char)CELL_ID(argv[1]);
-        }
-        char *s = malloc(len + 1);
-        if (!s) {
-            show_error("make-string: out of memory");
-            return TOK_ERROR;
-        }
-        memset(s, fill, len);
-        s[len] = '\0';
-        return make_string_owned(s);
-    }
-    case PSTRCOPY: {
-        REQUIRE_ARGC(argc, 1, 1, "string-copy");
-        CHECK_STRING(argv[0], "string-copy");
-        char *s = GET_STRING_PTR(argv[0]);
-        return make_string_copy(s);
-    }
-    case PSTR2LIST: {
-        REQUIRE_ARGC(argc, 1, 1, "string->list");
-        CHECK_STRING(argv[0], "string->list");
-        unsigned str = argv[0];
-        size_t len = strlen(GET_STRING_PTR(str));
-        GC_GUARD;
-        gc_protect(&str);
-        unsigned result = 0;
-        gc_protect(&result);
-        for (size_t i = len; i > 0; i--) {
-            char *s = GET_STRING_PTR(str);
-            unsigned ch = make_char(s[i - 1]);
-            gc_protect(&ch);
-            result = alloc_cons(ch, result);
-            gc_unprotect(1);
-        }
-        return result;
-    }
-    case PLIST2STR: {
-        REQUIRE_ARGC(argc, 1, 1, "list->string");
-        unsigned lst = argv[0];
-        unsigned list_len = 0;
-        if (!list_length_checked(lst, &list_len, "list->string"))
-            return TOK_ERROR;
-        size_t len = list_len;
-        for (unsigned it = lst; it; it = cdr(it)) {
-            if (!IS_CHAR(car(it))) {
-                show_error("list->string: list elements must be characters");
-                return TOK_ERROR;
-            }
-        }
-        if (len == SIZE_MAX) {
-            show_error("list->string: result too large");
-            return TOK_ERROR;
-        }
-        char *s = malloc(len + 1);
-        if (!s) {
-            show_error("list->string: out of memory");
-            return TOK_ERROR;
-        }
-        size_t i = 0;
-        for (; lst; lst = cdr(lst), i++) {
-            s[i] = (char)CELL_ID(car(lst));
-        }
-        s[i] = '\0';
-        return make_string_owned(s);
-    }
-    case PSTRFILL: {
-        REQUIRE_ARGC(argc, 2, 2, "string-fill!");
-        CHECK_STRING(argv[0], "string-fill!");
-        char *s = GET_STRING_PTR(argv[0]);
-        CHECK_CHAR(argv[1], "string-fill!");
-        int c = (unsigned char)CELL_ID(argv[1]);
-        size_t len = strlen(s);
-        for (size_t i = 0; i < len; i++)
-            s[i] = c;
-        return 0;
-    }
-
-    // String comparisons - delegated to prim_compare.c
+    case PSTR2SYM:
+    case PSYM2STR:
+    case PNUM2STR:
+    case PSTR2NUM:
+    case PMAKESTR:
+    case PSTRCOPY:
+    case PSTR2LIST:
+    case PLIST2STR:
+    case PSTRFILL:
+    case PSTRING:
     case PSTREQ:
     case PSTRLT:
     case PSTRGT:
@@ -580,10 +2177,8 @@ unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
     case PSTRLTI:
     case PSTRGTI:
     case PSTRLEI:
-    case PSTRGEI: {
-        unsigned offset = prim_id - PSTREQ;
-        return string_compare(argc, argv, (cmp_op)(offset % 5), offset >= 5);
-    }
+    case PSTRGEI:
+        return apply_string_primitive(prim_id, argc, argv);
 
     // Character operations - delegated to prim_char.c
     case PCHARCODE:
@@ -638,68 +2233,48 @@ unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
     case PRANDOMSEED:
         return apply_math_primitive(prim_id, argc, argv);
 
-    // Misc
-    case PERROR: {
-        fprintf(stderr, "error: ");
-        for (unsigned i = 0; i < argc; i++) {
-            display_obj_port(argv[i], stderr);
-            if (i + 1 < argc)
-                fprintf(stderr, " ");
-        }
-        fprintf(stderr, "\n");
-        return TOK_ERROR;
-    }
-    case PGENSYM: {
-        REQUIRE_ARGC(argc, 0, 0, "gensym");
-        char buf[32];
-        snprintf(buf, sizeof(buf), "g%u", gensym_counter++);
-        return atom_from_string(buf);
-    }
-    case PGCSTATS: {
-        REQUIRE_ARGC(argc, 0, 0, "gc-stats");
-        GC_GUARD;
-        // Return ((minor-gc . count) (major-gc . count) ...)
-        unsigned minor = store(ctx.minor_gc_count);
-        gc_protect(&minor);
-        unsigned major = store(ctx.major_gc_count);
-        gc_protect(&major);
-        unsigned heap_used = store(ctx.hptr - ctx.mmin);
-        gc_protect(&heap_used);
-        unsigned nursery_used = store(ctx.nursery_ptr - ctx.nursery_start);
-        gc_protect(&nursery_used);
-        unsigned result = 0;
-        gc_protect(&result);
-
-        unsigned key = atom_from_string("nursery");
-        gc_protect(&key);
-        unsigned entry = alloc_cons(key, nursery_used);
-        gc_protect(&entry);
-        result = alloc_cons(entry, result);
-        gc_unprotect(2);
-
-        key = atom_from_string("old-gen");
-        gc_protect(&key);
-        entry = alloc_cons(key, heap_used);
-        gc_protect(&entry);
-        result = alloc_cons(entry, result);
-        gc_unprotect(2);
-
-        key = atom_from_string("major-gc");
-        gc_protect(&key);
-        entry = alloc_cons(key, major);
-        gc_protect(&entry);
-        result = alloc_cons(entry, result);
-        gc_unprotect(2);
-
-        key = atom_from_string("minor-gc");
-        gc_protect(&key);
-        entry = alloc_cons(key, minor);
-        gc_protect(&entry);
-        result = alloc_cons(entry, result);
-        gc_unprotect(2);
-
-        return result;
-    }
+    // Miscellaneous local primitives
+    case PCURRENTSECOND:
+    case PCURRENTJIFFY:
+    case PJIFFIESPERSECOND:
+    case PEMERGENCYEXIT:
+    case PERROR:
+    case PGENSYM:
+    case PGCSTATS:
+    case PVALUES:
+    case PCOMMANDLINE:
+    case PWRITETOSTRING:
+    case PLISTREF:
+    case POPENBINARYINPUT:
+    case PREADBYTEVEC:
+    case PFILEEXISTS:
+    case PDELETEFILE:
+    case PRENAMEFILE:
+    case PCURRENTDIRECTORY:
+    case PDIRECTORYFILES:
+    case PGETENV:
+    case PGETENVS:
+    case POPENBINARYOUTPUT:
+    case PWRITEBYTEVEC:
+    case PREADBYTEVECINTO:
+    case PFEATURES:
+    case PMAKEHASHTABLE:
+    case PMAKESTRONGEQHASHTABLE:
+    case PMAKEEQHASHTABLE:
+    case PMAKESTRONGEQVHASHTABLE:
+    case PMAKEEQVHASHTABLE:
+    case PMAKEEQUALHASHTABLE:
+    case PHASHTABLEP:
+    case PHASHTABLEREF:
+    case PHASHTABLESET:
+    case PHASHTABLEDELETE:
+    case PHASHTABLEEXISTS:
+    case PHASHTABLESIZE:
+    case PHASHTABLECLEAR:
+    case PHASHTABLEKEYS:
+    case PHASHTABLEVALUES:
+    case PHASHTABLEALIST:
+        return apply_misc_primitive(prim_id, argc, argv);
     // PGCFLIP is handled specially in eval.c (needs environment as root)
 
     // Numeric tower operations - delegated to prim_numtower.c
@@ -719,554 +2294,48 @@ unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
     case PNAN:
         return apply_numtower_primitive(prim_id, argc, argv);
 
-    // String constructor
-    case PSTRING: {
-        // (string char ...) - construct string from characters
-        if (argc == UINT_MAX) {
-            show_error("string: result too large");
-            return TOK_ERROR;
-        }
-        char *s = malloc(argc + 1);
-        if (!s) {
-            show_error("string: out of memory");
-            return TOK_ERROR;
-        }
-        for (unsigned i = 0; i < argc; i++) {
-            if (!IS_CHAR(argv[i])) {
-                free(s);
-                show_error("string: argument is not a character");
-                return TOK_ERROR;
-            }
-            s[i] = (char)CELL_ID(argv[i]);
-        }
-        s[argc] = '\0';
-        return make_string_owned(s);
-    }
-
     // Transcript
-    case PTRANSCRIPTON: {
-        REQUIRE_ARGC(argc, 1, 1, "transcript-on");
-        CHECK_STRING(argv[0], "transcript-on");
-        if (ctx.transcript) {
-            show_error("transcript-on: transcript already active");
-            return TOK_ERROR;
-        }
-        char *filename = GET_STRING_PTR(argv[0]);
-        ctx.transcript = fopen(filename, "w");
-        if (!ctx.transcript) {
-            show_error("transcript-on: cannot open %s", filename);
-            return TOK_ERROR;
-        }
-        return 0;
-    }
-    case PTRANSCRIPTOFF: {
-        REQUIRE_ARGC(argc, 0, 0, "transcript-off");
-        if (!ctx.transcript) {
-            show_error("transcript-off: no transcript active");
-            return TOK_ERROR;
-        }
-        if (fclose(ctx.transcript) != 0) {
-            ctx.transcript = NULL;
-            show_error("transcript-off: close failed");
-            return TOK_ERROR;
-        }
-        ctx.transcript = NULL;
-        return 0;
-    }
-
-    // R5RS multiple values
-    case PVALUES: {
-        // (values) => zero values
-        // (values x) => x
-        // (values x y ...) => multiple values object
-        if (argc == 1)
-            return argv[0]; // Single value
-        // Multiple values - wrap in BT_MULTIVAL
-        GC_GUARD;
-        unsigned values = 0;
-        gc_protect(&values);
-        for (unsigned i = argc; i > 0; i--) {
-            values = alloc_cons(argv[i - 1], values);
-        }
-        unsigned mv = alloc();
-        CELL_TYPE(mv) = BT_MULTIVAL;
-        CELL_CAR(mv) = values;
-        CELL_CDR(mv) = 0;
-        return mv;
-    }
+    case PTRANSCRIPTON:
+    case PTRANSCRIPTOFF:
+        return apply_transcript_primitive(prim_id, argc, argv);
 
     // R5RS environment procedures
-    case PSCHEMEENV: {
-        REQUIRE_ARGC(argc, 1, 1, "scheme-report-environment");
-        int64_t version;
-        if (!expect_exact_int64(argv[0], &version, "scheme-report-environment"))
-            return TOK_ERROR;
-        if (version != 5) {
-            show_error("scheme-report-environment: unsupported version %lld",
-                       (long long)version);
-            return TOK_ERROR;
-        }
-        return default_environment();
-    }
-    case PNULLENV: {
-        REQUIRE_ARGC(argc, 1, 1, "null-environment");
-        int64_t version;
-        if (!expect_exact_int64(argv[0], &version, "null-environment"))
-            return TOK_ERROR;
-        if (version != 5) {
-            show_error("null-environment: unsupported version %lld",
-                       (long long)version);
-            return TOK_ERROR;
-        }
-        // Return environment with only syntax bindings (no procedures). Boolean
-        // literals are self-evaluating and do not need environment bindings.
-        return empty_environment();
-    }
+    case PSCHEMEENV:
+    case PNULLENV:
+        return apply_environment_primitive(prim_id, argc, argv);
 
     // Special cases handled elsewhere
     case PAPPLY:
-        show_error(
-            "apply: internal error - should be handled in apply_function");
-        return TOK_ERROR;
     case PLOAD:
-        show_error(
-            "load: internal error - should be handled in apply_function");
-        return TOK_ERROR;
     case PCALLCC:
-        show_error("call/cc must be called as a function, not a primitive");
-        return TOK_ERROR;
     case PCALLWITHVALUES:
-        show_error("call-with-values: internal error - should be handled in "
-                   "apply_function");
-        return TOK_ERROR;
     case PEVAL:
-        show_error(
-            "eval: internal error - should be handled in apply_function");
-        return TOK_ERROR;
     case PINTERACTIONENV:
-        show_error("interaction-environment: internal error - should be "
-                   "handled in apply_function");
-        return TOK_ERROR;
+        return unsupported_special_primitive(prim_id);
 
     // ========================================================================
     // Bitwise operations
     // ========================================================================
-    case PBITWISEAND: {
-        REQUIRE_ARGC(argc, 1, 999, "bitwise-and");
-        int64_t result;
-        if (!expect_exact_int64(argv[0], &result, "bitwise-and"))
-            return TOK_ERROR;
-        for (unsigned i = 1; i < argc; i++) {
-            int64_t b;
-            if (!expect_exact_int64(argv[i], &b, "bitwise-and"))
-                return TOK_ERROR;
-            result &= b;
-        }
-        return store(result);
-    }
-    case PBITWISEIOR: {
-        REQUIRE_ARGC(argc, 1, 999, "bitwise-ior");
-        int64_t result;
-        if (!expect_exact_int64(argv[0], &result, "bitwise-ior"))
-            return TOK_ERROR;
-        for (unsigned i = 1; i < argc; i++) {
-            int64_t b;
-            if (!expect_exact_int64(argv[i], &b, "bitwise-ior"))
-                return TOK_ERROR;
-            result |= b;
-        }
-        return store(result);
-    }
-    case PBITWISEXOR: {
-        REQUIRE_ARGC(argc, 1, 999, "bitwise-xor");
-        int64_t result;
-        if (!expect_exact_int64(argv[0], &result, "bitwise-xor"))
-            return TOK_ERROR;
-        for (unsigned i = 1; i < argc; i++) {
-            int64_t b;
-            if (!expect_exact_int64(argv[i], &b, "bitwise-xor"))
-                return TOK_ERROR;
-            result ^= b;
-        }
-        return store(result);
-    }
-    case PBITWISENOT: {
-        REQUIRE_ARGC(argc, 1, 1, "bitwise-not");
-        int64_t a;
-        if (!expect_exact_int64(argv[0], &a, "bitwise-not"))
-            return TOK_ERROR;
-        return store(~a);
-    }
-    case PARITHSHIFT: {
-        REQUIRE_ARGC(argc, 2, 2, "arithmetic-shift");
-        int64_t val, count;
-        if (!expect_exact_int64(argv[0], &val, "arithmetic-shift") ||
-            !expect_exact_int64(argv[1], &count, "arithmetic-shift"))
-            return TOK_ERROR;
-        if (count >= 0) {
-            if ((uint64_t)count > SIZE_MAX)
-                ERROR_RETURN("arithmetic-shift: count too large");
-            bignum *bn = bn_from_int(val);
-            bignum *shifted = bn ? bn_lshift(bn, (size_t)count) : NULL;
-            bn_free(bn);
-            if (!shifted)
-                ERROR_RETURN("arithmetic-shift: out of memory");
-            return store_integer(shifted);
-        } else {
-            uint64_t shift = -(uint64_t)count;
-            if (shift >= 63)
-                return store(val < 0 ? -1 : 0);
-            return store(val >> shift);
-        }
-    }
+    case PBITWISEAND:
+    case PBITWISEIOR:
+    case PBITWISENOT:
+    case PBITWISEXOR:
+    case PARITHSHIFT:
+        return apply_bitwise_primitive(prim_id, argc, argv);
 
     // ========================================================================
     // Bytevector operations
     // ========================================================================
-    case PMAKEBYTEVEC: {
-        REQUIRE_ARGC(argc, 1, 2, "make-bytevector");
-        int64_t len;
-        if (!expect_nonneg_int64(argv[0], &len, "make-bytevector"))
-            return TOK_ERROR;
-        if ((uint64_t)len > UINT_MAX ||
-            (uint64_t)len > SIZE_MAX - sizeof(bytevec_data)) {
-            show_error("make-bytevector: length too large");
-            return TOK_ERROR;
-        }
-        uint8_t fill = 0;
-        if (argc > 1) {
-            int64_t f;
-            if (!expect_u8(argv[1], &f, "make-bytevector"))
-                return TOK_ERROR;
-            fill = (uint8_t)f;
-        }
-        bytevec_data *bv = malloc(sizeof(bytevec_data) + (size_t)len);
-        if (!bv) {
-            show_error("make-bytevector: out of memory");
-            return TOK_ERROR;
-        }
-        bv->len = (unsigned)len;
-        memset(bv->data, fill, (size_t)len);
-        unsigned cell = alloc();
-        CELL_TYPE(cell) = BT_BYTEVEC;
-        CELL_PTR(cell) = bv;
-        return cell;
-    }
-    case PBYTEVECREF: {
-        REQUIRE_ARGC(argc, 2, 2, "bytevector-u8-ref");
-        if (!IS_BYTEVEC(argv[0])) {
-            show_error("bytevector-u8-ref: not a bytevector");
-            return TOK_ERROR;
-        }
-        bytevec_data *bv = (bytevec_data *)CELL_PTR(argv[0]);
-        int64_t idx;
-        if (!expect_nonneg_int64(argv[1], &idx, "bytevector-u8-ref"))
-            return TOK_ERROR;
-        if ((uint64_t)idx >= bv->len) {
-            show_error("bytevector-u8-ref: index out of bounds");
-            return TOK_ERROR;
-        }
-        return store(bv->data[idx]);
-    }
-    case PBYTEVECSET: {
-        REQUIRE_ARGC(argc, 3, 3, "bytevector-u8-set!");
-        if (!IS_BYTEVEC(argv[0])) {
-            show_error("bytevector-u8-set!: not a bytevector");
-            return TOK_ERROR;
-        }
-        bytevec_data *bv = (bytevec_data *)CELL_PTR(argv[0]);
-        int64_t idx, val;
-        if (!expect_nonneg_int64(argv[1], &idx, "bytevector-u8-set!") ||
-            !expect_u8(argv[2], &val, "bytevector-u8-set!"))
-            return TOK_ERROR;
-        if ((uint64_t)idx >= bv->len) {
-            show_error("bytevector-u8-set!: index out of bounds");
-            return TOK_ERROR;
-        }
-        bv->data[idx] = (uint8_t)val;
-        return 0;
-    }
-    case PBYTEVECLEN: {
-        REQUIRE_ARGC(argc, 1, 1, "bytevector-length");
-        if (!IS_BYTEVEC(argv[0])) {
-            show_error("bytevector-length: not a bytevector");
-            return TOK_ERROR;
-        }
-        return store(((bytevec_data *)CELL_PTR(argv[0]))->len);
-    }
-    case PBYTEVECUP: {
-        REQUIRE_ARGC(argc, 1, 1, "bytevector?");
-        return IS_BYTEVEC(argv[0]) ? ctx.atom_true : ctx.atom_false;
-    }
-    case PBYTEVEC: {
-        // (bytevector b1 b2 ...) - construct from byte values
-        bytevec_data *bv = malloc(sizeof(bytevec_data) + argc);
-        if (!bv) {
-            show_error("bytevector: out of memory");
-            return TOK_ERROR;
-        }
-        bv->len = argc;
-        for (unsigned i = 0; i < argc; i++) {
-            int64_t val;
-            if (!expect_u8(argv[i], &val, "bytevector")) {
-                free(bv);
-                return TOK_ERROR;
-            }
-            bv->data[i] = (uint8_t)val;
-        }
-        unsigned cell = alloc();
-        CELL_TYPE(cell) = BT_BYTEVEC;
-        CELL_PTR(cell) = bv;
-        return cell;
-    }
-    case PBYTEVECCOPY: {
-        REQUIRE_ARGC(argc, 1, 3, "bytevector-copy");
-        if (!IS_BYTEVEC(argv[0])) {
-            show_error("bytevector-copy: not a bytevector");
-            return TOK_ERROR;
-        }
-        bytevec_data *src = (bytevec_data *)CELL_PTR(argv[0]);
-        int64_t start = 0, end = src->len;
-        if (argc > 1 &&
-            !expect_nonneg_int64(argv[1], &start, "bytevector-copy"))
-            return TOK_ERROR;
-        if (argc > 2 &&
-            !expect_nonneg_int64(argv[2], &end, "bytevector-copy"))
-            return TOK_ERROR;
-        if (start > end || (uint64_t)end > src->len) {
-            show_error("bytevector-copy: invalid range");
-            return TOK_ERROR;
-        }
-        unsigned len = (unsigned)(end - start);
-        bytevec_data *bv = malloc(sizeof(bytevec_data) + len);
-        if (!bv) {
-            show_error("bytevector-copy: out of memory");
-            return TOK_ERROR;
-        }
-        bv->len = len;
-        memcpy(bv->data, src->data + start, len);
-        unsigned cell = alloc();
-        CELL_TYPE(cell) = BT_BYTEVEC;
-        CELL_PTR(cell) = bv;
-        return cell;
-    }
-    case PBYTEVECCOPYTO: {
-        REQUIRE_ARGC(argc, 3, 5, "bytevector-copy!");
-        if (!IS_BYTEVEC(argv[0]) || !IS_BYTEVEC(argv[2])) {
-            show_error("bytevector-copy!: not a bytevector");
-            return TOK_ERROR;
-        }
-        bytevec_data *dst = (bytevec_data *)CELL_PTR(argv[0]);
-        bytevec_data *src = (bytevec_data *)CELL_PTR(argv[2]);
-        int64_t at, start = 0, end = src->len;
-        if (!expect_nonneg_int64(argv[1], &at, "bytevector-copy!"))
-            return TOK_ERROR;
-        if (argc > 3 &&
-            !expect_nonneg_int64(argv[3], &start, "bytevector-copy!"))
-            return TOK_ERROR;
-        if (argc > 4 &&
-            !expect_nonneg_int64(argv[4], &end, "bytevector-copy!"))
-            return TOK_ERROR;
-        if (start > end) {
-            show_error("bytevector-copy!: invalid range");
-            return TOK_ERROR;
-        }
-        unsigned len = (unsigned)(end - start);
-        if ((uint64_t)at + len > dst->len || (uint64_t)end > src->len) {
-            show_error("bytevector-copy!: out of bounds");
-            return TOK_ERROR;
-        }
-        memmove(dst->data + at, src->data + start, len);
-        return 0;
-    }
-    case PBYTEVECAPPEND: {
-        // (bytevector-append bv1 bv2 ...)
-        unsigned total = 0;
-        for (unsigned i = 0; i < argc; i++) {
-            if (!IS_BYTEVEC(argv[i])) {
-                show_error("bytevector-append: not a bytevector");
-                return TOK_ERROR;
-            }
-            bytevec_data *src = (bytevec_data *)CELL_PTR(argv[i]);
-            if (src->len > UINT_MAX - total) {
-                show_error("bytevector-append: result too large");
-                return TOK_ERROR;
-            }
-            total += src->len;
-        }
-        bytevec_data *bv = malloc(sizeof(bytevec_data) + total);
-        if (!bv) {
-            show_error("bytevector-append: out of memory");
-            return TOK_ERROR;
-        }
-        bv->len = total;
-        unsigned pos = 0;
-        for (unsigned i = 0; i < argc; i++) {
-            bytevec_data *src = (bytevec_data *)CELL_PTR(argv[i]);
-            memcpy(bv->data + pos, src->data, src->len);
-            pos += src->len;
-        }
-        unsigned cell = alloc();
-        CELL_TYPE(cell) = BT_BYTEVEC;
-        CELL_PTR(cell) = bv;
-        return cell;
-    }
-
-    // ========================================================================
-    // Misc: command-line, write-to-string, list-ref
-    // ========================================================================
-    case PCOMMANDLINE: {
-        REQUIRE_ARGC(argc, 0, 0, "command-line");
-        extern int saved_argc;
-        extern char **saved_argv;
-        unsigned result = 0;
-        gc_protect(&result);
-        for (int i = saved_argc - 1; i >= 0; i--) {
-            unsigned s = make_string_copy(saved_argv[i]);
-            if (s == TOK_ERROR) {
-                gc_unprotect(1);
-                return TOK_ERROR;
-            }
-            gc_protect(&s);
-            result = alloc_cons(s, result);
-            gc_unprotect(1);
-        }
-        gc_unprotect(1);
-        return result;
-    }
-    case PWRITETOSTRING: {
-        REQUIRE_ARGC(argc, 1, 1, "write-to-string");
-        char *buf = NULL;
-        size_t buf_len = 0;
-        FILE *mem = open_memstream(&buf, &buf_len);
-        if (!mem) {
-            show_error("write-to-string: out of memory");
-            return TOK_ERROR;
-        }
-        write_obj_port(argv[0], mem);
-        if (fclose(mem) != 0) {
-            free(buf);
-            show_error("write-to-string: write failed");
-            return TOK_ERROR;
-        }
-        unsigned result = make_string_copy(buf);
-        free(buf);
-        return result;
-    }
-    case PLISTREF: {
-        REQUIRE_ARGC(argc, 2, 2, "list-ref");
-        int64_t idx;
-        if (!expect_nonneg_int64(argv[1], &idx, "list-ref"))
-            return TOK_ERROR;
-        unsigned lst = argv[0];
-        for (int64_t i = 0; i < idx; i++) {
-            if (!IS_PAIR(lst)) {
-                show_error("list-ref: index out of bounds"); return TOK_ERROR;
-            }
-            lst = cdr(lst);
-        }
-        if (!IS_PAIR(lst)) {
-            show_error("list-ref: index out of bounds"); return TOK_ERROR;
-        }
-        return car(lst);
-    }
-
-    // ========================================================================
-    // Binary I/O
-    // ========================================================================
-    case POPENBINARYINPUT: {
-        REQUIRE_ARGC(argc, 1, 1, "open-binary-input-file");
-        CHECK_STRING(argv[0], "open-binary-input-file");
-        const char *fname = GET_STRING_PTR(argv[0]);
-        FILE *f = fopen(fname, "rb");
-        if (!f) {
-            show_error("open-binary-input-file: cannot open %s", fname);
-            return TOK_ERROR;
-        }
-        unsigned cell = alloc();
-        CELL_TYPE(cell) = BT_INPORT;
-        CELL_PTR(cell) = f;
-        return cell;
-    }
-    case PREADBYTEVEC: {
-        REQUIRE_ARGC(argc, 2, 2, "read-bytevector");
-        int64_t count;
-        if (!expect_nonneg_int64(argv[0], &count, "read-bytevector"))
-            return TOK_ERROR;
-        if (!IS_INPORT(argv[1])) {
-            show_error("read-bytevector: not an input port");
-            return TOK_ERROR;
-        }
-        if ((uint64_t)count > UINT_MAX) {
-            show_error("read-bytevector: count too large");
-            return TOK_ERROR;
-        }
-        if ((uint64_t)count > SIZE_MAX - sizeof(bytevec_data)) {
-            show_error("read-bytevector: count too large");
-            return TOK_ERROR;
-        }
-        FILE *f = GET_PORT_PTR(argv[1]);
-        if (!f) {
-            show_error("read-bytevector: port is closed");
-            return TOK_ERROR;
-        }
-        if (count == 0) {
-            bytevec_data *bv = malloc(sizeof(bytevec_data));
-            if (!bv) {
-                show_error("read-bytevector: out of memory");
-                return TOK_ERROR;
-            }
-            bv->len = 0;
-            unsigned cell = alloc();
-            CELL_TYPE(cell) = BT_BYTEVEC;
-            CELL_PTR(cell) = bv;
-            return cell;
-        }
-        uint8_t *buf = malloc((size_t)count);
-        if (!buf) {
-            show_error("read-bytevector: out of memory");
-            return TOK_ERROR;
-        }
-        size_t n = 0;
-        while (n < (size_t)count && reader_port_pending_bytes(f) > 0) {
-            int c = reader_port_getc(f);
-            if (c == EOF)
-                break;
-            buf[n++] = (uint8_t)c;
-        }
-        if (n < (size_t)count)
-            n += fread(buf + n, 1, (size_t)count - n, f);
-        if (ferror(f)) {
-            free(buf);
-            show_error("read-bytevector: read failed");
-            return TOK_ERROR;
-        }
-        if (n == 0) {
-            free(buf);
-            // Return eof-object
-            return atom_from_string("eof-object");
-        }
-        bytevec_data *bv = malloc(sizeof(bytevec_data) + n);
-        if (!bv) {
-            free(buf);
-            show_error("read-bytevector: out of memory");
-            return TOK_ERROR;
-        }
-        bv->len = (unsigned)n;
-        memcpy(bv->data, buf, n);
-        free(buf);
-        unsigned cell = alloc();
-        CELL_TYPE(cell) = BT_BYTEVEC;
-        CELL_PTR(cell) = bv;
-        return cell;
-    }
-    case PFILEEXISTS: {
-        REQUIRE_ARGC(argc, 1, 1, "file-exists?");
-        CHECK_STRING(argv[0], "file-exists?");
-        FILE *f = fopen(GET_STRING_PTR(argv[0]), "r");
-        if (f) { fclose(f); return ctx.atom_true; }
-        return ctx.atom_false;
-    }
+    case PMAKEBYTEVEC:
+    case PBYTEVECREF:
+    case PBYTEVECSET:
+    case PBYTEVECLEN:
+    case PBYTEVECCOPY:
+    case PBYTEVECCOPYTO:
+    case PBYTEVECAPPEND:
+    case PBYTEVEC:
+    case PBYTEVECUP:
+        return apply_bytevector_primitive(prim_id, argc, argv);
 
     default:
         show_error("unknown primitive: %u", prim_id);
@@ -1283,7 +2352,7 @@ unsigned apply_primitive(unsigned prim_id, unsigned args)
     unsigned argv_stack[8];
     unsigned *argv = argv_stack;
     if (argc > sizeof(argv_stack) / sizeof(argv_stack[0])) {
-        argv = malloc_array(argc, sizeof(*argv));
+        argv = checked_malloc_array(argc, sizeof(*argv));
         if (!argv) {
             show_error("primitive: out of memory");
             return TOK_ERROR;

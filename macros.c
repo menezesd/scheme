@@ -111,42 +111,6 @@ static bool generated_gensym_atom(unsigned atom)
 // Helper Functions
 // ============================================================================
 
-// Check if a symbol is in a list of literals
-static bool is_literal(int64_t sym, unsigned literals)
-{
-    for (; literals; literals = cdr(literals)) {
-        if (IS_ATOM(car(literals)) && CELL_ID(car(literals)) == sym)
-            return true;
-    }
-    return false;
-}
-
-// Check if symbol is the ellipsis (0 means no ellipsis/disabled)
-static bool is_ellipsis(unsigned x, int64_t ellipsis_id)
-{
-    if (!ellipsis_id)
-        return false; // Ellipsis disabled (shadowed)
-    return IS_ATOM(x) && CELL_ID(x) == ellipsis_id;
-}
-
-// Check if symbol is underscore (wildcard)
-static bool is_underscore(unsigned x)
-{
-    return IS_KEYWORD(x, ctx.kw_underscore);
-}
-
-static bool proper_list_silent(unsigned x)
-{
-    while (IS_PAIR(x))
-        x = cdr(x);
-    return x == 0;
-}
-
-static bool let_binding_has_value(unsigned binding)
-{
-    return IS_PAIR(binding) && IS_PAIR(cdr(binding)) && !cddr(binding);
-}
-
 static bool same_literal_binding(unsigned literal, unsigned input,
                                  unsigned closure_env, unsigned use_env)
 {
@@ -178,7 +142,7 @@ static bool vector_pattern_literals_match(unsigned pattern, unsigned input,
     unsigned ellipsis_pos = pat_len;
 
     for (unsigned i = 0; i < pat_len; i++) {
-        if (is_ellipsis(pat_data[i], ellipsis_id)) {
+        if (syntax_is_ellipsis(pat_data[i], ellipsis_id)) {
             ellipsis_pos = i;
             break;
         }
@@ -246,9 +210,9 @@ static bool pattern_literals_match(unsigned pattern, unsigned input,
 
     if (IS_ATOM(pattern)) {
         int64_t id = CELL_ID(pattern);
-        if (is_literal(id, literals))
+        if (atom_list_contains_id(literals, id))
             return same_literal_binding(pattern, input, closure_env, use_env);
-        if (is_underscore(pattern))
+        if (syntax_is_underscore(pattern))
             return true;
         if (!identifier_valid(pattern))
             return IS_ATOM(input) && CELL_ID(input) == id;
@@ -262,7 +226,7 @@ static bool pattern_literals_match(unsigned pattern, unsigned input,
 
     if (IS_PAIR(pattern)) {
         if (IS_PAIR(cdr(pattern)) &&
-            is_ellipsis(cadr(pattern), ellipsis_id)) {
+            syntax_is_ellipsis(cadr(pattern), ellipsis_id)) {
             unsigned rest_pattern = cddr(pattern);
             unsigned elem_pattern = car(pattern);
             unsigned rest_input = input;
@@ -549,7 +513,8 @@ bool is_special_form(int64_t id)
 {
     return id == ctx.kw_lambda || id == ctx.kw_if || id == ctx.kw_define ||
            id == ctx.kw_set || id == ctx.kw_quote || id == ctx.kw_begin ||
-           id == ctx.kw_cond || id == ctx.kw_and || id == ctx.kw_or ||
+           id == ctx.kw_cond || id == ctx.kw_cond_expand ||
+           id == ctx.kw_and || id == ctx.kw_or ||
            id == ctx.kw_let_syntax || id == ctx.kw_letrec_syntax ||
            id == ctx.kw_define_syntax || id == ctx.kw_syntax_rules ||
            id == ctx.kw_quasiquote || id == ctx.kw_unquote ||
@@ -571,13 +536,6 @@ static bool keyword_bound_at_definition(int64_t sym_id, unsigned closure_env)
     return value != TOK_ERROR && !IS_SYNTAX(value);
 }
 
-static bool syntax_rules_form_like(unsigned expr)
-{
-    return IS_PAIR(expr) && IS_ATOM(car(expr)) &&
-           CELL_ID(car(expr)) == ctx.kw_syntax_rules &&
-           IS_PAIR(cdr(expr)) && IS_PAIR(cddr(expr));
-}
-
 static bool set_form_like(unsigned expr)
 {
     return IS_PAIR(expr) && IS_ATOM(car(expr)) &&
@@ -590,16 +548,6 @@ static bool define_form_like(unsigned expr)
     return IS_PAIR(expr) && IS_ATOM(car(expr)) &&
            CELL_ID(car(expr)) == ctx.kw_define && IS_PAIR(cdr(expr)) &&
            IS_PAIR(cddr(expr));
-}
-
-// Check if identifier is in a list (used for free_ids collection)
-static bool id_in_list(int64_t id, unsigned list)
-{
-    for (; list; list = cdr(list)) {
-        if (IS_ATOM(car(list)) && CELL_ID(car(list)) == id)
-            return true;
-    }
-    return false;
 }
 
 // Collect free identifiers from a template
@@ -823,7 +771,7 @@ static unsigned collect_free_ids(unsigned tmpl, unsigned bindings,
         // keyword names are still collected so lexical keyword bindings in the
         // macro definition environment remain referentially transparent.
         if (!is_pattern_var(id, bindings) && id != ellipsis_id &&
-            !id_in_list(id, collected)) {
+            !atom_list_contains_id(collected, id)) {
             // Add to collected list
             return alloc_cons(tmpl, collected);
         }
@@ -1045,29 +993,6 @@ static unsigned rename_free_ids_quasiquote(unsigned tmpl, unsigned rename_map,
     }
 
     return tmpl;
-}
-
-static bool binding_list_binds_id(unsigned binding_list, int64_t id)
-{
-    for (unsigned bl = binding_list; IS_PAIR(bl); bl = cdr(bl)) {
-        unsigned binding = car(bl);
-        if (let_binding_has_value(binding) && IS_ATOM(car(binding)) &&
-            CELL_ID(car(binding)) == id)
-            return true;
-    }
-    return false;
-}
-
-static bool lambda_params_bind_id(unsigned params, int64_t id)
-{
-    for (unsigned p = params; p; p = IS_PAIR(p) ? cdr(p) : 0) {
-        unsigned param = IS_PAIR(p) ? car(p) : p;
-        if (IS_ATOM(param) && CELL_ID(param) == id)
-            return true;
-        if (!IS_PAIR(p))
-            break;
-    }
-    return false;
 }
 
 static unsigned rename_free_ids_inner(unsigned tmpl, unsigned rename_map,
@@ -1309,8 +1234,8 @@ static bool pattern_binds_id(unsigned pattern, int64_t old_id,
     if (IS_ATOM(pattern)) {
         int64_t id = CELL_ID(pattern);
         return identifier_valid(pattern) && id == old_id &&
-               id != ellipsis_id && !is_underscore(pattern) &&
-               !is_literal(id, literals);
+               id != ellipsis_id && !syntax_is_underscore(pattern) &&
+               !atom_list_contains_id(literals, id);
     }
 
     if (IS_PAIR(pattern)) {
@@ -1608,7 +1533,6 @@ static unsigned rename_in_syntax_rules(unsigned tmpl, int64_t old_id,
 // Forward declaration
 static unsigned hygienize_template(unsigned tmpl, unsigned bindings);
 static unsigned hygienize_body_sequence(unsigned body, unsigned bindings);
-static bool rename_map_has_id(unsigned renames, int64_t id);
 
 static unsigned hygienize_quasiquote(unsigned tmpl, unsigned bindings,
                                      unsigned depth)
@@ -1943,7 +1867,7 @@ static unsigned hygienize_named_let(unsigned tmpl, unsigned bindings)
         unsigned var = car(binding);
         if (identifier_valid(var) && CELL_ID(var) != ctx.kw_ellipsis &&
             !is_pattern_var(CELL_ID(var), bindings) &&
-            !rename_map_has_id(renames, CELL_ID(var))) {
+            !assoc_list_has_atom_key_id(renames, CELL_ID(var))) {
             gc_protect(&var);
             unsigned new_sym = do_gensym();
             gc_protect(&new_sym);
@@ -2143,16 +2067,6 @@ static unsigned define_target_name(unsigned expr)
     return 0;
 }
 
-static bool rename_map_has_id(unsigned renames, int64_t id)
-{
-    for (unsigned r = renames; r; r = cdr(r)) {
-        unsigned entry = car(r);
-        if (IS_ATOM(car(entry)) && CELL_ID(car(entry)) == id)
-            return true;
-    }
-    return false;
-}
-
 static unsigned hygienize_define_no_target_rename(unsigned tmpl,
                                                   unsigned bindings)
 {
@@ -2250,7 +2164,7 @@ static unsigned hygienize_body_sequence(unsigned body, unsigned bindings)
         int64_t target_id = CELL_ID(target);
         if (target_id != ctx.kw_ellipsis &&
             !is_pattern_var(target_id, bindings) &&
-            !rename_map_has_id(renames, target_id)) {
+            !assoc_list_has_atom_key_id(renames, target_id)) {
             gc_protect(&target);
             unsigned new_sym = do_gensym();
             gc_protect(&new_sym);
@@ -2534,14 +2448,14 @@ unsigned syntax_match(unsigned pattern, unsigned input, unsigned literals,
         int64_t sym = CELL_ID(pattern);
 
         // Literal must match exactly
-        if (is_literal(sym, literals)) {
+        if (atom_list_contains_id(literals, sym)) {
             gc_unprotect(4);
             if (IS_ATOM(input) && CELL_ID(input) == sym)
                 return bindings;
             return TOK_ERROR;
         }
 
-        if (is_underscore(pattern)) {
+        if (syntax_is_underscore(pattern)) {
             gc_unprotect(4);
             return bindings;
         }
@@ -2576,7 +2490,7 @@ unsigned syntax_match(unsigned pattern, unsigned input, unsigned literals,
         // Check for ellipsis in vector pattern
         unsigned ellipsis_pos = pat_len;
         for (unsigned i = 0; i < pat_len; i++) {
-            if (is_ellipsis(pat_data[i], ellipsis_id)) {
+            if (syntax_is_ellipsis(pat_data[i], ellipsis_id)) {
                 ellipsis_pos = i;
                 break;
             }
@@ -2686,7 +2600,7 @@ unsigned syntax_match(unsigned pattern, unsigned input, unsigned literals,
     if (IS_PAIR(pattern)) {
         // Check for ellipsis in pattern: (pat ... rest)
         if (IS_PAIR(cdr(pattern)) &&
-            is_ellipsis(cadr(pattern), ellipsis_id)) {
+            syntax_is_ellipsis(cadr(pattern), ellipsis_id)) {
             // Collect matches for elem_pattern (zero or more)
             unsigned matches = 0, matches_tail = 0;
             gc_protect(&matches);
@@ -2824,7 +2738,7 @@ unsigned syntax_expand(unsigned tmpl, unsigned bindings, unsigned mark,
     // List template
     if (IS_PAIR(tmpl)) {
         // Check for ellipsis: (tmpl ... rest)
-        if (IS_PAIR(cdr(tmpl)) && is_ellipsis(cadr(tmpl), ellipsis_id)) {
+        if (IS_PAIR(cdr(tmpl)) && syntax_is_ellipsis(cadr(tmpl), ellipsis_id)) {
             unsigned elem_tmpl = car(tmpl);
             unsigned rest_tmpl = cddr(tmpl);
 
@@ -2936,7 +2850,7 @@ unsigned syntax_expand(unsigned tmpl, unsigned bindings, unsigned mark,
         // Check for ellipsis in vector template
         unsigned ellipsis_pos = len;
         for (unsigned i = 0; i < len; i++) {
-            if (is_ellipsis(data[i], ellipsis_id)) {
+            if (syntax_is_ellipsis(data[i], ellipsis_id)) {
                 ellipsis_pos = i;
                 break;
             }

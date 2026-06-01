@@ -67,12 +67,6 @@ void eval_reset_macro_expansion_depth(void)
     eval_macro_expansion_depth = 0;
 }
 
-static bool is_eof_object(unsigned expr)
-{
-    return IS_ATOM(expr) &&
-           strcmp(ctx.atom_table[CELL_ID(expr)], "eof-object") == 0;
-}
-
 // ============================================================================
 // Quasiquote Expansion
 // ============================================================================
@@ -552,14 +546,12 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
             }
             const char *filename = GET_STRING_PTR(filename_arg);
             const char *old_filename = reader_get_filename();
-            size_t filename_len = strlen(filename);
-            char *filename_copy = malloc(filename_len + 1);
+            char *filename_copy = checked_string_copy(filename);
             if (!filename_copy) {
                 show_error("load: out of memory");
                 tramp_error();
                 return;
             }
-            memcpy(filename_copy, filename, filename_len + 1);
             FILE *f = fopen(filename, "r");
             if (!f) {
                 show_error("load: cannot open file: %s", filename);
@@ -678,12 +670,11 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
     }
 
     if (IS_CONT(fn)) {
-        if (!args || cdr(args)) {
-            show_error("continuation expects exactly one argument");
-            tramp_error();
-            return;
-        }
-        tramp_apply(car(args), fn);
+        GC_GUARD;
+        gc_protect(&fn);
+        gc_protect(&args);
+        unsigned value = values_from_list(args);
+        tramp_apply(value, fn);
         return;
     }
 

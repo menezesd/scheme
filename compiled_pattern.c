@@ -20,35 +20,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-static unsigned grow_capacity(unsigned cap, size_t elem_size,
-                              const char *error_msg)
-{
-    if (cap == 0)
-        return 1;
-    if (cap > UINT_MAX / 2) {
-        lisp_panic(error_msg);
-    }
-    unsigned new_cap = cap * 2;
-    if ((size_t)new_cap > SIZE_MAX / elem_size) {
-        lisp_panic(error_msg);
-    }
-    return new_cap;
-}
-
-static void *malloc_array(unsigned count, size_t elem_size)
-{
-    if (elem_size != 0 && (size_t)count > SIZE_MAX / elem_size)
-        return NULL;
-    return malloc((size_t)count * elem_size);
-}
-
-static void *calloc_array(unsigned count, size_t elem_size)
-{
-    if (elem_size != 0 && (size_t)count > SIZE_MAX / elem_size)
-        return NULL;
-    return calloc(count, elem_size);
-}
-
 // ============================================================================
 // Pattern Registry (for GC)
 // ============================================================================
@@ -79,33 +50,32 @@ static void pattern_unregister(compiled_pattern *pat)
 // Allocation and Cleanup
 // ============================================================================
 
+static void compiled_pattern_destroy_unregistered(compiled_pattern *pat);
+
 compiled_pattern *compiled_pattern_new(void)
 {
-    compiled_pattern *pat = calloc(1, sizeof(compiled_pattern));
+    compiled_pattern *pat = checked_calloc_array(1, sizeof(compiled_pattern));
     if (!pat)
         return NULL;
 
     pat->code_cap = 32;
-    pat->code = malloc(pat->code_cap * sizeof(pat_instruction));
+    pat->code = checked_malloc_array(pat->code_cap, sizeof(pat_instruction));
     if (!pat->code) {
-        free(pat);
+        compiled_pattern_destroy_unregistered(pat);
         return NULL;
     }
 
     pat->const_cap = 8;
-    pat->constants = malloc(pat->const_cap * sizeof(unsigned));
+    pat->constants = checked_malloc_array(pat->const_cap, sizeof(unsigned));
     if (!pat->constants) {
-        free(pat->code);
-        free(pat);
+        compiled_pattern_destroy_unregistered(pat);
         return NULL;
     }
 
     pat->var_cap = 8;
-    pat->var_slots = malloc(pat->var_cap * sizeof(pat_var_slot));
+    pat->var_slots = checked_malloc_array(pat->var_cap, sizeof(pat_var_slot));
     if (!pat->var_slots) {
-        free(pat->constants);
-        free(pat->code);
-        free(pat);
+        compiled_pattern_destroy_unregistered(pat);
         return NULL;
     }
 
@@ -143,11 +113,11 @@ static void compiled_pattern_destroy_unregistered(compiled_pattern *pat)
 void pattern_emit(compiled_pattern *pat, unsigned opcode, unsigned operand)
 {
     if (pat->code_len >= pat->code_cap) {
-        unsigned new_cap = grow_capacity(pat->code_cap,
-                                         sizeof(pat_instruction),
-                                         "pattern_emit: capacity overflow");
-        pat_instruction *new_code =
-            realloc(pat->code, new_cap * sizeof(pat_instruction));
+        unsigned new_cap =
+            checked_grow_capacity(pat->code_cap, sizeof(pat_instruction),
+                                  "pattern_emit: capacity overflow");
+        pat_instruction *new_code = checked_realloc_array(
+            pat->code, new_cap, sizeof(pat_instruction));
         if (!new_code)
             lisp_panic("pattern_emit: realloc failed");
         pat->code = new_code;
@@ -181,11 +151,11 @@ unsigned pattern_add_constant(compiled_pattern *pat, unsigned value)
     }
 
     if (pat->const_len >= pat->const_cap) {
-        unsigned new_cap =
-            grow_capacity(pat->const_cap, sizeof(unsigned),
-                          "pattern_add_constant: capacity overflow");
+        unsigned new_cap = checked_grow_capacity(
+            pat->const_cap, sizeof(unsigned),
+            "pattern_add_constant: capacity overflow");
         unsigned *new_constants =
-            realloc(pat->constants, new_cap * sizeof(unsigned));
+            checked_realloc_array(pat->constants, new_cap, sizeof(unsigned));
         if (!new_constants)
             lisp_panic("pattern_add_constant: realloc failed");
         pat->constants = new_constants;
@@ -216,10 +186,10 @@ unsigned pattern_add_var(compiled_pattern *pat, unsigned atom, bool is_ellipsis,
 
     if (pat->var_count >= pat->var_cap) {
         unsigned new_cap =
-            grow_capacity(pat->var_cap, sizeof(pat_var_slot),
-                          "pattern_add_var: capacity overflow");
-        pat_var_slot *new_slots =
-            realloc(pat->var_slots, new_cap * sizeof(pat_var_slot));
+            checked_grow_capacity(pat->var_cap, sizeof(pat_var_slot),
+                                  "pattern_add_var: capacity overflow");
+        pat_var_slot *new_slots = checked_realloc_array(
+            pat->var_slots, new_cap, sizeof(pat_var_slot));
         if (!new_slots)
             lisp_panic("pattern_add_var: realloc failed");
         pat->var_slots = new_slots;
@@ -448,30 +418,6 @@ typedef struct {
     unsigned ellipsis_depth;
 } pattern_compile_ctx;
 
-// Check if symbol is in literals list
-static bool is_literal(int64_t sym, unsigned literals)
-{
-    for (; literals; literals = cdr(literals)) {
-        if (IS_ATOM(car(literals)) && CELL_ID(car(literals)) == sym)
-            return true;
-    }
-    return false;
-}
-
-// Check if symbol is ellipsis
-static bool is_ellipsis(unsigned x, int64_t ellipsis_id)
-{
-    if (!ellipsis_id)
-        return false;
-    return IS_ATOM(x) && CELL_ID(x) == ellipsis_id;
-}
-
-// Check if symbol is underscore
-static bool is_underscore(unsigned x)
-{
-    return IS_KEYWORD(x, ctx.kw_underscore);
-}
-
 // Forward declaration
 static void compile_pattern_node(unsigned pattern, pattern_compile_ctx *pctx);
 
@@ -546,7 +492,7 @@ static void compile_pattern_node(unsigned pattern, pattern_compile_ctx *pctx)
     }
 
     // Underscore: wildcard
-    if (is_underscore(pattern)) {
+    if (syntax_is_underscore(pattern)) {
         pattern_emit(pctx->pattern, PAT_BIND_UNDERSCORE, 0);
         return;
     }
@@ -555,7 +501,7 @@ static void compile_pattern_node(unsigned pattern, pattern_compile_ctx *pctx)
     if (IS_ATOM(pattern)) {
         int64_t sym = CELL_ID(pattern);
 
-        if (is_literal(sym, pctx->literals)) {
+        if (atom_list_contains_id(pctx->literals, sym)) {
             // Must match exact symbol
             pattern_emit(pctx->pattern, PAT_MATCH_ATOM_ID, (unsigned)sym);
         } else if (!identifier_valid(pattern)) {
@@ -579,7 +525,7 @@ static void compile_pattern_node(unsigned pattern, pattern_compile_ctx *pctx)
         // Check for ellipsis in vector
         unsigned ellipsis_pos = len;
         for (unsigned i = 0; i < len; i++) {
-            if (is_ellipsis(data[i], pctx->ellipsis_id)) {
+            if (syntax_is_ellipsis(data[i], pctx->ellipsis_id)) {
                 ellipsis_pos = i;
                 break;
             }
@@ -669,7 +615,7 @@ static void compile_pattern_node(unsigned pattern, pattern_compile_ctx *pctx)
     if (IS_PAIR(pattern)) {
         // Check for ellipsis: (elem ... rest)
         if (IS_PAIR(cdr(pattern)) &&
-            is_ellipsis(cadr(pattern), pctx->ellipsis_id)) {
+            syntax_is_ellipsis(cadr(pattern), pctx->ellipsis_id)) {
             compile_ellipsis(pattern, pctx);
             return;
         }
@@ -712,6 +658,36 @@ compiled_pattern *compile_pattern(unsigned pattern, unsigned literals,
 // Pattern Execution (Phase 3)
 // ============================================================================
 
+static void free_match_arrays(pat_match_state *state)
+{
+    free(state->input_stack);
+    free(state->bindings);
+    free(state->ellipsis_lists);
+    free(state->ellipsis_tails);
+    free(state->inner_lists);
+    free(state->inner_tails);
+    state->input_stack = NULL;
+    state->bindings = NULL;
+    state->ellipsis_lists = NULL;
+    state->ellipsis_tails = NULL;
+    state->inner_lists = NULL;
+    state->inner_tails = NULL;
+}
+
+static void free_choice_snapshot(pat_choice_point *cp)
+{
+    free(cp->bindings);
+    free(cp->ellipsis_lists);
+    free(cp->ellipsis_tails);
+    free(cp->inner_lists);
+    free(cp->inner_tails);
+    cp->bindings = NULL;
+    cp->ellipsis_lists = NULL;
+    cp->ellipsis_tails = NULL;
+    cp->inner_lists = NULL;
+    cp->inner_tails = NULL;
+}
+
 // Initialize match state - returns false on allocation failure
 static bool init_match_state(pat_match_state *state, compiled_pattern *pat,
                              unsigned input)
@@ -724,41 +700,38 @@ static bool init_match_state(pat_match_state *state, compiled_pattern *pat,
 
     // Input stack
     state->input_cap = 32;
-    state->input_stack = malloc_array(state->input_cap, sizeof(unsigned));
+    state->input_stack =
+        checked_malloc_array(state->input_cap, sizeof(unsigned));
     if (!state->input_stack)
         return false;
     state->input_sp = 0;
 
     // Bindings
     if (pat->var_count > 0) {
-        state->bindings = calloc_array(pat->var_count, sizeof(unsigned));
-        state->ellipsis_lists = calloc_array(pat->var_count, sizeof(unsigned));
-        state->ellipsis_tails = calloc_array(pat->var_count, sizeof(unsigned));
-        state->inner_lists = calloc_array(pat->var_count, sizeof(unsigned));
-        state->inner_tails = calloc_array(pat->var_count, sizeof(unsigned));
+        state->bindings =
+            checked_calloc_array(pat->var_count, sizeof(unsigned));
+        state->ellipsis_lists =
+            checked_calloc_array(pat->var_count, sizeof(unsigned));
+        state->ellipsis_tails =
+            checked_calloc_array(pat->var_count, sizeof(unsigned));
+        state->inner_lists =
+            checked_calloc_array(pat->var_count, sizeof(unsigned));
+        state->inner_tails =
+            checked_calloc_array(pat->var_count, sizeof(unsigned));
         if (!state->bindings || !state->ellipsis_lists ||
             !state->ellipsis_tails || !state->inner_lists ||
             !state->inner_tails) {
-            free(state->input_stack);
-            free(state->bindings);
-            free(state->ellipsis_lists);
-            free(state->ellipsis_tails);
-            free(state->inner_lists);
-            free(state->inner_tails);
+            free_match_arrays(state);
             return false;
         }
     }
 
     // Choice points
     state->choice_cap = 16;
-    state->choices = malloc_array(state->choice_cap, sizeof(pat_choice_point));
+    state->choices =
+        checked_malloc_array(state->choice_cap, sizeof(pat_choice_point));
     if (!state->choices) {
-        free(state->input_stack);
-        free(state->bindings);
-        free(state->ellipsis_lists);
-        free(state->ellipsis_tails);
-        free(state->inner_lists);
-        free(state->inner_tails);
+        free_match_arrays(state);
         return false;
     }
     state->choice_sp = 0;
@@ -769,29 +742,23 @@ static bool init_match_state(pat_match_state *state, compiled_pattern *pat,
 static void cleanup_match_state(pat_match_state *state)
 {
     for (unsigned i = 0; i < state->choice_sp; i++) {
-        free(state->choices[i].bindings);
-        free(state->choices[i].ellipsis_lists);
-        free(state->choices[i].ellipsis_tails);
-        free(state->choices[i].inner_lists);
-        free(state->choices[i].inner_tails);
+        free_choice_snapshot(&state->choices[i]);
     }
-    free(state->input_stack);
-    free(state->bindings);
-    free(state->ellipsis_lists);
-    free(state->ellipsis_tails);
-    free(state->inner_lists);
-    free(state->inner_tails);
+    free_match_arrays(state);
     free(state->choices);
+    state->choices = NULL;
 }
 
 // Push input onto stack
 static void push_input(pat_match_state *state, unsigned input)
 {
     if (state->input_sp >= state->input_cap) {
-        unsigned new_cap = grow_capacity(state->input_cap, sizeof(unsigned),
-                                         "pattern input stack: capacity overflow");
+        unsigned new_cap = checked_grow_capacity(
+            state->input_cap, sizeof(unsigned),
+            "pattern input stack: capacity overflow");
         unsigned *new_stack =
-            realloc(state->input_stack, new_cap * sizeof(unsigned));
+            checked_realloc_array(state->input_stack, new_cap,
+                                  sizeof(unsigned));
         if (!new_stack)
             lisp_panic("pattern input stack: realloc failed");
         state->input_stack = new_stack;
@@ -813,36 +780,22 @@ static unsigned *copy_choice_array(unsigned *src, unsigned len)
 {
     if (!src || len == 0)
         return NULL;
-    unsigned *copy = malloc_array(len, sizeof(unsigned));
+    unsigned *copy = checked_malloc_array(len, sizeof(unsigned));
     if (!copy)
         lisp_panic("pattern choice snapshot: allocation failed");
     memcpy(copy, src, len * sizeof(unsigned));
     return copy;
 }
 
-static void free_choice_snapshot(pat_choice_point *cp)
-{
-    free(cp->bindings);
-    free(cp->ellipsis_lists);
-    free(cp->ellipsis_tails);
-    free(cp->inner_lists);
-    free(cp->inner_tails);
-    cp->bindings = NULL;
-    cp->ellipsis_lists = NULL;
-    cp->ellipsis_tails = NULL;
-    cp->inner_lists = NULL;
-    cp->inner_tails = NULL;
-}
-
 // Push choice point
 static void push_choice(pat_match_state *state, unsigned retry_ip)
 {
     if (state->choice_sp >= state->choice_cap) {
-        unsigned new_cap = grow_capacity(state->choice_cap,
-                                         sizeof(pat_choice_point),
-                                         "pattern choice stack: capacity overflow");
-        pat_choice_point *new_choices =
-            realloc(state->choices, new_cap * sizeof(pat_choice_point));
+        unsigned new_cap = checked_grow_capacity(
+            state->choice_cap, sizeof(pat_choice_point),
+            "pattern choice stack: capacity overflow");
+        pat_choice_point *new_choices = checked_realloc_array(
+            state->choices, new_cap, sizeof(pat_choice_point));
         if (!new_choices)
             lisp_panic("pattern choice stack: realloc failed");
         state->choices = new_choices;

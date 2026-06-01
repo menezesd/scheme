@@ -1140,6 +1140,29 @@ TEST(eval_call_with_values_zero_values_to_list)
     PASS();
 }
 
+TEST(eval_callcc_accepts_multiple_values)
+{
+    unsigned env = default_environment();
+    unsigned result = eval_string(
+        "(call-with-values (lambda () (call/cc (lambda (k) (k 1 2)))) list)",
+        env);
+    ASSERT(IS_PAIR(result));
+    ASSERT(is_int(car(result), 1));
+    ASSERT(is_int(cadr(result), 2));
+    ASSERT(cddr(result) == 0);
+    PASS();
+}
+
+TEST(eval_callcc_accepts_zero_values)
+{
+    unsigned env = default_environment();
+    unsigned result = eval_string(
+        "(call-with-values (lambda () (call/cc (lambda (k) (k)))) list)",
+        env);
+    ASSERT(result == 0);
+    PASS();
+}
+
 // ============================================================================
 // GC Protection Tests
 // ============================================================================
@@ -3151,6 +3174,29 @@ TEST(compiled_call_with_values_zero_values_to_list)
     PASS();
 }
 
+TEST(compiled_callcc_accepts_multiple_values)
+{
+    unsigned env = default_environment();
+    unsigned result = compiled_eval_string(
+        "(call-with-values (lambda () (call/cc (lambda (k) (k 1 2)))) list)",
+        env);
+    ASSERT(IS_PAIR(result));
+    ASSERT(is_int(car(result), 1));
+    ASSERT(is_int(cadr(result), 2));
+    ASSERT(cddr(result) == 0);
+    PASS();
+}
+
+TEST(compiled_callcc_accepts_zero_values)
+{
+    unsigned env = default_environment();
+    unsigned result = compiled_eval_string(
+        "(call-with-values (lambda () (call/cc (lambda (k) (k)))) list)",
+        env);
+    ASSERT(result == 0);
+    PASS();
+}
+
 TEST(compiled_call_with_values_rejects_non_producer)
 {
     unsigned env = default_environment();
@@ -4707,6 +4753,8 @@ int main(void)
     RUN_TEST(compiled_callcc_rejects_wrong_arity);
     RUN_TEST(eval_call_with_values_accepts_zero_values);
     RUN_TEST(eval_call_with_values_zero_values_to_list);
+    RUN_TEST(eval_callcc_accepts_multiple_values);
+    RUN_TEST(eval_callcc_accepts_zero_values);
 
     // GC protection
     RUN_TEST(gc_shadow_stack_balanced);
@@ -4851,6 +4899,8 @@ int main(void)
     RUN_TEST(compiled_local_set_returns_assigned_value);
     RUN_TEST(compiled_call_with_values_accepts_zero_values);
     RUN_TEST(compiled_call_with_values_zero_values_to_list);
+    RUN_TEST(compiled_callcc_accepts_multiple_values);
+    RUN_TEST(compiled_callcc_accepts_zero_values);
     RUN_TEST(compiled_call_with_values_rejects_non_producer);
     RUN_TEST(compiled_define_syntax_preserves_custom_ellipsis);
     RUN_TEST(compiled_begin_define_syntax_is_visible_to_later_forms);

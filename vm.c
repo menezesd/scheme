@@ -38,31 +38,6 @@
 #define MAX_STACK_SIZE (1024 * 1024)
 #define MAX_FRAMES_SIZE (64 * 1024)
 
-static bool checked_array_size(unsigned count, size_t elem_size,
-                               size_t *size_out)
-{
-    if (elem_size != 0 && (size_t)count > SIZE_MAX / elem_size)
-        return false;
-    *size_out = (size_t)count * elem_size;
-    return true;
-}
-
-static bool checked_add_size(size_t a, size_t b, size_t *out)
-{
-    if (a > SIZE_MAX - b)
-        return false;
-    *out = a + b;
-    return true;
-}
-
-static void *malloc_array(unsigned count, size_t elem_size)
-{
-    size_t size;
-    if (!checked_array_size(count, elem_size, &size))
-        return NULL;
-    return malloc(size);
-}
-
 static void protect_and_box2(unsigned *a, unsigned *b)
 {
     gc_protect(a);
@@ -95,6 +70,114 @@ static void protect_and_box3(unsigned *a, unsigned *b, unsigned *c)
         VM_ERROR(vm, msg);                                                     \
         goto vm_dispatch_error;                                                \
     } while (0)
+
+static vector_data *vm_expect_vector_data(vm_state *vm, unsigned vec,
+                                          const char *msg)
+{
+    if (!IS_VECTOR(vec)) {
+        VM_ERROR(vm, msg);
+        return NULL;
+    }
+    return GET_VECTOR_PTR(vec);
+}
+
+static bool vm_expect_vector_index(vm_state *vm, unsigned vec, unsigned idx,
+                                   const char *not_vector_msg,
+                                   const char *not_integer_msg,
+                                   const char *out_of_bounds_msg,
+                                   vector_data **vd_out, unsigned *idx_out)
+{
+    vector_data *vd = vm_expect_vector_data(vm, vec, not_vector_msg);
+    if (!vd)
+        return false;
+
+    int64_t i = 0;
+    if (IS_FIXNUM(idx)) {
+        i = FIXNUM_VALUE(idx);
+    } else if (IS_NUM(idx)) {
+        i = CELL_ID(idx);
+    } else {
+        VM_ERROR(vm, not_integer_msg);
+        return false;
+    }
+
+    if (i < 0 || (uint64_t)i >= vd->len) {
+        VM_ERROR(vm, out_of_bounds_msg);
+        return false;
+    }
+
+    if (vd_out)
+        *vd_out = vd;
+    *idx_out = (unsigned)i;
+    return true;
+}
+
+static bool vm_integer_is_odd(vm_state *vm, unsigned n, const char *error_msg,
+                              bool *odd_out)
+{
+    if (IS_FIXNUM(n)) {
+        *odd_out = (FIXNUM_VALUE(n) & 1) != 0;
+        return true;
+    }
+    if (IS_NUM(n)) {
+        *odd_out = (CELL_ID(n) & 1) != 0;
+        return true;
+    }
+    if (IS_BIGNUM(n)) {
+        bignum *bn = get_bignum(n);
+        *odd_out = bn->len > 0 && (bn->limbs[0] & 1) != 0;
+        return true;
+    }
+    VM_ERROR(vm, error_msg);
+    return false;
+}
+
+static unsigned vm_unbox_fixnum_if_possible(unsigned val)
+{
+    if (IS_NUM(val)) {
+        int64_t n = CELL_ID(val);
+        if (FITS_FIXNUM(n))
+            return MAKE_FIXNUM((int32_t)n);
+    }
+    return val;
+}
+
+static unsigned vm_store_integer_result(int64_t n)
+{
+    return FITS_FIXNUM(n) ? MAKE_FIXNUM((int32_t)n) : store(n);
+}
+
+static void vm_show_undefined_variable(int64_t sym_id)
+{
+    if (sym_id >= 0 && (unsigned)sym_id < ctx.atom_table_cap &&
+        ctx.atom_table[sym_id]) {
+        show_error("undefined variable: %s", ctx.atom_table[sym_id]);
+    } else {
+        show_error("undefined variable: <id %ld>", (long)sym_id);
+    }
+}
+
+static void vm_deopt_binary_op(vm_state *vm, unsigned opcode, unsigned a,
+                               unsigned b)
+{
+    vm->code->code[vm->ip - 1] = opcode;
+    vm_push(vm, a);
+    vm_push(vm, b);
+    vm->ip--;
+}
+
+static unsigned vm_apply_with_one(unsigned n,
+                                  unsigned (*prim)(unsigned, unsigned *))
+{
+    GC_GUARD;
+    n = ensure_boxed(n);
+    gc_protect(&n);
+    unsigned one = store(1);
+    unsigned argv[2] = {n, one};
+    gc_protect(&argv[0]);
+    gc_protect(&argv[1]);
+    return prim(2, argv);
+}
 
 static unsigned vm_store_bignum_add_one(vm_state *vm, bignum *bn)
 {
@@ -234,13 +317,13 @@ void vm_init(vm_state *vm)
     memset(vm, 0, sizeof(vm_state));
 
     vm->stack_cap = INITIAL_STACK_SIZE;
-    vm->stack = malloc(vm->stack_cap * sizeof(unsigned));
+    vm->stack = checked_malloc_array(vm->stack_cap, sizeof(unsigned));
     if (!vm->stack) {
         lisp_panic("vm_init: failed to allocate stack");
     }
 
     vm->frames_cap = INITIAL_FRAMES_SIZE;
-    vm->frames = malloc(vm->frames_cap * sizeof(vm_frame));
+    vm->frames = checked_malloc_array(vm->frames_cap, sizeof(vm_frame));
     if (!vm->frames) {
         free(vm->stack);
         lisp_panic("vm_init: failed to allocate frames");
@@ -255,6 +338,34 @@ void vm_free(vm_state *vm)
     free(vm->stack);
     free(vm->frames);
     memset(vm, 0, sizeof(vm_state));
+}
+
+static bool vm_resize_stack(vm_state *vm, unsigned new_cap,
+                            const char *error_msg)
+{
+    unsigned *new_stack =
+        checked_realloc_array(vm->stack, new_cap, sizeof(unsigned));
+    if (!new_stack) {
+        VM_ERROR(vm, error_msg);
+        return false;
+    }
+    vm->stack = new_stack;
+    vm->stack_cap = new_cap;
+    return true;
+}
+
+static bool vm_resize_frames(vm_state *vm, unsigned new_cap,
+                             const char *error_msg)
+{
+    vm_frame *new_frames =
+        checked_realloc_array(vm->frames, new_cap, sizeof(vm_frame));
+    if (!new_frames) {
+        VM_ERROR(vm, error_msg);
+        return false;
+    }
+    vm->frames = new_frames;
+    vm->frames_cap = new_cap;
+    return true;
 }
 
 // ============================================================================
@@ -344,14 +455,11 @@ void vm_push(vm_state *vm, unsigned val)
             VM_ERROR(vm, "stack overflow");
             return;
         }
-        unsigned new_cap = vm->stack_cap * 2;
-        unsigned *new_stack = realloc(vm->stack, new_cap * sizeof(unsigned));
-        if (!new_stack) {
-            VM_ERROR(vm, "stack reallocation failed");
+        unsigned new_cap =
+            checked_grow_capacity(vm->stack_cap, sizeof(unsigned),
+                                  "vm_push: stack capacity overflow");
+        if (!vm_resize_stack(vm, new_cap, "stack reallocation failed"))
             return;
-        }
-        vm->stack = new_stack;
-        vm->stack_cap = new_cap;
     }
     LISP_ASSERT_FMT(vm->sp < vm->stack_cap,
                     "vm_push: sp=%u >= stack_cap=%u", vm->sp, vm->stack_cap);
@@ -389,14 +497,11 @@ static void push_frame(vm_state *vm, code_object *code, unsigned ip,
             VM_ERROR(vm, "call stack overflow");
             return;
         }
-        unsigned new_cap = vm->frames_cap * 2;
-        vm_frame *new_frames = realloc(vm->frames, new_cap * sizeof(vm_frame));
-        if (!new_frames) {
-            VM_ERROR(vm, "frame stack reallocation failed");
+        unsigned new_cap =
+            checked_grow_capacity(vm->frames_cap, sizeof(vm_frame),
+                                  "push_frame: frame capacity overflow");
+        if (!vm_resize_frames(vm, new_cap, "frame stack reallocation failed"))
             return;
-        }
-        vm->frames = new_frames;
-        vm->frames_cap = new_cap;
     }
     LISP_ASSERT_FMT(vm->fp < vm->frames_cap,
                     "push_frame: fp=%u >= frames_cap=%u", vm->fp, vm->frames_cap);
@@ -458,7 +563,7 @@ static unsigned capture_continuation(vm_state *vm)
     unsigned cell = alloc();
 
     // Single allocation for entire continuation
-    char *block = malloc(total_size);
+    char *block = checked_malloc_size(total_size);
     LISP_ASSERT_MSG(block != NULL, "capture_continuation: malloc failed");
 
     // Place struct at start, arrays after it
@@ -535,18 +640,9 @@ static void restore_continuation(vm_state *vm, unsigned cont_cell,
     }
     if (vm->stack_cap < cont->sp + 1) {
         unsigned new_cap = cont->sp + 1;
-        size_t new_size;
-        if (!checked_array_size(new_cap, sizeof(unsigned), &new_size)) {
-            VM_ERROR(vm, "restore_continuation: stack size overflow");
+        if (!vm_resize_stack(vm, new_cap,
+                             "restore_continuation: stack realloc failed"))
             return;
-        }
-        unsigned *new_stack = realloc(vm->stack, new_size);
-        if (!new_stack) {
-            VM_ERROR(vm, "restore_continuation: stack realloc failed");
-            return;
-        }
-        vm->stack = new_stack;
-        vm->stack_cap = new_cap;
     }
     memcpy(vm->stack, cont->stack, cont->sp * sizeof(unsigned));
     vm->sp = cont->sp;
@@ -555,18 +651,9 @@ static void restore_continuation(vm_state *vm, unsigned cont_cell,
     // Restore frames
     if (vm->frames_cap < cont->fp) {
         unsigned new_cap = cont->fp;
-        size_t new_size;
-        if (!checked_array_size(new_cap, sizeof(vm_frame), &new_size)) {
-            VM_ERROR(vm, "restore_continuation: frame size overflow");
+        if (!vm_resize_frames(vm, new_cap,
+                              "restore_continuation: frames realloc failed"))
             return;
-        }
-        vm_frame *new_frames = realloc(vm->frames, new_size);
-        if (!new_frames) {
-            VM_ERROR(vm, "restore_continuation: frames realloc failed");
-            return;
-        }
-        vm->frames = new_frames;
-        vm->frames_cap = new_cap;
     }
     memcpy(vm->frames, cont->frames, cont->fp * sizeof(vm_frame));
     vm->fp = cont->fp;
@@ -625,7 +712,7 @@ static bool vm_handle_apply(vm_state *vm, unsigned argc, unsigned *argv,
     unsigned *middle_args_heap = NULL;
 
     if (middle_count > MAX_APPLY_MIDDLE_ARGS) {
-        middle_args_heap = malloc_array(middle_count, sizeof(unsigned));
+        middle_args_heap = checked_malloc_array(middle_count, sizeof(unsigned));
         if (!middle_args_heap) {
             VM_ERROR(vm, "apply: out of memory for middle arguments");
             return false;
@@ -724,10 +811,8 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
         unsigned result = apply_primitive_argv(prim_id, argc, argv);
         vm->sp -= argc; // Pop args after primitive returns
         if (result == TOK_ERROR) {
-            vm->error = true;
-            vm->error_msg =
-                ctx.last_error[0] ? ctx.last_error : "primitive error";
-            vm->running = false;
+            VM_ERROR(vm, ctx.last_error[0] ? ctx.last_error
+                                           : "primitive error");
             return;
         }
         vm_push(vm, result);
@@ -741,23 +826,17 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
 
         // Check code object validity
         if (!code || !code->code) {
-            vm->error = true;
-            vm->error_msg = "closure has invalid code object";
-            vm->running = false;
+            VM_ERROR(vm, "closure has invalid code object");
             return;
         }
 
         // Check arity
         if (!code->has_rest && argc != code->arity) {
-            vm->error = true;
-            vm->error_msg = "wrong number of arguments";
-            vm->running = false;
+            VM_ERROR(vm, "wrong number of arguments");
             return;
         }
         if (code->has_rest && argc < code->arity) {
-            vm->error = true;
-            vm->error_msg = "too few arguments";
-            vm->running = false;
+            VM_ERROR(vm, "too few arguments");
             return;
         }
 
@@ -892,9 +971,7 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
         gc_unprotect(3);
 
         if (result == TOK_ERROR) {
-            vm->error = true;
-            vm->error_msg = "evaluation error";
-            vm->running = false;
+            VM_ERROR(vm, "evaluation error");
             return;
         }
 
@@ -904,22 +981,14 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
 
     if (IS_CELL(fn) && CELL_TYPE(fn) == BT_VMCONT) {
         // VM continuation invocation
-        if (argc != 1) {
-            vm->error = true;
-            vm->error_msg = "continuation: expected 1 argument";
-            vm->running = false;
-            return;
-        }
-        unsigned value = vm->stack[vm->sp - 1];
+        unsigned value = values_from_argv(argc, &vm->stack[vm->sp - argc]);
         vm->sp -= argc;
         restore_continuation(vm, fn, value);
         return;
     }
 
     show_error("not a procedure, got %s", type_name(fn));
-    vm->error = true;
-    vm->error_msg = ctx.last_error[0] ? ctx.last_error : "not a procedure";
-    vm->running = false;
+    VM_ERROR(vm, ctx.last_error[0] ? ctx.last_error : "not a procedure");
 }
 
 // ============================================================================
@@ -952,18 +1021,15 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
 
     while (vm->running) {
         if (!vm->code) {
-            vm->error = true;
-            vm->error_msg = "null code object";
+            VM_ERROR(vm, "null code object");
             break;
         }
         if (!vm->code->code) {
-            vm->error = true;
-            vm->error_msg = "null code array";
+            VM_ERROR(vm, "null code array");
             break;
         }
         if (vm->ip >= vm->code->code_len) {
-            vm->error = true;
-            vm->error_msg = "instruction pointer out of bounds";
+            VM_ERROR(vm, "instruction pointer out of bounds");
             break;
         }
 
@@ -972,13 +1038,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
         // Fast paths for most common opcodes (skip switch dispatch overhead)
         if (op == OP_CONST) {
             unsigned idx = vm->code->code[vm->ip++];
-            unsigned val = vm->code->constants[idx];
-            // Eagerly unbox small integers to fixnum tags
-            if (IS_NUM(val)) {
-                int64_t n = CELL_ID(val);
-                if (FITS_FIXNUM(n))
-                    val = MAKE_FIXNUM((int32_t)n);
-            }
+            unsigned val = vm_unbox_fixnum_if_possible(vm->code->constants[idx]);
             if (__builtin_expect(vm->sp < vm->stack_cap, 1)) {
                 vm->stack[vm->sp++] = val;
             } else {
@@ -993,12 +1053,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             vm->ip += 3;
             unsigned val = ic_lookup(sym_id, vm->env, cache_slot);
             if (__builtin_expect(val != TOK_ERROR, 1)) {
-                // Eagerly unbox small integers to fixnum tags
-                if (IS_NUM(val)) {
-                    int64_t n = CELL_ID(val);
-                    if (FITS_FIXNUM(n))
-                        val = MAKE_FIXNUM((int32_t)n);
-                }
+                val = vm_unbox_fixnum_if_possible(val);
                 if (__builtin_expect(vm->sp < vm->stack_cap, 1)) {
                     vm->stack[vm->sp++] = val;
                 } else {
@@ -1006,14 +1061,8 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 }
                 continue;
             }
-            vm->error = true;
-            if (sym_id >= 0 && (unsigned)sym_id < ctx.atom_table_cap &&
-                ctx.atom_table[sym_id])
-                show_error("undefined variable: %s", ctx.atom_table[sym_id]);
-            else
-                show_error("undefined variable: <id %ld>", (long)sym_id);
-            vm->error_msg = ctx.last_error;
-            vm->running = false;
+            vm_show_undefined_variable(sym_id);
+            VM_ERROR(vm, ctx.last_error);
             break;
         }
 
@@ -1021,12 +1070,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
         case OP_CONST: {
             // Fallback (shouldn't reach here normally)
             unsigned idx = vm->code->code[vm->ip++];
-            unsigned val = vm->code->constants[idx];
-            if (IS_NUM(val)) {
-                int64_t n = CELL_ID(val);
-                if (FITS_FIXNUM(n))
-                    val = MAKE_FIXNUM((int32_t)n);
-            }
+            unsigned val = vm_unbox_fixnum_if_possible(vm->code->constants[idx]);
             vm_push(vm, val);
             break;
         }
@@ -1054,22 +1098,12 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             vm->ip += 3;
             unsigned val = ic_lookup(sym_id, vm->env, cache_slot);
             if (val == TOK_ERROR) {
-                vm->error = true;
-                if (sym_id >= 0 && (unsigned)sym_id < ctx.atom_table_cap &&
-                    ctx.atom_table[sym_id])
-                    show_error("undefined variable: %s",
-                               ctx.atom_table[sym_id]);
-                vm->error_msg = ctx.last_error[0] ? ctx.last_error
-                                                   : "undefined variable";
-                vm->running = false;
+                vm_show_undefined_variable(sym_id);
+                VM_ERROR(vm, ctx.last_error[0] ? ctx.last_error
+                                               : "undefined variable");
                 break;
             }
-            if (IS_NUM(val)) {
-                int64_t n = CELL_ID(val);
-                if (FITS_FIXNUM(n))
-                    val = MAKE_FIXNUM((int32_t)n);
-            }
-            vm_push(vm, val);
+            vm_push(vm, vm_unbox_fixnum_if_possible(val));
             break;
         }
 
@@ -1094,9 +1128,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             int64_t target_id = vm->code->code[vm->ip++];
             unsigned target_cell = env_find_binding_cell(target_id, vm->env);
             if (!target_cell) {
-                vm->error = true;
-                vm->error_msg = "unbound variable in alias definition";
-                vm->running = false;
+                VM_ERROR(vm, "unbound variable in alias definition");
                 break;
             }
             GC_GUARD;
@@ -1119,9 +1151,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             val = ensure_boxed(val);
             unsigned result = setvar(sym_id, val, vm->env);
             if (result == TOK_ERROR) {
-                vm->error = true;
-                vm->error_msg = "unbound variable in set!";
-                vm->running = false;
+                VM_ERROR(vm, "unbound variable in set!");
                 break;
             }
             vm_push(vm, val);
@@ -1135,9 +1165,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             val = ensure_boxed(val);
             unsigned result = setvar(sym_id, val, vm->env);
             if (result == TOK_ERROR) {
-                vm->error = true;
-                vm->error_msg = "unbound variable in set!";
-                vm->running = false;
+                VM_ERROR(vm, "unbound variable in set!");
             }
             break;
         }
@@ -1289,7 +1317,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 if (!ctx.load_callback) {
                     VM_ERROR_BREAK(vm, "load: callback not set");
                 }
-                char *filename = strdup(GET_STRING_PTR(filename_cell));
+                char *filename = checked_string_copy(GET_STRING_PTR(filename_cell));
                 if (!filename) {
                     VM_ERROR_BREAK(vm, "load: out of memory");
                 }
@@ -1331,10 +1359,8 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                         result = ctx.eval_callback(call_expr, vm->env);
                     } else {
                         gc_unprotect(3);
-                        vm->error = true;
-                        vm->error_msg =
-                            "call-with-values: cannot call CPS producer";
-                        vm->running = false;
+                        VM_ERROR(vm,
+                                 "call-with-values: cannot call CPS producer");
                         break;
                     }
                     gc_unprotect(1);
@@ -1343,10 +1369,8 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                     result = apply_primitive_argv(CELL_ID(producer), 0, NULL);
                 } else {
                     gc_unprotect(2);
-                    vm->error = true;
-                    vm->error_msg =
-                        "call-with-values: producer is not a procedure";
-                    vm->running = false;
+                    VM_ERROR(vm,
+                             "call-with-values: producer is not a procedure");
                     break;
                 }
 
@@ -1416,10 +1440,8 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             unsigned result = apply_primitive_argv(prim_id, argc, argv);
             vm->sp -= argc; // Pop args after primitive returns
             if (result == TOK_ERROR) {
-                vm->error = true;
-                vm->error_msg =
-                    ctx.last_error[0] ? ctx.last_error : "primitive error";
-                vm->running = false;
+                VM_ERROR(vm, ctx.last_error[0] ? ctx.last_error
+                                               : "primitive error");
                 break;
             }
             vm_push(vm, result);
@@ -1505,24 +1527,9 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             unsigned n = vm->code->code[vm->ip++];
             // Box fixnums before building value list
             vm_box_stack_args(vm, n);
-            // Collect n values into a multival
-            GC_GUARD;
-            unsigned vals = 0;
-            gc_protect(&vals);
-            for (unsigned i = 0; i < n; i++) {
-                vals = alloc_cons(vm->stack[vm->sp - n + i], vals);
-            }
-            // Reverse
-            unsigned rev_vals = 0;
-            gc_protect(&rev_vals);
-            while (vals) {
-                rev_vals = alloc_cons(car(vals), rev_vals);
-                vals = cdr(vals);
-            }
+            unsigned value = values_from_argv(n, &vm->stack[vm->sp - n]);
             vm->sp -= n;
-
-            unsigned multival = make_typed_cell(BT_MULTIVAL, rev_vals, 0);
-            vm_push(vm, multival);
+            vm_push(vm, value);
             break;
         }
 
@@ -1564,9 +1571,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             if (!syntax_rules_valid(transformer_form,
                                     syntax_default_ellipsis_id(vm->env),
                                     "define-syntax")) {
-                vm->error = true;
-                vm->error_msg = "define-syntax: invalid syntax-rules";
-                vm->running = false;
+                VM_ERROR(vm, "define-syntax: invalid syntax-rules");
                 break;
             }
 
@@ -1575,9 +1580,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             unsigned transformer = make_syntax_transformer(transformer_form,
                                                            vm->env);
             if (transformer == TOK_ERROR) {
-                vm->error = true;
-                vm->error_msg = "define-syntax: transformer creation failed";
-                vm->running = false;
+                VM_ERROR(vm, "define-syntax: transformer creation failed");
                 gc_unprotect(1);
                 break;
             }
@@ -1670,9 +1673,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 }
                 vm_push(vm, result);
             } else {
-                vm->error = true;
-                vm->error_msg = "add1: not a number";
-                vm->running = false;
+                VM_ERROR(vm, "add1: not a number");
             }
             break;
         }
@@ -1711,9 +1712,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 }
                 vm_push(vm, result);
             } else {
-                vm->error = true;
-                vm->error_msg = "sub1: not a number";
-                vm->running = false;
+                VM_ERROR(vm, "sub1: not a number");
             }
             break;
         }
@@ -1781,8 +1780,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             unsigned a = vm_pop(vm);
             if (IS_FIXNUM(a) && IS_FIXNUM(b)) {
                 int64_t sum = (int64_t)FIXNUM_VALUE(a) + (int64_t)FIXNUM_VALUE(b);
-                vm_push(vm, FITS_FIXNUM(sum) ? MAKE_FIXNUM((int32_t)sum)
-                                             : store(sum));
+                vm_push(vm, vm_store_integer_result(sum));
                 // Quicken: next time, skip type checks
                 vm->code->code[vm->ip - 1] = OP_ADD_INT;
                 break;
@@ -1801,8 +1799,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             unsigned a = vm_pop(vm);
             if (IS_FIXNUM(a) && IS_FIXNUM(b)) {
                 int64_t diff = (int64_t)FIXNUM_VALUE(a) - (int64_t)FIXNUM_VALUE(b);
-                vm_push(vm, FITS_FIXNUM(diff) ? MAKE_FIXNUM((int32_t)diff)
-                                              : store(diff));
+                vm_push(vm, vm_store_integer_result(diff));
                 vm->code->code[vm->ip - 1] = OP_SUB_INT;
                 break;
             }
@@ -1820,8 +1817,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             unsigned a = vm_pop(vm);
             if (IS_FIXNUM(a) && IS_FIXNUM(b)) {
                 int64_t prod = (int64_t)FIXNUM_VALUE(a) * (int64_t)FIXNUM_VALUE(b);
-                vm_push(vm, FITS_FIXNUM(prod) ? MAKE_FIXNUM((int32_t)prod)
-                                              : store(prod));
+                vm_push(vm, vm_store_integer_result(prod));
                 vm->code->code[vm->ip - 1] = OP_MUL_INT;
                 break;
             }
@@ -1843,8 +1839,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                     VM_ERROR_BREAK(vm, "/: division by zero");
                 if (va % vb == 0) {
                     int64_t q = (int64_t)va / (int64_t)vb;
-                    vm_push(vm, FITS_FIXNUM(q) ? MAKE_FIXNUM((int32_t)q)
-                                                : store(q));
+                    vm_push(vm, vm_store_integer_result(q));
                     break;
                 }
                 // Result is rational — box and use full path
@@ -2273,9 +2268,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             for (; p != 0; p = cdr(p)) {
                 if (IS_FIXNUM(p) || !IS_PAIR(p)) {
                     gc_unprotect(5);
-                    vm->error = true;
-                    vm->error_msg = "append: not a proper list";
-                    vm->running = false;
+                    VM_ERROR(vm, "append: not a proper list");
                     break;
                 }
                 unsigned new_cell = alloc_cons(car(p), 0);
@@ -2310,9 +2303,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             for (; p != 0; p = cdr(p)) {
                 if (IS_FIXNUM(p) || !IS_PAIR(p)) {
                     gc_unprotect(3);
-                    vm->error = true;
-                    vm->error_msg = "reverse: not a proper list";
-                    vm->running = false;
+                    VM_ERROR(vm, "reverse: not a proper list");
                     break;
                 }
                 result = alloc_cons(car(p), result);
@@ -2356,21 +2347,13 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
         case OP_VECTORREF: {
             unsigned idx = vm_pop(vm);
             unsigned vec = vm_pop(vm);
-            if (!IS_VECTOR(vec)) {
-                VM_ERROR_BREAK(vm, "vector-ref: not a vector");
-            }
-            int64_t i = 0;
-            if (IS_FIXNUM(idx)) {
-                i = FIXNUM_VALUE(idx);
-            } else if (IS_NUM(idx)) {
-                i = CELL_ID(idx);
-            } else {
-                VM_ERROR_BREAK(vm, "vector-ref: index not an integer");
-            }
-            vector_data *vd = GET_VECTOR_PTR(vec);
-            if (i < 0 || (uint64_t)i >= vd->len) {
-                VM_ERROR_BREAK(vm, "vector-ref: index out of bounds");
-            }
+            vector_data *vd;
+            unsigned i;
+            if (!vm_expect_vector_index(
+                    vm, vec, idx, "vector-ref: not a vector",
+                    "vector-ref: index not an integer",
+                    "vector-ref: index out of bounds", &vd, &i))
+                goto vm_dispatch_error;
             vm_push(vm, vd->data[i]);
             break;
         }
@@ -2379,21 +2362,12 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             unsigned val = vm_pop(vm);
             unsigned idx = vm_pop(vm);
             unsigned vec = vm_pop(vm);
-            if (!IS_VECTOR(vec)) {
-                VM_ERROR_BREAK(vm, "vector-set!: not a vector");
-            }
-            int64_t i = 0;
-            if (IS_FIXNUM(idx)) {
-                i = FIXNUM_VALUE(idx);
-            } else if (IS_NUM(idx)) {
-                i = CELL_ID(idx);
-            } else {
-                VM_ERROR_BREAK(vm, "vector-set!: index not an integer");
-            }
-            vector_data *vd = GET_VECTOR_PTR(vec);
-            if (i < 0 || (uint64_t)i >= vd->len) {
-                VM_ERROR_BREAK(vm, "vector-set!: index out of bounds");
-            }
+            unsigned i;
+            if (!vm_expect_vector_index(
+                    vm, vec, idx, "vector-set!: not a vector",
+                    "vector-set!: index not an integer",
+                    "vector-set!: index out of bounds", NULL, &i))
+                goto vm_dispatch_error;
             gc_protect(&vec);
             val = ensure_boxed(val);
             gc_unprotect(1);
@@ -2404,10 +2378,10 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
 
         case OP_VECTORLEN: {
             unsigned vec = vm_pop(vm);
-            if (!IS_VECTOR(vec)) {
-                VM_ERROR_BREAK(vm, "vector-length: not a vector");
-            }
-            vector_data *vd = GET_VECTOR_PTR(vec);
+            vector_data *vd =
+                vm_expect_vector_data(vm, vec, "vector-length: not a vector");
+            if (!vd)
+                goto vm_dispatch_error;
             vm_push(vm, store(vd->len));
             break;
         }
@@ -2462,9 +2436,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 CELL_CDR(result) = denom;
                 vm_push(vm, result);
             } else {
-                vm->error = true;
-                vm->error_msg = "-: not a number";
-                vm->running = false;
+                VM_ERROR(vm, "-: not a number");
             }
             break;
         }
@@ -2529,9 +2501,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                     vm_push(vm, n);
                 }
             } else {
-                vm->error = true;
-                vm->error_msg = "abs: not a number";
-                vm->running = false;
+                VM_ERROR(vm, "abs: not a number");
             }
             break;
         }
@@ -2580,44 +2550,18 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
 
         case OP_EVEN: {
             unsigned n = vm_pop(vm);
-            if (IS_FIXNUM(n)) {
-                vm_push(vm, (FIXNUM_VALUE(n) & 1) == 0 ? ctx.atom_true : ctx.atom_false);
-                break;
-            }
-            bool even = false;
-            if (IS_NUM(n)) {
-                even = (CELL_ID(n) & 1) == 0;
-            } else if (IS_BIGNUM(n)) {
-                bignum *bn = get_bignum(n);
-                even = bn->len == 0 || (bn->limbs[0] & 1) == 0;
-            } else {
-                vm->error = true;
-                vm->error_msg = "even?: not an integer";
-                vm->running = false;
-                break;
-            }
-            vm_push(vm, even ? ctx.atom_true : ctx.atom_false);
+            bool odd;
+            if (!vm_integer_is_odd(vm, n, "even?: not an integer", &odd))
+                goto vm_dispatch_error;
+            vm_push(vm, odd ? ctx.atom_false : ctx.atom_true);
             break;
         }
 
         case OP_ODD: {
             unsigned n = vm_pop(vm);
-            if (IS_FIXNUM(n)) {
-                vm_push(vm, (FIXNUM_VALUE(n) & 1) != 0 ? ctx.atom_true : ctx.atom_false);
-                break;
-            }
-            bool odd = false;
-            if (IS_NUM(n)) {
-                odd = (CELL_ID(n) & 1) == 1;
-            } else if (IS_BIGNUM(n)) {
-                bignum *bn = get_bignum(n);
-                odd = bn->len > 0 && (bn->limbs[0] & 1) == 1;
-            } else {
-                vm->error = true;
-                vm->error_msg = "odd?: not an integer";
-                vm->running = false;
-                break;
-            }
+            bool odd;
+            if (!vm_integer_is_odd(vm, n, "odd?: not an integer", &odd))
+                goto vm_dispatch_error;
             vm_push(vm, odd ? ctx.atom_true : ctx.atom_false);
             break;
         }
@@ -2628,12 +2572,10 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             unsigned a = vm_pop(vm);
             if (__builtin_expect(IS_FIXNUM(a) && IS_FIXNUM(b), 1)) {
                 int64_t sum = (int64_t)FIXNUM_VALUE(a) + (int64_t)FIXNUM_VALUE(b);
-                vm_push(vm, FITS_FIXNUM(sum) ? MAKE_FIXNUM((int32_t)sum)
-                                             : store(sum));
+                vm_push(vm, vm_store_integer_result(sum));
             } else {
                 // Deopt: rewrite back to generic and re-execute
-                vm->code->code[vm->ip - 1] = OP_ADD;
-                vm_push(vm, a); vm_push(vm, b); vm->ip--;
+                vm_deopt_binary_op(vm, OP_ADD, a, b);
                 continue;
             }
             break;
@@ -2643,11 +2585,9 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             unsigned a = vm_pop(vm);
             if (__builtin_expect(IS_FIXNUM(a) && IS_FIXNUM(b), 1)) {
                 int64_t diff = (int64_t)FIXNUM_VALUE(a) - (int64_t)FIXNUM_VALUE(b);
-                vm_push(vm, FITS_FIXNUM(diff) ? MAKE_FIXNUM((int32_t)diff)
-                                              : store(diff));
+                vm_push(vm, vm_store_integer_result(diff));
             } else {
-                vm->code->code[vm->ip - 1] = OP_SUB;
-                vm_push(vm, a); vm_push(vm, b); vm->ip--;
+                vm_deopt_binary_op(vm, OP_SUB, a, b);
                 continue;
             }
             break;
@@ -2657,11 +2597,9 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             unsigned a = vm_pop(vm);
             if (__builtin_expect(IS_FIXNUM(a) && IS_FIXNUM(b), 1)) {
                 int64_t prod = (int64_t)FIXNUM_VALUE(a) * (int64_t)FIXNUM_VALUE(b);
-                vm_push(vm, FITS_FIXNUM(prod) ? MAKE_FIXNUM((int32_t)prod)
-                                              : store(prod));
+                vm_push(vm, vm_store_integer_result(prod));
             } else {
-                vm->code->code[vm->ip - 1] = OP_MUL;
-                vm_push(vm, a); vm_push(vm, b); vm->ip--;
+                vm_deopt_binary_op(vm, OP_MUL, a, b);
                 continue;
             }
             break;
@@ -2769,10 +2707,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             vm->ip += 3;
             unsigned n = ic_lookup(sym_id, vm->env, cache_slot);
             if (n == TOK_ERROR) {
-                if (sym_id >= 0 && (unsigned)sym_id < ctx.atom_table_cap &&
-                    ctx.atom_table[sym_id])
-                    show_error("undefined variable: %s",
-                               ctx.atom_table[sym_id]);
+                vm_show_undefined_variable(sym_id);
                 VM_ERROR_BREAK(vm, ctx.last_error[0] ? ctx.last_error
                                                      : "undefined variable");
             }
@@ -2784,8 +2719,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 int64_t val = CELL_ID(n);
                 if (val < INT64_MAX) {
                     int64_t r = val + 1;
-                    vm_push(vm, FITS_FIXNUM(r) ? MAKE_FIXNUM((int32_t)r)
-                                               : store(r));
+                    vm_push(vm, vm_store_integer_result(r));
                 } else {
                     bignum *bn = bn_from_int(val);
                     unsigned result = bn ? vm_store_bignum_add_one(vm, bn)
@@ -2796,15 +2730,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                     vm_push(vm, result);
                 }
             } else {
-                n = ensure_boxed(n);
-                gc_protect(&n);
-                unsigned one = store(1);
-                unsigned argv[2] = {n, one};
-                gc_protect(&argv[0]);
-                gc_protect(&argv[1]);
-                unsigned result = prim_plus(2, argv);
-                gc_unprotect(3);
-                vm_push(vm, result);
+                vm_push(vm, vm_apply_with_one(n, prim_plus));
             }
             break;
         }
@@ -2815,10 +2741,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             vm->ip += 3;
             unsigned n = ic_lookup(sym_id, vm->env, cache_slot);
             if (n == TOK_ERROR) {
-                if (sym_id >= 0 && (unsigned)sym_id < ctx.atom_table_cap &&
-                    ctx.atom_table[sym_id])
-                    show_error("undefined variable: %s",
-                               ctx.atom_table[sym_id]);
+                vm_show_undefined_variable(sym_id);
                 VM_ERROR_BREAK(vm, ctx.last_error[0] ? ctx.last_error
                                                      : "undefined variable");
             }
@@ -2830,8 +2753,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 int64_t val = CELL_ID(n);
                 if (val > INT64_MIN) {
                     int64_t r = val - 1;
-                    vm_push(vm, FITS_FIXNUM(r) ? MAKE_FIXNUM((int32_t)r)
-                                               : store(r));
+                    vm_push(vm, vm_store_integer_result(r));
                 } else {
                     bignum *bn = bn_from_int(val);
                     unsigned result = bn ? vm_store_bignum_sub_one(vm, bn)
@@ -2842,23 +2764,13 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                     vm_push(vm, result);
                 }
             } else {
-                n = ensure_boxed(n);
-                gc_protect(&n);
-                unsigned one = store(1);
-                unsigned argv[2] = {n, one};
-                gc_protect(&argv[0]);
-                gc_protect(&argv[1]);
-                unsigned result = prim_minus(2, argv);
-                gc_unprotect(3);
-                vm_push(vm, result);
+                vm_push(vm, vm_apply_with_one(n, prim_minus));
             }
             break;
         }
 
         default:
-            vm->error = true;
-            vm->error_msg = "unknown opcode";
-            vm->running = false;
+            VM_ERROR(vm, "unknown opcode");
             break;
         }
 vm_dispatch_error:

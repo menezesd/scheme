@@ -351,6 +351,43 @@ bool handle_cond(unsigned id, unsigned env, unsigned cont)
     return true;
 }
 
+bool handle_cond_expand(unsigned id, unsigned env, unsigned cont)
+{
+    unsigned clauses = cdr(id);
+    if (!list_length_checked(clauses, NULL, "cond-expand")) {
+        tramp_error();
+        return true;
+    }
+
+    FORLIST(c, clauses) {
+        unsigned clause = car(c);
+        if (!IS_PAIR(clause)) {
+            show_error("cond-expand: invalid clause");
+            tramp_error();
+            return true;
+        }
+        unsigned requirement = car(clause);
+        unsigned body = cdr(clause);
+        if (!list_length_checked(body, NULL, "cond-expand")) {
+            tramp_error();
+            return true;
+        }
+        bool is_else = IS_KEYWORD(requirement, ctx.kw_else) &&
+                       env_find_binding_cell(ctx.kw_else, env) == 0;
+        if (is_else || cond_expand_requirement_satisfied(requirement)) {
+            if (!body) {
+                tramp_apply(0, cont);
+            } else {
+                eval_body(body, env, cont);
+            }
+            return true;
+        }
+    }
+
+    tramp_apply(0, cont);
+    return true;
+}
+
 static bool handle_named_let(unsigned id, unsigned env, unsigned cont)
 {
     if (!syntax_arity_checked(id, 3, UINT_MAX, "let")) {
@@ -838,6 +875,8 @@ bool dispatch_special_form(int64_t kw, unsigned id, unsigned env, unsigned cont)
         return handle_or(id, env, cont);
     if (kw == ctx.kw_cond)
         return handle_cond(id, env, cont);
+    if (kw == ctx.kw_cond_expand)
+        return handle_cond_expand(id, env, cont);
     if (kw == ctx.kw_let)
         return handle_let(id, env, cont);
     if (kw == ctx.kw_letstar)

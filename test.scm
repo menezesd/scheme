@@ -381,6 +381,57 @@
 
 (test "values/call-with-values" 3
       (call-with-values (lambda () (values 1 2)) +))
+(test "call/cc continuation accepts multiple values" '(1 2)
+      (call-with-values
+        (lambda () (call/cc (lambda (k) (k 1 2))))
+        list))
+(test "call/cc continuation accepts zero values" '()
+      (call-with-values
+        (lambda () (call/cc (lambda (k) (k))))
+        list))
+(test "dynamic-wind continuation forwards multiple values" '((a b) (before after))
+      (let ((log '()))
+        (list
+          (call-with-values
+            (lambda ()
+              (dynamic-wind
+                (lambda () (set! log (cons 'before log)))
+                (lambda ()
+                  (call/cc
+                    (lambda (k)
+                      (k 'a 'b))))
+                (lambda () (set! log (cons 'after log)))))
+            list)
+          (reverse log))))
+
+(define-values (defined-a defined-b) (values 7 8))
+(test "define-values" 15 (+ defined-a defined-b))
+(test "let-values parallel"
+      3
+      (let ((x 1))
+        (let-values (((x y) (values 2 x)))
+          (+ x y))))
+(test "let*-values sequential"
+      5
+      (let*-values (((x y) (values 2 1))
+                    ((z) (+ x y)))
+        (+ z x)))
+(define arity-proc
+  (case-lambda
+    (() 'zero)
+    ((x) x)
+    ((x y) (+ x y))
+    ((a b c d e) (+ a b c d e))))
+(test "case-lambda zero" 'zero (arity-proc))
+(test "case-lambda one" 4 (arity-proc 4))
+(test "case-lambda two" 9 (arity-proc 4 5))
+(test "case-lambda five" 15 (arity-proc 1 2 3 4 5))
+(define rest-arity-proc
+  (case-lambda
+    ((x y . rest) rest)
+    (args args)))
+(test "case-lambda dotted rest" '(3 4) (rest-arity-proc 1 2 3 4))
+(test "case-lambda rest formals" '(1) (rest-arity-proc 1))
 
 ;;; ============================================================================
 ;;; List Utilities
@@ -415,6 +466,12 @@
 (test "take! beyond length" '(1 2 3)
       (let ((lst (list 1 2 3)))
         (take! lst 5)))
+(test "cut multiple slots" '(1 2 3 4 5)
+      ((cut list 1 <> 3 <> 5) 2 4))
+(test "cut rest slot" '(1 2 3 4 5)
+      ((cut list 1 <> 3 <...>) 2 4 5))
+(test "cute multiple slots" '(1 2 3 4 5)
+      ((cute list 1 <> 3 <> 5) 2 4))
 (test "partition" '((2 4 6) (1 3 5)) (partition even? '(1 2 3 4 5 6)))
 (test "zip" '((1 a) (2 b) (3 c)) (zip '(1 2 3) '(a b c)))
 (test "flatten" '(1 2 3 4 5) (flatten '(1 (2 (3 4) 5))))
@@ -715,6 +772,156 @@
 (test "inexact? float" #t (inexact? 3.14))
 (test "exact->inexact" 5.0 (exact->inexact 5))
 (test "inexact->exact" 5 (inexact->exact 5.0))
+
+;;; ============================================================================
+;;; R7RS/MIT Scheme Compatibility Additions
+;;; ============================================================================
+
+(section "Compatibility Additions")
+
+; Parameters
+(define sample-parameter (make-parameter 10))
+(test "parameter initial value" 10 (sample-parameter))
+(sample-parameter 12)
+(test "parameter set value" 12 (sample-parameter))
+(test "parameterize dynamic value"
+      '(99 12)
+      (list (parameterize ((sample-parameter 99)) (sample-parameter))
+            (sample-parameter)))
+
+; cond-expand and feature inquiry
+(test "features contains srfi-1" #t (if (memq 'srfi-1 (features)) #t #f))
+(test "cond-expand selects feature"
+      'has-bytevectors
+      (cond-expand
+        (bytevectors 'has-bytevectors)
+        (else 'missing)))
+(test "cond-expand supports and/not"
+      'ok
+      (cond-expand
+        ((and vesper (not imaginary-feature)) 'ok)
+        (else 'bad)))
+
+; Hash tables
+(define ht (make-hash-table))
+(test "hash-table? true" #t (hash-table? ht))
+(test "hash-table? false" #f (hash-table? '()))
+(hash-table-set! ht "answer" 42)
+(hash-table-set! ht '(a b) 'list-key)
+(test "hash-table-ref string key" 42 (hash-table-ref ht "answer"))
+(test "hash-table-ref equal list key" 'list-key (hash-table-ref ht '(a b)))
+(test "hash-table-ref default" 'missing (hash-table-ref ht 'none 'missing))
+(test "hash-table-exists?" #t (hash-table-exists? ht "answer"))
+(test "hash-table-size" 2 (hash-table-size ht))
+(hash-table-delete! ht "answer")
+(test "hash-table-delete!" #f (hash-table-exists? ht "answer"))
+(define resize-ht (make-hash-table 1))
+(let loop ((i 0))
+  (if (< i 100)
+      (begin
+        (hash-table-set! resize-ht i (* i i))
+        (loop (+ i 1)))))
+(test "hash-table resizes" 9801 (hash-table-ref resize-ht 99))
+(test "hash-table size after resize" 100 (hash-table-size resize-ht))
+(define equal-ht (make-equal-hash-table))
+(hash-table-set! equal-ht '(x y) 17)
+(test "make-equal-hash-table uses equal?" 17 (hash-table-ref equal-ht '(x y)))
+(define eq-key (list 'x 'y))
+(define eq-ht (make-strong-eq-hash-table))
+(hash-table-set! eq-ht eq-key 23)
+(test "make-strong-eq-hash-table same object" 23 (hash-table-ref eq-ht eq-key))
+(test "make-strong-eq-hash-table not equal list" 'missing
+      (hash-table-ref eq-ht '(x y) 'missing))
+(define eqv-ht (make-strong-eqv-hash-table))
+(hash-table-set! eqv-ht 1000 'numeric)
+(hash-table-set! eqv-ht "key" 'string-object)
+(test "make-strong-eqv-hash-table numeric" 'numeric (hash-table-ref eqv-ht 1000))
+(test "make-strong-eqv-hash-table not string equal" 'missing
+      (hash-table-ref eqv-ht (string-append "k" "ey") 'missing))
+(test "hash-table-keys" #t (if (member '(a b) (hash-table-keys ht)) #t #f))
+(test "hash-table-values" #t (if (memq 'list-key (hash-table-values ht)) #t #f))
+(test "hash-table->alist" #t (if (assoc '(a b) (hash-table->alist ht)) #t #f))
+(hash-table-update! ht '(a b) (lambda (x) (list x 'updated)))
+(test "hash-table-update!" '(list-key updated) (hash-table-ref ht '(a b)))
+(test "hash-table-ref/default" 'fallback
+      (hash-table-ref/default ht 'absent 'fallback))
+(define walk-sum 0)
+(hash-table-walk resize-ht (lambda (k v) (set! walk-sum (+ walk-sum 1))))
+(test "hash-table-walk" 100 walk-sum)
+(hash-table-clear! resize-ht)
+(test "hash-table-clear!" 0 (hash-table-size resize-ht))
+
+; I/O helpers and port predicates
+(define out-str-port (open-output-string))
+(write-string "abc" out-str-port)
+(test "write-string" "abc" (get-output-string out-str-port))
+(define out-str-port2 (open-output-string))
+(write-string "abcdef" out-str-port2 2 5)
+(test "write-string range" "cde" (get-output-string out-str-port2))
+(define in-str-port (open-input-string "abcdef"))
+(test "read-string" "abc" (read-string 3 in-str-port))
+(test "input-port-open?" #t (input-port-open? in-str-port))
+(close-input-port in-str-port)
+(test "input-port-open? closed" #f (input-port-open? in-str-port))
+(test "current-error-port output" #t (output-port? (current-error-port)))
+(test "string port textual" #t (textual-port? (open-input-string "abc")))
+
+; File/OS helpers
+(define compat-file "/tmp/vesper-compat-test.bin")
+(define compat-out (open-binary-output-file compat-file))
+(test "binary output port predicate" #t (binary-port? compat-out))
+(test "binary output not textual" #f (textual-port? compat-out))
+(write-bytevector (bytevector 65 66 67) compat-out)
+(close-output-port compat-out)
+(test "file-exists? compat file" #t (file-exists? compat-file))
+(define compat-in (open-binary-input-file compat-file))
+(test "binary input port predicate" #t (binary-port? compat-in))
+(test "read-bytevector file" #u8(65 66 67) (read-bytevector 3 compat-in))
+(close-input-port compat-in)
+(delete-file compat-file)
+(test "delete-file compat file" #f (file-exists? compat-file))
+(define compat-text-file "/tmp/vesper-compat-text.txt")
+(define compat-text-out (open-output-file compat-text-file))
+(test "text output port predicate" #t (textual-port? compat-text-out))
+(test "text output not binary" #f (binary-port? compat-text-out))
+(close-output-port compat-text-out)
+(delete-file compat-text-file)
+(test "current-directory returns string" #t (string? (current-directory)))
+(test "directory-files returns list" #t (list? (directory-files ".")))
+(test "current-jiffy integer" #t (integer? (current-jiffy)))
+(test "jiffies-per-second" 1000000000 (jiffies-per-second))
+(test "get-environment-variables returns alist"
+      #t
+      (let ((envs (get-environment-variables)))
+        (or (null? envs)
+            (and (pair? (car envs))
+                 (string? (caar envs))
+                 (string? (cdar envs))))))
+
+(section "Vector/String Additions")
+
+(test "vector-copy" '#(2 3) (vector-copy '#(1 2 3 4) 1 3))
+(define copy-target (vector 0 0 0 0))
+(vector-copy! copy-target 1 '#(8 9))
+(test "vector-copy!" '#(0 8 9 0) copy-target)
+(test "vector-append" '#(1 2 3 4) (vector-append '#(1 2) '#(3 4)))
+(test "vector-map" '#(5 7 9) (vector-map + '#(1 2 3) '#(4 5 6)))
+(define vector-for-each-sum 0)
+(vector-for-each (lambda (x) (set! vector-for-each-sum (+ vector-for-each-sum x)))
+                 '#(1 2 3))
+(test "vector-for-each" 6 vector-for-each-sum)
+(test "string-map" "bcd"
+      (string-map (lambda (ch) (integer->char (+ 1 (char->integer ch)))) "abc"))
+(define string-for-each-sum 0)
+(string-for-each
+  (lambda (ch)
+    (set! string-for-each-sum (+ string-for-each-sum (char->integer ch))))
+  "ab")
+(test "string-for-each" (+ (char->integer #\a) (char->integer #\b))
+      string-for-each-sum)
+(define string-copy-target (string #\x #\x #\x #\x))
+(string-copy! string-copy-target 1 "abcd" 1 3)
+(test "string-copy!" "xbcx" string-copy-target)
 
 ;;; ============================================================================
 ;;; Summary

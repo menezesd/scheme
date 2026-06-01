@@ -659,7 +659,7 @@ TEST(code_sweep_marks_vm_continuation_code)
 
     unsigned cont_cell = alloc();
     size_t block_size = sizeof(vm_continuation) + sizeof(vm_frame);
-    vm_continuation *cont = calloc(1, block_size);
+    vm_continuation *cont = checked_calloc_array(1, block_size);
     ASSERT(cont != NULL);
     cont->code = code;
     cont->fp = 1;
@@ -685,7 +685,7 @@ TEST(gc_updates_vm_continuation_letrec_roots)
 {
     unsigned saved = alloc();
     CELL_TYPE(saved) = BT_STRING;
-    CELL_PTR(saved) = strdup("saved");
+    CELL_PTR(saved) = checked_string_copy("saved");
     ASSERT(CELL_PTR(saved) != NULL);
 
     GC_GUARD;
@@ -699,7 +699,7 @@ TEST(gc_updates_vm_continuation_letrec_roots)
 
     unsigned cont_cell = alloc();
     size_t block_size = sizeof(vm_continuation) + sizeof(unsigned);
-    vm_continuation *cont = calloc(1, block_size);
+    vm_continuation *cont = checked_calloc_array(1, block_size);
     ASSERT(cont != NULL);
     cont->letrec_frame = letrec_frame;
     cont->letrec_saved_len = 1;
@@ -760,7 +760,8 @@ TEST(gc_closes_unreachable_file_port)
 
     unsigned port = alloc();
     CELL_TYPE(port) = BT_INPORT;
-    CELL_PTR(port) = f;
+    CELL_PTR(port) = file_port_new(f, false, true, true);
+    ASSERT(CELL_PTR(port) != NULL);
 
     gc(0);
 
@@ -777,7 +778,8 @@ TEST(gc_forgets_unreachable_file_port_reader_state)
 
     unsigned port = alloc();
     CELL_TYPE(port) = BT_INPORT;
-    CELL_PTR(port) = f;
+    CELL_PTR(port) = file_port_new(f, false, true, true);
+    ASSERT(CELL_PTR(port) != NULL);
 
     unsigned value = read_obj_port(f);
     ASSERT(value != TOK_ERROR);
@@ -798,7 +800,8 @@ TEST(gc_preserves_current_file_port_until_replaced)
 
     unsigned port = alloc();
     CELL_TYPE(port) = BT_INPORT;
-    CELL_PTR(port) = f;
+    CELL_PTR(port) = file_port_new(f, false, true, true);
+    ASSERT(CELL_PTR(port) != NULL);
     ctx.current_input = f;
     ctx.current_input_cell = port;
 

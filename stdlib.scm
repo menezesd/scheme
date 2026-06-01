@@ -1242,11 +1242,42 @@
       (let ((winds *wind-stack*))
         (primitive-call/cc
          (lambda (cont)
-           (proc (lambda (val)
+           (proc (lambda vals
                    (do-wind *wind-stack* winds)
-                   (cont val)))))))))
+                   (apply cont vals)))))))))
 
 (define call/cc call-with-current-continuation)
+
+;;; ============================================================================
+;;; SRFI-39/R7RS parameters
+;;; ============================================================================
+
+(define (make-parameter init . maybe-converter)
+  (let ((converter (if (null? maybe-converter)
+                       (lambda (x) x)
+                       (car maybe-converter)))
+        (cell (vector 'parameter #f)))
+    (vector-set! cell 1 (converter init))
+    (lambda args
+      (cond ((null? args)
+             (vector-ref cell 1))
+            ((null? (cdr args))
+             (vector-set! cell 1 (converter (car args))))
+            (else
+             (error "parameter: expected zero or one argument"))))))
+
+(define-syntax parameterize
+  (syntax-rules ()
+    ((parameterize () body ...)
+     (begin body ...))
+    ((parameterize ((param value) rest ...) body ...)
+     (let ((p param)
+           (new-value value))
+       (let ((old-value (p)))
+         (dynamic-wind
+          (lambda () (p new-value))
+          (lambda () (parameterize (rest ...) body ...))
+          (lambda () (p old-value))))))))
 
 ;;; ============================================================================
 ;;; SRFI-9: Defining Record Types
@@ -1348,9 +1379,26 @@
     ((cut-helper (param ...) (arg ...) (<...>))
      (lambda (param ... . rest-args) (apply arg ... rest-args)))
 
-    ;; Slot: add a parameter
-    ((cut-helper (param ...) (arg ...) (<> . rest))
-     (cut-helper (param ... x) (arg ... x) rest))
+    ;; Slot: add a fresh parameter. Explicit states avoid reusing one
+    ;; introduced identifier for every <>.
+    ((cut-helper () (arg ...) (<> . rest))
+     (cut-helper (x1) (arg ... x1) rest))
+    ((cut-helper (x1) (arg ...) (<> . rest))
+     (cut-helper (x1 x2) (arg ... x2) rest))
+    ((cut-helper (x1 x2) (arg ...) (<> . rest))
+     (cut-helper (x1 x2 x3) (arg ... x3) rest))
+    ((cut-helper (x1 x2 x3) (arg ...) (<> . rest))
+     (cut-helper (x1 x2 x3 x4) (arg ... x4) rest))
+    ((cut-helper (x1 x2 x3 x4) (arg ...) (<> . rest))
+     (cut-helper (x1 x2 x3 x4 x5) (arg ... x5) rest))
+    ((cut-helper (x1 x2 x3 x4 x5) (arg ...) (<> . rest))
+     (cut-helper (x1 x2 x3 x4 x5 x6) (arg ... x6) rest))
+    ((cut-helper (x1 x2 x3 x4 x5 x6) (arg ...) (<> . rest))
+     (cut-helper (x1 x2 x3 x4 x5 x6 x7) (arg ... x7) rest))
+    ((cut-helper (x1 x2 x3 x4 x5 x6 x7) (arg ...) (<> . rest))
+     (cut-helper (x1 x2 x3 x4 x5 x6 x7 x8) (arg ... x8) rest))
+    ((cut-helper (x1 x2 x3 x4 x5 x6 x7 x8) (arg ...) (<> . rest))
+     (error "cut: too many slots"))
 
     ;; Expression: evaluate and add to args
     ((cut-helper (param ...) (arg ...) (expr . rest))
@@ -1379,9 +1427,26 @@
     ((cute-helper (param ...) (arg ...) (<...>))
      (lambda (param ... . rest-args) (apply arg ... rest-args)))
 
-    ;; Slot: add a parameter (no binding needed)
-    ((cute-helper (param ...) (arg ...) (<> . rest))
-     (cute-helper (param ... x) (arg ... x) rest))
+    ;; Slot: add a fresh parameter. Explicit states avoid reusing one
+    ;; introduced identifier for every <>.
+    ((cute-helper () (arg ...) (<> . rest))
+     (cute-helper (x1) (arg ... x1) rest))
+    ((cute-helper (x1) (arg ...) (<> . rest))
+     (cute-helper (x1 x2) (arg ... x2) rest))
+    ((cute-helper (x1 x2) (arg ...) (<> . rest))
+     (cute-helper (x1 x2 x3) (arg ... x3) rest))
+    ((cute-helper (x1 x2 x3) (arg ...) (<> . rest))
+     (cute-helper (x1 x2 x3 x4) (arg ... x4) rest))
+    ((cute-helper (x1 x2 x3 x4) (arg ...) (<> . rest))
+     (cute-helper (x1 x2 x3 x4 x5) (arg ... x5) rest))
+    ((cute-helper (x1 x2 x3 x4 x5) (arg ...) (<> . rest))
+     (cute-helper (x1 x2 x3 x4 x5 x6) (arg ... x6) rest))
+    ((cute-helper (x1 x2 x3 x4 x5 x6) (arg ...) (<> . rest))
+     (cute-helper (x1 x2 x3 x4 x5 x6 x7) (arg ... x7) rest))
+    ((cute-helper (x1 x2 x3 x4 x5 x6 x7) (arg ...) (<> . rest))
+     (cute-helper (x1 x2 x3 x4 x5 x6 x7 x8) (arg ... x8) rest))
+    ((cute-helper (x1 x2 x3 x4 x5 x6 x7 x8) (arg ...) (<> . rest))
+     (error "cute: too many slots"))
 
     ;; Expression: wrap in a let to evaluate once, using nested approach
     ((cute-helper (param ...) (arg ...) (expr . rest))
@@ -1554,6 +1619,161 @@
     ((receive formals expression body ...)
      (call-with-values (lambda () expression)
        (lambda formals body ...)))))
+
+;;; ============================================================================
+;;; R7RS multiple-value binding forms
+;;; ============================================================================
+
+(define-syntax define-values
+  (syntax-rules ()
+    ((define-values (var ...) expression)
+     (begin
+       (define var #f) ...
+       (let ((vals (call-with-values (lambda () expression) list)))
+         (define-values-set! (var ...) vals))))))
+
+(define-syntax define-values-set!
+  (syntax-rules ()
+    ((define-values-set! () vals)
+     (if #f #f))
+    ((define-values-set! (var rest ...) vals)
+     (begin
+       (set! var (car vals))
+       (define-values-set! (rest ...) (cdr vals))))))
+
+(define-syntax let-values-bind
+  (syntax-rules ()
+    ((let-values-bind () body ...)
+     (let () body ...))
+    ((let-values-bind ((vals (var ...)) rest ...) body ...)
+     (call-with-values
+       (lambda () (apply values vals))
+       (lambda (var ...)
+         (let-values-bind (rest ...) body ...))))))
+
+(define-syntax let-values
+  (syntax-rules ()
+    ((let-values (((var ...) expression) ...) body ...)
+     (let ((vals (call-with-values (lambda () expression) list)) ...)
+       (let-values-bind ((vals (var ...)) ...) body ...)))))
+
+(define-syntax let*-values
+  (syntax-rules ()
+    ((let*-values () body ...)
+     (let () body ...))
+    ((let*-values (((var ...) expression) rest ...) body ...)
+     (call-with-values
+       (lambda () expression)
+       (lambda (var ...)
+         (let*-values (rest ...) body ...))))))
+
+;;; ============================================================================
+;;; R7RS case-lambda
+;;; ============================================================================
+
+(define-syntax case-lambda
+  (syntax-rules ()
+    ((case-lambda clause ...)
+     (lambda args
+       (case-lambda-dispatch
+         args
+         (list (case-lambda-clause clause) ...))))))
+
+(define-syntax case-lambda-clause
+  (syntax-rules ()
+    ((case-lambda-clause (formals body ...))
+     (cons 'formals (lambda formals body ...)))))
+
+(define (case-lambda-formals-match? formals argc)
+  (let loop ((xs formals) (n argc))
+    (cond
+      ((symbol? xs) #t)
+      ((null? xs) (= n 0))
+      ((pair? xs) (and (> n 0) (loop (cdr xs) (- n 1))))
+      (else #f))))
+
+(define (case-lambda-dispatch args clauses)
+  (let ((argc (length args)))
+    (let loop ((xs clauses))
+      (if (null? xs)
+          (error "case-lambda: no matching clause")
+          (let ((clause (car xs)))
+            (if (case-lambda-formals-match? (car clause) argc)
+                (apply (cdr clause) args)
+                (loop (cdr xs))))))))
+
+;;; ============================================================================
+;;; Hash-table utilities
+;;; ============================================================================
+
+(define (hash-table-ref/default table key default)
+  (hash-table-ref table key default))
+
+(define (hash-table-update! table key proc . maybe-default)
+  (let ((default (if (null? maybe-default) #f (car maybe-default))))
+    (hash-table-set! table key
+                     (proc (hash-table-ref table key default)))))
+
+(define (hash-table-walk table proc)
+  (for-each (lambda (entry)
+              (proc (car entry) (cdr entry)))
+            (hash-table->alist table)))
+
+;;; ============================================================================
+;;; Vector and string library additions
+;;; ============================================================================
+
+(define (vector-copy vec . rest)
+  (let* ((start (if (pair? rest) (car rest) 0))
+         (rest2 (if (pair? rest) (cdr rest) '()))
+         (end (if (pair? rest2) (car rest2) (vector-length vec)))
+         (len (- end start))
+         (out (make-vector len)))
+    (let loop ((i 0))
+      (if (= i len)
+          out
+          (begin
+            (vector-set! out i (vector-ref vec (+ start i)))
+            (loop (+ i 1)))))))
+
+(define (vector-copy! to at from . rest)
+  (let* ((start (if (pair? rest) (car rest) 0))
+         (rest2 (if (pair? rest) (cdr rest) '()))
+         (end (if (pair? rest2) (car rest2) (vector-length from)))
+         (tmp (vector-copy from start end))
+         (len (vector-length tmp)))
+    (let loop ((i 0))
+      (if (= i len)
+          (if #f #f)
+          (begin
+            (vector-set! to (+ at i) (vector-ref tmp i))
+            (loop (+ i 1)))))))
+
+(define (vector-append . vecs)
+  (list->vector (apply append (map vector->list vecs))))
+
+(define (vector-map proc vec . vecs)
+  (list->vector (apply map proc (vector->list vec) (map vector->list vecs))))
+
+(define (vector-for-each proc vec . vecs)
+  (apply for-each proc (vector->list vec) (map vector->list vecs)))
+
+(define (string-map proc str . strs)
+  (list->string (apply map proc (string->list str) (map string->list strs))))
+
+(define (string-for-each proc str . strs)
+  (apply for-each proc (string->list str) (map string->list strs)))
+
+(define (string-copy! to at from . rest)
+  (let* ((start (if (pair? rest) (car rest) 0))
+         (rest2 (if (pair? rest) (cdr rest) '()))
+         (end (if (pair? rest2) (car rest2) (string-length from))))
+    (let loop ((i start) (j at))
+      (if (= i end)
+          (if #f #f)
+          (begin
+            (string-set! to j (string-ref from i))
+            (loop (+ i 1) (+ j 1)))))))
 
 ;;; ============================================================================
 ;;; SRFI-2: and-let* (guarded evaluation)

@@ -68,8 +68,8 @@ enum lisp_type {
     BT_MACRO,    // Legacy macro (not hygienic)
     BT_SYNTAX,   // Hygienic macro: syntax-rules transformer object
     BT_CONT,     // First-class continuation (captured by call/cc)
-    BT_INPORT,   // Input file port: id = FILE* pointer
-    BT_OUTPORT,  // Output file port: id = FILE* pointer
+    BT_INPORT,   // Input file port: id = file_port* pointer
+    BT_OUTPORT,  // Output file port: id = file_port* pointer
     BT_STRINPORT,       // String input port: id = string_port* pointer
     BT_STROUTPORT,      // String output port: id = string_port* pointer
     BT_MULTIVAL,        // Multiple return values: car = list of values
@@ -79,6 +79,7 @@ enum lisp_type {
     BT_COMPILED_PATTERN = 102, // Compiled pattern: ptr = compiled_pattern*
     BT_BYTEVEC = 103,          // Bytevector: ptr = bytevec_data*
     BT_BINDING_REF = 104,      // Alias to an environment value cell
+    BT_HASHTABLE = 105,        // Hash table: ptr = hash_table_data*
     BT_BROKENHEART = -1 // GC forwarding pointer: car = new location
 };
 
@@ -196,6 +197,33 @@ typedef struct {
     uint8_t data[]; // Flexible array member
 } bytevec_data;
 
+typedef struct {
+    FILE *file;
+    bool binary;
+    bool input;
+    bool owns_file;
+} file_port;
+
+typedef enum {
+    HASH_EQ,
+    HASH_EQV,
+    HASH_EQUAL,
+} hash_equiv;
+
+// Hash table bucket entry. Keys and values are Scheme cell IDs.
+typedef struct hash_entry {
+    unsigned key;
+    unsigned value;
+    struct hash_entry *next;
+} hash_entry;
+
+typedef struct {
+    unsigned size;
+    unsigned capacity;
+    hash_equiv equiv;
+    hash_entry **buckets;
+} hash_table_data;
+
 // String port structure (for string I/O with fast appending)
 typedef struct {
     char *data; // Buffer data
@@ -267,6 +295,7 @@ typedef struct {
     int kw_and;
     int kw_or;
     int kw_cond;
+    int kw_cond_expand;
     int kw_set;
     int kw_define;
     int kw_if;
@@ -282,6 +311,9 @@ typedef struct {
     int kw_ellipsis;
     int kw_underscore;
     int kw_else;
+    int kw_and_feature;
+    int kw_or_feature;
+    int kw_not_feature;
     int kw_arrow; // => for cond receiver syntax
     int kw_let_syntax;
     int kw_letrec_syntax;
@@ -292,8 +324,10 @@ typedef struct {
     // Current ports for dynamic I/O
     FILE *current_input;
     FILE *current_output;
+    FILE *current_error;
     unsigned current_input_cell;  // Current input port cell (0 = use FILE*)
     unsigned current_output_cell; // Current output port cell (0 = use FILE*)
+    unsigned current_error_cell;  // Current error port cell (0 = use FILE*)
     FILE *transcript;             // NULL if not recording
     // Callbacks for VM special primitives (set by main.c)
     unsigned (*load_callback)(const char *filename,
@@ -526,6 +560,45 @@ enum primitive_id {
     PREADBYTEVEC,
     // File system
     PFILEEXISTS,
+    PDELETEFILE,
+    PRENAMEFILE,
+    PCURRENTDIRECTORY,
+    PDIRECTORYFILES,
+    PGETENV,
+    POPENBINARYOUTPUT,
+    PWRITEBYTEVEC,
+    PREADBYTEVECINTO,
+    PREADSTRING,
+    PWRITESTRING,
+    PU8READY,
+    PCURRENTERROR,
+    PSETCURRENTERROR,
+    PPORTOPENP,
+    PINPUTPORTOPENP,
+    POUTPUTPORTOPENP,
+    PTEXTUALPORTP,
+    PBINARYPORTP,
+    PFEATURES,
+    PMAKEHASHTABLE,
+    PMAKESTRONGEQHASHTABLE,
+    PMAKEEQHASHTABLE,
+    PMAKESTRONGEQVHASHTABLE,
+    PMAKEEQVHASHTABLE,
+    PMAKEEQUALHASHTABLE,
+    PHASHTABLEP,
+    PHASHTABLEREF,
+    PHASHTABLESET,
+    PHASHTABLEDELETE,
+    PHASHTABLEEXISTS,
+    PHASHTABLESIZE,
+    PHASHTABLECLEAR,
+    PHASHTABLEKEYS,
+    PHASHTABLEVALUES,
+    PHASHTABLEALIST,
+    PCURRENTJIFFY,
+    PJIFFIESPERSECOND,
+    PGETENVS,
+    PEMERGENCYEXIT,
     PRIM_COUNT // Total number of primitives
 };
 
@@ -629,6 +702,7 @@ static inline int32_t FIXNUM_VALUE(unsigned v)
 #define IS_VECTOR(c) (IS_CELL(c) && CELL_TYPE(c) == BT_VECTOR)
 #define IS_BYTEVEC(c) (IS_CELL(c) && CELL_TYPE(c) == BT_BYTEVEC)
 #define IS_BINDING_REF(c) (IS_CELL(c) && CELL_TYPE(c) == BT_BINDING_REF)
+#define IS_HASHTABLE(c) (IS_CELL(c) && CELL_TYPE(c) == BT_HASHTABLE)
 #define IS_NIL(c) ((c) == 0)
 #define IS_FALSE(c) ((c) == CELL_ATOM_FALSE)
 #define IS_TRUTHY(c) ((c) != CELL_ATOM_FALSE)
@@ -658,8 +732,10 @@ static inline int32_t FIXNUM_VALUE(unsigned v)
 #define CELL_PTR(c) (ctx.cons_cells[(c)].ptr)
 #define GET_STRING_PTR(c) ((char *)CELL_PTR(c))
 #define GET_VECTOR_PTR(c) ((vector_data *)CELL_PTR(c))
-#define GET_PORT_PTR(c) ((FILE *)CELL_PTR(c))
+#define GET_FILE_PORT_PTR(c) ((file_port *)CELL_PTR(c))
+#define GET_PORT_PTR(c) (GET_FILE_PORT_PTR(c)->file)
 #define GET_STRPORT_PTR(c) ((string_port *)CELL_PTR(c))
+#define GET_HASHTABLE_PTR(c) ((hash_table_data *)CELL_PTR(c))
 #define GET_CHAR_CODE(c) ((int)CELL_ID(c))
 
 // ============================================================================

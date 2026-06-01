@@ -22,6 +22,11 @@
 #include <string.h>
 #include <strings.h>
 
+static inline unsigned scheme_bool(bool value)
+{
+    return value ? ctx.atom_true : ctx.atom_false;
+}
+
 // ============================================================================
 // Numeric Tower Classification
 // ============================================================================
@@ -35,6 +40,40 @@ typedef enum {
     NUM_COMPLEX   // Has BT_COMPLEX
 } numeric_level;
 
+static inline void classify_arg_value(unsigned x, numeric_level *level,
+                                      bool *all_exact)
+{
+    if (x == 0)
+        return;
+    if (IS_FIXNUM(x) || !IS_CELL(x))
+        return;
+
+    switch (CELL_TYPE(x)) {
+    case BT_COMPLEX:
+        if (!is_exact(x))
+            *all_exact = false;
+        *level = NUM_COMPLEX;
+        break;
+    case BT_INEXACT:
+        *all_exact = false;
+        if (*level < NUM_INEXACT)
+            *level = NUM_INEXACT;
+        break;
+    case BT_RATIONAL:
+        if (*level < NUM_RATIONAL)
+            *level = NUM_RATIONAL;
+        break;
+    case BT_BIGNUM:
+        if (*level < NUM_BIGNUM)
+            *level = NUM_BIGNUM;
+        break;
+    case BT_NUM:
+        break;
+    default:
+        break;
+    }
+}
+
 // Classify a list of arguments in a single pass
 static inline numeric_level classify_args(unsigned args, bool *all_exact_out)
 {
@@ -43,37 +82,7 @@ static inline numeric_level classify_args(unsigned args, bool *all_exact_out)
 
     FORLIST(a, args)
     {
-        unsigned x = car(a);
-        if (x == 0)
-            continue;
-        if (IS_FIXNUM(x) || !IS_CELL(x))
-            continue;
-
-        switch (CELL_TYPE(x)) {
-        case BT_COMPLEX:
-            if (!is_exact(x))
-                all_ex = false;
-            level = NUM_COMPLEX;
-            break;
-        case BT_INEXACT:
-            all_ex = false;
-            if (level < NUM_INEXACT)
-                level = NUM_INEXACT;
-            break;
-        case BT_RATIONAL:
-            if (level < NUM_RATIONAL)
-                level = NUM_RATIONAL;
-            break;
-        case BT_BIGNUM:
-            if (level < NUM_BIGNUM)
-                level = NUM_BIGNUM;
-            break;
-        case BT_NUM:
-            // Already at NUM_INTEGER or higher
-            break;
-        default:
-            break;
-        }
+        classify_arg_value(car(a), &level, &all_ex);
     }
 
     if (all_exact_out)
@@ -88,36 +97,7 @@ static inline numeric_level classify_args_argv(unsigned argc, unsigned *argv,
     bool all_ex = true;
 
     for (unsigned i = 0; i < argc; i++) {
-        unsigned x = argv[i];
-        if (x == 0)
-            continue;
-        if (IS_FIXNUM(x) || !IS_CELL(x))
-            continue;
-
-        switch (CELL_TYPE(x)) {
-        case BT_COMPLEX:
-            if (!is_exact(x))
-                all_ex = false;
-            level = NUM_COMPLEX;
-            break;
-        case BT_INEXACT:
-            all_ex = false;
-            if (level < NUM_INEXACT)
-                level = NUM_INEXACT;
-            break;
-        case BT_RATIONAL:
-            if (level < NUM_RATIONAL)
-                level = NUM_RATIONAL;
-            break;
-        case BT_BIGNUM:
-            if (level < NUM_BIGNUM)
-                level = NUM_BIGNUM;
-            break;
-        case BT_NUM:
-            break;
-        default:
-            break;
-        }
+        classify_arg_value(argv[i], &level, &all_ex);
     }
 
     if (all_exact_out)
@@ -293,6 +273,34 @@ static inline void get_rational_cells(unsigned x, unsigned *num,
     }
 }
 
+static inline bool to_bignum_pair(unsigned a, unsigned b, bignum **ba,
+                                  bignum **bb, const char *name)
+{
+    *ba = to_bignum(a);
+    *bb = to_bignum(b);
+    if (!*ba || !*bb) {
+        bn_free(*ba);
+        bn_free(*bb);
+        show_error("%s: out of memory", name);
+        return false;
+    }
+    return true;
+}
+
+static inline bool bn_from_int_pair(int64_t a, int64_t b, bignum **ba,
+                                    bignum **bb, const char *name)
+{
+    *ba = bn_from_int(a);
+    *bb = bn_from_int(b);
+    if (!*ba || !*bb) {
+        bn_free(*ba);
+        bn_free(*bb);
+        show_error("%s: out of memory", name);
+        return false;
+    }
+    return true;
+}
+
 // Multiply two integer cells (BT_NUM or BT_BIGNUM), returns new cell.
 // NOTE: Allocates memory. Callers should use gc_protect on inputs if they
 // need to survive potential GC during allocation.
@@ -306,14 +314,9 @@ static inline unsigned multiply_cells(unsigned a, unsigned b)
         }
     }
     // Slow path: use bignum arithmetic
-    bignum *ba = to_bignum(a);
-    bignum *bb = to_bignum(b);
-    if (!ba || !bb) {
-        bn_free(ba);
-        bn_free(bb);
-        show_error("*: out of memory");
+    bignum *ba, *bb;
+    if (!to_bignum_pair(a, b, &ba, &bb, "*"))
         return TOK_ERROR;
-    }
     bignum *result = bn_mul(ba, bb);
     bn_free(ba);
     bn_free(bb);
@@ -337,14 +340,9 @@ static inline unsigned add_cells(unsigned a, unsigned b)
         }
     }
     // Slow path: use bignum arithmetic
-    bignum *ba = to_bignum(a);
-    bignum *bb = to_bignum(b);
-    if (!ba || !bb) {
-        bn_free(ba);
-        bn_free(bb);
-        show_error("+: out of memory");
+    bignum *ba, *bb;
+    if (!to_bignum_pair(a, b, &ba, &bb, "+"))
         return TOK_ERROR;
-    }
     bn_add_ip(ba, bb);
     bn_free(bb);
     return store_integer(ba);
@@ -363,14 +361,9 @@ static inline unsigned subtract_cells(unsigned a, unsigned b)
         }
     }
     // Slow path: use bignum arithmetic
-    bignum *ba = to_bignum(a);
-    bignum *bb = to_bignum(b);
-    if (!ba || !bb) {
-        bn_free(ba);
-        bn_free(bb);
-        show_error("-: out of memory");
+    bignum *ba, *bb;
+    if (!to_bignum_pair(a, b, &ba, &bb, "-"))
         return TOK_ERROR;
-    }
     bn_sub_ip(ba, bb);
     bn_free(bb);
     return store_integer(ba);
@@ -423,6 +416,19 @@ static inline bool expect_exact_int64(unsigned val, int64_t *out,
     return false;
 }
 
+static inline bool exact_int64_value(unsigned val, int64_t *out)
+{
+    if (IS_FIXNUM(val)) {
+        *out = FIXNUM_VALUE(val);
+        return true;
+    }
+    if (IS_NUM(val)) {
+        *out = CELL_ID(val);
+        return true;
+    }
+    return false;
+}
+
 static inline bool expect_nonneg_int64(unsigned val, int64_t *out,
                                        const char *name)
 {
@@ -455,6 +461,114 @@ static inline bool check_numeric_argv(unsigned argc, unsigned *argv,
             show_error("%s: not a number", name);
             return false;
         }
+    }
+    return true;
+}
+
+static inline bool index_in_bounds(int64_t idx, size_t len, const char *name)
+{
+    if ((uint64_t)idx >= len) {
+        show_error("%s: index out of bounds", name);
+        return false;
+    }
+    return true;
+}
+
+static inline bool expect_index(unsigned val, size_t len, int64_t *out,
+                                const char *name)
+{
+    return expect_nonneg_int64(val, out, name) &&
+           index_in_bounds(*out, len, name);
+}
+
+static inline bool require_number(unsigned x, const char *name)
+{
+    if (is_numeric(x))
+        return true;
+    show_error("%s: not a number", name);
+    return false;
+}
+
+static inline bool require_real(unsigned x, const char *name)
+{
+    if (is_numeric(x) && !IS_COMPLEX(x))
+        return true;
+    show_error("%s: not a real number", name);
+    return false;
+}
+
+static inline bool expect_char_value(unsigned val, int *out, const char *name)
+{
+    if (!IS_CHAR(val)) {
+        show_error("%s: not a character", name);
+        return false;
+    }
+    *out = (unsigned char)CELL_ID(val);
+    return true;
+}
+
+static inline char *require_string_ptr(unsigned value, const char *name)
+{
+    if (!IS_STRING(value)) {
+        show_error("%s: not a string", name);
+        return NULL;
+    }
+    return GET_STRING_PTR(value);
+}
+
+static inline unsigned make_pointer_cell(enum lisp_type type, void *ptr)
+{
+    unsigned cell = alloc();
+    CELL_TYPE(cell) = type;
+    CELL_PTR(cell) = ptr;
+    return cell;
+}
+
+static inline file_port *file_port_new(FILE *file, bool binary, bool input,
+                                       bool owns_file)
+{
+    file_port *port = checked_malloc_size(sizeof(file_port));
+    if (!port)
+        return NULL;
+    port->file = file;
+    port->binary = binary;
+    port->input = input;
+    port->owns_file = owns_file;
+    return port;
+}
+
+static inline unsigned make_file_port_cell(FILE *file, bool binary, bool input,
+                                           bool owns_file,
+                                           enum lisp_type type,
+                                           const char *name)
+{
+    file_port *port = file_port_new(file, binary, input, owns_file);
+    if (!port) {
+        if (owns_file && file)
+            fclose(file);
+        show_error("%s: out of memory", name);
+        return TOK_ERROR;
+    }
+    return make_pointer_cell(type, port);
+}
+
+static inline unsigned open_file_port(const char *filename, const char *mode,
+                                      enum lisp_type type, const char *name)
+{
+    FILE *f = fopen(filename, mode);
+    if (!f) {
+        show_error("%s: cannot open %s", name, filename);
+        return TOK_ERROR;
+    }
+    return make_file_port_cell(f, strchr(mode, 'b') != NULL,
+                               type == BT_INPORT, true, type, name);
+}
+
+static inline bool flush_file_port(FILE *fport, const char *name)
+{
+    if (fflush(fport) != 0) {
+        show_error("%s: flush failed", name);
+        return false;
     }
     return true;
 }
@@ -506,6 +620,28 @@ unsigned prim_div(unsigned argc, unsigned *argv);
 unsigned prim_modulo(unsigned argc, unsigned *argv);
 unsigned numeric_compare(unsigned argc, unsigned *argv, cmp_op op);
 
+static inline unsigned apply_binary_primitive(unsigned a, unsigned b,
+                                              unsigned (*prim)(unsigned,
+                                                               unsigned *))
+{
+    unsigned argv[2] = {a, b};
+    gc_protect(&argv[0]);
+    gc_protect(&argv[1]);
+    unsigned result = prim(2, argv);
+    gc_unprotect(2);
+    return result;
+}
+
+static inline unsigned apply_binary_compare(unsigned a, unsigned b, cmp_op op)
+{
+    unsigned argv[2] = {a, b};
+    gc_protect(&argv[0]);
+    gc_protect(&argv[1]);
+    unsigned result = numeric_compare(2, argv, op);
+    gc_unprotect(2);
+    return result;
+}
+
 // Binary addition: a + b without list building
 // Returns TOK_ERROR on non-numeric operands
 static inline unsigned binary_add(unsigned a, unsigned b)
@@ -519,25 +655,15 @@ static inline unsigned binary_add(unsigned a, unsigned b)
             return store(result);
         }
         // Overflow - use bignum
-        bignum *ba = bn_from_int(va);
-        bignum *bb = bn_from_int(vb);
-        if (!ba || !bb) {
-            bn_free(ba);
-            bn_free(bb);
-            show_error("+: out of memory");
+        bignum *ba, *bb;
+        if (!bn_from_int_pair(va, vb, &ba, &bb, "+"))
             return TOK_ERROR;
-        }
         bn_add_ip(ba, bb);
         bn_free(bb);
         return store_integer(ba);
     }
     // Fall back to full numeric tower
-    unsigned argv[2] = {a, b};
-    gc_protect(&argv[0]);
-    gc_protect(&argv[1]);
-    unsigned result = prim_plus(2, argv);
-    gc_unprotect(2);
-    return result;
+    return apply_binary_primitive(a, b, prim_plus);
 }
 
 // Binary subtraction: a - b without list building
@@ -552,25 +678,15 @@ static inline unsigned binary_sub(unsigned a, unsigned b)
             return store(result);
         }
         // Overflow - use bignum
-        bignum *ba = bn_from_int(va);
-        bignum *bb = bn_from_int(vb);
-        if (!ba || !bb) {
-            bn_free(ba);
-            bn_free(bb);
-            show_error("-: out of memory");
+        bignum *ba, *bb;
+        if (!bn_from_int_pair(va, vb, &ba, &bb, "-"))
             return TOK_ERROR;
-        }
         bn_sub_ip(ba, bb);
         bn_free(bb);
         return store_integer(ba);
     }
     // Fall back to full numeric tower
-    unsigned argv[2] = {a, b};
-    gc_protect(&argv[0]);
-    gc_protect(&argv[1]);
-    unsigned result = prim_minus(2, argv);
-    gc_unprotect(2);
-    return result;
+    return apply_binary_primitive(a, b, prim_minus);
 }
 
 // Binary multiplication: a * b without list building
@@ -585,14 +701,9 @@ static inline unsigned binary_mul(unsigned a, unsigned b)
             return store(result);
         }
         // Overflow - use bignum
-        bignum *ba = bn_from_int(va);
-        bignum *bb = bn_from_int(vb);
-        if (!ba || !bb) {
-            bn_free(ba);
-            bn_free(bb);
-            show_error("*: out of memory");
+        bignum *ba, *bb;
+        if (!bn_from_int_pair(va, vb, &ba, &bb, "*"))
             return TOK_ERROR;
-        }
         bignum *br = bn_mul(ba, bb);
         bn_free(ba);
         bn_free(bb);
@@ -603,12 +714,7 @@ static inline unsigned binary_mul(unsigned a, unsigned b)
         return store_integer(br);
     }
     // Fall back to full numeric tower
-    unsigned argv[2] = {a, b};
-    gc_protect(&argv[0]);
-    gc_protect(&argv[1]);
-    unsigned result = prim_mult(2, argv);
-    gc_unprotect(2);
-    return result;
+    return apply_binary_primitive(a, b, prim_mult);
 }
 
 // Binary division: a / b without list building
@@ -639,12 +745,7 @@ static inline unsigned binary_div(unsigned a, unsigned b)
         return normalize_rational(va, vb);
     }
     // Fall back to full numeric tower
-    unsigned argv[2] = {a, b};
-    gc_protect(&argv[0]);
-    gc_protect(&argv[1]);
-    unsigned result = prim_div(2, argv);
-    gc_unprotect(2);
-    return result;
+    return apply_binary_primitive(a, b, prim_div);
 }
 
 // Binary modulo: a mod b
@@ -667,12 +768,7 @@ static inline unsigned binary_mod(unsigned a, unsigned b)
         return store(r);
     }
     // Fall back to full modulo with bignum support
-    unsigned argv[2] = {a, b};
-    gc_protect(&argv[0]);
-    gc_protect(&argv[1]);
-    unsigned result = prim_modulo(2, argv);
-    gc_unprotect(2);
-    return result;
+    return apply_binary_primitive(a, b, prim_modulo);
 }
 
 // Binary less-than comparison: a < b
@@ -684,12 +780,7 @@ static inline unsigned binary_lt(unsigned a, unsigned b)
         return CELL_ID(a) < CELL_ID(b) ? ctx.atom_true : ctx.atom_false;
     }
     // Fall back to full comparison
-    unsigned argv[2] = {a, b};
-    gc_protect(&argv[0]);
-    gc_protect(&argv[1]);
-    unsigned result = numeric_compare(2, argv, CMP_LT);
-    gc_unprotect(2);
-    return result;
+    return apply_binary_compare(a, b, CMP_LT);
 }
 
 // Binary numeric equality: a = b
@@ -700,12 +791,7 @@ static inline unsigned binary_numeq(unsigned a, unsigned b)
         return CELL_ID(a) == CELL_ID(b) ? ctx.atom_true : ctx.atom_false;
     }
     // Fall back to full comparison
-    unsigned argv[2] = {a, b};
-    gc_protect(&argv[0]);
-    gc_protect(&argv[1]);
-    unsigned result = numeric_compare(2, argv, CMP_EQ);
-    gc_unprotect(2);
-    return result;
+    return apply_binary_compare(a, b, CMP_EQ);
 }
 
 // Binary greater-than comparison: a > b
@@ -716,12 +802,7 @@ static inline unsigned binary_gt(unsigned a, unsigned b)
         return CELL_ID(a) > CELL_ID(b) ? ctx.atom_true : ctx.atom_false;
     }
     // Fall back to full comparison
-    unsigned argv[2] = {a, b};
-    gc_protect(&argv[0]);
-    gc_protect(&argv[1]);
-    unsigned result = numeric_compare(2, argv, CMP_GT);
-    gc_unprotect(2);
-    return result;
+    return apply_binary_compare(a, b, CMP_GT);
 }
 
 // Binary less-than-or-equal comparison: a <= b
@@ -732,12 +813,7 @@ static inline unsigned binary_le(unsigned a, unsigned b)
         return CELL_ID(a) <= CELL_ID(b) ? ctx.atom_true : ctx.atom_false;
     }
     // Fall back to full comparison
-    unsigned argv[2] = {a, b};
-    gc_protect(&argv[0]);
-    gc_protect(&argv[1]);
-    unsigned result = numeric_compare(2, argv, CMP_LE);
-    gc_unprotect(2);
-    return result;
+    return apply_binary_compare(a, b, CMP_LE);
 }
 
 // Binary greater-than-or-equal comparison: a >= b
@@ -748,12 +824,7 @@ static inline unsigned binary_ge(unsigned a, unsigned b)
         return CELL_ID(a) >= CELL_ID(b) ? ctx.atom_true : ctx.atom_false;
     }
     // Fall back to full comparison
-    unsigned argv[2] = {a, b};
-    gc_protect(&argv[0]);
-    gc_protect(&argv[1]);
-    unsigned result = numeric_compare(2, argv, CMP_GE);
-    gc_unprotect(2);
-    return result;
+    return apply_binary_compare(a, b, CMP_GE);
 }
 
 // ============================================================================
@@ -803,60 +874,70 @@ static inline int compare_exact_integers(unsigned a, unsigned b)
 // String Port Operations
 // ============================================================================
 
+static inline string_port *strport_alloc_with_data(char *data, size_t len,
+                                                   size_t cap)
+{
+    string_port *sp = checked_malloc_size(sizeof(string_port));
+    if (!sp) {
+        free(data);
+        return NULL;
+    }
+    sp->data = data;
+    sp->len = len;
+    sp->cap = cap;
+    sp->pos = 0;
+    return sp;
+}
+
 // Create a new output string port
 static inline string_port *strport_new(void)
 {
-    string_port *sp = malloc(sizeof(string_port));
-    if (!sp)
+    char *data = checked_malloc_size(INITIAL_STRING_CAP);
+    if (!data)
         return NULL;
-    sp->data = malloc(INITIAL_STRING_CAP);
-    if (!sp->data) {
-        free(sp);
-        return NULL;
-    }
-    sp->data[0] = '\0';
-    sp->len = 0;
-    sp->cap = INITIAL_STRING_CAP;
-    sp->pos = 0;
-    return sp;
+    data[0] = '\0';
+    return strport_alloc_with_data(data, 0, INITIAL_STRING_CAP);
 }
 
 // Create a string input port from a string (copies the string)
 static inline string_port *strport_from_string(const char *s)
 {
-    string_port *sp = malloc(sizeof(string_port));
-    if (!sp)
-        return NULL;
     size_t len = strlen(s);
-    if (len == SIZE_MAX) {
-        free(sp);
+    char *data = checked_string_copy_len(s, len);
+    if (!data)
         return NULL;
+    return strport_alloc_with_data(data, len, len + 1);
+}
+
+static inline bool strport_grow(string_port *sp)
+{
+    size_t new_cap;
+    if (!checked_grow_capacity_size(sp->cap, 1, &new_cap))
+        return false;
+    char *new_data = checked_realloc_size(sp->data, new_cap);
+    if (!new_data)
+        return false;
+    sp->data = new_data;
+    sp->cap = new_cap;
+    return true;
+}
+
+static inline bool strport_ensure_capacity(string_port *sp, size_t min_cap)
+{
+    while (sp->cap < min_cap) {
+        if (!strport_grow(sp))
+            return false;
     }
-    sp->data = malloc(len + 1);
-    if (!sp->data) {
-        free(sp);
-        return NULL;
-    }
-    memcpy(sp->data, s, len + 1);
-    sp->len = len;
-    sp->cap = len + 1;
-    sp->pos = 0;
-    return sp;
+    return true;
 }
 
 // Write a character to string port (fast amortized O(1))
 static inline bool strport_putc(string_port *sp, int c)
 {
-    if (sp->len + 1 >= sp->cap) {
-        if (sp->cap > SIZE_MAX / 2)
-            return false;
-        size_t new_cap = sp->cap * 2;
-        char *new_data = realloc(sp->data, new_cap);
-        if (!new_data)
-            return false;
-        sp->data = new_data;
-        sp->cap = new_cap;
-    }
+    if (sp->len > SIZE_MAX - 2)
+        return false;
+    if (!strport_ensure_capacity(sp, sp->len + 2))
+        return false;
     sp->data[sp->len++] = (char)c;
     sp->data[sp->len] = '\0';
     return true;
@@ -868,16 +949,8 @@ static inline bool strport_puts(string_port *sp, const char *s)
     size_t slen = strlen(s);
     if (slen > SIZE_MAX - sp->len - 1)
         return false;
-    while (sp->len + slen >= sp->cap) {
-        if (sp->cap > SIZE_MAX / 2)
-            return false;
-        size_t new_cap = sp->cap * 2;
-        char *new_data = realloc(sp->data, new_cap);
-        if (!new_data)
-            return false;
-        sp->data = new_data;
-        sp->cap = new_cap;
-    }
+    if (!strport_ensure_capacity(sp, sp->len + slen + 1))
+        return false;
     memcpy(sp->data + sp->len, s, slen + 1);
     sp->len += slen;
     return true;
@@ -947,6 +1020,36 @@ static inline int extract_current_port_cell(unsigned current_cell, port_dir dir,
     return -1;
 }
 
+static inline int extract_explicit_port_cell(unsigned p, port_dir dir,
+                                             FILE **file_out,
+                                             string_port **strport_out,
+                                             const char *fn_name)
+{
+    bool is_strport = (dir == PORT_INPUT) ? IS_STRINPORT(p) : IS_STROUTPORT(p);
+    if (is_strport) {
+        *strport_out = GET_STRPORT_PTR(p);
+        if (!*strport_out) {
+            show_error("%s: port is closed", fn_name);
+            return -1;
+        }
+        return 1;
+    }
+
+    bool is_fileport = (dir == PORT_INPUT) ? IS_INPORT(p) : IS_OUTPORT(p);
+    if (!is_fileport) {
+        show_error("%s: argument must be %s port", fn_name,
+                   dir == PORT_INPUT ? "input" : "output");
+        return -1;
+    }
+
+    *file_out = GET_PORT_PTR(p);
+    if (!*file_out) {
+        show_error("%s: port is closed", fn_name);
+        return -1;
+    }
+    return 0;
+}
+
 // Unified port extraction - handles both file and string ports
 // Returns: 0 = file port, 1 = string port, -1 = error
 static inline int extract_port(unsigned args, port_dir dir, bool use_second_arg,
@@ -969,32 +1072,7 @@ static inline int extract_port(unsigned args, port_dir dir, bool use_second_arg,
     }
 
     unsigned p = car(port_arg);
-
-    // Check for string port
-    bool is_strport = (dir == PORT_INPUT) ? IS_STRINPORT(p) : IS_STROUTPORT(p);
-    if (is_strport) {
-        *strport_out = GET_STRPORT_PTR(p);
-        if (!*strport_out) {
-            show_error("%s: port is closed", fn_name);
-            return -1;
-        }
-        return 1;
-    }
-
-    // Check for file port
-    bool is_fileport = (dir == PORT_INPUT) ? IS_INPORT(p) : IS_OUTPORT(p);
-    if (!is_fileport) {
-        show_error("%s: argument must be %s port", fn_name,
-                   dir == PORT_INPUT ? "input" : "output");
-        return -1;
-    }
-
-    *file_out = GET_PORT_PTR(p);
-    if (!*file_out) {
-        show_error("%s: port is closed", fn_name);
-        return -1;
-    }
-    return 0;
+    return extract_explicit_port_cell(p, dir, file_out, strport_out, fn_name);
 }
 
 // Unified port extraction for argv-based primitives
@@ -1018,30 +1096,7 @@ static inline int extract_port_argv(unsigned *argv, int port_index,
     }
 
     unsigned p = argv[port_index];
-
-    bool is_strport = (dir == PORT_INPUT) ? IS_STRINPORT(p) : IS_STROUTPORT(p);
-    if (is_strport) {
-        *strport_out = GET_STRPORT_PTR(p);
-        if (!*strport_out) {
-            show_error("%s: port is closed", fn_name);
-            return -1;
-        }
-        return 1;
-    }
-
-    bool is_fileport = (dir == PORT_INPUT) ? IS_INPORT(p) : IS_OUTPORT(p);
-    if (!is_fileport) {
-        show_error("%s: argument must be %s port", fn_name,
-                   dir == PORT_INPUT ? "input" : "output");
-        return -1;
-    }
-
-    *file_out = GET_PORT_PTR(p);
-    if (!*file_out) {
-        show_error("%s: port is closed", fn_name);
-        return -1;
-    }
-    return 0;
+    return extract_explicit_port_cell(p, dir, file_out, strport_out, fn_name);
 }
 
 // Convenience wrappers
@@ -1101,7 +1156,7 @@ static inline unsigned make_string_owned(char *s)
 // Create a string cell by copying a C string (handles allocation + error)
 static inline unsigned make_string_copy(const char *s)
 {
-    char *copy = strdup(s);
+    char *copy = checked_string_copy(s);
     if (!copy) {
         show_error("out of memory");
         return TOK_ERROR;
@@ -1114,17 +1169,11 @@ static inline unsigned make_string_copy(const char *s)
 // ============================================================================
 
 // Numeric operations (prim_numeric.c)
-unsigned prim_plus(unsigned argc, unsigned *argv);
-unsigned prim_minus(unsigned argc, unsigned *argv);
-unsigned prim_mult(unsigned argc, unsigned *argv);
-unsigned prim_div(unsigned argc, unsigned *argv);
-unsigned prim_modulo(unsigned argc, unsigned *argv);
 unsigned prim_remainder(unsigned argc, unsigned *argv);
 unsigned prim_quotient(unsigned argc, unsigned *argv);
 unsigned prim_abs(unsigned argc, unsigned *argv);
 
 // Comparison operations (prim_compare.c)
-unsigned numeric_compare(unsigned argc, unsigned *argv, cmp_op op);
 unsigned char_compare(unsigned argc, unsigned *argv, cmp_op op,
                       bool case_insensitive);
 unsigned string_compare(unsigned argc, unsigned *argv, cmp_op op,

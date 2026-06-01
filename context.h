@@ -281,6 +281,9 @@ unsigned list_length(unsigned lst);
 // Count list length for proper lists; returns false and reports error on improper
 bool list_length_checked(unsigned lst, unsigned *len_out, const char *name);
 
+// Check whether a value is a proper list without reporting an error.
+bool proper_list_silent(unsigned x);
+
 // Validate proper-list arity for special forms.
 bool syntax_arity_checked(unsigned form, unsigned min_args, unsigned max_args,
                           const char *name);
@@ -293,6 +296,21 @@ bool lambda_params_valid(unsigned params);
 
 // Validate ((var expr) ...) binding syntax.
 bool binding_list_valid(unsigned bindings, const char *name);
+
+// Check whether a binding has exactly the shape (name value).
+bool let_binding_has_value(unsigned binding);
+
+// Check whether binding/parameter lists bind the identifier with this atom ID.
+bool binding_list_binds_id(unsigned binding_list, int64_t id);
+bool lambda_params_bind_id(unsigned params, int64_t id);
+bool atom_list_contains_id(unsigned list, int64_t id);
+bool syntax_is_ellipsis(unsigned x, int64_t ellipsis_id);
+bool syntax_is_underscore(unsigned x);
+bool is_eof_object(unsigned expr);
+bool syntax_rules_form_like(unsigned expr);
+bool assoc_list_has_atom_key_id(unsigned assoc_list, int64_t id);
+bool feature_id_available(int64_t id);
+bool cond_expand_requirement_satisfied(unsigned requirement);
 
 // Validate cond clause syntax.
 bool cond_clauses_valid(unsigned clauses, const char *name, unsigned env);
@@ -312,6 +330,28 @@ bool check_args(unsigned args, unsigned min, unsigned max, const char *name);
 
 // Append element to list being built (modifies head/tail pointers)
 void list_append(unsigned *head, unsigned *tail, unsigned elem);
+
+// Overflow-checked array allocation helpers.
+void *checked_malloc_array(unsigned count, size_t elem_size);
+void *checked_calloc_array(unsigned count, size_t elem_size);
+void *checked_realloc_array(void *ptr, unsigned count, size_t elem_size);
+void *checked_malloc_size(size_t size);
+void *checked_realloc_size(void *ptr, size_t size);
+void *checked_malloc_flex(size_t base_size, size_t count, size_t elem_size);
+char *checked_string_copy_len(const char *s, size_t len);
+char *checked_string_copy(const char *s);
+bool checked_array_size(unsigned count, size_t elem_size, size_t *size_out);
+bool checked_add_size(size_t a, size_t b, size_t *out);
+bool checked_flex_size(size_t base_size, size_t count, size_t elem_size,
+                       size_t *size_out);
+unsigned checked_grow_capacity(unsigned cap, size_t elem_size,
+                               const char *error_msg);
+bool checked_grow_capacity_size(size_t cap, size_t elem_size,
+                                size_t *new_cap_out);
+
+// Pack zero, one, or many values using Scheme multiple-value convention.
+unsigned values_from_list(unsigned args);
+unsigned values_from_argv(unsigned argc, unsigned *argv);
 
 // Deep equality comparison
 bool deep_equal(unsigned a, unsigned b);

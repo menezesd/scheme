@@ -5,38 +5,45 @@
 
 #include "prim_internal.h"
 
+#define STRING_APPEND_STACK_LENGTHS 64
+
+static void free_string_append_lengths(size_t *lengths, size_t *stack_lengths)
+{
+    if (lengths != stack_lengths)
+        free(lengths);
+}
+
 unsigned prim_string_append(unsigned argc, unsigned *argv)
 {
     // First pass: validate and compute total length, cache individual lengths
     size_t total = 0;
-    size_t lens[64];    // Stack-allocated for common case
-    size_t *lengths = (argc <= 64) ? lens : malloc(argc * sizeof(size_t));
+    size_t stack_lengths[STRING_APPEND_STACK_LENGTHS];
+    size_t *lengths = (argc <= STRING_APPEND_STACK_LENGTHS)
+                          ? stack_lengths
+                          : checked_malloc_array(argc, sizeof(size_t));
     if (!lengths) {
         show_error("string-append: out of memory");
         return TOK_ERROR;
     }
 
     for (unsigned i = 0; i < argc; i++) {
-        if (!IS_STRING(argv[i])) {
-            if (argc > 64)
-                free(lengths);
-            show_error("string-append: not a string");
+        char *s = require_string_ptr(argv[i], "string-append");
+        if (!s) {
+            free_string_append_lengths(lengths, stack_lengths);
             return TOK_ERROR;
         }
-        lengths[i] = strlen(GET_STRING_PTR(argv[i]));
+        lengths[i] = strlen(s);
         if (lengths[i] > SIZE_MAX - total - 1) {
-            if (argc > 64)
-                free(lengths);
+            free_string_append_lengths(lengths, stack_lengths);
             show_error("string-append: result too large");
             return TOK_ERROR;
         }
         total += lengths[i];
     }
 
-    char *result = malloc(total + 1);
+    char *result = checked_malloc_flex(0, total + 1, 1);
     if (!result) {
-        if (argc > 64)
-            free(lengths);
+        free_string_append_lengths(lengths, stack_lengths);
         show_error("string-append: out of memory");
         return TOK_ERROR;
     }
@@ -49,8 +56,7 @@ unsigned prim_string_append(unsigned argc, unsigned *argv)
     }
     *pos = '\0';
 
-    if (argc > 64)
-        free(lengths);
+    free_string_append_lengths(lengths, stack_lengths);
 
     return make_string_owned(result);
 }
@@ -58,8 +64,9 @@ unsigned prim_string_append(unsigned argc, unsigned *argv)
 unsigned prim_substring(unsigned argc, unsigned *argv)
 {
     REQUIRE_ARGC(argc, 2, 3, "substring");
-    CHECK_STRING(argv[0], "substring");
-    char *s = GET_STRING_PTR(argv[0]);
+    char *s = require_string_ptr(argv[0], "substring");
+    if (!s)
+        return TOK_ERROR;
     size_t slen = strlen(s);
     int64_t start;
     if (!expect_nonneg_int64(argv[1], &start, "substring"))
@@ -76,16 +83,10 @@ unsigned prim_substring(unsigned argc, unsigned *argv)
         return TOK_ERROR;
     }
     size_t result_len = end - start;
-    if (result_len == SIZE_MAX) {
-        show_error("substring: result too large");
-        return TOK_ERROR;
-    }
-    char *result = malloc(result_len + 1);
+    char *result = checked_string_copy_len(s + start, result_len);
     if (!result) {
         show_error("substring: out of memory");
         return TOK_ERROR;
     }
-    memcpy(result, s + start, result_len);
-    result[result_len] = '\0';
     return make_string_owned(result);
 }

@@ -12,6 +12,12 @@ typedef struct {
     const char *name;
 } char_pred_entry;
 
+typedef struct {
+    unsigned id;
+    int (*transform)(int);
+    const char *name;
+} char_transform_entry;
+
 static const char_pred_entry char_predicates[] = {
     {PCHARALPHA, isalpha, "char-alphabetic?"},
     {PCHARNUMERIC, isdigit, "char-numeric?"},
@@ -20,43 +26,89 @@ static const char_pred_entry char_predicates[] = {
     {PCHARLOWER, islower, "char-lower-case?"},
     {0, NULL, NULL}};
 
+static const char_transform_entry char_transforms[] = {
+    {PCHARUP, toupper, "char-upcase"},
+    {PCHARDOWN, tolower, "char-downcase"},
+    {0, NULL, NULL}};
+
+static const char_pred_entry *find_char_predicate(unsigned prim_id)
+{
+    for (const char_pred_entry *e = char_predicates; e->predicate; e++) {
+        if (e->id == prim_id)
+            return e;
+    }
+    return NULL;
+}
+
+static const char_transform_entry *find_char_transform(unsigned prim_id)
+{
+    for (const char_transform_entry *e = char_transforms; e->transform; e++) {
+        if (e->id == prim_id)
+            return e;
+    }
+    return NULL;
+}
+
+static unsigned char_predicate_value(unsigned arg, const char *name,
+                                     int (*predicate)(int))
+{
+    int c;
+    if (!expect_char_value(arg, &c, name))
+        return TOK_ERROR;
+    return scheme_bool(predicate(c));
+}
+
+static unsigned char_transform(unsigned arg, const char *name,
+                               int (*transform)(int))
+{
+    int c;
+    if (!expect_char_value(arg, &c, name))
+        return TOK_ERROR;
+    return make_char(transform(c));
+}
+
+static unsigned char_code_value(unsigned arg, const char *name)
+{
+    int c;
+    if (!expect_char_value(arg, &c, name))
+        return TOK_ERROR;
+    return store(c);
+}
+
+static unsigned integer_to_char_value(unsigned arg, const char *name)
+{
+    int64_t code;
+    if (!expect_exact_int64(arg, &code, name))
+        return TOK_ERROR;
+    if (code < 0 || code > 0x10FFFF) {
+        show_error("%s: code point out of range", name);
+        return TOK_ERROR;
+    }
+    return make_char((int)code);
+}
+
 unsigned apply_char_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
 {
-    // Check table-driven predicates first
-    for (const char_pred_entry *e = char_predicates; e->predicate; e++) {
-        if (e->id == prim_id) {
-            REQUIRE_ARGC(argc, 1, 1, e->name);
-            CHECK_CHAR(argv[0], e->name);
-            int c = (unsigned char)CELL_ID(argv[0]);
-            return e->predicate(c) ? ctx.atom_true : ctx.atom_false;
-        }
+    const char_pred_entry *pred = find_char_predicate(prim_id);
+    if (pred) {
+        REQUIRE_ARGC(argc, 1, 1, pred->name);
+        return char_predicate_value(argv[0], pred->name, pred->predicate);
+    }
+
+    const char_transform_entry *transform = find_char_transform(prim_id);
+    if (transform) {
+        REQUIRE_ARGC(argc, 1, 1, transform->name);
+        return char_transform(argv[0], transform->name,
+                              transform->transform);
     }
 
     switch (prim_id) {
     case PCHARCODE:
         REQUIRE_ARGC(argc, 1, 1, "char->integer");
-        CHECK_CHAR(argv[0], "char->integer");
-        return store(CELL_ID(argv[0]));
+        return char_code_value(argv[0], "char->integer");
     case PCODECHAR:
         REQUIRE_ARGC(argc, 1, 1, "integer->char");
-        {
-            int64_t code;
-            if (!expect_exact_int64(argv[0], &code, "integer->char"))
-                return TOK_ERROR;
-            if (code < 0 || code > 0x10FFFF) {
-                show_error("integer->char: code point out of range");
-                return TOK_ERROR;
-            }
-            return make_char((int)code);
-        }
-    case PCHARUP:
-        REQUIRE_ARGC(argc, 1, 1, "char-upcase");
-        CHECK_CHAR(argv[0], "char-upcase");
-        return make_char(toupper((unsigned char)CELL_ID(argv[0])));
-    case PCHARDOWN:
-        REQUIRE_ARGC(argc, 1, 1, "char-downcase");
-        CHECK_CHAR(argv[0], "char-downcase");
-        return make_char(tolower((unsigned char)CELL_ID(argv[0])));
+        return integer_to_char_value(argv[0], "integer->char");
     // Character comparisons (PCHAREQ..PCHARGEI are sequential)
     case PCHAREQ:
     case PCHARLT:

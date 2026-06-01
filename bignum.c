@@ -37,12 +37,14 @@
 
 static bignum *bn_alloc(size_t cap)
 {
+    size_t limbs_size;
     if (cap > SIZE_MAX / sizeof(limb_t))
         return NULL;
     bignum *b = malloc(sizeof(bignum));
     if (!b)
         return NULL;
-    b->limbs = calloc(cap, sizeof(limb_t));
+    limbs_size = cap * sizeof(limb_t);
+    b->limbs = calloc(limbs_size, 1);
     if (!b->limbs) {
         free(b);
         return NULL;
@@ -51,6 +53,20 @@ static bignum *bn_alloc(size_t cap)
     b->cap = cap;
     b->sign = 0;
     return b;
+}
+
+static char *bn_alloc_string(size_t len)
+{
+    if (len == SIZE_MAX)
+        return NULL;
+    return malloc(len + 1);
+}
+
+static limb_t *bn_realloc_limbs(limb_t *limbs, size_t cap)
+{
+    if (cap > SIZE_MAX / sizeof(limb_t))
+        return NULL;
+    return realloc(limbs, cap * sizeof(limb_t));
 }
 
 static void bn_ensure_cap(bignum *b, size_t cap)
@@ -68,7 +84,7 @@ static void bn_ensure_cap(bignum *b, size_t cap)
         fprintf(stderr, "bignum: capacity overflow\n");
         abort();
     }
-    limb_t *new_limbs = realloc(b->limbs, new_cap * sizeof(limb_t));
+    limb_t *new_limbs = bn_realloc_limbs(b->limbs, new_cap);
     if (!new_limbs) {
         fprintf(stderr, "bignum: out of memory\n");
         abort();
@@ -299,7 +315,7 @@ static char *bn_to_string_simple(const bignum *a, int base)
     size_t max_digits = a->len * LIMB_BITS;
     if (max_digits > SIZE_MAX - 2)
         return NULL;
-    char *buf = malloc(max_digits + 2);
+    char *buf = bn_alloc_string(max_digits + 1);
     if (!buf)
         return NULL;
 
@@ -399,9 +415,12 @@ static char *bn_to_string_dc(const bignum *a, size_t num_digits)
     // Recursively convert each half
     char *hi_str;
     if (bn_is_zero(hi)) {
-        hi_str = malloc(1);
-        if (!hi_str)
+        hi_str = bn_alloc_string(0);
+        if (!hi_str) {
+            bn_free(hi);
+            bn_free(lo);
             return NULL;
+        }
         hi_str[0] = '\0';
     } else {
         hi_str = bn_to_string_dc(hi, hi_digits);
@@ -430,7 +449,7 @@ static char *bn_to_string_dc(const bignum *a, size_t num_digits)
         free(lo_str);
         return NULL;
     }
-    char *result = malloc(hi_len + pad + lo_len + 1);
+    char *result = bn_alloc_string(hi_len + pad + lo_len);
     if (!result) {
         free(hi_str);
         free(lo_str);
@@ -452,7 +471,7 @@ char *bn_to_string(const bignum *a, int base)
         return NULL;
 
     if (a->len == 0) {
-        char *s = malloc(2);
+        char *s = bn_alloc_string(1);
         if (!s)
             return NULL;
         s[0] = '0';
@@ -479,7 +498,7 @@ char *bn_to_string(const bignum *a, int base)
                 free(digits);
                 return NULL;
             }
-            char *result = malloc(len + 2);
+            char *result = bn_alloc_string(len + 1);
             if (!result) {
                 free(digits);
                 return NULL;

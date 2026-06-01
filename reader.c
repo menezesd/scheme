@@ -121,15 +121,14 @@ static int add_datum_label(int label)
 {
     // Grow the array if needed
     if (datum_label_count >= datum_label_cap) {
-        if (datum_label_cap > INT_MAX / 2 ||
-            (size_t)datum_label_cap * 2 > SIZE_MAX / sizeof(datum_label_entry)) {
+        if (datum_label_cap > INT_MAX / 2) {
             show_error("too many datum labels");
             return -1;
         }
         int new_cap = datum_label_cap == 0 ? INITIAL_DATUM_LABELS
                                            : datum_label_cap * 2;
-        datum_label_entry *new_labels =
-            realloc(datum_labels, new_cap * sizeof(datum_label_entry));
+        datum_label_entry *new_labels = checked_realloc_array(
+            datum_labels, (unsigned)new_cap, sizeof(datum_label_entry));
         if (!new_labels) {
             show_error("out of memory for datum labels");
             return -1;
@@ -281,7 +280,7 @@ typedef struct {
 
 static void sb_init(string_buffer *sb)
 {
-    sb->data = malloc(INITIAL_STRING_CAP);
+    sb->data = checked_malloc_size(INITIAL_STRING_CAP);
     if (!sb->data) {
         lisp_panic("failed to allocate string buffer");
     }
@@ -293,11 +292,11 @@ static void sb_init(string_buffer *sb)
 static void sb_append(string_buffer *sb, int ch)
 {
     if (sb->len + 1 >= sb->cap) {
-        if (sb->cap > SIZE_MAX / 2) {
+        size_t new_cap;
+        if (!checked_grow_capacity_size(sb->cap, 1, &new_cap)) {
             lisp_panic("string buffer too large");
         }
-        size_t new_cap = sb->cap * 2;
-        char *new_data = realloc(sb->data, new_cap);
+        char *new_data = checked_realloc_size(sb->data, new_cap);
         if (!new_data) {
             lisp_panic("failed to grow string buffer");
         }
@@ -725,7 +724,8 @@ unsigned read_token(void)
                             show_error("bytevector literal too large");
                             return TOK_ERROR;
                         }
-                        bytevec_data *bv = malloc(sizeof(bytevec_data) + count);
+                        bytevec_data *bv =
+                            checked_malloc_flex(sizeof(bytevec_data), count, 1);
                         if (!bv) {
                             show_error("bytevector literal: out of memory");
                             return TOK_ERROR;

@@ -26,7 +26,7 @@ SAN_TARGET = vesper-asan
 SAN_CFLAGS = $(DEBUG_CFLAGS) -fsanitize=address,undefined
 SAN_LDFLAGS = $(LDFLAGS) -fsanitize=address,undefined
 
-.PHONY: all clean distclean debug sanitize test test-c test-prop test-all
+.PHONY: all clean distclean debug sanitize test test-interpreter test-c test-prop test-all
 
 all: $(TARGET)
 
@@ -105,6 +105,9 @@ run: $(TARGET)
 test: $(TARGET)
 	@./$(TARGET) < test.scm 2>&1 | grep -E '(^===|PASS|FAIL|^Tests:|passed|FAILED)'
 
+test-interpreter: $(TARGET)
+	@./$(TARGET) --interpreter < test.scm 2>&1 | grep -E '(^===|PASS|FAIL|^Tests:|passed|FAILED)'
+
 # C unit tests
 TEST_SRCS = test_bignum.c test_reader.c test_context.c test_macros.c test_eval.c test_pattern.c
 TEST_BINS = $(TEST_SRCS:.c=)
@@ -141,7 +144,7 @@ test-prop: $(TARGET)
 	@./$(TARGET) property_tests.scm
 
 # Run all tests
-test-all: test test-c test-prop
+test-all: test test-interpreter test-c test-prop
 
 clean:
 	rm -f $(OBJS) $(DEBUG_OBJS) $(SAN_OBJS) $(TARGET) $(DEBUG_TARGET) \

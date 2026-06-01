@@ -6,88 +6,269 @@
 #include "prim_internal.h"
 #include "writer.h"
 
+static void close_string_port(unsigned port)
+{
+    string_port *sp = GET_STRPORT_PTR(port);
+    if (sp)
+        strport_free(sp);
+    CELL_ID(port) = 0;
+}
+
+static unsigned close_port_arg(unsigned port, bool input)
+{
+    const char *name = input ? "close-input-port" : "close-output-port";
+    const char *direction = input ? "input" : "output";
+
+    if ((input && IS_STRINPORT(port)) || (!input && IS_STROUTPORT(port))) {
+        close_string_port(port);
+        return 0;
+    }
+
+    if ((input && !IS_INPORT(port)) || (!input && !IS_OUTPORT(port))) {
+        show_error("%s: not an %s port", name, direction);
+        return TOK_ERROR;
+    }
+
+    file_port *fp = GET_FILE_PORT_PTR(port);
+    FILE *f = fp ? fp->file : NULL;
+    bool close_failed = false;
+    if (f)
+        reader_forget_port(f);
+    if (f && fp->owns_file)
+        close_failed = fclose(f) != 0;
+    if (fp)
+        fp->file = NULL;
+    if (close_failed) {
+        show_error("%s: close failed", name);
+        return TOK_ERROR;
+    }
+    return 0;
+}
+
+typedef struct {
+    unsigned id;
+    bool (*predicate)(unsigned value);
+    const char *name;
+} port_predicate_entry;
+
+static bool input_port_predicate(unsigned value) { return IS_INPUT_PORT(value); }
+static bool output_port_predicate(unsigned value)
+{
+    return IS_OUTPUT_PORT(value);
+}
+static bool string_port_predicate(unsigned value)
+{
+    return IS_STRINPORT(value) || IS_STROUTPORT(value);
+}
+static bool port_open_predicate(unsigned value)
+{
+    if (IS_INPORT(value) || IS_OUTPORT(value))
+        return GET_PORT_PTR(value) != NULL;
+    if (IS_STRINPORT(value) || IS_STROUTPORT(value))
+        return GET_STRPORT_PTR(value) != NULL;
+    return false;
+}
+static bool input_port_open_predicate(unsigned value)
+{
+    return IS_INPUT_PORT(value) && port_open_predicate(value);
+}
+static bool output_port_open_predicate(unsigned value)
+{
+    return IS_OUTPUT_PORT(value) && port_open_predicate(value);
+}
+static bool textual_port_predicate(unsigned value)
+{
+    if (IS_STRINPORT(value) || IS_STROUTPORT(value))
+        return true;
+    if (IS_INPORT(value) || IS_OUTPORT(value)) {
+        file_port *fp = GET_FILE_PORT_PTR(value);
+        return fp && !fp->binary;
+    }
+    return false;
+}
+static bool binary_port_predicate(unsigned value)
+{
+    if (IS_INPORT(value) || IS_OUTPORT(value)) {
+        file_port *fp = GET_FILE_PORT_PTR(value);
+        return fp && fp->binary;
+    }
+    return false;
+}
+
+static const port_predicate_entry port_predicates[] = {
+    {PINPUTPORTP, input_port_predicate, "input-port?"},
+    {POUTPUTPORTP, output_port_predicate, "output-port?"},
+    {PSTRINGPORTP, string_port_predicate, "string-port?"},
+    {PPORTOPENP, port_open_predicate, "port-open?"},
+    {PINPUTPORTOPENP, input_port_open_predicate, "input-port-open?"},
+    {POUTPUTPORTOPENP, output_port_open_predicate, "output-port-open?"},
+    {PTEXTUALPORTP, textual_port_predicate, "textual-port?"},
+    {PBINARYPORTP, binary_port_predicate, "binary-port?"},
+    {0, NULL, NULL},
+};
+
+static const port_predicate_entry *find_port_predicate(unsigned prim_id)
+{
+    for (const port_predicate_entry *entry = port_predicates; entry->predicate;
+         entry++) {
+        if (entry->id == prim_id)
+            return entry;
+    }
+    return NULL;
+}
+
+static unsigned output_string_value(unsigned port, const char *name)
+{
+    if (!IS_STROUTPORT(port)) {
+        show_error("%s: not a string output port", name);
+        return TOK_ERROR;
+    }
+    string_port *sp = GET_STRPORT_PTR(port);
+    if (!sp) {
+        show_error("%s: port is closed", name);
+        return TOK_ERROR;
+    }
+    char *copy = checked_string_copy_len(sp->data, sp->len);
+    if (!copy) {
+        show_error("%s: out of memory", name);
+        return TOK_ERROR;
+    }
+    return make_string_owned(copy);
+}
+
+static unsigned set_current_port(unsigned port, bool input)
+{
+    const char *name =
+        input ? "set-current-input-port!" : "set-current-output-port!";
+    const char *direction = input ? "input" : "output";
+
+    if ((input && IS_INPORT(port)) || (!input && IS_OUTPORT(port))) {
+        FILE *f = GET_PORT_PTR(port);
+        if (!f) {
+            show_error("%s: port is closed", name);
+            return TOK_ERROR;
+        }
+        if (input) {
+            ctx.current_input = f;
+            ctx.current_input_cell = port;
+        } else {
+            ctx.current_output = f;
+            ctx.current_output_cell = port;
+        }
+        return port;
+    }
+
+    if ((input && IS_STRINPORT(port)) || (!input && IS_STROUTPORT(port))) {
+        if (!GET_STRPORT_PTR(port)) {
+            show_error("%s: port is closed", name);
+            return TOK_ERROR;
+        }
+        if (input) {
+            ctx.current_input_cell = port;
+        } else {
+            ctx.current_output_cell = port;
+        }
+        return port;
+    }
+
+    show_error("%s: not an %s port, got %s", name, direction, type_name(port));
+    return TOK_ERROR;
+}
+
+static unsigned set_current_error_port(unsigned port)
+{
+    if (IS_OUTPORT(port)) {
+        FILE *f = GET_PORT_PTR(port);
+        if (!f) {
+            show_error("set-current-error-port!: port is closed");
+            return TOK_ERROR;
+        }
+        ctx.current_error = f;
+        ctx.current_error_cell = port;
+        return port;
+    }
+    if (IS_STROUTPORT(port)) {
+        if (!GET_STRPORT_PTR(port)) {
+            show_error("set-current-error-port!: port is closed");
+            return TOK_ERROR;
+        }
+        ctx.current_error_cell = port;
+        return port;
+    }
+    show_error("set-current-error-port!: not an output port, got %s",
+               type_name(port));
+    return TOK_ERROR;
+}
+
+static bool flush_output_port_arg(unsigned port)
+{
+    if (IS_OUTPORT(port)) {
+        FILE *fport = GET_PORT_PTR(port);
+        if (!fport) {
+            show_error("flush-output-port: port is closed");
+            return false;
+        }
+        return flush_file_port(fport, "flush-output-port");
+    }
+
+    if (IS_STROUTPORT(port)) {
+        string_port *sport = GET_STRPORT_PTR(port);
+        if (!sport) {
+            show_error("flush-output-port: port is closed");
+            return false;
+        }
+        return true;
+    }
+
+    show_error("flush-output-port: not an output port, got %s",
+               type_name(port));
+    return false;
+}
+
+static bool flush_current_output_port(void)
+{
+    FILE *fport;
+    string_port *sport;
+    int ptype = extract_port_argv(NULL, -1, PORT_OUTPUT, &fport, &sport,
+                                  "flush-output-port");
+    if (ptype == -1)
+        return false;
+    return ptype != 0 || flush_file_port(fport, "flush-output-port");
+}
+
 unsigned apply_port_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
 {
+    const port_predicate_entry *predicate = find_port_predicate(prim_id);
+    if (predicate) {
+        REQUIRE_ARGC(argc, 1, 1, predicate->name);
+        return scheme_bool(predicate->predicate(argv[0]));
+    }
+
     switch (prim_id) {
     case POPENINPUT: {
         REQUIRE_ARGC(argc, 1, 1, "open-input-file");
-        CHECK_STRING(argv[0], "open-input-file");
-        char *filename = GET_STRING_PTR(argv[0]);
-        FILE *f = fopen(filename, "r");
-        if (!f) {
-            show_error("open-input-file: cannot open %s", filename);
+        char *filename = require_string_ptr(argv[0], "open-input-file");
+        if (!filename)
             return TOK_ERROR;
-        }
-        unsigned p = alloc();
-        CELL_TYPE(p) = BT_INPORT;
-        CELL_PTR(p) = f;
-        return p;
+        return open_file_port(filename, "r", BT_INPORT, "open-input-file");
     }
     case POPENOUTPUT: {
         REQUIRE_ARGC(argc, 1, 2, "open-output-file");
-        CHECK_STRING(argv[0], "open-output-file");
-        char *filename = GET_STRING_PTR(argv[0]);
+        char *filename = require_string_ptr(argv[0], "open-output-file");
+        if (!filename)
+            return TOK_ERROR;
         const char *mode = "w";
         if (argc > 1) {
             mode = IS_FALSE(argv[1]) ? "w" : "a";
         }
-        FILE *f = fopen(filename, mode);
-        if (!f) {
-            show_error("open-output-file: cannot open %s", filename);
-            return TOK_ERROR;
-        }
-        unsigned p = alloc();
-        CELL_TYPE(p) = BT_OUTPORT;
-        CELL_PTR(p) = f;
-        return p;
+        return open_file_port(filename, mode, BT_OUTPORT, "open-output-file");
     }
     case PCLOSEINPUT:
     case PCLOSEOUTPUT: {
         const char *name =
             prim_id == PCLOSEINPUT ? "close-input-port" : "close-output-port";
         REQUIRE_ARGC(argc, 1, 1, name);
-        unsigned port = argv[0];
-        // Handle string ports
-        if (prim_id == PCLOSEINPUT && IS_STRINPORT(port)) {
-            string_port *sp = GET_STRPORT_PTR(port);
-            if (sp)
-                strport_free(sp);
-            CELL_ID(port) = 0;
-            return 0;
-        }
-        if (prim_id == PCLOSEOUTPUT && IS_STROUTPORT(port)) {
-            string_port *sp = GET_STRPORT_PTR(port);
-            if (sp)
-                strport_free(sp);
-            CELL_ID(port) = 0;
-            return 0;
-        }
-        if ((prim_id == PCLOSEINPUT && !IS_INPORT(port)) ||
-            (prim_id == PCLOSEOUTPUT && !IS_OUTPORT(port))) {
-            show_error("%s: not an %s port", name,
-                       prim_id == PCLOSEINPUT ? "input" : "output");
-            return TOK_ERROR;
-        }
-        FILE *f = GET_PORT_PTR(port);
-        bool close_failed = false;
-        if (f)
-            reader_forget_port(f);
-        if (f && f != stdin && f != stdout)
-            close_failed = fclose(f) != 0;
-        CELL_ID(port) = 0;
-        if (close_failed) {
-            show_error("%s: close failed", name);
-            return TOK_ERROR;
-        }
-        return 0;
-    }
-    case PINPUTPORTP: {
-        REQUIRE_ARGC(argc, 1, 1, "input-port?");
-        return IS_INPUT_PORT(argv[0]) ? ctx.atom_true : ctx.atom_false;
-    }
-    case POUTPUTPORTP: {
-        REQUIRE_ARGC(argc, 1, 1, "output-port?");
-        return IS_OUTPUT_PORT(argv[0]) ? ctx.atom_true : ctx.atom_false;
+        return close_port_arg(argv[0], prim_id == PCLOSEINPUT);
     }
     case PCURRENTINPUT: {
         REQUIRE_ARGC(argc, 0, 0, "current-input-port");
@@ -95,10 +276,8 @@ unsigned apply_port_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         if (ctx.current_input_cell != 0) {
             return ctx.current_input_cell;
         }
-        unsigned p = alloc();
-        CELL_TYPE(p) = BT_INPORT;
-        CELL_PTR(p) = ctx.current_input;
-        return p;
+        return make_file_port_cell(ctx.current_input, false, true, false,
+                                   BT_INPORT, "current-input-port");
     }
     case PCURRENTOUTPUT: {
         REQUIRE_ARGC(argc, 0, 0, "current-output-port");
@@ -106,10 +285,16 @@ unsigned apply_port_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         if (ctx.current_output_cell != 0) {
             return ctx.current_output_cell;
         }
-        unsigned p = alloc();
-        CELL_TYPE(p) = BT_OUTPORT;
-        CELL_PTR(p) = ctx.current_output;
-        return p;
+        return make_file_port_cell(ctx.current_output, false, false, false,
+                                   BT_OUTPORT, "current-output-port");
+    }
+    case PCURRENTERROR: {
+        REQUIRE_ARGC(argc, 0, 0, "current-error-port");
+        if (ctx.current_error_cell != 0) {
+            return ctx.current_error_cell;
+        }
+        return make_file_port_cell(ctx.current_error, false, false, false,
+                                   BT_OUTPORT, "current-error-port");
     }
     // String ports
     case POPENOUTPUTSTRING: {
@@ -119,141 +304,45 @@ unsigned apply_port_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
             show_error("open-output-string: out of memory");
             return TOK_ERROR;
         }
-        unsigned p = alloc();
-        CELL_TYPE(p) = BT_STROUTPORT;
-        CELL_PTR(p) = sp;
-        return p;
+        return make_pointer_cell(BT_STROUTPORT, sp);
     }
     case PGETOUTPUTSTRING: {
         REQUIRE_ARGC(argc, 1, 1, "get-output-string");
-        unsigned port = argv[0];
-        if (!IS_STROUTPORT(port)) {
-            show_error("get-output-string: not a string output port");
-            return TOK_ERROR;
-        }
-        string_port *sp = GET_STRPORT_PTR(port);
-        if (!sp) {
-            show_error("get-output-string: port is closed");
-            return TOK_ERROR;
-        }
-        // Copy the string to a new BT_STRING cell
-        if (sp->len == SIZE_MAX) {
-            show_error("get-output-string: result too large");
-            return TOK_ERROR;
-        }
-        char *copy = malloc(sp->len + 1);
-        if (!copy) {
-            show_error("get-output-string: out of memory");
-            return TOK_ERROR;
-        }
-        memcpy(copy, sp->data, sp->len + 1);
-        return make_string_owned(copy);
+        return output_string_value(argv[0], "get-output-string");
     }
     case POPENINPUTSTRING: {
         REQUIRE_ARGC(argc, 1, 1, "open-input-string");
-        unsigned str = argv[0];
-        if (!IS_STRING(str)) {
-            show_error("open-input-string: not a string");
+        char *str = require_string_ptr(argv[0], "open-input-string");
+        if (!str)
             return TOK_ERROR;
-        }
-        string_port *sp = strport_from_string(GET_STRING_PTR(str));
+        string_port *sp = strport_from_string(str);
         if (!sp) {
             show_error("open-input-string: out of memory");
             return TOK_ERROR;
         }
-        unsigned p = alloc();
-        CELL_TYPE(p) = BT_STRINPORT;
-        CELL_PTR(p) = sp;
-        return p;
-    }
-    case PSTRINGPORTP: {
-        REQUIRE_ARGC(argc, 1, 1, "string-port?");
-        unsigned a = argv[0];
-        return (IS_STRINPORT(a) || IS_STROUTPORT(a)) ? ctx.atom_true
-                                                     : ctx.atom_false;
+        return make_pointer_cell(BT_STRINPORT, sp);
     }
     // Internal port setters (used by with-input-from-file etc.)
     case PSETCURRENTINPUT: {
         REQUIRE_ARGC(argc, 1, 1, "set-current-input-port!");
-        unsigned port = argv[0];
-        if (IS_INPORT(port)) {
-            if (!GET_PORT_PTR(port)) {
-                show_error("set-current-input-port!: port is closed");
-                return TOK_ERROR;
-            }
-            ctx.current_input = GET_PORT_PTR(port);
-            ctx.current_input_cell = port;
-        } else if (IS_STRINPORT(port)) {
-            if (!GET_STRPORT_PTR(port)) {
-                show_error("set-current-input-port!: port is closed");
-                return TOK_ERROR;
-            }
-            ctx.current_input_cell = port;
-        } else {
-            show_error("set-current-input-port!: not an input port, got %s",
-                       type_name(port));
-            return TOK_ERROR;
-        }
-        return port;
+        return set_current_port(argv[0], true);
     }
     case PSETCURRENTOUTPUT: {
         REQUIRE_ARGC(argc, 1, 1, "set-current-output-port!");
-        unsigned port = argv[0];
-        if (IS_OUTPORT(port)) {
-            if (!GET_PORT_PTR(port)) {
-                show_error("set-current-output-port!: port is closed");
-                return TOK_ERROR;
-            }
-            ctx.current_output = GET_PORT_PTR(port);
-            ctx.current_output_cell = port;
-        } else if (IS_STROUTPORT(port)) {
-            if (!GET_STRPORT_PTR(port)) {
-                show_error("set-current-output-port!: port is closed");
-                return TOK_ERROR;
-            }
-            ctx.current_output_cell = port;
-        } else {
-            show_error("set-current-output-port!: not an output port, got %s",
-                       type_name(port));
-            return TOK_ERROR;
-        }
-        return port;
+        return set_current_port(argv[0], false);
+    }
+    case PSETCURRENTERROR: {
+        REQUIRE_ARGC(argc, 1, 1, "set-current-error-port!");
+        return set_current_error_port(argv[0]);
     }
     case PFLUSHOUTPUT: {
         REQUIRE_ARGC(argc, 0, 1, "flush-output-port");
-        FILE *fport;
-        string_port *sport;
         if (argc == 0) {
-            int ptype = extract_port_argv(argv, -1, PORT_OUTPUT, &fport,
-                                          &sport, "flush-output-port");
-            if (ptype == -1) return TOK_ERROR;
-            if (ptype == 0 && fflush(fport) != 0) {
-                show_error("flush-output-port: flush failed");
+            if (!flush_current_output_port())
                 return TOK_ERROR;
-            }
         } else {
-            unsigned port = argv[0];
-            if (IS_OUTPORT(port)) {
-                fport = GET_PORT_PTR(port);
-                if (!fport) {
-                    show_error("flush-output-port: port is closed");
-                    return TOK_ERROR;
-                }
-                if (fflush(fport) != 0) {
-                    show_error("flush-output-port: flush failed");
-                    return TOK_ERROR;
-                }
-            } else if (IS_STROUTPORT(port)) {
-                sport = GET_STRPORT_PTR(port);
-                if (!sport) {
-                    show_error("flush-output-port: port is closed");
-                    return TOK_ERROR;
-                }
-            } else {
-                show_error("flush-output-port: not an output port, got %s",
-                           type_name(port));
+            if (!flush_output_port_arg(argv[0]))
                 return TOK_ERROR;
-            }
         }
         return 0;
     }

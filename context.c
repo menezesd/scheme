@@ -52,6 +52,7 @@ lisp_context ctx = {.hptr = HEAP_RESERVED,
                     .cons_cells = NULL,     // Allocated in init_heap
                     .current_input = NULL,  // Set to stdin in init_keywords
                     .current_output = NULL, // Set to stdout in init_keywords
+                    .current_error = NULL,  // Set to stderr in init_keywords
                     .transcript = NULL};
 
 tramp_state tramp;
@@ -143,7 +144,8 @@ static void init_shadow_stack(void)
 {
     if (!shadow_stack) {
         shadow_stack_size = 4096;
-        shadow_stack = malloc(shadow_stack_size * sizeof(unsigned *));
+        shadow_stack =
+            checked_malloc_array((unsigned)shadow_stack_size, sizeof(unsigned *));
         if (!shadow_stack) {
             lisp_panic("failed to allocate shadow stack");
         }
@@ -161,8 +163,8 @@ void gc_protect(unsigned *ptr)
             lisp_panic("shadow stack too large");
         }
         int new_size = shadow_stack_size * 2;
-        unsigned **new_stack =
-            realloc(shadow_stack, new_size * sizeof(unsigned *));
+        unsigned **new_stack = checked_realloc_array(
+            shadow_stack, (unsigned)new_size, sizeof(unsigned *));
         if (!new_stack) {
             lisp_panic("failed to expand shadow stack");
         }
@@ -393,6 +395,21 @@ static void free_external_cell_data(unsigned x)
 {
     if (CELL_TYPE(x) == BT_BIGNUM) {
         free_bignum_cell(x);
+    } else if (CELL_TYPE(x) == BT_HASHTABLE) {
+        hash_table_data *ht = (hash_table_data *)CELL_PTR(x);
+        if (ht) {
+            for (unsigned i = 0; i < ht->capacity; i++) {
+                hash_entry *entry = ht->buckets[i];
+                while (entry) {
+                    hash_entry *next = entry->next;
+                    free(entry);
+                    entry = next;
+                }
+            }
+            free(ht->buckets);
+            free(ht);
+        }
+        CELL_PTR(x) = NULL;
     } else if (CELL_TYPE(x) == BT_VECTOR) {
         vector_data *vd = (vector_data *)CELL_PTR(x);
         if (vd)
@@ -411,11 +428,13 @@ static void free_external_cell_data(unsigned x)
         }
         CELL_PTR(x) = NULL;
     } else if (CELL_TYPE(x) == BT_INPORT || CELL_TYPE(x) == BT_OUTPORT) {
-        FILE *f = (FILE *)CELL_PTR(x);
-        if (f && f != stdin && f != stdout && f != ctx.current_input &&
-            f != ctx.current_output) {
-            reader_forget_port(f);
-            fclose(f);
+        file_port *port = (file_port *)CELL_PTR(x);
+        if (port) {
+            if (port->file && port->owns_file) {
+                reader_forget_port(port->file);
+                fclose(port->file);
+            }
+            free(port);
         }
         CELL_PTR(x) = NULL;
     } else if (CELL_TYPE(x) == BT_VMCONT) {
@@ -757,12 +776,12 @@ unsigned make_vector(unsigned len, unsigned fill)
     GC_GUARD;
     gc_protect(&fill);
 
-    if ((size_t)len > (SIZE_MAX - sizeof(vector_data)) / sizeof(unsigned)) {
+    if (!checked_flex_size(sizeof(vector_data), len, sizeof(unsigned), NULL)) {
         show_error("make-vector: length too large");
         return TOK_ERROR;
     }
     vector_data *vd =
-        malloc(sizeof(vector_data) + (size_t)len * sizeof(unsigned));
+        checked_malloc_flex(sizeof(vector_data), len, sizeof(unsigned));
     if (!vd) {
         show_error("make-vector: out of memory");
         return TOK_ERROR;
@@ -940,7 +959,7 @@ static void rehash_atom_table(void)
     }
     unsigned new_cap = next_prime(old_cap * 2);
 
-    const char **new_table = calloc(new_cap, sizeof(const char *));
+    const char **new_table = checked_calloc_array(new_cap, sizeof(const char *));
     if (!new_table) {
         // Can't resize - continue with current table
         fprintf(stderr, "Warning: failed to resize atom table\n");
@@ -1001,7 +1020,7 @@ int intern(const char *s)
     }
 
     if (!ctx.atom_table[hash_value]) {
-        ctx.atom_table[hash_value] = strdup(s);
+        ctx.atom_table[hash_value] = checked_string_copy(s);
         if (!ctx.atom_table[hash_value]) {
             lisp_panic("failed to allocate memory for atom");
         }
@@ -1277,6 +1296,134 @@ bool list_length_checked(unsigned lst, unsigned *len_out, const char *name)
     return true;
 }
 
+bool proper_list_silent(unsigned x)
+{
+    while (IS_PAIR(x))
+        x = cdr(x);
+    return x == 0;
+}
+
+bool let_binding_has_value(unsigned binding)
+{
+    return IS_PAIR(binding) && IS_PAIR(cdr(binding)) && !cddr(binding);
+}
+
+bool binding_list_binds_id(unsigned binding_list, int64_t id)
+{
+    for (unsigned bl = binding_list; IS_PAIR(bl); bl = cdr(bl)) {
+        unsigned binding = car(bl);
+        if (let_binding_has_value(binding) && IS_ATOM(car(binding)) &&
+            CELL_ID(car(binding)) == id)
+            return true;
+    }
+    return false;
+}
+
+bool lambda_params_bind_id(unsigned params, int64_t id)
+{
+    for (unsigned p = params; p; p = IS_PAIR(p) ? cdr(p) : 0) {
+        unsigned param = IS_PAIR(p) ? car(p) : p;
+        if (IS_ATOM(param) && CELL_ID(param) == id)
+            return true;
+        if (!IS_PAIR(p))
+            break;
+    }
+    return false;
+}
+
+bool atom_list_contains_id(unsigned list, int64_t id)
+{
+    for (; list; list = cdr(list)) {
+        if (IS_ATOM(car(list)) && CELL_ID(car(list)) == id)
+            return true;
+    }
+    return false;
+}
+
+bool syntax_is_ellipsis(unsigned x, int64_t ellipsis_id)
+{
+    if (!ellipsis_id)
+        return false;
+    return IS_ATOM(x) && CELL_ID(x) == ellipsis_id;
+}
+
+bool syntax_is_underscore(unsigned x)
+{
+    return IS_KEYWORD(x, ctx.kw_underscore);
+}
+
+bool is_eof_object(unsigned expr)
+{
+    return IS_ATOM(expr) &&
+           strcmp(ctx.atom_table[CELL_ID(expr)], "eof-object") == 0;
+}
+
+bool syntax_rules_form_like(unsigned expr)
+{
+    return IS_PAIR(expr) && IS_ATOM(car(expr)) &&
+           CELL_ID(car(expr)) == ctx.kw_syntax_rules &&
+           IS_PAIR(cdr(expr)) && IS_PAIR(cddr(expr));
+}
+
+bool assoc_list_has_atom_key_id(unsigned assoc_list, int64_t id)
+{
+    for (unsigned p = assoc_list; p; p = cdr(p)) {
+        unsigned entry = car(p);
+        if (IS_PAIR(entry) && IS_ATOM(car(entry)) && CELL_ID(car(entry)) == id)
+            return true;
+    }
+    return false;
+}
+
+bool feature_id_available(int64_t id)
+{
+    static const char *features[] = {
+        "vesper", "r5rs", "r7rs-small-subset", "srfi-1", "srfi-2",
+        "srfi-8", "srfi-9", "srfi-26", "srfi-27", "srfi-28",
+        "bytevectors", "exact-rationals", "complex", "full-unicode-absent",
+        NULL};
+
+    if (id < 0 || (unsigned)id >= ctx.atom_table_cap || !ctx.atom_table[id])
+        return false;
+    for (int i = 0; features[i]; i++) {
+        if (strcmp(ctx.atom_table[id], features[i]) == 0)
+            return true;
+    }
+    return false;
+}
+
+bool cond_expand_requirement_satisfied(unsigned requirement)
+{
+    if (!requirement)
+        return true;
+    if (IS_ATOM(requirement))
+        return feature_id_available(CELL_ID(requirement));
+    if (!IS_PAIR(requirement) || !IS_ATOM(car(requirement)))
+        return false;
+
+    int64_t op = CELL_ID(car(requirement));
+    unsigned args = cdr(requirement);
+    if (op == ctx.kw_and_feature) {
+        for (; args; args = cdr(args)) {
+            if (!cond_expand_requirement_satisfied(car(args)))
+                return false;
+        }
+        return true;
+    }
+    if (op == ctx.kw_or_feature) {
+        for (; args; args = cdr(args)) {
+            if (cond_expand_requirement_satisfied(car(args)))
+                return true;
+        }
+        return false;
+    }
+    if (op == ctx.kw_not_feature) {
+        return IS_PAIR(args) && !cdr(args) &&
+               !cond_expand_requirement_satisfied(car(args));
+    }
+    return false;
+}
+
 bool syntax_arity_checked(unsigned form, unsigned min_args, unsigned max_args,
                           const char *name)
 {
@@ -1451,6 +1598,160 @@ void list_append(unsigned *head, unsigned *tail, unsigned elem)
     }
 }
 
+void *checked_malloc_array(unsigned count, size_t elem_size)
+{
+    size_t size;
+    if (!checked_array_size(count, elem_size, &size))
+        return NULL;
+    return malloc(size);
+}
+
+void *checked_calloc_array(unsigned count, size_t elem_size)
+{
+    size_t size;
+    if (!checked_array_size(count, elem_size, &size))
+        return NULL;
+    return calloc(size, 1);
+}
+
+void *checked_realloc_array(void *ptr, unsigned count, size_t elem_size)
+{
+    size_t size;
+    if (!checked_array_size(count, elem_size, &size))
+        return NULL;
+    return realloc(ptr, size);
+}
+
+void *checked_malloc_size(size_t size)
+{
+    return malloc(size);
+}
+
+void *checked_realloc_size(void *ptr, size_t size)
+{
+    return realloc(ptr, size);
+}
+
+bool checked_flex_size(size_t base_size, size_t count, size_t elem_size,
+                       size_t *size_out)
+{
+    if (elem_size != 0 && count > (SIZE_MAX - base_size) / elem_size)
+        return false;
+    if (size_out)
+        *size_out = base_size + count * elem_size;
+    return true;
+}
+
+void *checked_malloc_flex(size_t base_size, size_t count, size_t elem_size)
+{
+    size_t size;
+    if (!checked_flex_size(base_size, count, elem_size, &size))
+        return NULL;
+    return malloc(size);
+}
+
+char *checked_string_copy_len(const char *s, size_t len)
+{
+    if (len == SIZE_MAX)
+        return NULL;
+    char *copy = malloc(len + 1);
+    if (!copy)
+        return NULL;
+    memcpy(copy, s, len);
+    copy[len] = '\0';
+    return copy;
+}
+
+char *checked_string_copy(const char *s)
+{
+    return checked_string_copy_len(s, strlen(s));
+}
+
+bool checked_array_size(unsigned count, size_t elem_size, size_t *size_out)
+{
+    if (elem_size != 0 && (size_t)count > SIZE_MAX / elem_size)
+        return false;
+    *size_out = (size_t)count * elem_size;
+    return true;
+}
+
+bool checked_add_size(size_t a, size_t b, size_t *out)
+{
+    if (a > SIZE_MAX - b)
+        return false;
+    *out = a + b;
+    return true;
+}
+
+unsigned checked_grow_capacity(unsigned cap, size_t elem_size,
+                               const char *error_msg)
+{
+    if (cap == 0)
+        return 1;
+    if (cap > UINT_MAX / 2) {
+        lisp_panic(error_msg);
+    }
+    unsigned new_cap = cap * 2;
+    if (elem_size != 0 && (size_t)new_cap > SIZE_MAX / elem_size) {
+        lisp_panic(error_msg);
+    }
+    return new_cap;
+}
+
+bool checked_grow_capacity_size(size_t cap, size_t elem_size,
+                                size_t *new_cap_out)
+{
+    if (cap == 0) {
+        *new_cap_out = 1;
+        return true;
+    }
+    if (cap > SIZE_MAX / 2)
+        return false;
+    size_t new_cap = cap * 2;
+    if (elem_size != 0 && new_cap > SIZE_MAX / elem_size)
+        return false;
+    *new_cap_out = new_cap;
+    return true;
+}
+
+static unsigned make_multival(unsigned values)
+{
+    GC_GUARD;
+    gc_protect(&values);
+    unsigned mv = alloc();
+    CELL_TYPE(mv) = BT_MULTIVAL;
+    CELL_CAR(mv) = values;
+    CELL_CDR(mv) = 0;
+    return mv;
+}
+
+unsigned values_from_list(unsigned args)
+{
+    if (args && !cdr(args))
+        return car(args);
+    return make_multival(args);
+}
+
+unsigned values_from_argv(unsigned argc, unsigned *argv)
+{
+    LISP_ASSERT_MSG(argc == 0 || argv != NULL, "values_from_argv: null argv");
+
+    if (argc == 1)
+        return argv[0];
+
+    GC_GUARD;
+    for (unsigned i = 0; i < argc; i++)
+        gc_protect(&argv[i]);
+
+    unsigned values = 0;
+    gc_protect(&values);
+    for (unsigned i = argc; i > 0; i--) {
+        values = alloc_cons(argv[i - 1], values);
+    }
+
+    return make_multival(values);
+}
+
 typedef struct {
     unsigned a;
     unsigned b;
@@ -1476,12 +1777,17 @@ static bool equal_seen_contains(equal_seen_set *seen, unsigned a, unsigned b)
 static bool equal_seen_add(equal_seen_set *seen, unsigned a, unsigned b)
 {
     if (seen->len == seen->cap) {
-        size_t new_cap = seen->cap ? seen->cap * 2 : 16;
-        if (new_cap < seen->cap ||
-            new_cap > SIZE_MAX / sizeof(*seen->items))
+        size_t new_cap;
+        if (seen->cap == 0) {
+            new_cap = 16;
+        } else if (!checked_grow_capacity_size(seen->cap,
+                                               sizeof(*seen->items),
+                                               &new_cap)) {
             return false;
+        }
         equal_seen_pair *new_items =
-            realloc(seen->items, new_cap * sizeof(*seen->items));
+            checked_realloc_size(seen->items,
+                                 new_cap * sizeof(*seen->items));
         if (!new_items)
             return false;
         seen->items = new_items;
@@ -1529,6 +1835,12 @@ static bool deep_equal_seen(unsigned a, unsigned b, equal_seen_set *seen)
                deep_equal_seen(cdr(a), cdr(b), seen);
     case BT_STRING:
         return strcmp(GET_STRING_PTR(a), GET_STRING_PTR(b)) == 0;
+    case BT_BYTEVEC: {
+        bytevec_data *ba = (bytevec_data *)CELL_PTR(a);
+        bytevec_data *bb = (bytevec_data *)CELL_PTR(b);
+        return ba->len == bb->len &&
+               memcmp(ba->data, bb->data, ba->len) == 0;
+    }
     case BT_CONS:
         if (equal_seen_contains(seen, a, b))
             return true;
@@ -1600,7 +1912,8 @@ unsigned collect(unsigned x)
         return 0;
 
     case BT_STRING:
-    case BT_BYTEVEC: {
+    case BT_BYTEVEC:
+    case BT_HASHTABLE: {
         // Pointer-based types: share the malloc'd data between old and new cells.
         // The old region is swept after collection, freeing unreachable data.
         unsigned xx = alloc();
@@ -1608,6 +1921,16 @@ unsigned collect(unsigned x)
         CELL_ID(xx) = CELL_ID(x);
         CELL_TYPE(x) = BT_BROKENHEART;
         CELL_CAR(x) = xx;
+        if (CELL_TYPE(xx) == BT_HASHTABLE) {
+            hash_table_data *ht = (hash_table_data *)CELL_PTR(xx);
+            for (unsigned i = 0; ht && i < ht->capacity; i++) {
+                for (hash_entry *entry = ht->buckets[i]; entry;
+                     entry = entry->next) {
+                    entry->key = collect(entry->key);
+                    entry->value = collect(entry->value);
+                }
+            }
+        }
         return xx;
     }
 
@@ -1645,6 +1968,16 @@ unsigned collect(unsigned x)
         // String port GC follows the same invariant as strings above.
         // The string_port struct and its data buffer are shared during
         // collection; only unreachable ports in the old region are freed.
+        unsigned xx = alloc();
+        CELL_TYPE(xx) = CELL_TYPE(x);
+        CELL_PTR(xx) = CELL_PTR(x);
+        CELL_TYPE(x) = BT_BROKENHEART;
+        CELL_CAR(x) = xx;
+        return xx;
+    }
+
+    case BT_INPORT:
+    case BT_OUTPORT: {
         unsigned xx = alloc();
         CELL_TYPE(xx) = CELL_TYPE(x);
         CELL_PTR(xx) = CELL_PTR(x);
@@ -1709,6 +2042,7 @@ unsigned gc(unsigned root)
     tramp.value = collect(tramp.value);
     ctx.current_input_cell = collect(ctx.current_input_cell);
     ctx.current_output_cell = collect(ctx.current_output_cell);
+    ctx.current_error_cell = collect(ctx.current_error_cell);
     reader_update_datum_labels(collect);
 
     // Collect shadow stack entries - these are pointers to local C variables
@@ -1857,7 +2191,8 @@ unsigned collect_to_old(unsigned x)
         return 0;
 
     case BT_STRING:
-    case BT_BYTEVEC: {
+    case BT_BYTEVEC:
+    case BT_HASHTABLE: {
         // Copy pointer-based cell to old gen (share malloc'd data)
         if (ctx.hptr >= ctx.nursery_start) {
             lisp_panic("old generation full during minor GC");
@@ -1867,6 +2202,16 @@ unsigned collect_to_old(unsigned x)
         CELL_ID(xx) = CELL_ID(x);
         CELL_TYPE(x) = BT_BROKENHEART;
         CELL_CAR(x) = xx;
+        if (CELL_TYPE(xx) == BT_HASHTABLE) {
+            hash_table_data *ht = (hash_table_data *)CELL_PTR(xx);
+            for (unsigned i = 0; ht && i < ht->capacity; i++) {
+                for (hash_entry *entry = ht->buckets[i]; entry;
+                     entry = entry->next) {
+                    entry->key = collect_to_old(entry->key);
+                    entry->value = collect_to_old(entry->value);
+                }
+            }
+        }
         return xx;
     }
 
@@ -1901,6 +2246,19 @@ unsigned collect_to_old(unsigned x)
 
     case BT_STRINPORT:
     case BT_STROUTPORT: {
+        if (ctx.hptr >= ctx.nursery_start) {
+            lisp_panic("old generation full during minor GC");
+        }
+        unsigned xx = ctx.hptr++;
+        CELL_TYPE(xx) = CELL_TYPE(x);
+        CELL_PTR(xx) = CELL_PTR(x);
+        CELL_TYPE(x) = BT_BROKENHEART;
+        CELL_CAR(x) = xx;
+        return xx;
+    }
+
+    case BT_INPORT:
+    case BT_OUTPORT: {
         if (ctx.hptr >= ctx.nursery_start) {
             lisp_panic("old generation full during minor GC");
         }
@@ -1955,6 +2313,7 @@ unsigned minor_gc(unsigned root)
     tramp.value = collect_to_old(tramp.value);
     ctx.current_input_cell = collect_to_old(ctx.current_input_cell);
     ctx.current_output_cell = collect_to_old(ctx.current_output_cell);
+    ctx.current_error_cell = collect_to_old(ctx.current_error_cell);
     reader_update_datum_labels(collect_to_old);
 
     // Collect shadow stack entries
@@ -2006,6 +2365,15 @@ unsigned minor_gc(unsigned root)
                     vector_data *vd = (vector_data *)CELL_PTR(cell);
                     for (unsigned j = 0; j < vd->len; j++) {
                         vd->data[j] = collect_to_old(vd->data[j]);
+                    }
+                } else if (t == BT_HASHTABLE) {
+                    hash_table_data *ht = (hash_table_data *)CELL_PTR(cell);
+                    for (unsigned j = 0; ht && j < ht->capacity; j++) {
+                        for (hash_entry *entry = ht->buckets[j]; entry;
+                             entry = entry->next) {
+                            entry->key = collect_to_old(entry->key);
+                            entry->value = collect_to_old(entry->value);
+                        }
                     }
                 } else if (t == BT_VMCONT) {
                     // VM continuation: update cell references inside struct
@@ -2076,6 +2444,10 @@ void init_keywords(void)
     // Initialize current ports
     ctx.current_input = stdin;
     ctx.current_output = stdout;
+    ctx.current_error = stderr;
+    ctx.current_input_cell = 0;
+    ctx.current_output_cell = 0;
+    ctx.current_error_cell = 0;
     ctx.transcript = NULL;
 
     // Initialize small integer cache (cells INT_CACHE_START to
@@ -2108,6 +2480,7 @@ void init_keywords(void)
     ctx.kw_and = intern("and");
     ctx.kw_or = intern("or");
     ctx.kw_cond = intern("cond");
+    ctx.kw_cond_expand = intern("cond-expand");
     ctx.kw_set = intern("set!");
     ctx.kw_define = intern("define");
     ctx.kw_if = intern("if");
@@ -2123,6 +2496,9 @@ void init_keywords(void)
     ctx.kw_ellipsis = intern("...");
     ctx.kw_underscore = intern("_");
     ctx.kw_else = intern("else");
+    ctx.kw_and_feature = intern("and");
+    ctx.kw_or_feature = intern("or");
+    ctx.kw_not_feature = intern("not");
     ctx.kw_arrow = intern("=>");
     ctx.kw_let_syntax = intern("let-syntax");
     ctx.kw_letrec_syntax = intern("letrec-syntax");

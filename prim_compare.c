@@ -74,6 +74,35 @@ static unsigned complex_numeq(unsigned a, unsigned b)
     return imag_eq;
 }
 
+static bool compare_number_pair(unsigned prev, unsigned curr, cmp_op op,
+                                const char *name, bool *ok_out)
+{
+    if (IS_COMPLEX(prev) || IS_COMPLEX(curr)) {
+        if (op != CMP_EQ) {
+            show_error("%s: expected real numbers", name);
+            return false;
+        }
+        unsigned eq = complex_numeq(prev, curr);
+        if (eq == TOK_ERROR)
+            return false;
+        *ok_out = eq == ctx.atom_true;
+        return true;
+    }
+
+    if (is_exact_real_number(prev) && is_exact_real_number(curr)) {
+        int cmp;
+        if (!compare_exact_reals(prev, curr, &cmp))
+            return false;
+        *ok_out = APPLY_CMP_OP(op, cmp, 0);
+        return true;
+    }
+
+    double f = to_double(prev);
+    double v = to_double(curr);
+    *ok_out = APPLY_CMP_OP(op, f, v);
+    return true;
+}
+
 unsigned numeric_compare(unsigned argc, unsigned *argv, cmp_op op)
 {
     if (argc == 0)
@@ -85,16 +114,16 @@ unsigned numeric_compare(unsigned argc, unsigned *argv, cmp_op op)
         return TOK_ERROR;
 
     unsigned first = argv[0];
-    if (IS_NUM(first)) {
-        int64_t prev = CELL_ID(first);
+    int64_t prev_int;
+    if (exact_int64_value(first, &prev_int)) {
         for (unsigned i = 1; i < argc; i++) {
             unsigned c = argv[i];
-            if (!IS_NUM(c))
+            int64_t curr;
+            if (!exact_int64_value(c, &curr))
                 goto slow_path;
-            int64_t curr = CELL_ID(c);
-            if (!APPLY_CMP_OP(op, prev, curr))
+            if (!APPLY_CMP_OP(op, prev_int, curr))
                 return ctx.atom_false;
-            prev = curr;
+            prev_int = curr;
         }
         return ctx.atom_true;
     }
@@ -104,26 +133,8 @@ slow_path:;
     for (unsigned i = 1; i < argc; i++) {
         unsigned curr = argv[i];
         bool ok;
-
-        if (IS_COMPLEX(prev) || IS_COMPLEX(curr)) {
-            if (op != CMP_EQ) {
-                show_error("%s: expected real numbers", name);
-                return TOK_ERROR;
-            }
-            unsigned eq = complex_numeq(prev, curr);
-            if (eq == TOK_ERROR)
-                return TOK_ERROR;
-            ok = eq == ctx.atom_true;
-        } else if (is_exact_real_number(prev) && is_exact_real_number(curr)) {
-            int cmp;
-            if (!compare_exact_reals(prev, curr, &cmp))
-                return TOK_ERROR;
-            ok = APPLY_CMP_OP(op, cmp, 0);
-        } else {
-            double f = to_double(prev);
-            double v = to_double(curr);
-            ok = APPLY_CMP_OP(op, f, v);
-        }
+        if (!compare_number_pair(prev, curr, op, name, &ok))
+            return TOK_ERROR;
         if (!ok)
             return ctx.atom_false;
         prev = curr;
@@ -135,25 +146,25 @@ unsigned char_compare(unsigned argc, unsigned *argv, cmp_op op,
                       bool case_insensitive)
 {
     REQUIRE_ARGC(argc, 2, 2, "char comparison");
-    CHECK_CHAR(argv[0], "char comparison");
-    CHECK_CHAR(argv[1], "char comparison");
-    int c1 = (unsigned char)CELL_ID(argv[0]);
-    int c2 = (unsigned char)CELL_ID(argv[1]);
+    int c1, c2;
+    if (!expect_char_value(argv[0], &c1, "char comparison") ||
+        !expect_char_value(argv[1], &c2, "char comparison"))
+        return TOK_ERROR;
     if (case_insensitive) {
         c1 = tolower(c1);
         c2 = tolower(c2);
     }
-    return APPLY_CMP_OP(op, c1, c2) ? ctx.atom_true : ctx.atom_false;
+    return scheme_bool(APPLY_CMP_OP(op, c1, c2));
 }
 
 unsigned string_compare(unsigned argc, unsigned *argv, cmp_op op,
                         bool case_insensitive)
 {
     REQUIRE_ARGC(argc, 2, 2, "string comparison");
-    CHECK_STRING(argv[0], "string comparison");
-    CHECK_STRING(argv[1], "string comparison");
-    char *s1 = GET_STRING_PTR(argv[0]);
-    char *s2 = GET_STRING_PTR(argv[1]);
+    char *s1 = require_string_ptr(argv[0], "string comparison");
+    char *s2 = require_string_ptr(argv[1], "string comparison");
+    if (!s1 || !s2)
+        return TOK_ERROR;
     int cmp = case_insensitive ? strcasecmp(s1, s2) : strcmp(s1, s2);
-    return APPLY_CMP_OP(op, cmp, 0) ? ctx.atom_true : ctx.atom_false;
+    return scheme_bool(APPLY_CMP_OP(op, cmp, 0));
 }

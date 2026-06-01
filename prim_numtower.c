@@ -5,22 +5,6 @@
 
 #include "prim_internal.h"
 
-static bool require_number(unsigned x, const char *name)
-{
-    if (is_numeric(x))
-        return true;
-    show_error("%s: not a number", name);
-    return false;
-}
-
-static bool require_real(unsigned x, const char *name)
-{
-    if (is_numeric(x) && !IS_COMPLEX(x))
-        return true;
-    show_error("%s: not a real number", name);
-    return false;
-}
-
 /**
  * Convert an inexact real number to an exact rational.
  * Uses IEEE754 representation: value = mantissa * 2^exponent
@@ -119,63 +103,172 @@ static unsigned prim_inexact_to_exact(unsigned x)
     }
 }
 
+static unsigned rational_component(unsigned x, bool numerator, const char *name)
+{
+    if (IS_FIXNUM(x))
+        return numerator ? x : store(1);
+    if (!IS_CELL(x)) {
+        show_error("%s: not a rational", name);
+        return TOK_ERROR;
+    }
+
+    switch (CELL_TYPE(x)) {
+    case BT_NUM:
+    case BT_BIGNUM:
+        return numerator ? x : store(1);
+    case BT_RATIONAL:
+        return numerator ? CELL_CAR(x) : CELL_CDR(x);
+    case BT_INEXACT: {
+        double d = to_double(x);
+        if (floor(d) == d)
+            return numerator ? store_inexact(d) : store_inexact(1.0);
+        show_error("%s: inexact non-integer", name);
+        return TOK_ERROR;
+    }
+    default:
+        show_error("%s: not a rational", name);
+        return TOK_ERROR;
+    }
+}
+
+typedef enum {
+    REAL_TEST_FINITE,
+    REAL_TEST_INFINITE,
+    REAL_TEST_NAN,
+} real_test;
+
+typedef struct {
+    unsigned id;
+    real_test test;
+    const char *name;
+} real_test_entry;
+
+static const real_test_entry real_tests[] = {
+    {PFINITE, REAL_TEST_FINITE, "finite?"},
+    {PINFINITE, REAL_TEST_INFINITE, "infinite?"},
+    {PNAN, REAL_TEST_NAN, "nan?"},
+    {0, REAL_TEST_FINITE, NULL},
+};
+
+static const real_test_entry *find_real_test(unsigned prim_id)
+{
+    for (const real_test_entry *entry = real_tests; entry->name; entry++) {
+        if (entry->id == prim_id)
+            return entry;
+    }
+    return NULL;
+}
+
+static unsigned numeric_real_test(unsigned x, real_test test)
+{
+    if (!is_numeric(x))
+        return ctx.atom_false;
+
+    if (IS_INEXACT(x)) {
+        double d = to_double(x);
+        bool result = false;
+        switch (test) {
+        case REAL_TEST_FINITE:
+            result = isfinite(d);
+            break;
+        case REAL_TEST_INFINITE:
+            result = isinf(d);
+            break;
+        case REAL_TEST_NAN:
+            result = isnan(d);
+            break;
+        }
+        return scheme_bool(result);
+    }
+
+    if (IS_COMPLEX(x)) {
+        double real = to_double(CELL_CAR(x));
+        double imag = to_double(CELL_CDR(x));
+        bool result = false;
+        switch (test) {
+        case REAL_TEST_FINITE:
+            result = isfinite(real) && isfinite(imag);
+            break;
+        case REAL_TEST_INFINITE:
+            result = isinf(real) || isinf(imag);
+            break;
+        case REAL_TEST_NAN:
+            result = isnan(real) || isnan(imag);
+            break;
+        }
+        return scheme_bool(result);
+    }
+
+    return scheme_bool(test == REAL_TEST_FINITE);
+}
+
+static unsigned complex_part(unsigned x, bool real_part, const char *name)
+{
+    if (!require_number(x, name))
+        return TOK_ERROR;
+    if (IS_COMPLEX(x))
+        return real_part ? CELL_CAR(x) : CELL_CDR(x);
+    return real_part ? x : store(0);
+}
+
+static unsigned magnitude_value(unsigned x, const char *name)
+{
+    if (!require_number(x, name))
+        return TOK_ERROR;
+    if (IS_FIXNUM(x)) {
+        int32_t n = FIXNUM_VALUE(x);
+        return n < 0 ? store(-(int64_t)n) : store(n);
+    }
+    if (IS_COMPLEX(x)) {
+        double real = to_double(CELL_CAR(x));
+        double imag = to_double(CELL_CDR(x));
+        return store_inexact(sqrt(real * real + imag * imag));
+    }
+    if (IS_NUM(x))
+        return CELL_ID(x) < 0 ? negate_number(x) : x;
+    if (IS_BIGNUM(x)) {
+        bignum *bn = get_bignum(x);
+        if (bn->sign) {
+            bignum *abs_bn = bn_neg(bn);
+            if (!abs_bn) {
+                show_error("%s: out of memory", name);
+                return TOK_ERROR;
+            }
+            return store_integer(abs_bn);
+        }
+        return x;
+    }
+    if (IS_RATIONAL(x)) {
+        unsigned num = CELL_CAR(x);
+        if (!is_negative_number(num))
+            return x;
+        GC_GUARD;
+        gc_protect(&x);
+        unsigned abs_num = negate_number(num);
+        gc_protect(&abs_num);
+        unsigned denom = CELL_CDR(x);
+        return normalize_rational_cells(abs_num, denom);
+    }
+    return store_inexact(fabs(to_double(x)));
+}
+
 unsigned apply_numtower_primitive(unsigned prim_id, unsigned argc,
                                   unsigned *argv)
 {
+    const real_test_entry *real_test = find_real_test(prim_id);
+    if (real_test) {
+        REQUIRE_ARGC(argc, 1, 1, real_test->name);
+        return numeric_real_test(argv[0], real_test->test);
+    }
+
     switch (prim_id) {
     case PNUMERATOR: {
         REQUIRE_ARGC(argc, 1, 1, "numerator");
-        unsigned x = argv[0];
-        if (IS_FIXNUM(x))
-            return x;
-        if (!IS_CELL(x)) {
-            show_error("numerator: not a rational");
-            return TOK_ERROR;
-        }
-        switch (CELL_TYPE(x)) {
-        case BT_NUM:
-        case BT_BIGNUM:
-            return x; // Integer is its own numerator
-        case BT_RATIONAL:
-            return CELL_CAR(x);
-        case BT_INEXACT: {
-            double d = to_double(x);
-            if (floor(d) == d)
-                return store_inexact(d);
-            show_error("numerator: inexact non-integer");
-            return TOK_ERROR;
-        }
-        default:
-            show_error("numerator: not a rational");
-            return TOK_ERROR;
-        }
+        return rational_component(argv[0], true, "numerator");
     }
     case PDENOMINATOR: {
         REQUIRE_ARGC(argc, 1, 1, "denominator");
-        unsigned x = argv[0];
-        if (IS_FIXNUM(x))
-            return store(1);
-        if (!IS_CELL(x)) {
-            show_error("denominator: not a rational");
-            return TOK_ERROR;
-        }
-        switch (CELL_TYPE(x)) {
-        case BT_NUM:
-        case BT_BIGNUM:
-            return store(1); // Integer has denominator 1
-        case BT_RATIONAL:
-            return CELL_CDR(x);
-        case BT_INEXACT: {
-            double d = to_double(x);
-            if (floor(d) == d)
-                return store_inexact(1.0);
-            show_error("denominator: inexact non-integer");
-            return TOK_ERROR;
-        }
-        default:
-            show_error("denominator: not a rational");
-            return TOK_ERROR;
-        }
+        return rational_component(argv[0], false, "denominator");
     }
     case PMAKERECT: {
         REQUIRE_ARGC(argc, 2, 2, "make-rectangular");
@@ -204,65 +297,15 @@ unsigned apply_numtower_primitive(unsigned prim_id, unsigned argc,
     }
     case PREALPART: {
         REQUIRE_ARGC(argc, 1, 1, "real-part");
-        unsigned x = argv[0];
-        if (!require_number(x, "real-part"))
-            return TOK_ERROR;
-        if (IS_COMPLEX(x)) {
-            return CELL_CAR(x);
-        }
-        return x; // Real numbers are their own real part
+        return complex_part(argv[0], true, "real-part");
     }
     case PIMAGPART: {
         REQUIRE_ARGC(argc, 1, 1, "imag-part");
-        unsigned x = argv[0];
-        if (!require_number(x, "imag-part"))
-            return TOK_ERROR;
-        if (IS_COMPLEX(x)) {
-            return CELL_CDR(x);
-        }
-        return store(0); // Real numbers have 0 imaginary part
+        return complex_part(argv[0], false, "imag-part");
     }
     case PMAGNITUDE: {
         REQUIRE_ARGC(argc, 1, 1, "magnitude");
-        unsigned x = argv[0];
-        if (!require_number(x, "magnitude"))
-            return TOK_ERROR;
-        if (IS_FIXNUM(x)) {
-            int32_t n = FIXNUM_VALUE(x);
-            return n < 0 ? store(-(int64_t)n) : store(n);
-        }
-        if (IS_COMPLEX(x)) {
-            double real = to_double(CELL_CAR(x));
-            double imag = to_double(CELL_CDR(x));
-            return store_inexact(sqrt(real * real + imag * imag));
-        }
-        // For real numbers, magnitude is abs
-        if (IS_NUM(x))
-            return CELL_ID(x) < 0 ? negate_number(x) : x;
-        if (IS_BIGNUM(x)) {
-            bignum *bn = get_bignum(x);
-            if (bn->sign) {
-                bignum *abs_bn = bn_neg(bn);
-                if (!abs_bn) {
-                    show_error("magnitude: out of memory");
-                    return TOK_ERROR;
-                }
-                return store_integer(abs_bn);
-            }
-            return x;
-        }
-        if (IS_RATIONAL(x)) {
-            unsigned num = CELL_CAR(x);
-            if (!is_negative_number(num))
-                return x;
-            GC_GUARD;
-            gc_protect(&x);
-            unsigned abs_num = negate_number(num);
-            gc_protect(&abs_num);
-            unsigned denom = CELL_CDR(x);
-            return normalize_rational_cells(abs_num, denom);
-        }
-        return store_inexact(fabs(to_double(x)));
+        return magnitude_value(argv[0], "magnitude");
     }
     case PANGLE: {
         REQUIRE_ARGC(argc, 1, 1, "angle");
@@ -369,60 +412,6 @@ unsigned apply_numtower_primitive(unsigned prim_id, unsigned argc,
         if (negative)
             mid_n = -mid_n;
         return normalize_rational(mid_n, mid_d);
-    }
-    case PFINITE: {
-        REQUIRE_ARGC(argc, 1, 1, "finite?");
-        unsigned x = argv[0];
-        if (!is_numeric(x))
-            return ctx.atom_false;
-        if (IS_INEXACT(x)) {
-            double d = to_double(x);
-            return isfinite(d) ? ctx.atom_true : ctx.atom_false;
-        }
-        if (IS_COMPLEX(x)) {
-            double real = to_double(CELL_CAR(x));
-            double imag = to_double(CELL_CDR(x));
-            return (isfinite(real) && isfinite(imag)) ? ctx.atom_true
-                                                      : ctx.atom_false;
-        }
-        // All exact numbers are finite
-        return ctx.atom_true;
-    }
-    case PINFINITE: {
-        REQUIRE_ARGC(argc, 1, 1, "infinite?");
-        unsigned x = argv[0];
-        if (!is_numeric(x))
-            return ctx.atom_false;
-        if (IS_INEXACT(x)) {
-            double d = to_double(x);
-            return isinf(d) ? ctx.atom_true : ctx.atom_false;
-        }
-        if (IS_COMPLEX(x)) {
-            double real = to_double(CELL_CAR(x));
-            double imag = to_double(CELL_CDR(x));
-            return (isinf(real) || isinf(imag)) ? ctx.atom_true
-                                                : ctx.atom_false;
-        }
-        // Exact numbers are never infinite
-        return ctx.atom_false;
-    }
-    case PNAN: {
-        REQUIRE_ARGC(argc, 1, 1, "nan?");
-        unsigned x = argv[0];
-        if (!is_numeric(x))
-            return ctx.atom_false;
-        if (IS_INEXACT(x)) {
-            double d = to_double(x);
-            return isnan(d) ? ctx.atom_true : ctx.atom_false;
-        }
-        if (IS_COMPLEX(x)) {
-            double real = to_double(CELL_CAR(x));
-            double imag = to_double(CELL_CDR(x));
-            return (isnan(real) || isnan(imag)) ? ctx.atom_true
-                                                : ctx.atom_false;
-        }
-        // Exact numbers are never NaN
-        return ctx.atom_false;
     }
     default:
         return TOK_ERROR;

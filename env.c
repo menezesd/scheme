@@ -597,9 +597,20 @@ static const struct {
     {"list-ref", PLISTREF},
     // Binary I/O
     {"open-binary-input-file", POPENBINARYINPUT},
+    {"open-binary-output-file", POPENBINARYOUTPUT},
     {"read-bytevector", PREADBYTEVEC},
+    {"read-bytevector!", PREADBYTEVECINTO},
+    {"write-bytevector", PWRITEBYTEVEC},
+    {"read-string", PREADSTRING},
+    {"write-string", PWRITESTRING},
+    {"u8-ready?", PU8READY},
     // File system
     {"file-exists?", PFILEEXISTS},
+    {"delete-file", PDELETEFILE},
+    {"rename-file", PRENAMEFILE},
+    {"current-directory", PCURRENTDIRECTORY},
+    {"directory-files", PDIRECTORYFILES},
+    {"get-environment-variable", PGETENV},
 
     // Control
     {"apply", PAPPLY},
@@ -656,9 +667,41 @@ static const struct {
     // Internal port setters
     {"set-current-input-port!", PSETCURRENTINPUT},
     {"set-current-output-port!", PSETCURRENTOUTPUT},
+    {"set-current-error-port!", PSETCURRENTERROR},
+    {"current-error-port", PCURRENTERROR},
     {"flush-output-port", PFLUSHOUTPUT},
     {"flush-output", PFLUSHOUTPUT},
     {"current-second", PCURRENTSECOND},
+    {"current-jiffy", PCURRENTJIFFY},
+    {"jiffies-per-second", PJIFFIESPERSECOND},
+    {"get-environment-variables", PGETENVS},
+    {"emergency-exit", PEMERGENCYEXIT},
+    {"features", PFEATURES},
+
+    // Hash tables
+    {"make-hash-table", PMAKEHASHTABLE},
+    {"make-strong-eq-hash-table", PMAKESTRONGEQHASHTABLE},
+    {"make-eq-hash-table", PMAKEEQHASHTABLE},
+    {"make-strong-eqv-hash-table", PMAKESTRONGEQVHASHTABLE},
+    {"make-eqv-hash-table", PMAKEEQVHASHTABLE},
+    {"make-equal-hash-table", PMAKEEQUALHASHTABLE},
+    {"hash-table?", PHASHTABLEP},
+    {"hash-table-ref", PHASHTABLEREF},
+    {"hash-table-set!", PHASHTABLESET},
+    {"hash-table-delete!", PHASHTABLEDELETE},
+    {"hash-table-exists?", PHASHTABLEEXISTS},
+    {"hash-table-size", PHASHTABLESIZE},
+    {"hash-table-clear!", PHASHTABLECLEAR},
+    {"hash-table-keys", PHASHTABLEKEYS},
+    {"hash-table-values", PHASHTABLEVALUES},
+    {"hash-table->alist", PHASHTABLEALIST},
+
+    // R7RS-ish port predicates
+    {"port-open?", PPORTOPENP},
+    {"input-port-open?", PINPUTPORTOPENP},
+    {"output-port-open?", POUTPUTPORTOPENP},
+    {"textual-port?", PTEXTUALPORTP},
+    {"binary-port?", PBINARYPORTP},
 
     {NULL, 0}};
 

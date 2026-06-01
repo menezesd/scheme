@@ -21,6 +21,7 @@ compiler, semispace garbage collector, hygienic macros, and full numeric tower.
 make          # Build the interpreter
 make debug    # Build with debug symbols and sanitizers
 make test     # Run Scheme test suite
+make test-interpreter # Run Scheme test suite with CPS interpreter
 make test-c   # Run C unit tests
 make test-all # Run all tests
 make clean    # Remove build artifacts

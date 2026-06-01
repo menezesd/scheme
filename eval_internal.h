@@ -676,6 +676,7 @@ bool handle_define(unsigned id, unsigned env, unsigned cont);
 bool handle_and(unsigned id, unsigned env, unsigned cont);
 bool handle_or(unsigned id, unsigned env, unsigned cont);
 bool handle_cond(unsigned id, unsigned env, unsigned cont);
+bool handle_cond_expand(unsigned id, unsigned env, unsigned cont);
 bool handle_let(unsigned id, unsigned env, unsigned cont);
 bool handle_letstar(unsigned id, unsigned env, unsigned cont);
 bool handle_letrec(unsigned id, unsigned env, unsigned cont);

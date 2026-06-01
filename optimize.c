@@ -18,28 +18,35 @@
 #include <stdlib.h>
 #include <string.h>
 
-static void *malloc_array(unsigned count, size_t elem_size)
-{
-    if (elem_size != 0 && (size_t)count > SIZE_MAX / elem_size)
-        return NULL;
-    return malloc((size_t)count * elem_size);
-}
-
-static void *calloc_array(unsigned count, size_t elem_size)
-{
-    if (elem_size != 0 && (size_t)count > SIZE_MAX / elem_size)
-        return NULL;
-    return calloc(count, elem_size);
-}
-
 static void *calloc_array_plus_one(unsigned count, size_t elem_size)
 {
     if (count == UINT_MAX)
         return NULL;
     unsigned count_plus_one = count + 1;
-    if (elem_size != 0 && (size_t)count_plus_one > SIZE_MAX / elem_size)
-        return NULL;
-    return calloc(count_plus_one, elem_size);
+    return checked_calloc_array(count_plus_one, elem_size);
+}
+
+static bool is_jump_opcode(unsigned op)
+{
+    switch (op) {
+    case OP_JUMP:
+    case OP_JUMPIF:
+    case OP_JUMPIFNOT:
+    case OP_JUMPIFNULL:
+    case OP_JUMPIFNOTNULL:
+    case OP_JUMPIFZERO:
+    case OP_JUMPIFNOTZERO:
+    case OP_NUMEQ_JUMPIFNOT:
+    case OP_LT_JUMPIFNOT:
+    case OP_GT_JUMPIFNOT:
+    case OP_LE_JUMPIFNOT:
+    case OP_GE_JUMPIFNOT:
+    case OP_NUMEQ_INT_JUMPIFNOT:
+    case OP_LT_INT_JUMPIFNOT:
+        return true;
+    default:
+        return false;
+    }
 }
 
 // ============================================================================
@@ -92,6 +99,34 @@ unsigned instruction_size(unsigned op)
     }
 }
 
+static void mark_jump_targets(const unsigned *code, unsigned len,
+                              bool *is_jump_target)
+{
+    for (unsigned i = 0; i < len;) {
+        unsigned op = code[i];
+        unsigned size = instruction_size(op);
+        if (is_jump_opcode(op)) {
+            unsigned target = code[i + 1];
+            if (target <= len)
+                is_jump_target[target] = true;
+        }
+        i += size;
+    }
+}
+
+static void mark_dead_until_target(const unsigned *code, unsigned len,
+                                   const bool *is_jump_target, bool *remove,
+                                   unsigned start)
+{
+    for (unsigned i = start; i < len && !is_jump_target[i];) {
+        unsigned size = instruction_size(code[i]);
+        for (unsigned j = 0; j < size && i + j < len; j++) {
+            remove[i + j] = true;
+        }
+        i += size;
+    }
+}
+
 // ============================================================================
 // Common Subexpression Elimination (CSE)
 // ============================================================================
@@ -134,7 +169,7 @@ static void cse_pass(code_object *code)
     unsigned len = code->code_len;
 
     // Allocate new code buffer (max same size as original)
-    unsigned *new_code = malloc_array(len, sizeof(unsigned));
+    unsigned *new_code = checked_malloc_array(len, sizeof(unsigned));
     if (!new_code)
         return;
 
@@ -144,22 +179,7 @@ static void cse_pass(code_object *code)
         free(new_code);
         return;
     }
-    for (unsigned i = 0; i < len;) {
-        unsigned op = c[i];
-        unsigned size = instruction_size(op);
-        if (op == OP_JUMP || op == OP_JUMPIF || op == OP_JUMPIFNOT ||
-            op == OP_JUMPIFNULL || op == OP_JUMPIFNOTNULL ||
-            op == OP_JUMPIFZERO || op == OP_JUMPIFNOTZERO ||
-                op == OP_NUMEQ_JUMPIFNOT || op == OP_LT_JUMPIFNOT ||
-                op == OP_GT_JUMPIFNOT || op == OP_LE_JUMPIFNOT ||
-                op == OP_GE_JUMPIFNOT ||
-                op == OP_NUMEQ_INT_JUMPIFNOT || op == OP_LT_INT_JUMPIFNOT) {
-            unsigned target = c[i + 1];
-            if (target <= len)
-                is_jump_target[target] = true;
-        }
-        i += size;
-    }
+    mark_jump_targets(c, len, is_jump_target);
 
     // Build offset map as we go (old position -> new position)
     unsigned *offset_map = calloc_array_plus_one(len, sizeof(unsigned));
@@ -299,13 +319,7 @@ static void cse_pass(code_object *code)
             unsigned op = new_code[j];
             unsigned size = instruction_size(op);
 
-            if (op == OP_JUMP || op == OP_JUMPIF || op == OP_JUMPIFNOT ||
-                op == OP_JUMPIFNULL || op == OP_JUMPIFNOTNULL ||
-                op == OP_JUMPIFZERO || op == OP_JUMPIFNOTZERO ||
-                op == OP_NUMEQ_JUMPIFNOT || op == OP_LT_JUMPIFNOT ||
-                op == OP_GT_JUMPIFNOT || op == OP_LE_JUMPIFNOT ||
-                op == OP_GE_JUMPIFNOT ||
-                op == OP_NUMEQ_INT_JUMPIFNOT || op == OP_LT_INT_JUMPIFNOT) {
+            if (is_jump_opcode(op)) {
                 unsigned old_target = new_code[j + 1];
                 // Find the new target using offset map
                 // Search for the closest mapped position
@@ -348,32 +362,17 @@ void peephole_optimize(code_object *code)
     bool *is_jump_target = calloc_array_plus_one(len, sizeof(bool));
     if (!is_jump_target)
         return;
-    for (unsigned i = 0; i < len;) {
-        unsigned op = c[i];
-        unsigned size = instruction_size(op);
-        if (op == OP_JUMP || op == OP_JUMPIF || op == OP_JUMPIFNOT ||
-            op == OP_JUMPIFNULL || op == OP_JUMPIFNOTNULL ||
-            op == OP_JUMPIFZERO || op == OP_JUMPIFNOTZERO ||
-                op == OP_NUMEQ_JUMPIFNOT || op == OP_LT_JUMPIFNOT ||
-                op == OP_GT_JUMPIFNOT || op == OP_LE_JUMPIFNOT ||
-                op == OP_GE_JUMPIFNOT ||
-                op == OP_NUMEQ_INT_JUMPIFNOT || op == OP_LT_INT_JUMPIFNOT) {
-            unsigned target = c[i + 1];
-            if (target <= len)
-                is_jump_target[target] = true;
-        }
-        i += size;
-    }
+    mark_jump_targets(c, len, is_jump_target);
 
     // First pass: identify which bytes to remove and build offset map
     // offset_map[old] = new offset after compaction
-    unsigned *offset_map = malloc_array(len, sizeof(unsigned));
+    unsigned *offset_map = checked_malloc_array(len, sizeof(unsigned));
     if (!offset_map) {
         free(is_jump_target);
         return;
     }
 
-    bool *remove = calloc_array(len, sizeof(bool));
+    bool *remove = checked_calloc_array(len, sizeof(bool));
     if (!remove) {
         free(offset_map);
         free(is_jump_target);
@@ -398,30 +397,14 @@ void peephole_optimize(code_object *code)
         // Pattern: RETURN/HALT followed by non-jump-target code -> remove dead code
         if ((op == OP_RETURN || op == OP_HALT) && i + 1 < len) {
             // Mark all instructions after RETURN/HALT until we hit a jump target
-            unsigned j = i + size;
-            while (j < len && !is_jump_target[j]) {
-                unsigned dead_op = c[j];
-                unsigned dead_size = instruction_size(dead_op);
-                for (unsigned k = 0; k < dead_size && j + k < len; k++) {
-                    remove[j + k] = true;
-                }
-                j += dead_size;
-            }
+            mark_dead_until_target(c, len, is_jump_target, remove, i + size);
             i += size;
             continue;
         }
 
         // Pattern: unconditional JUMP followed by non-jump-target code -> remove dead code
         if (op == OP_JUMP && i + 2 < len && !is_jump_target[i + 2]) {
-            unsigned j = i + 2; // Skip JUMP and its operand
-            while (j < len && !is_jump_target[j]) {
-                unsigned dead_op = c[j];
-                unsigned dead_size = instruction_size(dead_op);
-                for (unsigned k = 0; k < dead_size && j + k < len; k++) {
-                    remove[j + k] = true;
-                }
-                j += dead_size;
-            }
+            mark_dead_until_target(c, len, is_jump_target, remove, i + 2);
             // Don't skip - continue to check other patterns for JUMP
         }
 
@@ -670,13 +653,7 @@ void peephole_optimize(code_object *code)
         unsigned size = instruction_size(op);
 
         // Thread any jump instruction
-        if (op == OP_JUMP || op == OP_JUMPIF || op == OP_JUMPIFNOT ||
-            op == OP_JUMPIFNULL || op == OP_JUMPIFNOTNULL ||
-            op == OP_JUMPIFZERO || op == OP_JUMPIFNOTZERO ||
-                op == OP_NUMEQ_JUMPIFNOT || op == OP_LT_JUMPIFNOT ||
-                op == OP_GT_JUMPIFNOT || op == OP_LE_JUMPIFNOT ||
-                op == OP_GE_JUMPIFNOT ||
-                op == OP_NUMEQ_INT_JUMPIFNOT || op == OP_LT_INT_JUMPIFNOT) {
+        if (is_jump_opcode(op)) {
 
             unsigned target = c[i + 1];
             unsigned visited_count = 0;
@@ -722,13 +699,7 @@ void peephole_optimize(code_object *code)
         c[write++] = op;
 
         // Handle operands, fixing jump targets
-        if (op == OP_JUMP || op == OP_JUMPIF || op == OP_JUMPIFNOT ||
-            op == OP_JUMPIFNULL || op == OP_JUMPIFNOTNULL ||
-            op == OP_JUMPIFZERO || op == OP_JUMPIFNOTZERO ||
-                op == OP_NUMEQ_JUMPIFNOT || op == OP_LT_JUMPIFNOT ||
-                op == OP_GT_JUMPIFNOT || op == OP_LE_JUMPIFNOT ||
-                op == OP_GE_JUMPIFNOT ||
-                op == OP_NUMEQ_INT_JUMPIFNOT || op == OP_LT_INT_JUMPIFNOT) {
+        if (is_jump_opcode(op)) {
             unsigned old_target = c[read + 1];
             unsigned new_target =
                 (old_target < len) ? offset_map[old_target] : final_len;

@@ -29,130 +29,278 @@
 #include <errno.h>
 #include <poll.h>
 
+static unsigned write_arg_to_string_port(unsigned arg, string_port *sport,
+                                         const char *name, bool display)
+{
+    char *buf = NULL;
+    size_t buflen = 0;
+    FILE *memfp = open_memstream(&buf, &buflen);
+    if (!memfp) {
+        show_error("%s: out of memory", name);
+        return TOK_ERROR;
+    }
+
+    if (display && IS_STRING(arg)) {
+        fprintf(memfp, "%s", GET_STRING_PTR(arg));
+    } else if (display) {
+        display_obj_port(arg, memfp);
+    } else {
+        write_obj_port(arg, memfp);
+    }
+
+    if (fclose(memfp) != 0) {
+        free(buf);
+        show_error("%s: write failed", name);
+        return TOK_ERROR;
+    }
+    if (!strport_puts(sport, buf)) {
+        free(buf);
+        show_error("%s: string port write failed", name);
+        return TOK_ERROR;
+    }
+    free(buf);
+    return arg;
+}
+
+static bool write_arg_to_file_port(unsigned arg, FILE *fport, const char *name,
+                                   bool display)
+{
+    if (display && IS_STRING(arg)) {
+        fprintf(fport, "%s", GET_STRING_PTR(arg));
+        if (ctx.transcript && fport == ctx.current_output)
+            fprintf(ctx.transcript, "%s", GET_STRING_PTR(arg));
+    } else if (display) {
+        display_obj_port(arg, fport);
+        if (ctx.transcript && fport == ctx.current_output)
+            display_obj_port(arg, ctx.transcript);
+    } else {
+        write_obj_port(arg, fport);
+        if (ctx.transcript && fport == ctx.current_output)
+            write_obj_port(arg, ctx.transcript);
+    }
+
+    return flush_file_port(fport, name);
+}
+
+static bool write_newline_to_file_port(FILE *fport)
+{
+    fprintf(fport, "\n");
+    if (ctx.transcript && fport == ctx.current_output)
+        fprintf(ctx.transcript, "\n");
+    return flush_file_port(fport, "newline");
+}
+
+static bool write_char_to_string_port(string_port *sport, int c,
+                                      const char *name)
+{
+    if (!strport_putc(sport, c)) {
+        show_error("%s: string port write failed", name);
+        return false;
+    }
+    return true;
+}
+
+static void close_reader_stream(FILE *port)
+{
+    reader_forget_port(port);
+    fclose(port);
+}
+
+static int extract_optional_port(unsigned argc, unsigned *argv,
+                                 unsigned argc_with_port, port_dir dir,
+                                 FILE **fport, string_port **sport,
+                                 const char *name)
+{
+    int port_index = (argc == argc_with_port) ? (int)argc_with_port - 1 : -1;
+    return extract_port_argv(argv, port_index, dir, fport, sport, name);
+}
+
+static unsigned write_object_with_optional_port(unsigned argc, unsigned *argv,
+                                                const char *name, bool display)
+{
+    unsigned arg = argv[0];
+    FILE *fport;
+    string_port *sport;
+    int ptype = extract_optional_port(argc, argv, 2, PORT_OUTPUT, &fport,
+                                      &sport, name);
+    if (ptype == -1)
+        return TOK_ERROR;
+    if (ptype == 1)
+        return write_arg_to_string_port(arg, sport, name, display);
+    if (!write_arg_to_file_port(arg, fport, name, display))
+        return TOK_ERROR;
+    return arg;
+}
+
+static bool reject_reader_token(unsigned result, const char *name)
+{
+    if (result == TOK_CLOSE || result == TOK_DOT) {
+        show_error("%s: unexpected reader token", name);
+        return false;
+    }
+    return true;
+}
+
+static unsigned read_or_peek_char(FILE *fport, string_port *sport, int ptype,
+                                  bool peek, const char *name)
+{
+    int c;
+    if (ptype == 1) {
+        c = peek ? strport_peekc(sport) : strport_getc(sport);
+    } else {
+        c = peek ? reader_port_peekc(fport) : reader_port_getc(fport);
+    }
+    if (c == EOF) {
+        if (ptype == 0 && ferror(fport)) {
+            show_error("%s: read failed", name);
+            return TOK_ERROR;
+        }
+        return atom_from_string("eof-object");
+    }
+    return make_char(c);
+}
+
+static bool grow_read_line_buffer(char **buf, size_t *cap)
+{
+    size_t new_cap;
+    if (!checked_grow_capacity_size(*cap, 1, &new_cap)) {
+        show_error("read-line: line too long");
+        return false;
+    }
+    char *newbuf = checked_realloc_size(*buf, new_cap);
+    if (!newbuf) {
+        show_error("read-line: out of memory");
+        return false;
+    }
+    *buf = newbuf;
+    *cap = new_cap;
+    return true;
+}
+
+static unsigned read_string_value(unsigned count_arg, unsigned argc,
+                                  unsigned *argv, const char *name)
+{
+    int64_t count;
+    if (!expect_nonneg_int64(count_arg, &count, name))
+        return TOK_ERROR;
+    FILE *fport;
+    string_port *sport;
+    int ptype = extract_optional_port(argc, argv, 2, PORT_INPUT, &fport,
+                                      &sport, name);
+    if (ptype == -1)
+        return TOK_ERROR;
+    if (count == 0)
+        return make_string_copy("");
+    if ((uint64_t)count > SIZE_MAX - 1) {
+        show_error("%s: count too large", name);
+        return TOK_ERROR;
+    }
+    char *buf = checked_malloc_size((size_t)count + 1);
+    if (!buf) {
+        show_error("%s: out of memory", name);
+        return TOK_ERROR;
+    }
+    size_t n = 0;
+    while (n < (size_t)count) {
+        int c = ptype == 1 ? strport_getc(sport) : reader_port_getc(fport);
+        if (c == EOF)
+            break;
+        buf[n++] = (char)c;
+    }
+    if (ptype == 0 && ferror(fport)) {
+        free(buf);
+        show_error("%s: read failed", name);
+        return TOK_ERROR;
+    }
+    if (n == 0) {
+        free(buf);
+        return atom_from_string("eof-object");
+    }
+    buf[n] = '\0';
+    return make_string_owned(buf);
+}
+
+static unsigned write_string_value(unsigned argc, unsigned *argv,
+                                   const char *name)
+{
+    char *str = require_string_ptr(argv[0], name);
+    if (!str)
+        return TOK_ERROR;
+    size_t len = strlen(str);
+    int64_t start = 0;
+    int64_t end = (int64_t)len;
+    unsigned port_index = 1;
+    if (argc >= 3) {
+        port_index = 1;
+        if (!expect_index(argv[2], (unsigned)len + 1, &start, name))
+            return TOK_ERROR;
+        if (argc >= 4) {
+            if (!expect_index(argv[3], (unsigned)len + 1, &end, name))
+                return TOK_ERROR;
+        }
+    }
+    if (start > end) {
+        show_error("%s: invalid range", name);
+        return TOK_ERROR;
+    }
+    FILE *fport;
+    string_port *sport;
+    int ptype = argc >= 2 ? extract_port_argv(argv, (int)port_index,
+                                             PORT_OUTPUT, &fport, &sport, name)
+                          : extract_port_argv(argv, -1, PORT_OUTPUT, &fport,
+                                             &sport, name);
+    if (ptype == -1)
+        return TOK_ERROR;
+    if (ptype == 1) {
+        size_t slice_len = (size_t)(end - start);
+        char *slice = checked_string_copy_len(str + start, slice_len);
+        if (!slice) {
+            show_error("%s: out of memory", name);
+            return TOK_ERROR;
+        }
+        bool ok = strport_puts(sport, slice);
+        free(slice);
+        if (!ok) {
+            show_error("%s: string port write failed", name);
+            return TOK_ERROR;
+        }
+    } else {
+        size_t slice_len = (size_t)(end - start);
+        if ((slice_len > 0 &&
+             fwrite(str + start, 1, slice_len, fport) != slice_len) ||
+            !flush_file_port(fport, name)) {
+            show_error("%s: write failed", name);
+            return TOK_ERROR;
+        }
+    }
+    return 0;
+}
+
 unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
 {
     switch (prim_id) {
     case PDISPLAY: {
         REQUIRE_ARGC(argc, 1, 2, "display");
-        unsigned arg = argv[0];
-        FILE *fport;
-        string_port *sport;
-        int port_index = (argc == 2) ? 1 : -1;
-        int ptype = extract_port_argv(argv, port_index, PORT_OUTPUT, &fport,
-                                      &sport, "display");
-        if (ptype == -1) return TOK_ERROR;
-        if (ptype == 1) {
-            // String port: use open_memstream to capture output
-            char *buf = NULL;
-            size_t buflen = 0;
-            FILE *memfp = open_memstream(&buf, &buflen);
-            if (!memfp) {
-                show_error("display: out of memory");
-                return TOK_ERROR;
-            }
-            if (IS_STRING(arg)) {
-                fprintf(memfp, "%s", GET_STRING_PTR(arg));
-            } else {
-                display_obj_port(arg, memfp);
-            }
-            if (fclose(memfp) != 0) {
-                free(buf);
-                show_error("display: write failed");
-                return TOK_ERROR;
-            }
-            if (!strport_puts(sport, buf)) {
-                free(buf);
-                show_error("display: string port write failed");
-                return TOK_ERROR;
-            }
-            free(buf);
-        } else {
-            if (IS_STRING(arg)) {
-                fprintf(fport, "%s", GET_STRING_PTR(arg));
-                // Transcript
-                if (ctx.transcript && fport == ctx.current_output) {
-                    fprintf(ctx.transcript, "%s", GET_STRING_PTR(arg));
-                }
-            } else {
-                display_obj_port(arg, fport);
-                // Transcript
-                if (ctx.transcript && fport == ctx.current_output) {
-                    display_obj_port(arg, ctx.transcript);
-                }
-            }
-            if (fflush(fport) != 0) {
-                show_error("display: flush failed");
-                return TOK_ERROR;
-            }
-        }
-        return arg;
+        return write_object_with_optional_port(argc, argv, "display", true);
     }
     case PWRITE: {
         REQUIRE_ARGC(argc, 1, 2, "write");
-        unsigned arg = argv[0];
-        FILE *fport;
-        string_port *sport;
-        int port_index = (argc == 2) ? 1 : -1;
-        int ptype = extract_port_argv(argv, port_index, PORT_OUTPUT, &fport,
-                                      &sport, "write");
-        if (ptype == -1) return TOK_ERROR;
-        if (ptype == 1) {
-            // String port: use open_memstream to capture output
-            char *buf = NULL;
-            size_t buflen = 0;
-            FILE *memfp = open_memstream(&buf, &buflen);
-            if (!memfp) {
-                show_error("write: out of memory");
-                return TOK_ERROR;
-            }
-            write_obj_port(arg, memfp);
-            if (fclose(memfp) != 0) {
-                free(buf);
-                show_error("write: write failed");
-                return TOK_ERROR;
-            }
-            if (!strport_puts(sport, buf)) {
-                free(buf);
-                show_error("write: string port write failed");
-                return TOK_ERROR;
-            }
-            free(buf);
-        } else {
-            write_obj_port(arg, fport);
-            // Transcript
-            if (ctx.transcript && fport == ctx.current_output) {
-                write_obj_port(arg, ctx.transcript);
-            }
-            if (fflush(fport) != 0) {
-                show_error("write: flush failed");
-                return TOK_ERROR;
-            }
-        }
-        return arg;
+        return write_object_with_optional_port(argc, argv, "write", false);
     }
     case PNEWLINE: {
         REQUIRE_ARGC(argc, 0, 1, "newline");
         FILE *port;
         string_port *sport;
-        int port_index = (argc == 1) ? 0 : -1;
-        int ptype = extract_port_argv(argv, port_index, PORT_OUTPUT, &port,
-                                      &sport, "newline");
+        int ptype = extract_optional_port(argc, argv, 1, PORT_OUTPUT, &port,
+                                          &sport, "newline");
         if (ptype == -1) return TOK_ERROR;
 
         if (ptype == 1) {
-            if (!strport_putc(sport, '\n')) {
-                show_error("newline: string port write failed");
+            if (!write_char_to_string_port(sport, '\n', "newline"))
                 return TOK_ERROR;
-            }
         } else {
-            fprintf(port, "\n");
-            if (ctx.transcript && port == ctx.current_output) {
-                fprintf(ctx.transcript, "\n");
-            }
-            if (fflush(port) != 0) {
-                show_error("newline: flush failed");
+            if (!write_newline_to_file_port(port))
                 return TOK_ERROR;
-            }
         }
         return 0;
     }
@@ -160,9 +308,8 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         REQUIRE_ARGC(argc, 0, 1, "read");
         FILE *fport;
         string_port *sport;
-        int port_index = (argc == 1) ? 0 : -1;
-        int ptype = extract_port_argv(argv, port_index, PORT_INPUT, &fport,
-                                      &sport, "read");
+        int ptype = extract_optional_port(argc, argv, 1, PORT_INPUT, &fport,
+                                          &sport, "read");
         if (ptype == -1) return TOK_ERROR;
         if (ptype == 1) {
             // String port: use fmemopen on remaining content
@@ -179,15 +326,13 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
             // Update string port position based on how much was consumed
             long consumed = ftell(mem);
             if (consumed < 0) {
-                reader_forget_port(mem);
-                fclose(mem);
+                close_reader_stream(mem);
                 show_error("read: failed to update string port position");
                 return TOK_ERROR;
             }
             size_t pending = reader_port_pending_bytes(mem);
             if ((size_t)consumed < pending) {
-                reader_forget_port(mem);
-                fclose(mem);
+                close_reader_stream(mem);
                 show_error("read: invalid reader pushback state");
                 return TOK_ERROR;
             }
@@ -197,64 +342,32 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
                 show_error("read: close failed");
                 return TOK_ERROR;
             }
-            if (result == TOK_CLOSE || result == TOK_DOT) {
-                show_error("read: unexpected reader token");
+            if (!reject_reader_token(result, "read"))
                 return TOK_ERROR;
-            }
             return result;
         }
         unsigned result = read_obj_port(fport);
-        if (result == TOK_CLOSE || result == TOK_DOT) {
-            show_error("read: unexpected reader token");
+        if (!reject_reader_token(result, "read"))
             return TOK_ERROR;
-        }
         return result;
     }
     case PREADCHAR: {
         REQUIRE_ARGC(argc, 0, 1, "read-char");
         FILE *fport;
         string_port *sport;
-        int port_index = (argc == 1) ? 0 : -1;
-        int ptype = extract_port_argv(argv, port_index, PORT_INPUT, &fport,
-                                      &sport, "read-char");
+        int ptype = extract_optional_port(argc, argv, 1, PORT_INPUT, &fport,
+                                          &sport, "read-char");
         if (ptype == -1) return TOK_ERROR;
-        int c;
-        if (ptype == 1) {
-            c = strport_getc(sport);
-        } else {
-            c = reader_port_getc(fport);
-        }
-        if (c == EOF) {
-            if (ptype == 0 && ferror(fport)) {
-                show_error("read-char: read failed");
-                return TOK_ERROR;
-            }
-            return atom_from_string("eof-object");
-        }
-        return make_char(c);
+        return read_or_peek_char(fport, sport, ptype, false, "read-char");
     }
     case PPEEKCHAR: {
         REQUIRE_ARGC(argc, 0, 1, "peek-char");
         FILE *fport;
         string_port *sport;
-        int port_index = (argc == 1) ? 0 : -1;
-        int ptype = extract_port_argv(argv, port_index, PORT_INPUT, &fport,
-                                      &sport, "peek-char");
+        int ptype = extract_optional_port(argc, argv, 1, PORT_INPUT, &fport,
+                                          &sport, "peek-char");
         if (ptype == -1) return TOK_ERROR;
-        int c;
-        if (ptype == 1) {
-            c = strport_peekc(sport);
-        } else {
-            c = reader_port_peekc(fport);
-        }
-        if (c == EOF) {
-            if (ptype == 0 && ferror(fport)) {
-                show_error("peek-char: read failed");
-                return TOK_ERROR;
-            }
-            return atom_from_string("eof-object");
-        }
-        return make_char(c);
+        return read_or_peek_char(fport, sport, ptype, true, "peek-char");
     }
     case PWRITECHAR: {
         REQUIRE_ARGC(argc, 1, 2, "write-char");
@@ -262,44 +375,37 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         int c = (unsigned char)CELL_ID(argv[0]);
         FILE *fport;
         string_port *sport;
-        int port_index = (argc == 2) ? 1 : -1;
-        int ptype = extract_port_argv(argv, port_index, PORT_OUTPUT, &fport,
-                                      &sport, "write-char");
+        int ptype = extract_optional_port(argc, argv, 2, PORT_OUTPUT, &fport,
+                                          &sport, "write-char");
         if (ptype == -1) return TOK_ERROR;
         if (ptype == 1) {
-            if (!strport_putc(sport, c)) {
-                show_error("write-char: string port write failed");
+            if (!write_char_to_string_port(sport, c, "write-char"))
                 return TOK_ERROR;
-            }
         } else {
             fputc(c, fport);
-            if (fflush(fport) != 0) {
-                show_error("write-char: flush failed");
+            if (!flush_file_port(fport, "write-char"))
                 return TOK_ERROR;
-            }
         }
         return 0;
     }
     case PEOF: {
         REQUIRE_ARGC(argc, 1, 1, "eof-object?");
         unsigned arg = argv[0];
-        return (IS_ATOM(arg) &&
-                strcmp(ctx.atom_table[CELL_ID(arg)], "eof-object") == 0)
-                   ? ctx.atom_true
-                   : ctx.atom_false;
+        return scheme_bool(IS_ATOM(arg) &&
+                           strcmp(ctx.atom_table[CELL_ID(arg)],
+                                  "eof-object") == 0);
     }
     case PCHARREADY: {
         REQUIRE_ARGC(argc, 0, 1, "char-ready?");
         FILE *fport;
         string_port *sport;
-        int port_index = (argc == 1) ? 0 : -1;
-        int ptype = extract_port_argv(argv, port_index, PORT_INPUT, &fport,
-                                      &sport, "char-ready?");
+        int ptype = extract_optional_port(argc, argv, 1, PORT_INPUT, &fport,
+                                          &sport, "char-ready?");
         if (ptype == -1) return TOK_ERROR;
 
         if (ptype == 1) {
             // String port: ready if there are characters remaining
-            return (sport->pos < sport->len) ? ctx.atom_true : ctx.atom_false;
+            return scheme_bool(sport->pos < sport->len);
         }
         if (reader_port_pending_bytes(fport) > 0)
             return ctx.atom_true;
@@ -323,22 +429,56 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
             show_error("char-ready?: port error");
             return TOK_ERROR;
         }
-        return (ret > 0 && (pfd.revents & POLLIN)) ? ctx.atom_true
-                                                   : ctx.atom_false;
+        return scheme_bool(ret > 0 && (pfd.revents & POLLIN));
+    }
+    case PU8READY: {
+        REQUIRE_ARGC(argc, 0, 1, "u8-ready?");
+        FILE *fport;
+        string_port *sport;
+        int ptype = extract_optional_port(argc, argv, 1, PORT_INPUT, &fport,
+                                          &sport, "u8-ready?");
+        if (ptype == -1) return TOK_ERROR;
+        if (ptype == 1)
+            return scheme_bool(sport->pos < sport->len);
+        if (reader_port_pending_bytes(fport) > 0)
+            return ctx.atom_true;
+        int fd = fileno(fport);
+        if (fd < 0)
+            return ctx.atom_true;
+        struct pollfd pfd = {.fd = fd, .events = POLLIN, .revents = 0};
+        int ret = poll(&pfd, 1, 0);
+        if (ret < 0) {
+            if (errno == EINTR)
+                return ctx.atom_false;
+            show_error("u8-ready?: poll failed");
+            return TOK_ERROR;
+        }
+        if (pfd.revents & (POLLERR | POLLNVAL)) {
+            show_error("u8-ready?: port error");
+            return TOK_ERROR;
+        }
+        return scheme_bool(ret > 0 && (pfd.revents & POLLIN));
+    }
+    case PREADSTRING: {
+        REQUIRE_ARGC(argc, 1, 2, "read-string");
+        return read_string_value(argv[0], argc, argv, "read-string");
+    }
+    case PWRITESTRING: {
+        REQUIRE_ARGC(argc, 1, 4, "write-string");
+        return write_string_value(argc, argv, "write-string");
     }
     case PREADLINE: {
         REQUIRE_ARGC(argc, 0, 1, "read-line");
         FILE *fport;
         string_port *sport;
-        int port_index = (argc == 1) ? 0 : -1;
-        int ptype = extract_port_argv(argv, port_index, PORT_INPUT, &fport,
-                                      &sport, "read-line");
+        int ptype = extract_optional_port(argc, argv, 1, PORT_INPUT, &fport,
+                                          &sport, "read-line");
         if (ptype == -1) return TOK_ERROR;
 
         // Build line in temporary buffer
         size_t cap = 128;
         size_t len = 0;
-        char *buf = malloc(cap);
+        char *buf = checked_malloc_size(cap);
         if (!buf) {
             show_error("read-line: out of memory");
             return TOK_ERROR;
@@ -354,19 +494,10 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
             if (c == EOF || c == '\n')
                 break;
             if (len + 1 >= cap) {
-                if (cap > SIZE_MAX / 2) {
+                if (!grow_read_line_buffer(&buf, &cap)) {
                     free(buf);
-                    show_error("read-line: line too long");
                     return TOK_ERROR;
                 }
-                cap *= 2;
-                char *newbuf = realloc(buf, cap);
-                if (!newbuf) {
-                    free(buf);
-                    show_error("read-line: out of memory");
-                    return TOK_ERROR;
-                }
-                buf = newbuf;
             }
             buf[len++] = (char)c;
         }

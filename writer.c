@@ -64,6 +64,8 @@ const char *type_name(unsigned cell)
         return "vector";
     case BT_BYTEVEC:
         return "bytevector";
+    case BT_HASHTABLE:
+        return "hash-table";
     case BT_CONS:
         return "pair";
     case BT_FUNCTION:
@@ -444,6 +446,9 @@ static void write_obj_fp(unsigned s, bool with_quotes, FILE *fp)
         fprintf(fp, ")");
         break;
     }
+    case BT_HASHTABLE:
+        fprintf(fp, "#<hash-table>");
+        break;
     case BT_CONS:
         fprintf(fp, "(");
         write_obj_fp(car(s), with_quotes, fp);

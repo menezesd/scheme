@@ -15,24 +15,8 @@
 #include "bytecode.h"
 #include "compile_internal.h"
 #include "context.h"
-#include <limits.h>
 #include <stdint.h>
 #include <stdlib.h>
-
-static unsigned grow_capacity(unsigned cap, size_t elem_size,
-                              const char *error_msg)
-{
-    if (cap == 0)
-        return 1;
-    if (cap > UINT_MAX / 2) {
-        lisp_panic(error_msg);
-    }
-    unsigned new_cap = cap * 2;
-    if ((size_t)new_cap > SIZE_MAX / elem_size) {
-        lisp_panic(error_msg);
-    }
-    return new_cap;
-}
 
 // ============================================================================
 // Code Object Registry
@@ -65,33 +49,40 @@ static void code_unregister(code_object *code)
 // Code Object Creation and Destruction
 // ============================================================================
 
+static void code_destroy_shallow(code_object *code)
+{
+    if (!code)
+        return;
+    free(code->code);
+    free(code->constants);
+    free(code->children);
+    free(code);
+}
+
 code_object *code_new(void)
 {
-    code_object *c = calloc(1, sizeof(code_object));
+    code_object *c = checked_calloc_array(1, sizeof(code_object));
     if (!c)
         return NULL;
 
     c->code_cap = 64;
-    c->code = malloc(c->code_cap * sizeof(unsigned));
+    c->code = checked_malloc_array(c->code_cap, sizeof(unsigned));
     if (!c->code) {
-        free(c);
+        code_destroy_shallow(c);
         return NULL;
     }
 
     c->const_cap = 16;
-    c->constants = malloc(c->const_cap * sizeof(unsigned));
+    c->constants = checked_malloc_array(c->const_cap, sizeof(unsigned));
     if (!c->constants) {
-        free(c->code);
-        free(c);
+        code_destroy_shallow(c);
         return NULL;
     }
 
     c->children_cap = 4;
-    c->children = malloc(c->children_cap * sizeof(code_object *));
+    c->children = checked_malloc_array(c->children_cap, sizeof(code_object *));
     if (!c->children) {
-        free(c->constants);
-        free(c->code);
-        free(c);
+        code_destroy_shallow(c);
         return NULL;
     }
 
@@ -105,13 +96,10 @@ void code_free(code_object *code)
     if (!code)
         return;
     code_unregister(code);
-    free(code->code);
-    free(code->constants);
     for (unsigned i = 0; i < code->children_len; i++) {
         code_free(code->children[i]);
     }
-    free(code->children);
-    free(code);
+    code_destroy_shallow(code);
 }
 
 // ============================================================================
@@ -122,9 +110,10 @@ void code_emit(code_object *code, unsigned instr)
 {
     if (code->code_len >= code->code_cap) {
         unsigned new_cap =
-            grow_capacity(code->code_cap, sizeof(unsigned),
-                          "code_emit: capacity overflow");
-        unsigned *new_code = realloc(code->code, new_cap * sizeof(unsigned));
+            checked_grow_capacity(code->code_cap, sizeof(unsigned),
+                                  "code_emit: capacity overflow");
+        unsigned *new_code =
+            checked_realloc_array(code->code, new_cap, sizeof(unsigned));
         if (!new_code) {
             lisp_panic("code_emit: realloc failed");
         }
@@ -143,10 +132,10 @@ unsigned code_add_const(code_object *code, unsigned val)
     }
     if (code->const_len >= code->const_cap) {
         unsigned new_cap =
-            grow_capacity(code->const_cap, sizeof(unsigned),
-                          "code_add_const: capacity overflow");
+            checked_grow_capacity(code->const_cap, sizeof(unsigned),
+                                  "code_add_const: capacity overflow");
         unsigned *new_consts =
-            realloc(code->constants, new_cap * sizeof(unsigned));
+            checked_realloc_array(code->constants, new_cap, sizeof(unsigned));
         if (!new_consts) {
             lisp_panic("code_add_const: realloc failed");
         }
@@ -160,11 +149,11 @@ unsigned code_add_const(code_object *code, unsigned val)
 unsigned code_add_child(code_object *code, code_object *child)
 {
     if (code->children_len >= code->children_cap) {
-        unsigned new_cap = grow_capacity(code->children_cap,
-                                         sizeof(code_object *),
-                                         "code_add_child: capacity overflow");
-        code_object **new_children =
-            realloc(code->children, new_cap * sizeof(code_object *));
+        unsigned new_cap =
+            checked_grow_capacity(code->children_cap, sizeof(code_object *),
+                                  "code_add_child: capacity overflow");
+        code_object **new_children = checked_realloc_array(
+            code->children, new_cap, sizeof(code_object *));
         if (!new_children) {
             lisp_panic("code_add_child: realloc failed");
         }
@@ -280,10 +269,7 @@ void gc_sweep_code_objects(void)
             // Unlink from registry
             *prev = code->gc_next;
             // Free the code object (but not children - they're in registry too)
-            free(code->code);
-            free(code->constants);
-            free(code->children);
-            free(code);
+            code_destroy_shallow(code);
         } else {
             prev = &code->gc_next;
         }

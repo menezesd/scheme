@@ -21,13 +21,6 @@ static bool use_bytecode = true;
 // File Loading Utilities
 // ============================================================================
 
-// Check if expression is the eof-object atom
-static bool is_eof_object(unsigned expr)
-{
-    return IS_ATOM(expr) && strcmp(ctx.atom_table[CELL_ID(expr)],
-                                   "eof-object") == 0;
-}
-
 // Track evaluation depth to only sweep code objects at top level
 static int eval_depth = 0;
 
@@ -240,7 +233,7 @@ static unsigned load_callback(const char *filename, unsigned *env_ptr)
                 show_error("load: filename too long");
                 return TOK_ERROR;
             }
-            with_ext = malloc(len + 5);
+            with_ext = checked_malloc_flex(0, len + 5, 1);
             if (!with_ext) {
                 show_error("load: out of memory");
                 return TOK_ERROR;
