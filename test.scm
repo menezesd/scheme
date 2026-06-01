@@ -361,6 +361,14 @@
         (force p)
         (force p)
         (= count 1)))
+(test "promise? delay" #t (promise? (delay 1)))
+(test "promise? non-promise" #f (promise? (lambda () 1)))
+(test "make-promise" 42 (force (make-promise 42)))
+(test "make-promise preserves promise" #t
+      (let ((p (delay 3)))
+        (eq? p (make-promise p))))
+(test "delay-force" 9 (force (delay-force (delay (+ 4 5)))))
+(test "eof-object" #t (eof-object? (eof-object)))
 
 ;;; ============================================================================
 ;;; Bignums
@@ -848,6 +856,13 @@
 (define walk-sum 0)
 (hash-table-walk resize-ht (lambda (k v) (set! walk-sum (+ walk-sum 1))))
 (test "hash-table-walk" 100 walk-sum)
+(test "hash-table-fold" 100
+      (hash-table-fold (lambda (k v acc) (+ acc 1)) 0 resize-ht))
+(test "hash-table-map" #t
+      (if (member 9801 (hash-table-map (lambda (k v) v) resize-ht)) #t #f))
+(define resize-ht-copy (hash-table-copy resize-ht))
+(test "hash-table-copy size" 100 (hash-table-size resize-ht-copy))
+(test "hash-table-copy value" 9801 (hash-table-ref resize-ht-copy 99))
 (hash-table-clear! resize-ht)
 (test "hash-table-clear!" 0 (hash-table-size resize-ht))
 
@@ -863,6 +878,12 @@
 (test "input-port-open?" #t (input-port-open? in-str-port))
 (close-input-port in-str-port)
 (test "input-port-open? closed" #f (input-port-open? in-str-port))
+(define peek-u8-port (open-input-string "AZ"))
+(test "peek-u8" (char->integer #\A) (peek-u8 peek-u8-port))
+(test "peek-u8 does not consume" (char->integer #\A) (read-u8 peek-u8-port))
+(test "read-u8 after peek" (char->integer #\Z) (read-u8 peek-u8-port))
+(test "peek-u8 eof" #t (eof-object? (peek-u8 peek-u8-port)))
+(close-input-port peek-u8-port)
 (test "current-error-port output" #t (output-port? (current-error-port)))
 (test "string port textual" #t (textual-port? (open-input-string "abc")))
 
@@ -898,6 +919,163 @@
                  (string? (caar envs))
                  (string? (cdar envs))))))
 
+(section "Additional R7RS Compatibility")
+
+(test "boolean=? true" #t (boolean=? #t #t #t))
+(test "boolean=? false" #f (boolean=? #t #t #f))
+(test "boolean=? rejects non-boolean" #f (boolean=? #t 1))
+(define call-with-port-result
+  (let ((p (open-input-string "x")))
+    (cons (call-with-port p read-char)
+          (input-port-open? p))))
+(test "call-with-port closes" (cons #\x #f) call-with-port-result)
+(define close-port-output (open-output-string))
+(test "port? output" #t (port? close-port-output))
+(close-port close-port-output)
+(test "close-port closes output" #f (output-port-open? close-port-output))
+(test "exact alias" #t (exact? (exact 1.0)))
+(test "inexact alias" #t (inexact? (inexact 1)))
+(test "exact-integer?" #t (exact-integer? 42))
+(test "exact-integer? inexact" #f (exact-integer? 42.0))
+(test "floor-quotient positive" 3 (floor-quotient 10 3))
+(test "floor-remainder positive" 1 (floor-remainder 10 3))
+(test "floor-quotient negative" -4 (floor-quotient -10 3))
+(test "floor-remainder negative" 2 (floor-remainder -10 3))
+(test "floor/ values" '(-4 2)
+      (call-with-values (lambda () (floor/ -10 3)) list))
+(test "truncate-quotient negative" -3 (truncate-quotient -10 3))
+(test "truncate-remainder negative" -1 (truncate-remainder -10 3))
+(test "truncate/ values" '(-3 -1)
+      (call-with-values (lambda () (truncate/ -10 3)) list))
+(test "truncate/ bignum values"
+      '(-33333333333333333333 -1)
+      (call-with-values
+        (lambda () (truncate/ -100000000000000000000 3))
+        list))
+(test "floor/ bignum values"
+      '(-33333333333333333334 2)
+      (call-with-values
+        (lambda () (floor/ -100000000000000000000 3))
+        list))
+(test "letrec*" 3
+      (letrec* ((x 1)
+                (y (+ x 2)))
+        y))
+(define list-set-target (list 'a 'b 'c))
+(list-set! list-set-target 1 'x)
+(test "list-set!" '(a x c) list-set-target)
+(test "square" 49 (square 7))
+(test "string->vector" '#(#\b #\c) (string->vector "abcd" 1 3))
+(test "symbol=? true" #t (symbol=? 'a 'a 'a))
+(test "symbol=? false" #f (symbol=? 'a 'a 'b))
+(test "symbol=? rejects non-symbol" #f (symbol=? 'a 1))
+(test "vector->string" "bc" (vector->string '#(#\a #\b #\c #\d) 1 3))
+(test "write-simple" "\"x\"" (call-with-output-string
+                                (lambda (p) (write-simple "x" p))))
+(test "write-shared" "(1 2)" (call-with-output-string
+                                (lambda (p) (write-shared '(1 2) p))))
+(test "exact-nonnegative-integer?" #t (exact-nonnegative-integer? 0))
+(test "exact-rational?" #t (exact-rational? 1/3))
+(test "exact-integer-sqrt" '(5 2)
+      (call-with-values (lambda () (exact-integer-sqrt 27)) list))
+(test "euclidean/" '(4 3)
+      (call-with-values (lambda () (euclidean/ -13 -4)) list))
+(test "ceiling/" '(4 -3)
+      (call-with-values (lambda () (ceiling/ 13 4)) list))
+(test "round/" '(4 -1)
+      (call-with-values (lambda () (round/ 15 4)) list))
+(test "integer-divide" '(-3 -1)
+      (let ((qr (integer-divide -10 3)))
+        (list (integer-divide-quotient qr)
+              (integer-divide-remainder qr))))
+(test "modexp" 46 (modexp 1234 5678 90))
+(test "floor->exact" #t (exact? (floor->exact 3.7)))
+(test "logistic" 0.5 (logistic 0))
+(test "conjugate" -2 (imag-part (conjugate (make-rectangular 1 2))))
+(test "digit-value" 15 (digit-value #\f))
+(test "char-foldcase" #\a (char-foldcase #\A))
+(test "string-foldcase" "abc" (string-foldcase "AbC"))
+(test "utf8 roundtrip" "abc" (utf8->string (string->utf8 "abc")))
+(test "utf8 encodes two-byte character" #u8(195 169)
+      (string->utf8 (string (integer->char 233))))
+(test "utf8 decodes two-byte character" (string (integer->char 233))
+      (utf8->string #u8(195 169)))
+(test "environment returns environment" #t (pair? (environment '(scheme base))))
+(test "environment rejects unknown library"
+      #t
+      (guard (exn
+              ((error-object? exn) #t)
+              (else #f))
+        (environment '(scheme imaginary))))
+(define-library (compat smoke)
+  (export define-library-value)
+  (import (scheme base))
+  (begin
+    (define define-library-value 91)))
+(test "define-library begin" 91 define-library-value)
+(test "error object guard"
+      '("boom" (1 2))
+      (guard (exn
+              ((error-object? exn)
+               (list (error-object-message exn)
+                     (error-object-irritants exn))))
+        (error "boom" 1 2)))
+(test "syntax-error object kind"
+      #t
+      (guard (exn
+              ((read-error? exn) #t)
+              (else #f))
+        (syntax-error "bad syntax")))
+(test "file-error? structured object"
+      #t
+      (file-error? (make-error-object 'file "missing" '("x"))))
+(define include-test-file "/tmp/vesper-include-test.scm")
+(define include-test-out (open-output-file include-test-file))
+(write-string "(define included-value 77)" include-test-out)
+(close-output-port include-test-out)
+(include "/tmp/vesper-include-test.scm")
+(test "include" 77 included-value)
+(delete-file include-test-file)
+(define-record-type record-collision
+  (make-record-a x)
+  record-a?
+  (x record-a-x set-record-a-x!))
+(define-record-type record-collision
+  (make-record-b x)
+  record-b?
+  (x record-b-x))
+(define-record-type reordered-record
+  (make-reordered y x)
+  reordered-record?
+  (x reordered-x)
+  (y reordered-y))
+(define-record-type partial-record
+  (make-partial y)
+  partial-record?
+  (x partial-x)
+  (y partial-y))
+(define record-a-instance (make-record-a 1))
+(define record-b-instance (make-record-b 2))
+(define reordered-record-instance (make-reordered 20 10))
+(define partial-record-instance (make-partial 30))
+(test "record unique tag" #f (record-a? record-b-instance))
+(test "record accessor" 1 (record-a-x record-a-instance))
+(set-record-a-x! record-a-instance 3)
+(test "record mutator" 3 (record-a-x record-a-instance))
+(test "record constructor reordered fields" '(10 20)
+      (list (reordered-x reordered-record-instance)
+            (reordered-y reordered-record-instance)))
+(test "record constructor omitted field" #f
+      (partial-x partial-record-instance))
+(test "record constructor included field" 30
+      (partial-y partial-record-instance))
+(test "record accessor rejects wrong type"
+      #t
+      (guard (exn
+              ((error-object? exn) #t)
+              (else #f))
+        (record-a-x record-b-instance)))
+
 (section "Vector/String Additions")
 
 (test "vector-copy" '#(2 3) (vector-copy '#(1 2 3 4) 1 3))
@@ -922,6 +1100,46 @@
 (define string-copy-target (string #\x #\x #\x #\x))
 (string-copy! string-copy-target 1 "abcd" 1 3)
 (test "string-copy!" "xbcx" string-copy-target)
+(define unicode-string "aé𝄞")
+(test "utf8 string-length counts characters" 3 (string-length unicode-string))
+(test "utf8 string->list decodes characters" '(97 233 119070)
+      (map char->integer (string->list unicode-string)))
+(test "utf8 string-ref uses character index" 119070
+      (char->integer (string-ref unicode-string 2)))
+(test "utf8 substring uses character indexes" "é𝄞"
+      (substring unicode-string 1 3))
+(test "utf8 string-set! can change byte width"
+      "a𝄞𝄞"
+      (let ((s (string-copy unicode-string)))
+        (string-set! s 1 (integer->char 119070))
+        s))
+(test "utf8 string-fill! range"
+      "aéé"
+      (let ((s (string-copy unicode-string)))
+        (string-fill! s (integer->char 233) 1 3)
+        s))
+(test "utf8 escape string literal" 119070
+      (char->integer (string-ref "\x1D11E;" 0)))
+(test "string-append*" "abc" (string-append* '("a" "b" "c")))
+(test "string*" "a12#t" (string* (list "a" 12 #t)))
+(test "string-compare" 'lt
+      (string-compare "a" "b" (lambda () 'eq) (lambda () 'lt) (lambda () 'gt)))
+(test "string-upper-case?" #t (string-upper-case? "ABC"))
+(test "string-lower-case?" #f (string-lower-case? "Abc"))
+(test "string-count" 3 (string-count char-alphabetic? "abc123"))
+(test "string-any" #\b (string-any (lambda (c) (and (char=? c #\b) c)) "abc"))
+(test "string-every" #t (string-every char-alphabetic? "abc"))
+(test "string-null?" #t (string-null? ""))
+(test "string-head" "ab" (string-head "abcd" 2))
+(test "string-tail" "cd" (string-tail "abcd" 2))
+(test "string-hash modulus" #t (< (string-hash "abc" 10) 10))
+(define builder (string-builder))
+(builder #\a)
+(builder "bé")
+(test "string-builder count" 3 (builder 'count))
+(test "string-builder value" "abé" (builder))
+(builder 'reset!)
+(test "string-builder empty" #t (builder 'empty?))
 
 ;;; ============================================================================
 ;;; Summary

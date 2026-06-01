@@ -78,6 +78,55 @@ TEST(read_bignum)
     PASS();
 }
 
+TEST(read_hex_integer)
+{
+    unsigned x = read_from_string("#x2a");
+    ASSERT(CELL_TYPE(x) == BT_NUM);
+    ASSERT_EQ(CELL_ID(x), 42);
+    PASS();
+}
+
+TEST(read_octal_integer)
+{
+    unsigned x = read_from_string("#o52");
+    ASSERT(CELL_TYPE(x) == BT_NUM);
+    ASSERT_EQ(CELL_ID(x), 42);
+    PASS();
+}
+
+TEST(read_binary_integer)
+{
+    unsigned x = read_from_string("#b101010");
+    ASSERT(CELL_TYPE(x) == BT_NUM);
+    ASSERT_EQ(CELL_ID(x), 42);
+    PASS();
+}
+
+TEST(read_prefixed_signed_integer)
+{
+    unsigned x = read_from_string("#b-101010");
+    ASSERT(CELL_TYPE(x) == BT_NUM);
+    ASSERT_EQ(CELL_ID(x), -42);
+    x = read_from_string("#o+52");
+    ASSERT(CELL_TYPE(x) == BT_NUM);
+    ASSERT_EQ(CELL_ID(x), 42);
+    PASS();
+}
+
+TEST(read_prefixed_uppercase_radix)
+{
+    unsigned x = read_from_string("#X2A");
+    ASSERT(CELL_TYPE(x) == BT_NUM);
+    ASSERT_EQ(CELL_ID(x), 42);
+    x = read_from_string("#O52");
+    ASSERT(CELL_TYPE(x) == BT_NUM);
+    ASSERT_EQ(CELL_ID(x), 42);
+    x = read_from_string("#B101010");
+    ASSERT(CELL_TYPE(x) == BT_NUM);
+    ASSERT_EQ(CELL_ID(x), 42);
+    PASS();
+}
+
 TEST(read_prefixed_bignum)
 {
     unsigned x = read_from_string("#x8000000000000000");
@@ -137,6 +186,19 @@ TEST(read_string_with_escapes)
     ASSERT(CELL_TYPE(x) == BT_STRING);
     const char *str = GET_STRING_PTR(x);
     ASSERT_STR_EQ(str, "hello\nworld");
+    PASS();
+}
+
+TEST(read_string_hex_scalar_escape)
+{
+    unsigned x = read_from_string("\"\\x1D11E;\"");
+    ASSERT(CELL_TYPE(x) == BT_STRING);
+    const unsigned char *str = (const unsigned char *)GET_STRING_PTR(x);
+    ASSERT_EQ(str[0], 0xF0);
+    ASSERT_EQ(str[1], 0x9D);
+    ASSERT_EQ(str[2], 0x84);
+    ASSERT_EQ(str[3], 0x9E);
+    ASSERT_EQ(str[4], 0);
     PASS();
 }
 
@@ -553,6 +615,11 @@ int main(void)
     RUN_TEST(read_floating_point);
     RUN_TEST(read_rational);
     RUN_TEST(read_bignum);
+    RUN_TEST(read_hex_integer);
+    RUN_TEST(read_octal_integer);
+    RUN_TEST(read_binary_integer);
+    RUN_TEST(read_prefixed_signed_integer);
+    RUN_TEST(read_prefixed_uppercase_radix);
     RUN_TEST(read_prefixed_bignum);
     RUN_TEST(read_prefixed_int64_min);
     RUN_TEST(read_prefixed_integer_rejects_trailing_junk);
@@ -562,6 +629,7 @@ int main(void)
     // Strings
     RUN_TEST(read_simple_string);
     RUN_TEST(read_string_with_escapes);
+    RUN_TEST(read_string_hex_scalar_escape);
     RUN_TEST(read_empty_string);
 
     // Characters

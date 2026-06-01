@@ -1673,7 +1673,12 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 }
                 vm_push(vm, result);
             } else {
-                VM_ERROR(vm, "add1: not a number");
+                unsigned result = vm_apply_with_one(n, prim_plus);
+                if (result == TOK_ERROR) {
+                    VM_ERROR_BREAK(vm, ctx.last_error[0] ? ctx.last_error
+                                                         : "add1 failed");
+                }
+                vm_push(vm, result);
             }
             break;
         }
@@ -1712,7 +1717,12 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 }
                 vm_push(vm, result);
             } else {
-                VM_ERROR(vm, "sub1: not a number");
+                unsigned result = vm_apply_with_one(n, prim_minus);
+                if (result == TOK_ERROR) {
+                    VM_ERROR_BREAK(vm, ctx.last_error[0] ? ctx.last_error
+                                                         : "sub1 failed");
+                }
+                vm_push(vm, result);
             }
             break;
         }

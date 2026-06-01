@@ -419,6 +419,8 @@ static const struct {
     {"/", PDIV},
     {"modulo", PMOD},
     {"remainder", PREMAINDER},
+    {"truncate/", PTRUNCATEDIVREM},
+    {"floor/", PFLOORDIVREM},
     {"quotient", PQUOTIENT},
     {"abs", PABS},
 
@@ -471,6 +473,7 @@ static const struct {
     {"read-char", PREADCHAR},
     {"peek-char", PPEEKCHAR},
     {"write-char", PWRITECHAR},
+    {"eof-object", PEOFOBJECT},
     {"eof-object?", PEOF},
     {"char-ready?", PCHARREADY},
     {"read-line", PREADLINE},
@@ -604,6 +607,7 @@ static const struct {
     {"read-string", PREADSTRING},
     {"write-string", PWRITESTRING},
     {"u8-ready?", PU8READY},
+    {"peek-u8", PPEEKU8},
     // File system
     {"file-exists?", PFILEEXISTS},
     {"delete-file", PDELETEFILE},

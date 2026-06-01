@@ -55,6 +55,8 @@ static unsigned char_predicate_value(unsigned arg, const char *name,
     int c;
     if (!expect_char_value(arg, &c, name))
         return TOK_ERROR;
+    if (c > UCHAR_MAX)
+        return ctx.atom_false;
     return scheme_bool(predicate(c));
 }
 
@@ -64,6 +66,8 @@ static unsigned char_transform(unsigned arg, const char *name,
     int c;
     if (!expect_char_value(arg, &c, name))
         return TOK_ERROR;
+    if (c > UCHAR_MAX)
+        return arg;
     return make_char(transform(c));
 }
 

@@ -69,6 +69,87 @@ static bool bignum_division_operands(unsigned xa, unsigned xb, bignum **a_out,
     return true;
 }
 
+static unsigned divrem_values(unsigned q, unsigned r)
+{
+    unsigned values[2] = {q, r};
+    return values_from_argv(2, values);
+}
+
+static unsigned bignum_truncate_divrem_values(unsigned xa, unsigned xb,
+                                              const char *name)
+{
+    GC_GUARD;
+    bignum *a, *b;
+    if (!bignum_division_operands(xa, xb, &a, &b, name))
+        return TOK_ERROR;
+
+    bignum *r = NULL;
+    bignum *q = bn_div(a, b, &r);
+    bn_free(a);
+    bn_free(b);
+    if (!q || !r) {
+        bn_free(q);
+        bn_free(r);
+        show_error("%s: out of memory", name);
+        return TOK_ERROR;
+    }
+
+    unsigned qv = store_integer(q);
+    gc_protect(&qv);
+    unsigned rv = store_integer(r);
+    gc_protect(&rv);
+    return divrem_values(qv, rv);
+}
+
+static unsigned bignum_floor_divrem_values(unsigned xa, unsigned xb,
+                                           const char *name)
+{
+    GC_GUARD;
+    bignum *a, *b;
+    if (!bignum_division_operands(xa, xb, &a, &b, name))
+        return TOK_ERROR;
+
+    bignum *r = NULL;
+    bignum *q = bn_div(a, b, &r);
+    if (!q || !r) {
+        bn_free(a);
+        bn_free(b);
+        bn_free(q);
+        bn_free(r);
+        show_error("%s: out of memory", name);
+        return TOK_ERROR;
+    }
+
+    if (!bn_is_zero(r) && bn_sign(a) != bn_sign(b)) {
+        bignum *one = bn_from_int(1);
+        bignum *adjusted_q = one ? bn_sub(q, one) : NULL;
+        bignum *adjusted_r = adjusted_q ? bn_add(r, b) : NULL;
+        bn_free(one);
+        if (!adjusted_q || !adjusted_r) {
+            bn_free(a);
+            bn_free(b);
+            bn_free(q);
+            bn_free(r);
+            bn_free(adjusted_q);
+            bn_free(adjusted_r);
+            show_error("%s: out of memory", name);
+            return TOK_ERROR;
+        }
+        bn_free(q);
+        bn_free(r);
+        q = adjusted_q;
+        r = adjusted_r;
+    }
+
+    bn_free(a);
+    bn_free(b);
+    unsigned qv = store_integer(q);
+    gc_protect(&qv);
+    unsigned rv = store_integer(r);
+    gc_protect(&rv);
+    return divrem_values(qv, rv);
+}
+
 static bool bignum_add_args_ip(bignum *result, unsigned argc, unsigned *argv,
                                unsigned start, const char *name)
 {
@@ -819,6 +900,85 @@ unsigned prim_quotient(unsigned argc, unsigned *argv)
         return store_integer(result);
     }
     return store(a / b);
+}
+
+unsigned prim_truncate_divrem(unsigned argc, unsigned *argv)
+{
+    REQUIRE_ARGC(argc, 2, 2, "truncate/");
+    unsigned xa = argv[0], xb = argv[1];
+    if (!require_exact_integer_pair(xa, xb, "truncate/"))
+        return TOK_ERROR;
+
+    if (EITHER_BIGNUM(xa, xb))
+        return bignum_truncate_divrem_values(xa, xb, "truncate/");
+
+    int64_t a, b;
+    exact_int64_value(xa, &a);
+    exact_int64_value(xb, &b);
+    CHECK_DIV_ZERO(b, "truncate/");
+    if (a == INT64_MIN && b == -1) {
+        bignum *q = bn_from_int(a);
+        if (!q) {
+            show_error("truncate/: out of memory");
+            return TOK_ERROR;
+        }
+        bn_neg_ip(q);
+        unsigned qv = store_integer(q);
+        GC_GUARD;
+        gc_protect(&qv);
+        unsigned rv = store(0);
+        gc_protect(&rv);
+        return divrem_values(qv, rv);
+    }
+    GC_GUARD;
+    unsigned qv = store(a / b);
+    gc_protect(&qv);
+    unsigned rv = store(a % b);
+    gc_protect(&rv);
+    return divrem_values(qv, rv);
+}
+
+unsigned prim_floor_divrem(unsigned argc, unsigned *argv)
+{
+    REQUIRE_ARGC(argc, 2, 2, "floor/");
+    unsigned xa = argv[0], xb = argv[1];
+    if (!require_exact_integer_pair(xa, xb, "floor/"))
+        return TOK_ERROR;
+
+    if (EITHER_BIGNUM(xa, xb))
+        return bignum_floor_divrem_values(xa, xb, "floor/");
+
+    int64_t a, b;
+    exact_int64_value(xa, &a);
+    exact_int64_value(xb, &b);
+    CHECK_DIV_ZERO(b, "floor/");
+    if (a == INT64_MIN && b == -1) {
+        bignum *q = bn_from_int(a);
+        if (!q) {
+            show_error("floor/: out of memory");
+            return TOK_ERROR;
+        }
+        bn_neg_ip(q);
+        unsigned qv = store_integer(q);
+        GC_GUARD;
+        gc_protect(&qv);
+        unsigned rv = store(0);
+        gc_protect(&rv);
+        return divrem_values(qv, rv);
+    }
+
+    int64_t q = a / b;
+    int64_t r = a % b;
+    if (r != 0 && ((a < 0 && b > 0) || (a > 0 && b < 0))) {
+        q -= 1;
+        r += b;
+    }
+    GC_GUARD;
+    unsigned qv = store(q);
+    gc_protect(&qv);
+    unsigned rv = store(r);
+    gc_protect(&rv);
+    return divrem_values(qv, rv);
 }
 
 unsigned prim_abs(unsigned argc, unsigned *argv)

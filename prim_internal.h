@@ -17,6 +17,7 @@
 #include "writer.h"
 #include <ctype.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -503,7 +504,12 @@ static inline bool expect_char_value(unsigned val, int *out, const char *name)
         show_error("%s: not a character", name);
         return false;
     }
-    *out = (unsigned char)CELL_ID(val);
+    int64_t code = CELL_ID(val);
+    if (code < 0 || code > 0x10FFFF) {
+        show_error("%s: invalid character code", name);
+        return false;
+    }
+    *out = (int)code;
     return true;
 }
 
@@ -1171,6 +1177,8 @@ static inline unsigned make_string_copy(const char *s)
 // Numeric operations (prim_numeric.c)
 unsigned prim_remainder(unsigned argc, unsigned *argv);
 unsigned prim_quotient(unsigned argc, unsigned *argv);
+unsigned prim_truncate_divrem(unsigned argc, unsigned *argv);
+unsigned prim_floor_divrem(unsigned argc, unsigned *argv);
 unsigned prim_abs(unsigned argc, unsigned *argv);
 
 // Comparison operations (prim_compare.c)

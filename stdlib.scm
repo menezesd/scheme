@@ -167,6 +167,33 @@
 ;;; Guard (R7RS exception handling)
 ;;; ============================================================================
 
+(define primitive-error error)
+(define *error-object-tag* (list 'error-object))
+
+(define (make-error-object kind message irritants)
+  (vector *error-object-tag* kind message irritants))
+
+(define (error-object? obj)
+  (and (vector? obj)
+       (= (vector-length obj) 4)
+       (eq? (vector-ref obj 0) *error-object-tag*)))
+
+(define (error-object-message obj)
+  (if (error-object? obj)
+      (vector-ref obj 2)
+      (primitive-error "error-object-message: not an error object")))
+
+(define (error-object-irritants obj)
+  (if (error-object? obj)
+      (vector-ref obj 3)
+      (primitive-error "error-object-irritants: not an error object")))
+
+(define (read-error? obj)
+  (and (error-object? obj) (eq? (vector-ref obj 1) 'read)))
+
+(define (file-error? obj)
+  (and (error-object? obj) (eq? (vector-ref obj 1) 'file)))
+
 ;; Simple exception system using continuations
 (define *current-exception-handler*
   (lambda (exn)
@@ -187,6 +214,12 @@
 
 (define (raise-continuable obj)
   (*current-exception-handler* obj))
+
+(define (error message . irritants)
+  (raise (make-error-object 'error message irritants)))
+
+(define (syntax-error message . irritants)
+  (raise (make-error-object 'read message irritants)))
 
 (define-syntax guard
   (syntax-rules ()
@@ -463,21 +496,47 @@
 ; not is already a primitive, but define it for completeness
 ; (define (not x) (if x #f #t))
 
-; Force/delay (simple implementation)
+(define *promise-tag* (list 'promise))
+
+(define (%make-lazy-promise thunk)
+  (vector *promise-tag* #f thunk))
+
+(define (make-promise obj)
+  (if (promise? obj)
+      obj
+      (vector *promise-tag* #t obj)))
+
+(define (promise? obj)
+  (and (vector? obj)
+       (= (vector-length obj) 3)
+       (eq? (vector-ref obj 0) *promise-tag*)))
+
+; Force/delay
 (define-syntax delay
   (syntax-rules ()
     ((delay expr)
-     (let ((forced #f) (value #f))
-       (lambda ()
-         (if forced
-             value
-             (begin
-               (set! value expr)
-               (set! forced #t)
-               value)))))))
+     (%make-lazy-promise (lambda () expr)))))
 
 (define (force promise)
-  (promise))
+  (if (not (promise? promise))
+      (error "force: not a promise")
+      (if (vector-ref promise 1)
+          (vector-ref promise 2)
+          (let ((result ((vector-ref promise 2))))
+            (if (promise? result)
+                (let ((value (force result)))
+                  (vector-set! promise 1 #t)
+                  (vector-set! promise 2 value)
+                  value)
+                (begin
+                  (vector-set! promise 1 #t)
+                  (vector-set! promise 2 result)
+                  result))))))
+
+(define-syntax delay-force
+  (syntax-rules ()
+    ((delay-force expr)
+     (%make-lazy-promise (lambda () expr)))))
 
 ;;; ============================================================================
 ;;; File I/O forms (R3RS)
@@ -1298,6 +1357,10 @@
 ;;
 ;; Implementation uses vectors: #(<type-tag> <field1> <field2> ...)
 
+(define (record-constructor-field-ref field bindings)
+  (cond ((assq field bindings) => cdr)
+        (else #f)))
+
 (define-syntax define-record-type
   (syntax-rules ()
     ((define-record-type type-name
@@ -1305,12 +1368,14 @@
        predicate-name
        field-spec ...)
      (begin
-       ;; Generate a unique type tag (a gensym would be better, but symbol works)
-       (define type-tag 'type-name)
+       ;; Generate a unique type tag for this definition.
+       (define type-tag (list 'type-name))
 
        ;; Constructor: creates a vector with type tag and fields
-       (define (constructor-name constructor-field ...)
-         (vector type-tag constructor-field ...))
+       (define-record-constructor constructor-name
+         type-tag
+         (constructor-field ...)
+         field-spec ...)
 
        ;; Predicate: checks if value is a vector with matching type tag
        (define (predicate-name obj)
@@ -1320,6 +1385,34 @@
 
        ;; Generate field accessors and mutators
        (define-record-fields type-name predicate-name 1 field-spec ...)))))
+
+(define-syntax define-record-constructor
+  (syntax-rules ()
+    ((define-record-constructor constructor-name
+       type-tag
+       (constructor-field ...)
+       field-spec ...)
+     (define (constructor-name constructor-field ...)
+       (list->vector
+         (cons type-tag
+               (define-record-constructor-values
+                 (list (cons 'constructor-field constructor-field) ...)
+                 field-spec ...)))))))
+
+(define-syntax define-record-constructor-values
+  (syntax-rules ()
+    ((define-record-constructor-values bindings)
+     '())
+    ((define-record-constructor-values bindings
+       (field-name accessor-name)
+       rest ...)
+     (cons (record-constructor-field-ref 'field-name bindings)
+           (define-record-constructor-values bindings rest ...)))
+    ((define-record-constructor-values bindings
+       (field-name accessor-name mutator-name)
+       rest ...)
+     (cons (record-constructor-field-ref 'field-name bindings)
+           (define-record-constructor-values bindings rest ...)))))
 
 ;; Helper macro to define field accessors/mutators
 ;; Index starts at 1 because position 0 is the type tag
@@ -1335,7 +1428,9 @@
        rest ...)
      (begin
        (define (accessor-name obj)
-         (vector-ref obj index))
+         (if (predicate-name obj)
+             (vector-ref obj index)
+             (error "record accessor: wrong record type" obj)))
        (define-record-fields type-name predicate-name (+ index 1) rest ...)))
 
     ;; Field with accessor and mutator
@@ -1344,9 +1439,13 @@
        rest ...)
      (begin
        (define (accessor-name obj)
-         (vector-ref obj index))
+         (if (predicate-name obj)
+             (vector-ref obj index)
+             (error "record accessor: wrong record type" obj)))
        (define (mutator-name obj val)
-         (vector-set! obj index val))
+         (if (predicate-name obj)
+             (vector-set! obj index val)
+             (error "record mutator: wrong record type" obj)))
        (define-record-fields type-name predicate-name (+ index 1) rest ...)))))
 
 ;;; ============================================================================
@@ -1719,6 +1818,28 @@
               (proc (car entry) (cdr entry)))
             (hash-table->alist table)))
 
+(define (hash-table-for-each proc table)
+  (hash-table-walk table proc))
+
+(define (hash-table-fold proc init table)
+  (let loop ((entries (hash-table->alist table)) (acc init))
+    (if (null? entries)
+        acc
+        (let ((entry (car entries)))
+          (loop (cdr entries)
+                (proc (car entry) (cdr entry) acc))))))
+
+(define (hash-table-map proc table)
+  (map (lambda (entry) (proc (car entry) (cdr entry)))
+       (hash-table->alist table)))
+
+(define (hash-table-copy table . maybe-mutable)
+  (let ((copy (make-hash-table (hash-table-size table))))
+    (hash-table-walk table
+      (lambda (key value)
+        (hash-table-set! copy key value)))
+    copy))
+
 ;;; ============================================================================
 ;;; Vector and string library additions
 ;;; ============================================================================
@@ -1764,16 +1885,618 @@
 (define (string-for-each proc str . strs)
   (apply for-each proc (string->list str) (map string->list strs)))
 
+(define (string* objects)
+  (call-with-output-string
+    (lambda (port)
+      (for-each (lambda (obj) (display obj port)) objects))))
+
+(define (string-append* strings)
+  (apply string-append strings))
+
+(define (string-compare string1 string2 if-eq if-lt if-gt)
+  (cond ((string=? string1 string2) (if-eq))
+        ((string<? string1 string2) (if-lt))
+        (else (if-gt))))
+
+(define (string-compare-ci string1 string2 if-eq if-lt if-gt)
+  (string-compare (string-foldcase string1)
+                  (string-foldcase string2)
+                  if-eq
+                  if-lt
+                  if-gt))
+
+(define (string-upper-case? str)
+  (let loop ((chars (string->list str)) (saw-letter? #f))
+    (cond ((null? chars) saw-letter?)
+          ((char-alphabetic? (car chars))
+           (and (char-upper-case? (car chars))
+                (loop (cdr chars) #t)))
+          (else
+           (loop (cdr chars) saw-letter?)))))
+
+(define (string-lower-case? str)
+  (let loop ((chars (string->list str)) (saw-letter? #f))
+    (cond ((null? chars) saw-letter?)
+          ((char-alphabetic? (car chars))
+           (and (char-lower-case? (car chars))
+                (loop (cdr chars) #t)))
+          (else
+           (loop (cdr chars) saw-letter?)))))
+
+(define (string-count proc str . strs)
+  (let ((count 0))
+    (apply string-for-each
+           (lambda chars
+             (if (apply proc chars)
+                 (set! count (+ count 1))))
+           str
+           strs)
+    count))
+
+(define (string-any proc str . strs)
+  (let loop ((char-lists (cons (string->list str) (map string->list strs))))
+    (if (or (null? char-lists) (any null? char-lists))
+        #f
+        (let ((value (apply proc (map car char-lists))))
+          (if value
+              value
+              (loop (map cdr char-lists)))))))
+
+(define (string-every proc str . strs)
+  (let loop ((char-lists (cons (string->list str) (map string->list strs)))
+             (last #t))
+    (if (or (null? char-lists) (any null? char-lists))
+        last
+        (let ((value (apply proc (map car char-lists))))
+          (if value
+              (loop (map cdr char-lists) value)
+              #f)))))
+
+(define (string-null? str)
+  (= (string-length str) 0))
+
+(define (string-head str end)
+  (substring str 0 end))
+
+(define (string-tail str start)
+  (substring str start))
+
+(define (string-hash str . maybe-modulus)
+  (let ((modulus (if (null? maybe-modulus) #f (car maybe-modulus))))
+    (let loop ((chars (string->list str)) (hash 5381))
+      (if (null? chars)
+          (if modulus (modulo hash modulus) hash)
+          (loop (cdr chars)
+                (+ (* hash 33) (char->integer (car chars))))))))
+
+(define (string-hash-ci str . maybe-modulus)
+  (apply string-hash (string-foldcase str) maybe-modulus))
+
+(define (string-builder . maybe-buffer-length)
+  (let ((chunks '())
+        (count 0))
+    (lambda args
+      (cond
+        ((null? args)
+         (apply string-append (reverse chunks)))
+        ((eq? (car args) 'immutable)
+         (apply string-append (reverse chunks)))
+        ((eq? (car args) 'mutable)
+         (string-copy (apply string-append (reverse chunks))))
+        ((eq? (car args) 'empty?)
+         (= count 0))
+        ((eq? (car args) 'count)
+         count)
+        ((eq? (car args) 'reset!)
+         (set! chunks '())
+         (set! count 0))
+        ((char? (car args))
+         (let ((piece (string (car args))))
+           (set! chunks (cons piece chunks))
+           (set! count (+ count 1))))
+        ((string? (car args))
+         (set! chunks (cons (car args) chunks))
+         (set! count (+ count (string-length (car args)))))
+        (else
+         (error "string-builder: expected character, string, or command"
+                (car args)))))))
+
 (define (string-copy! to at from . rest)
   (let* ((start (if (pair? rest) (car rest) 0))
          (rest2 (if (pair? rest) (cdr rest) '()))
-         (end (if (pair? rest2) (car rest2) (string-length from))))
-    (let loop ((i start) (j at))
-      (if (= i end)
-          (if #f #f)
+         (end (if (pair? rest2) (car rest2) (string-length from)))
+         (temp (string-copy from start end)))
+    (let loop ((i 0) (j at))
+      (if (= i (string-length temp))
+          j
           (begin
-            (string-set! to j (string-ref from i))
+            (string-set! to j (string-ref temp i))
             (loop (+ i 1) (+ j 1)))))))
+
+;;; ============================================================================
+;;; Additional R7RS compatibility procedures
+;;; ============================================================================
+
+(define (boolean=? first second . rest)
+  (and (boolean? first)
+       (boolean? second)
+       (eq? first second)
+       (let loop ((xs rest))
+         (or (null? xs)
+             (and (boolean? (car xs))
+                  (eq? first (car xs))
+                  (loop (cdr xs)))))))
+
+(define (call-with-port port proc)
+  (dynamic-wind
+    (lambda () #f)
+    (lambda () (proc port))
+    (lambda () (close-port port))))
+
+(define (close-port port)
+  (cond
+    ((input-port? port) (close-input-port port))
+    ((output-port? port) (close-output-port port))
+    (else (error "close-port: not a port"))))
+
+(define exact inexact->exact)
+(define inexact exact->inexact)
+
+(define (exact-integer? x)
+  (and (integer? x) (exact? x)))
+
+(define (exact-integer-sqrt n)
+  (if (not (exact-nonnegative-integer? n))
+      (error "exact-integer-sqrt: expected exact nonnegative integer" n)
+      (let loop ((lo 0) (hi (+ n 1)))
+        (if (<= (- hi lo) 1)
+            (values lo (- n (* lo lo)))
+            (let* ((mid (quotient (+ lo hi) 2))
+                   (sq (* mid mid)))
+              (if (<= sq n)
+                  (loop mid hi)
+                  (loop lo mid)))))))
+
+(define (exact-nonnegative-integer? x)
+  (and (exact-integer? x) (>= x 0)))
+
+(define (exact-rational? x)
+  (and (rational? x) (exact? x)))
+
+(define (1+ z) (+ z 1))
+(define (-1+ z) (- z 1))
+
+(define (copysign x y)
+  (let ((mag (abs x)))
+    (if (or (< y 0)
+            (and (= y 0) (< (/ 1.0 y) 0)))
+        (- mag)
+        mag)))
+
+(define (integer-select divproc n d selector)
+  (call-with-values
+    (lambda () (divproc n d))
+    selector))
+
+(define (euclidean/ n d)
+  (call-with-values
+    (lambda () (truncate/ n d))
+    (lambda (q r)
+      (cond
+        ((< r 0)
+         (if (> d 0)
+             (values (- q 1) (+ r d))
+             (values (+ q 1) (- r d))))
+        (else (values q r))))))
+
+(define (ceiling/ n d)
+  (call-with-values
+    (lambda () (truncate/ n d))
+    (lambda (q r)
+      (if (and (not (= r 0))
+               (or (and (> n 0) (> d 0))
+                   (and (< n 0) (< d 0))))
+          (values (+ q 1) (- r d))
+          (values q r)))))
+
+(define (round/ n d)
+  (call-with-values
+    (lambda () (truncate/ n d))
+    (lambda (q r)
+      (let* ((abs-r (abs r))
+             (abs-d (abs d))
+             (twice-r (* 2 abs-r))
+             (same-sign? (or (and (> n 0) (> d 0))
+                             (and (< n 0) (< d 0))))
+             (adjust? (or (> twice-r abs-d)
+                          (and (= twice-r abs-d) (odd? q)))))
+        (if adjust?
+            (if same-sign?
+                (values (+ q 1) (- r d))
+                (values (- q 1) (+ r d)))
+            (values q r))))))
+
+(define (euclidean-quotient n d)
+  (integer-select euclidean/ n d (lambda (q r) q)))
+
+(define (euclidean-remainder n d)
+  (integer-select euclidean/ n d (lambda (q r) r)))
+
+(define (floor-quotient n d)
+  (call-with-values
+    (lambda () (floor/ n d))
+    (lambda (q r) q)))
+
+(define (floor-remainder n d)
+  (call-with-values
+    (lambda () (floor/ n d))
+    (lambda (q r) r)))
+
+(define (ceiling-quotient n d)
+  (integer-select ceiling/ n d (lambda (q r) q)))
+
+(define (ceiling-remainder n d)
+  (integer-select ceiling/ n d (lambda (q r) r)))
+
+(define (truncate-quotient n d)
+  (call-with-values
+    (lambda () (truncate/ n d))
+    (lambda (q r) q)))
+
+(define (truncate-remainder n d)
+  (call-with-values
+    (lambda () (truncate/ n d))
+    (lambda (q r) r)))
+
+(define (round-quotient n d)
+  (integer-select round/ n d (lambda (q r) q)))
+
+(define (round-remainder n d)
+  (integer-select round/ n d (lambda (q r) r)))
+
+(define integer-floor floor-quotient)
+(define integer-ceiling ceiling-quotient)
+(define integer-truncate truncate-quotient)
+(define integer-round round-quotient)
+
+(define (integer-divide n d)
+  (call-with-values
+    (lambda () (truncate/ n d))
+    (lambda (q r) (vector q r))))
+
+(define (integer-divide-quotient qr)
+  (vector-ref qr 0))
+
+(define (integer-divide-remainder qr)
+  (vector-ref qr 1))
+
+(define (modexp b e m)
+  (if (= m 0)
+      (error "modexp: modulus must be nonzero")
+      (let loop ((base (modulo b m))
+                 (exp e)
+                 (result (modulo 1 m)))
+        (cond
+          ((< exp 0) (error "modexp: negative exponent"))
+          ((= exp 0) result)
+          ((odd? exp)
+           (loop (modulo (* base base) m)
+                 (quotient exp 2)
+                 (modulo (* result base) m)))
+          (else
+           (loop (modulo (* base base) m)
+                 (quotient exp 2)
+                 result))))))
+
+(define (floor->exact x) (exact (floor x)))
+(define (ceiling->exact x) (exact (ceiling x)))
+(define (truncate->exact x) (exact (truncate x)))
+(define (round->exact x) (exact (round x)))
+
+(define (rationalize->exact x y)
+  (exact (rationalize x y)))
+
+(define (simplest-rational x y)
+  (rationalize (/ (+ x y) 2) (/ (abs (- y x)) 2)))
+
+(define (simplest-exact-rational x y)
+  (exact (simplest-rational x y)))
+
+(define (log1p z) (log (+ 1 z)))
+(define logp1 log1p)
+(define (expm1 z) (- (exp z) 1))
+(define (exp2 z) (expt 2 z))
+(define (exp10 z) (expt 10 z))
+(define (exp2m1 z) (- (exp2 z) 1))
+(define (exp10m1 z) (- (exp10 z) 1))
+(define (log2 z) (/ (log z) (log 2)))
+(define (log10 z) (/ (log z) (log 10)))
+(define (log2p1 z) (log2 (+ 1 z)))
+(define (log10p1 z) (log10 (+ 1 z)))
+(define (log1mexp x) (log (- 1 (exp x))))
+(define (log1pexp x) (log (+ 1 (exp x))))
+
+(define (versin z) (- 1 (cos z)))
+(define (exsec z) (/ (versin z) (cos z)))
+(define (aversin z) (acos (- 1 z)))
+(define (aexsec z) (acos (/ 1 (+ 1 z))))
+
+(define (logistic x)
+  (if (< x 0)
+      (let ((e (exp x))) (/ e (+ 1 e)))
+      (/ 1 (+ 1 (exp (- x))))))
+
+(define (logit p)
+  (log (/ p (- 1 p))))
+
+(define (logistic-1/2 x)
+  (- (logistic x) 1/2))
+
+(define (logit1/2+ p)
+  (logit (+ 1/2 p)))
+
+(define (log-logistic x)
+  (- (log1pexp (- x))))
+
+(define (logit-exp x)
+  (- x (log1mexp x)))
+
+(define (logsumexp xs)
+  (if (null? xs)
+      (log 0)
+      (let ((m (apply max xs)))
+        (if (infinite? m)
+            m
+            (+ m (log (apply + (map (lambda (x) (exp (- x m))) xs))))))))
+
+(define pi (acos -1))
+(define (sin-pi* x) (sin (* pi x)))
+(define (cos-pi* x) (cos (* pi x)))
+(define (tan-pi* x) (tan (* pi x)))
+(define (versin-pi* x) (versin (* pi x)))
+(define (exsec-pi* x) (exsec (* pi x)))
+(define (asin/pi x) (/ (asin x) pi))
+(define (acos/pi x) (/ (acos x) pi))
+(define (atan/pi x) (/ (atan x) pi))
+(define (atan2/pi y x) (/ (atan y x) pi))
+(define (aversin/pi x) (/ (aversin x) pi))
+(define (aexsec/pi x) (/ (aexsec x) pi))
+
+(define (rsqrt z) (/ 1 (sqrt z)))
+(define (sqrt1pm1 z) (- (sqrt (+ 1 z)) 1))
+(define (compound z1 z2) (expt (+ 1 z1) z2))
+(define (compoundm1 z1 z2) (- (compound z1 z2) 1))
+(define (conjugate z)
+  (make-rectangular (real-part z) (- (imag-part z))))
+
+(define (digit-value ch)
+  (let ((n (char->integer ch)))
+    (cond
+      ((and (>= n (char->integer #\0)) (<= n (char->integer #\9)))
+       (- n (char->integer #\0)))
+      ((and (>= n (char->integer #\A)) (<= n (char->integer #\Z)))
+       (+ 10 (- n (char->integer #\A))))
+      ((and (>= n (char->integer #\a)) (<= n (char->integer #\z)))
+       (+ 10 (- n (char->integer #\a))))
+      (else #f))))
+
+(define (char-foldcase ch)
+  (char-downcase ch))
+
+(define (string-foldcase s)
+  (string-downcase s))
+
+(define (utf8-continuation-byte? b)
+  (and (>= b 128) (<= b 191)))
+
+(define (utf8-encode-codepoint code)
+  (cond
+    ((<= code 127)
+     (list code))
+    ((<= code 2047)
+     (list (+ 192 (quotient code 64))
+           (+ 128 (remainder code 64))))
+    ((<= code 65535)
+     (list (+ 224 (quotient code 4096))
+           (+ 128 (remainder (quotient code 64) 64))
+           (+ 128 (remainder code 64))))
+    ((<= code 1114111)
+     (list (+ 240 (quotient code 262144))
+           (+ 128 (remainder (quotient code 4096) 64))
+           (+ 128 (remainder (quotient code 64) 64))
+           (+ 128 (remainder code 64))))
+    (else
+     (error "string->utf8: character out of Unicode range" code))))
+
+(define (string->utf8 s . rest)
+  (let* ((start (if (null? rest) 0 (car rest)))
+         (end (if (or (null? rest) (null? (cdr rest)))
+                  (string-length s)
+                  (cadr rest))))
+    (apply bytevector
+           (let loop ((i start) (bytes '()))
+             (if (= i end)
+                 (reverse bytes)
+                 (loop (+ i 1)
+                       (append-reverse
+                         (utf8-encode-codepoint
+                           (char->integer (string-ref s i)))
+                         bytes)))))))
+
+(define (utf8-decode-one bv i end)
+  (let ((b0 (bytevector-u8-ref bv i)))
+    (cond
+      ((< b0 128)
+       (cons b0 (+ i 1)))
+      ((and (>= b0 194) (<= b0 223))
+       (if (>= (+ i 1) end)
+           (error "utf8->string: truncated UTF-8 sequence")
+           (let ((b1 (bytevector-u8-ref bv (+ i 1))))
+             (if (not (utf8-continuation-byte? b1))
+                 (error "utf8->string: invalid UTF-8 continuation byte" b1)
+                 (cons (+ (* (- b0 192) 64)
+                          (- b1 128))
+                       (+ i 2))))))
+      ((and (>= b0 224) (<= b0 239))
+       (if (>= (+ i 2) end)
+           (error "utf8->string: truncated UTF-8 sequence")
+           (let ((b1 (bytevector-u8-ref bv (+ i 1)))
+                 (b2 (bytevector-u8-ref bv (+ i 2))))
+             (if (or (not (utf8-continuation-byte? b1))
+                     (not (utf8-continuation-byte? b2))
+                     (and (= b0 224) (< b1 160))
+                     (and (= b0 237) (> b1 159)))
+                 (error "utf8->string: invalid UTF-8 sequence")
+                 (cons (+ (* (- b0 224) 4096)
+                          (* (- b1 128) 64)
+                          (- b2 128))
+                       (+ i 3))))))
+      ((and (>= b0 240) (<= b0 244))
+       (if (>= (+ i 3) end)
+           (error "utf8->string: truncated UTF-8 sequence")
+           (let ((b1 (bytevector-u8-ref bv (+ i 1)))
+                 (b2 (bytevector-u8-ref bv (+ i 2)))
+                 (b3 (bytevector-u8-ref bv (+ i 3))))
+             (if (or (not (utf8-continuation-byte? b1))
+                     (not (utf8-continuation-byte? b2))
+                     (not (utf8-continuation-byte? b3))
+                     (and (= b0 240) (< b1 144))
+                     (and (= b0 244) (> b1 143)))
+                 (error "utf8->string: invalid UTF-8 sequence")
+                 (cons (+ (* (- b0 240) 262144)
+                          (* (- b1 128) 4096)
+                          (* (- b2 128) 64)
+                          (- b3 128))
+                       (+ i 4))))))
+      (else
+       (error "utf8->string: invalid UTF-8 leading byte" b0)))))
+
+(define (utf8->string bv . rest)
+  (let* ((start (if (null? rest) 0 (car rest)))
+         (end (if (or (null? rest) (null? (cdr rest)))
+                  (bytevector-length bv)
+                  (cadr rest))))
+    (list->string
+      (let loop ((i start) (chars '()))
+        (if (= i end)
+            (reverse chars)
+            (let* ((decoded (utf8-decode-one bv i end))
+                   (code (car decoded)))
+              (loop (cdr decoded)
+                    (cons (integer->char code) chars))))))))
+
+(define *supported-r7rs-environments*
+  '((scheme base)
+    (scheme case-lambda)
+    (scheme char)
+    (scheme complex)
+    (scheme cxr)
+    (scheme eval)
+    (scheme file)
+    (scheme inexact)
+    (scheme lazy)
+    (scheme load)
+    (scheme process-context)
+    (scheme read)
+    (scheme repl)
+    (scheme time)
+    (scheme write)))
+
+(define (supported-r7rs-environment? spec)
+  (if (member spec *supported-r7rs-environments*) #t #f))
+
+(define (environment . specs)
+  (for-each
+    (lambda (spec)
+      (if (not (supported-r7rs-environment? spec))
+          (error "environment: unsupported library specifier" spec)))
+    specs)
+  (interaction-environment))
+
+(define-syntax import
+  (syntax-rules ()
+    ((import spec ...)
+     (begin))))
+
+(define-syntax define-library
+  (syntax-rules (export import begin include include-ci)
+    ((define-library name)
+     (begin))
+    ((define-library name (export export-spec ...) clause ...)
+     (define-library name clause ...))
+    ((define-library name (import import-spec ...) clause ...)
+     (define-library name clause ...))
+    ((define-library name (begin body ...) clause ...)
+     (begin body ... (define-library name clause ...)))
+    ((define-library name (include filename ...) clause ...)
+     (begin (include filename ...) (define-library name clause ...)))
+    ((define-library name (include-ci filename ...) clause ...)
+     (begin (include-ci filename ...) (define-library name clause ...)))))
+
+(define-syntax include
+  (syntax-rules ()
+    ((include filename ...)
+     (begin (load filename) ...))))
+
+(define-syntax include-ci
+  (syntax-rules ()
+    ((include-ci filename ...)
+     (include filename ...))))
+
+(define-syntax letrec*
+  (syntax-rules ()
+    ((letrec* ((var init) ...) body ...)
+     (let ((var #f) ...)
+       (set! var init) ...
+       body ...))))
+
+(define (list-set! lst k obj)
+  (set-car! (list-tail lst k) obj))
+
+(define (port? obj)
+  (or (input-port? obj) (output-port? obj)))
+
+(define (square x)
+  (* x x))
+
+(define (string->vector str . rest)
+  (let* ((start (if (null? rest) 0 (car rest)))
+         (end (if (or (null? rest) (null? (cdr rest)))
+                  (string-length str)
+                  (cadr rest)))
+         (vec (make-vector (- end start))))
+    (let loop ((i start) (j 0))
+      (if (< i end)
+          (begin
+            (vector-set! vec j (string-ref str i))
+            (loop (+ i 1) (+ j 1)))
+          vec))))
+
+(define (symbol=? first second . rest)
+  (and (symbol? first)
+       (symbol? second)
+       (eq? first second)
+       (let loop ((xs rest))
+         (or (null? xs)
+             (and (symbol? (car xs))
+                  (eq? first (car xs))
+                  (loop (cdr xs)))))))
+
+(define (vector->string vec . rest)
+  (let* ((start (if (null? rest) 0 (car rest)))
+         (end (if (or (null? rest) (null? (cdr rest)))
+                  (vector-length vec)
+                  (cadr rest)))
+         (str (make-string (- end start))))
+    (let loop ((i start) (j 0))
+      (if (< i end)
+          (begin
+            (string-set! str j (vector-ref vec i))
+            (loop (+ i 1) (+ j 1)))
+          str))))
+
+(define write-shared write)
+(define write-simple write)
 
 ;;; ============================================================================
 ;;; SRFI-2: and-let* (guarded evaluation)

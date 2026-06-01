@@ -160,6 +160,25 @@ static unsigned read_or_peek_char(FILE *fport, string_port *sport, int ptype,
     return make_char(c);
 }
 
+static unsigned read_or_peek_u8(FILE *fport, string_port *sport, int ptype,
+                                bool peek, const char *name)
+{
+    int c;
+    if (ptype == 1) {
+        c = peek ? strport_peekc(sport) : strport_getc(sport);
+    } else {
+        c = peek ? reader_port_peekc(fport) : reader_port_getc(fport);
+    }
+    if (c == EOF) {
+        if (ptype == 0 && ferror(fport)) {
+            show_error("%s: read failed", name);
+            return TOK_ERROR;
+        }
+        return atom_from_string("eof-object");
+    }
+    return store(c & 0xff);
+}
+
 static bool grow_read_line_buffer(char **buf, size_t *cap)
 {
     size_t new_cap;
@@ -395,6 +414,9 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
                            strcmp(ctx.atom_table[CELL_ID(arg)],
                                   "eof-object") == 0);
     }
+    case PEOFOBJECT:
+        REQUIRE_ARGC(argc, 0, 0, "eof-object");
+        return atom_from_string("eof-object");
     case PCHARREADY: {
         REQUIRE_ARGC(argc, 0, 1, "char-ready?");
         FILE *fport;
@@ -458,6 +480,15 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
             return TOK_ERROR;
         }
         return scheme_bool(ret > 0 && (pfd.revents & POLLIN));
+    }
+    case PPEEKU8: {
+        REQUIRE_ARGC(argc, 0, 1, "peek-u8");
+        FILE *fport;
+        string_port *sport;
+        int ptype = extract_optional_port(argc, argv, 1, PORT_INPUT, &fport,
+                                          &sport, "peek-u8");
+        if (ptype == -1) return TOK_ERROR;
+        return read_or_peek_u8(fport, sport, ptype, true, "peek-u8");
     }
     case PREADSTRING: {
         REQUIRE_ARGC(argc, 1, 2, "read-string");

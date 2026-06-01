@@ -334,23 +334,206 @@ static bool char_list_length(unsigned lst, unsigned *len_out,
     return true;
 }
 
-static unsigned make_char_list_from_string(unsigned str, const char *name)
+static bool utf8_encode_char(int code, char out[4], size_t *len,
+                             const char *name)
 {
-    char *s = require_string_ptr(str, name);
+    if (code <= 0 || code > 0x10FFFF || (code >= 0xD800 && code <= 0xDFFF)) {
+        show_error("%s: character cannot be stored in a string", name);
+        return false;
+    }
+    if (code <= 0x7F) {
+        out[0] = (char)code;
+        *len = 1;
+    } else if (code <= 0x7FF) {
+        out[0] = (char)(0xC0 | (code >> 6));
+        out[1] = (char)(0x80 | (code & 0x3F));
+        *len = 2;
+    } else if (code <= 0xFFFF) {
+        out[0] = (char)(0xE0 | (code >> 12));
+        out[1] = (char)(0x80 | ((code >> 6) & 0x3F));
+        out[2] = (char)(0x80 | (code & 0x3F));
+        *len = 3;
+    } else {
+        out[0] = (char)(0xF0 | (code >> 18));
+        out[1] = (char)(0x80 | ((code >> 12) & 0x3F));
+        out[2] = (char)(0x80 | ((code >> 6) & 0x3F));
+        out[3] = (char)(0x80 | (code & 0x3F));
+        *len = 4;
+    }
+    return true;
+}
+
+static bool utf8_decode_next(const char *s, size_t byte_len, size_t *offset,
+                             int *code, const char *name)
+{
+    if (*offset >= byte_len) {
+        show_error("%s: invalid UTF-8 offset", name);
+        return false;
+    }
+
+    const unsigned char *bytes = (const unsigned char *)s;
+    unsigned char b0 = bytes[*offset];
+    if (b0 == 0) {
+        show_error("%s: null character in string", name);
+        return false;
+    }
+    if (b0 < 0x80) {
+        *code = b0;
+        (*offset)++;
+        return true;
+    }
+
+    size_t needed;
+    int value;
+    if (b0 >= 0xC2 && b0 <= 0xDF) {
+        needed = 2;
+        value = b0 & 0x1F;
+    } else if (b0 >= 0xE0 && b0 <= 0xEF) {
+        needed = 3;
+        value = b0 & 0x0F;
+    } else if (b0 >= 0xF0 && b0 <= 0xF4) {
+        needed = 4;
+        value = b0 & 0x07;
+    } else {
+        show_error("%s: invalid UTF-8 leading byte", name);
+        return false;
+    }
+
+    if (byte_len - *offset < needed) {
+        show_error("%s: truncated UTF-8 sequence", name);
+        return false;
+    }
+    for (size_t i = 1; i < needed; i++) {
+        unsigned char b = bytes[*offset + i];
+        if ((b & 0xC0) != 0x80) {
+            show_error("%s: invalid UTF-8 continuation byte", name);
+            return false;
+        }
+        value = (value << 6) | (b & 0x3F);
+    }
+
+    if ((needed == 3 && value < 0x800) ||
+        (needed == 4 && value < 0x10000) ||
+        value > 0x10FFFF || (value >= 0xD800 && value <= 0xDFFF)) {
+        show_error("%s: invalid UTF-8 sequence", name);
+        return false;
+    }
+
+    *code = value;
+    *offset += needed;
+    return true;
+}
+
+static bool utf8_count_chars(const char *s, size_t *chars,
+                             const char *name)
+{
+    size_t byte_len = strlen(s);
+    size_t offset = 0;
+    size_t count = 0;
+    while (offset < byte_len) {
+        int code;
+        if (!utf8_decode_next(s, byte_len, &offset, &code, name))
+            return false;
+        count++;
+    }
+    *chars = count;
+    return true;
+}
+
+static bool utf8_byte_offset_for_index(const char *s, size_t char_index,
+                                       bool allow_end, size_t *byte_offset,
+                                       const char *name)
+{
+    size_t byte_len = strlen(s);
+    size_t offset = 0;
+    size_t count = 0;
+    while (offset < byte_len && count < char_index) {
+        int code;
+        if (!utf8_decode_next(s, byte_len, &offset, &code, name))
+            return false;
+        count++;
+    }
+    if (count == char_index && (allow_end || offset < byte_len)) {
+        *byte_offset = offset;
+        return true;
+    }
+    show_error("%s: index out of bounds", name);
+    return false;
+}
+
+static bool utf8_range_offsets(const char *s, int64_t start, int64_t end,
+                               size_t *start_byte, size_t *end_byte,
+                               const char *name)
+{
+    size_t char_len;
+    if (!utf8_count_chars(s, &char_len, name))
+        return false;
+    if (start < 0 || end < start || (uint64_t)end > char_len) {
+        show_error("%s: invalid indices", name);
+        return false;
+    }
+    return utf8_byte_offset_for_index(s, (size_t)start, true, start_byte,
+                                      name) &&
+           utf8_byte_offset_for_index(s, (size_t)end, true, end_byte, name);
+}
+
+static unsigned make_char_list_from_string_range(unsigned argc, unsigned *argv,
+                                                 const char *name)
+{
+    char *s = require_string_ptr(argv[0], name);
     if (!s)
         return TOK_ERROR;
-    size_t len = strlen(s);
+    size_t byte_len = strlen(s);
+    size_t char_len;
+    if (!utf8_count_chars(s, &char_len, name))
+        return TOK_ERROR;
+    int64_t start = 0;
+    int64_t end = (int64_t)char_len;
+    if (argc > 1 && !expect_nonneg_int64(argv[1], &start, name))
+        return TOK_ERROR;
+    if (argc > 2 && !expect_nonneg_int64(argv[2], &end, name))
+        return TOK_ERROR;
+    size_t start_byte, end_byte;
+    if (!utf8_range_offsets(s, start, end, &start_byte, &end_byte, name))
+        return TOK_ERROR;
+    size_t range_len = (size_t)(end - start);
     GC_GUARD;
-    gc_protect(&str);
+    gc_protect(&argv[0]);
     unsigned result = 0;
     gc_protect(&result);
-    for (size_t i = len; i > 0; i--) {
-        char *chars = GET_STRING_PTR(str);
-        unsigned ch = make_char(chars[i - 1]);
+    size_t offsets_count = range_len == 0 ? 1 : range_len;
+    size_t *offsets = checked_malloc_array(offsets_count, sizeof(size_t));
+    if (!offsets) {
+        show_error("%s: out of memory", name);
+        return TOK_ERROR;
+    }
+    size_t offset = start_byte;
+    for (size_t i = 0; i < range_len; i++) {
+        offsets[i] = offset;
+        int code;
+        if (!utf8_decode_next(s, byte_len, &offset, &code, name)) {
+            free(offsets);
+            return TOK_ERROR;
+        }
+    }
+    if (offset != end_byte) {
+        free(offsets);
+        show_error("%s: invalid UTF-8 range", name);
+        return TOK_ERROR;
+    }
+    for (size_t i = range_len; i > 0; i--) {
+        offset = offsets[i - 1];
+        int code;
+        if (!utf8_decode_next(s, byte_len, &offset, &code, name)) {
+            free(offsets);
+            return TOK_ERROR;
+        }
+        unsigned ch = make_char(code);
         gc_protect(&ch);
         result = alloc_cons(ch, result);
         gc_unprotect(1);
     }
+    free(offsets);
     return result;
 }
 
@@ -359,13 +542,30 @@ static unsigned make_string_from_char_list(unsigned lst, const char *name)
     unsigned list_len = 0;
     if (!char_list_length(lst, &list_len, name))
         return TOK_ERROR;
-    size_t len = list_len;
-    char *s = string_buffer_new(len, name, "result");
+    size_t total = 0;
+    for (unsigned it = lst; it; it = cdr(it)) {
+        char encoded[4];
+        size_t encoded_len;
+        if (!utf8_encode_char((int)CELL_ID(car(it)), encoded, &encoded_len,
+                              name))
+            return TOK_ERROR;
+        if (encoded_len > SIZE_MAX - total - 1) {
+            show_error("%s: result too large", name);
+            return TOK_ERROR;
+        }
+        total += encoded_len;
+    }
+    char *s = string_buffer_new(total, name, "result");
     if (!s)
         return TOK_ERROR;
     size_t i = 0;
-    for (; lst; lst = cdr(lst), i++)
-        s[i] = (char)CELL_ID(car(lst));
+    for (; lst; lst = cdr(lst)) {
+        char encoded[4];
+        size_t encoded_len;
+        utf8_encode_char((int)CELL_ID(car(lst)), encoded, &encoded_len, name);
+        memcpy(s + i, encoded, encoded_len);
+        i += encoded_len;
+    }
     s[i] = '\0';
     return make_string_owned(s);
 }
@@ -373,36 +573,90 @@ static unsigned make_string_from_char_list(unsigned lst, const char *name)
 static unsigned make_string_from_chars(unsigned argc, unsigned *argv,
                                        const char *name)
 {
-    if (argc == UINT_MAX) {
-        show_error("%s: result too large", name);
-        return TOK_ERROR;
-    }
-    char *s = string_buffer_new(argc, name, "result");
-    if (!s)
-        return TOK_ERROR;
+    size_t total = 0;
     for (unsigned i = 0; i < argc; i++) {
         if (!IS_CHAR(argv[i])) {
-            free(s);
             show_error("%s: argument is not a character", name);
             return TOK_ERROR;
         }
-        s[i] = (char)CELL_ID(argv[i]);
+        char encoded[4];
+        size_t encoded_len;
+        if (!utf8_encode_char((int)CELL_ID(argv[i]), encoded, &encoded_len,
+                              name))
+            return TOK_ERROR;
+        if (encoded_len > SIZE_MAX - total - 1) {
+            show_error("%s: result too large", name);
+            return TOK_ERROR;
+        }
+        total += encoded_len;
     }
-    s[argc] = '\0';
+    char *s = string_buffer_new(total, name, "result");
+    if (!s)
+        return TOK_ERROR;
+    size_t pos = 0;
+    for (unsigned i = 0; i < argc; i++) {
+        char encoded[4];
+        size_t encoded_len;
+        utf8_encode_char((int)CELL_ID(argv[i]), encoded, &encoded_len, name);
+        memcpy(s + pos, encoded, encoded_len);
+        pos += encoded_len;
+    }
+    s[pos] = '\0';
     return make_string_owned(s);
 }
 
-static unsigned fill_string(unsigned str, unsigned fill, const char *name)
+static unsigned fill_string_range(unsigned argc, unsigned *argv,
+                                  const char *name)
 {
-    char *s = require_string_ptr(str, name);
+    char *s = require_string_ptr(argv[0], name);
     if (!s)
         return TOK_ERROR;
     int c;
-    if (!expect_char_value(fill, &c, name))
+    if (!expect_char_value(argv[1], &c, name))
         return TOK_ERROR;
-    size_t len = strlen(s);
-    for (size_t i = 0; i < len; i++)
-        s[i] = (char)c;
+    char encoded[4];
+    size_t encoded_len;
+    if (!utf8_encode_char(c, encoded, &encoded_len, name))
+        return TOK_ERROR;
+    size_t char_len;
+    if (!utf8_count_chars(s, &char_len, name))
+        return TOK_ERROR;
+    int64_t start = 0;
+    int64_t end = (int64_t)char_len;
+    if (argc > 2 && !expect_nonneg_int64(argv[2], &start, name))
+        return TOK_ERROR;
+    if (argc > 3 && !expect_nonneg_int64(argv[3], &end, name))
+        return TOK_ERROR;
+    size_t start_byte, end_byte;
+    if (!utf8_range_offsets(s, start, end, &start_byte, &end_byte, name))
+        return TOK_ERROR;
+    size_t fill_count = (size_t)(end - start);
+    size_t old_byte_len = strlen(s);
+    size_t removed = end_byte - start_byte;
+    if (encoded_len != 0 && fill_count > (SIZE_MAX - old_byte_len - 1) / encoded_len) {
+        show_error("%s: result too large", name);
+        return TOK_ERROR;
+    }
+    size_t inserted = fill_count * encoded_len;
+    if (old_byte_len < removed || inserted > SIZE_MAX - (old_byte_len - removed) - 1) {
+        show_error("%s: result too large", name);
+        return TOK_ERROR;
+    }
+    size_t new_len = old_byte_len - removed + inserted;
+    char *result = checked_malloc_flex(0, new_len + 1, 1);
+    if (!result) {
+        show_error("%s: out of memory", name);
+        return TOK_ERROR;
+    }
+    memcpy(result, s, start_byte);
+    char *pos = result + start_byte;
+    for (size_t i = 0; i < fill_count; i++) {
+        memcpy(pos, encoded, encoded_len);
+        pos += encoded_len;
+    }
+    memcpy(pos, s + end_byte, old_byte_len - end_byte + 1);
+    free(s);
+    CELL_PTR(argv[0]) = result;
     return 0;
 }
 
@@ -412,18 +666,29 @@ static unsigned make_filled_string(unsigned len_arg, unsigned fill_arg,
     int64_t len;
     if (!expect_nonneg_int64(len_arg, &len, name))
         return TOK_ERROR;
-    char fill = ' ';
+    int fill = ' ';
     if (has_fill) {
-        int c;
-        if (!expect_char_value(fill_arg, &c, name))
+        if (!expect_char_value(fill_arg, &fill, name))
             return TOK_ERROR;
-        fill = (char)c;
     }
-    char *s = string_buffer_new((uint64_t)len, name, "length");
+    char encoded[4];
+    size_t encoded_len;
+    if (!utf8_encode_char(fill, encoded, &encoded_len, name))
+        return TOK_ERROR;
+    if ((uint64_t)len > (SIZE_MAX - 1) / encoded_len) {
+        show_error("%s: result too large", name);
+        return TOK_ERROR;
+    }
+    size_t total = (size_t)len * encoded_len;
+    char *s = string_buffer_new(total, name, "length");
     if (!s)
         return TOK_ERROR;
-    memset(s, fill, len);
-    s[len] = '\0';
+    char *pos = s;
+    for (int64_t i = 0; i < len; i++) {
+        memcpy(pos, encoded, encoded_len);
+        pos += encoded_len;
+    }
+    s[total] = '\0';
     return make_string_owned(s);
 }
 
@@ -447,8 +712,12 @@ static unsigned make_string_from_symbol(unsigned sym, const char *name)
 
 static unsigned length_value(unsigned value, const char *name)
 {
-    if (IS_STRING(value))
-        return store(strlen(GET_STRING_PTR(value)));
+    if (IS_STRING(value)) {
+        size_t len;
+        if (!utf8_count_chars(GET_STRING_PTR(value), &len, name))
+            return TOK_ERROR;
+        return store(len);
+    }
     if (IS_VECTOR(value))
         return store(vector_len(value));
     unsigned len = 0;
@@ -548,7 +817,10 @@ static unsigned string_length_value(unsigned str, const char *name)
     char *s = require_string_ptr(str, name);
     if (!s)
         return TOK_ERROR;
-    return store(strlen(s));
+    size_t len;
+    if (!utf8_count_chars(s, &len, name))
+        return TOK_ERROR;
+    return store(len);
 }
 
 static unsigned string_ref_value(unsigned str, unsigned index,
@@ -557,11 +829,18 @@ static unsigned string_ref_value(unsigned str, unsigned index,
     char *s = require_string_ptr(str, name);
     if (!s)
         return TOK_ERROR;
-    size_t len = strlen(s);
     int64_t idx;
-    if (!expect_index(index, len, &idx, name))
+    if (!expect_nonneg_int64(index, &idx, name))
         return TOK_ERROR;
-    return make_char(s[idx]);
+    size_t byte_offset;
+    if (!utf8_byte_offset_for_index(s, (size_t)idx, false, &byte_offset,
+                                    name))
+        return TOK_ERROR;
+    size_t decode_offset = byte_offset;
+    int code;
+    if (!utf8_decode_next(s, strlen(s), &decode_offset, &code, name))
+        return TOK_ERROR;
+    return make_char(code);
 }
 
 static unsigned string_set_value(unsigned str, unsigned index,
@@ -570,25 +849,66 @@ static unsigned string_set_value(unsigned str, unsigned index,
     char *s = require_string_ptr(str, name);
     if (!s)
         return TOK_ERROR;
-    size_t len = strlen(s);
     int64_t idx;
     if (!expect_nonneg_int64(index, &idx, name))
         return TOK_ERROR;
     int c;
     if (!expect_char_value(value, &c, name))
         return TOK_ERROR;
-    if (!index_in_bounds(idx, len, name))
+    char encoded[4];
+    size_t encoded_len;
+    if (!utf8_encode_char(c, encoded, &encoded_len, name))
         return TOK_ERROR;
-    s[idx] = c;
+    size_t start_byte;
+    if (!utf8_byte_offset_for_index(s, (size_t)idx, false, &start_byte,
+                                    name))
+        return TOK_ERROR;
+    size_t end_byte = start_byte;
+    int old_code;
+    size_t old_byte_len = strlen(s);
+    if (!utf8_decode_next(s, old_byte_len, &end_byte, &old_code, name))
+        return TOK_ERROR;
+    size_t removed = end_byte - start_byte;
+    size_t new_len = old_byte_len - removed + encoded_len;
+    char *result = checked_malloc_flex(0, new_len + 1, 1);
+    if (!result) {
+        show_error("%s: out of memory", name);
+        return TOK_ERROR;
+    }
+    memcpy(result, s, start_byte);
+    memcpy(result + start_byte, encoded, encoded_len);
+    memcpy(result + start_byte + encoded_len, s + end_byte,
+           old_byte_len - end_byte + 1);
+    free(s);
+    CELL_PTR(str) = result;
     return 0;
 }
 
-static unsigned string_copy_value(unsigned str, const char *name)
+static unsigned string_copy_value(unsigned argc, unsigned *argv,
+                                  const char *name)
 {
-    char *s = require_string_ptr(str, name);
+    char *s = require_string_ptr(argv[0], name);
     if (!s)
         return TOK_ERROR;
-    return make_string_copy(s);
+    size_t char_len;
+    if (!utf8_count_chars(s, &char_len, name))
+        return TOK_ERROR;
+    int64_t start = 0;
+    int64_t end = (int64_t)char_len;
+    if (argc > 1 && !expect_nonneg_int64(argv[1], &start, name))
+        return TOK_ERROR;
+    if (argc > 2 && !expect_nonneg_int64(argv[2], &end, name))
+        return TOK_ERROR;
+    size_t start_byte, end_byte;
+    if (!utf8_range_offsets(s, start, end, &start_byte, &end_byte, name))
+        return TOK_ERROR;
+    char *copy = checked_string_copy_len(s + start_byte,
+                                         end_byte - start_byte);
+    if (!copy) {
+        show_error("%s: out of memory", name);
+        return TOK_ERROR;
+    }
+    return make_string_owned(copy);
 }
 
 static bytevec_data *require_bytevector(unsigned value, const char *name)
@@ -939,6 +1259,10 @@ static unsigned apply_arithmetic_primitive(unsigned prim_id, unsigned argc,
         return prim_modulo(argc, argv);
     case PREMAINDER:
         return prim_remainder(argc, argv);
+    case PTRUNCATEDIVREM:
+        return prim_truncate_divrem(argc, argv);
+    case PFLOORDIVREM:
+        return prim_floor_divrem(argc, argv);
     case PQUOTIENT:
         return prim_quotient(argc, argv);
     case PABS:
@@ -1069,17 +1393,17 @@ static unsigned apply_string_primitive(unsigned prim_id, unsigned argc,
         return make_filled_string(argv[0], argc > 1 ? argv[1] : 0,
                                   argc > 1, "make-string");
     case PSTRCOPY:
-        REQUIRE_ARGC(argc, 1, 1, "string-copy");
-        return string_copy_value(argv[0], "string-copy");
+        REQUIRE_ARGC(argc, 1, 3, "string-copy");
+        return string_copy_value(argc, argv, "string-copy");
     case PSTR2LIST:
-        REQUIRE_ARGC(argc, 1, 1, "string->list");
-        return make_char_list_from_string(argv[0], "string->list");
+        REQUIRE_ARGC(argc, 1, 3, "string->list");
+        return make_char_list_from_string_range(argc, argv, "string->list");
     case PLIST2STR:
         REQUIRE_ARGC(argc, 1, 1, "list->string");
         return make_string_from_char_list(argv[0], "list->string");
     case PSTRFILL:
-        REQUIRE_ARGC(argc, 2, 2, "string-fill!");
-        return fill_string(argv[0], argv[1], "string-fill!");
+        REQUIRE_ARGC(argc, 2, 4, "string-fill!");
+        return fill_string_range(argc, argv, "string-fill!");
     case PSTRING:
         return make_string_from_chars(argc, argv, "string");
     case PSTREQ:
@@ -2059,6 +2383,8 @@ unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
     case PDIV:
     case PMOD:
     case PREMAINDER:
+    case PTRUNCATEDIVREM:
+    case PFLOORDIVREM:
     case PQUOTIENT:
     case PABS:
         return apply_arithmetic_primitive(prim_id, argc, argv);
@@ -2119,8 +2445,10 @@ unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
     case PPEEKCHAR:
     case PWRITECHAR:
     case PEOF:
+    case PEOFOBJECT:
     case PCHARREADY:
     case PU8READY:
+    case PPEEKU8:
     case PREADLINE:
     case PREADSTRING:
     case PWRITESTRING:

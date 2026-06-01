@@ -2543,6 +2543,36 @@ TEST(compiled_add1_sub1_preserves_type_error)
     PASS();
 }
 
+TEST(compiled_add1_sub1_support_non_integer_numbers)
+{
+    unsigned env = default_environment();
+    unsigned inexact = compiled_eval_string("(let ((x 0)) (+ 1 (exp x)))", env);
+    ASSERT(IS_INEXACT(inexact));
+    ASSERT(to_double(inexact) == 2.0);
+
+    unsigned rational = compiled_eval_string("(let ((x 1/2)) (+ 1 x))", env);
+    ASSERT(CELL_TYPE(rational) == BT_RATIONAL);
+    ASSERT(is_int(CELL_CAR(rational), 3));
+    ASSERT(is_int(CELL_CDR(rational), 2));
+
+    unsigned complex =
+        compiled_eval_string("(let ((x 1+2i)) (+ 1 x))", env);
+    ASSERT(CELL_TYPE(complex) == BT_COMPLEX);
+    ASSERT(is_int(CELL_CAR(complex), 2));
+    ASSERT(is_int(CELL_CDR(complex), 2));
+
+    unsigned sub =
+        compiled_eval_string("(let ((x 1.0)) (- x 1))", env);
+    ASSERT(IS_INEXACT(sub));
+    ASSERT(to_double(sub) == 0.0);
+
+    unsigned logistic_shape = compiled_eval_string(
+        "(let ((x 0)) (/ 1 (+ 1 (exp (- x)))))", env);
+    ASSERT(IS_INEXACT(logistic_shape));
+    ASSERT(to_double(logistic_shape) == 0.5);
+    PASS();
+}
+
 TEST(compiled_zerop_preserves_type_error)
 {
     unsigned env = default_environment();
@@ -4863,6 +4893,7 @@ int main(void)
     RUN_TEST(compiled_divide_by_one_preserves_type_error);
     RUN_TEST(compiled_double_not_returns_boolean);
     RUN_TEST(compiled_add1_sub1_preserves_type_error);
+    RUN_TEST(compiled_add1_sub1_support_non_integer_numbers);
     RUN_TEST(compiled_zerop_preserves_type_error);
     RUN_TEST(compiled_if_numeq_preserves_type_error);
     RUN_TEST(compiled_if_less_than_preserves_type_error);

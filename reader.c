@@ -307,6 +307,31 @@ static void sb_append(string_buffer *sb, int ch)
     sb->data[sb->len] = '\0';
 }
 
+static bool sb_append_utf8(string_buffer *sb, int64_t code)
+{
+    if (code <= 0 || code > 0x10FFFF ||
+        (code >= 0xD800 && code <= 0xDFFF)) {
+        show_error("invalid string character scalar value");
+        return false;
+    }
+    if (code <= 0x7F) {
+        sb_append(sb, (int)code);
+    } else if (code <= 0x7FF) {
+        sb_append(sb, 0xC0 | (int)(code >> 6));
+        sb_append(sb, 0x80 | (int)(code & 0x3F));
+    } else if (code <= 0xFFFF) {
+        sb_append(sb, 0xE0 | (int)(code >> 12));
+        sb_append(sb, 0x80 | (int)((code >> 6) & 0x3F));
+        sb_append(sb, 0x80 | (int)(code & 0x3F));
+    } else {
+        sb_append(sb, 0xF0 | (int)(code >> 18));
+        sb_append(sb, 0x80 | (int)((code >> 12) & 0x3F));
+        sb_append(sb, 0x80 | (int)((code >> 6) & 0x3F));
+        sb_append(sb, 0x80 | (int)(code & 0x3F));
+    }
+    return true;
+}
+
 static char *sb_finish(string_buffer *sb)
 {
     return sb->data; // Caller takes ownership
@@ -477,19 +502,47 @@ static unsigned read_string_literal(void)
             case 'b': c = '\b'; break;
             case 'e': c = 27; break; // ESC
             case 'x': {
-                // Hex escape: \xNN
-                int hi = reader_getchar();
-                int lo = reader_getchar();
-                int val = 0;
-                if (isxdigit(hi) && isxdigit(lo)) {
-                    val = (hi <= '9' ? hi - '0' : (hi | 32) - 'a' + 10) * 16 +
-                          (lo <= '9' ? lo - '0' : (lo | 32) - 'a' + 10);
-                } else {
-                    show_warning("invalid hex escape: \\x%c%c", hi, lo);
-                    reader_ungetc(lo);
-                    reader_ungetc(hi);
+                string_buffer hex;
+                sb_init(&hex);
+                int h = reader_getchar();
+                while (isxdigit(h)) {
+                    sb_append(&hex, h);
+                    h = reader_getchar();
                 }
-                c = val;
+                if (h == ';') {
+                    if (hex.len == 0) {
+                        sb_free(&hex);
+                        show_error("invalid hex scalar escape: \\x;");
+                        sb_free(&sb);
+                        return TOK_ERROR;
+                    }
+                    errno = 0;
+                    char *end = NULL;
+                    int64_t scalar = strtoll(hex.data, &end, 16);
+                    if (errno == ERANGE || !end || *end != '\0' ||
+                        !sb_append_utf8(&sb, scalar)) {
+                        sb_free(&hex);
+                        sb_free(&sb);
+                        return TOK_ERROR;
+                    }
+                    sb_free(&hex);
+                    continue;
+                }
+                if (h != EOF)
+                    reader_ungetc(h);
+                if (hex.len == 2) {
+                    int hi = hex.data[0];
+                    int lo = hex.data[1];
+                    c = (hi <= '9' ? hi - '0' : (hi | 32) - 'a' + 10) * 16 +
+                        (lo <= '9' ? lo - '0' : (lo | 32) - 'a' + 10);
+                    sb_free(&hex);
+                    break;
+                }
+                show_warning("invalid hex escape");
+                for (size_t i = hex.len; i > 0; i--)
+                    reader_ungetc(hex.data[i - 1]);
+                sb_free(&hex);
+                c = 'x';
                 break;
             }
             default:
