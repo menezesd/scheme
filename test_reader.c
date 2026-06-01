@@ -459,6 +459,22 @@ TEST(read_symbol_ascii_folds_without_mangling_utf8)
     PASS();
 }
 
+TEST(read_symbol_unicode_foldcase)
+{
+    unsigned x = read_from_string("ẞİKſµΣςσﬃ");
+    ASSERT(CELL_TYPE(x) == BT_ATOM);
+    ASSERT_STR_EQ(ctx.atom_table[CELL_ID(x)], "ssi̇ksμσσσffi");
+    PASS();
+}
+
+TEST(read_no_fold_case_preserves_unicode_identifier)
+{
+    unsigned x = read_from_string("#!no-fold-case ẞİKſµΣςσﬃ");
+    ASSERT(CELL_TYPE(x) == BT_ATOM);
+    ASSERT_STR_EQ(ctx.atom_table[CELL_ID(x)], "ẞİKſµΣςσﬃ");
+    PASS();
+}
+
 TEST(read_symbol_rejects_invalid_utf8)
 {
     const char invalid[] = {(char)0xC0, (char)0x80, '\0'};
@@ -860,6 +876,8 @@ int main(void)
     RUN_TEST(read_symbol_with_special_chars);
     RUN_TEST(read_symbol_preserves_utf8_identifier);
     RUN_TEST(read_symbol_ascii_folds_without_mangling_utf8);
+    RUN_TEST(read_symbol_unicode_foldcase);
+    RUN_TEST(read_no_fold_case_preserves_unicode_identifier);
     RUN_TEST(read_symbol_rejects_invalid_utf8);
     RUN_TEST(read_escaped_identifier);
     RUN_TEST(read_escaped_identifier_rejects_invalid_escape);

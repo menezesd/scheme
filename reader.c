@@ -27,6 +27,7 @@
 #include "reader.h"
 #include "bignum.h"
 #include "context.h"
+#include "prim_internal.h"
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
@@ -443,11 +444,88 @@ static bool validate_utf8_string(const char *s)
     return true;
 }
 
+static void sb_append_utf8_scalar(string_buffer *sb, uint32_t code)
+{
+    if (code < 0x80) {
+        sb_append(sb, (int)code);
+    } else if (code < 0x800) {
+        sb_append(sb, 0xC0 | (int)(code >> 6));
+        sb_append(sb, 0x80 | (int)(code & 0x3F));
+    } else if (code < 0x10000) {
+        sb_append(sb, 0xE0 | (int)(code >> 12));
+        sb_append(sb, 0x80 | (int)((code >> 6) & 0x3F));
+        sb_append(sb, 0x80 | (int)(code & 0x3F));
+    } else {
+        sb_append(sb, 0xF0 | (int)(code >> 18));
+        sb_append(sb, 0x80 | (int)((code >> 12) & 0x3F));
+        sb_append(sb, 0x80 | (int)((code >> 6) & 0x3F));
+        sb_append(sb, 0x80 | (int)(code & 0x3F));
+    }
+}
+
 static void sb_append_token_char(string_buffer *sb, int c)
 {
-    if (reader_fold_case && c >= 'A' && c <= 'Z')
-        c = c - 'A' + 'a';
-    sb_append(sb, c);
+    if (c < 0x80) {
+        if (reader_fold_case && c >= 'A' && c <= 'Z')
+            c = c - 'A' + 'a';
+        sb_append(sb, c);
+        return;
+    }
+
+    unsigned char first = (unsigned char)c;
+    size_t needed;
+    uint32_t code;
+    if (first >= 0xC2 && first <= 0xDF) {
+        needed = 2;
+        code = first & 0x1F;
+    } else if (first >= 0xE0 && first <= 0xEF) {
+        needed = 3;
+        code = first & 0x0F;
+    } else if (first >= 0xF0 && first <= 0xF4) {
+        needed = 4;
+        code = first & 0x07;
+    } else {
+        sb_append(sb, c);
+        return;
+    }
+
+    unsigned char bytes[4] = {first, 0, 0, 0};
+    for (size_t i = 1; i < needed; i++) {
+        int next = reader_getchar();
+        if (next == EOF) {
+            sb_append(sb, c);
+            return;
+        }
+        bytes[i] = (unsigned char)next;
+        if ((bytes[i] & 0xC0) != 0x80) {
+            for (size_t j = 0; j <= i; j++)
+                sb_append(sb, bytes[j]);
+            return;
+        }
+        code = (code << 6) | (uint32_t)(bytes[i] & 0x3F);
+    }
+
+    if ((needed == 3 && code < 0x800) ||
+        (needed == 4 && code < 0x10000) || !valid_string_scalar(code)) {
+        for (size_t i = 0; i < needed; i++)
+            sb_append(sb, bytes[i]);
+        return;
+    }
+
+    if (!reader_fold_case) {
+        for (size_t i = 0; i < needed; i++)
+            sb_append(sb, bytes[i]);
+        return;
+    }
+
+    const uint32_t *mapping;
+    size_t length;
+    if (unicode_full_foldcase(code, &mapping, &length)) {
+        for (size_t i = 0; i < length; i++)
+            sb_append_utf8_scalar(sb, mapping[i]);
+    } else {
+        sb_append_utf8_scalar(sb, unicode_simple_foldcase(code));
+    }
 }
 
 static bool read_reader_directive(void)

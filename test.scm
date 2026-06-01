@@ -1035,6 +1035,10 @@
              (< (abs (- (imag-part z) 1.0)) 1e-12))))
 (test "digit-value" 15 (digit-value #\f))
 (test "unicode digit-value" 5 (digit-value (integer->char #x0665)))
+(test "unicode digit-value extended arabic-indic" 7
+      (digit-value (integer->char #x06F7)))
+(test "unicode digit-value fullwidth" 9
+      (digit-value (integer->char #xFF19)))
 (test "char-foldcase" #\a (char-foldcase #\A))
 (test "string-foldcase" "abc" (string-foldcase "AbC"))
 (test "unicode char predicates" #t
@@ -1269,12 +1273,20 @@
                             (write-to-string (integer->char #x1D11E))))))
 (test "unicode identifier preserves utf8" 42
       (let ((λ 42)) λ))
-(test "unicode identifier ascii-folds only ascii" 7
+(test "unicode identifier folds ascii and preserves lowercase unicode" 7
       (let ((fooλ 7)) Fooλ))
+(test "unicode identifier foldcase" 12
+      (let ((straße 12)) STRAẞE))
+(test "unicode identifier foldcase expands ligature" 13
+      (let ((office 13)) oﬃce))
 (test "reader no-fold-case directive" "FOO"
       (symbol->string (read (open-input-string "#!no-fold-case FOO"))))
+(test "reader no-fold-case preserves unicode" "ẞİKſµΣςσﬃ"
+      (symbol->string (read (open-input-string "#!no-fold-case ẞİKſµΣςσﬃ"))))
 (test "reader fold-case directive" "foo"
       (symbol->string (read (open-input-string "#!fold-case FOO"))))
+(test "reader unicode foldcase directive" "ssi̇ksμσσσffi"
+      (symbol->string (read (open-input-string "#!fold-case ẞİKſµΣςσﬃ"))))
 (test "reader case directive toggles" '("FOO" "bar")
       (let ((p (open-input-string "#!no-fold-case FOO #!fold-case BAR")))
         (list (symbol->string (read p)) (symbol->string (read p)))))

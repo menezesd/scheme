@@ -110,9 +110,60 @@ TEST(unicode_normalization_fixture)
     PASS();
 }
 
+static void assert_normalized_codepoints(const uint32_t *input_codes,
+                                         size_t input_length,
+                                         const uint32_t *expected_codes,
+                                         size_t expected_length,
+                                         unsigned prim_id)
+{
+    char *input = malloc(input_length * 4 + 1);
+    char *expected = malloc(expected_length * 4 + 1);
+    ASSERT(input != NULL);
+    ASSERT(expected != NULL);
+
+    size_t pos = 0;
+    for (size_t i = 0; i < input_length; i++)
+        pos += (size_t)append_utf8(input + pos, input_codes[i]);
+    input[pos] = '\0';
+    pos = 0;
+    for (size_t i = 0; i < expected_length; i++)
+        pos += (size_t)append_utf8(expected + pos, expected_codes[i]);
+    expected[pos] = '\0';
+
+    unsigned actual = normalize_c_string(input, prim_id);
+    ASSERT(actual != TOK_ERROR);
+    ASSERT(CELL_TYPE(actual) == BT_STRING);
+    ASSERT_STR_EQ(GET_STRING_PTR(actual), expected);
+
+    free(input);
+    free(expected);
+}
+
+TEST(unicode_targeted_normalization)
+{
+    uint32_t composed_e[] = {0x00E9};
+    uint32_t decomposed_e[] = {'e', 0x0301};
+    uint32_t unordered_marks[] = {'a', 0x0301, 0x0327};
+    uint32_t ordered_marks[] = {'a', 0x0327, 0x0301};
+    uint32_t ligature[] = {0xFB03};
+    uint32_t ffi[] = {'f', 'f', 'i'};
+    uint32_t fullwidth[] = {0xFF21, 0xFF22, 0xFF23,
+                            0xFF11, 0xFF12, 0xFF13};
+    uint32_t ascii[] = {'A', 'B', 'C', '1', '2', '3'};
+
+    assert_normalized_codepoints(composed_e, 1, decomposed_e, 2, PSTRNFD);
+    assert_normalized_codepoints(decomposed_e, 2, composed_e, 1, PSTRNFC);
+    assert_normalized_codepoints(unordered_marks, 3, ordered_marks, 3,
+                                 PSTRNFD);
+    assert_normalized_codepoints(ligature, 1, ffi, 3, PSTRNFKD);
+    assert_normalized_codepoints(fullwidth, 6, ascii, 6, PSTRNFKC);
+    PASS();
+}
+
 int main(void)
 {
     init_heap();
     RUN_TEST(unicode_normalization_fixture);
+    RUN_TEST(unicode_targeted_normalization);
     TEST_SUMMARY("unicode normalization");
 }

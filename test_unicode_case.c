@@ -90,6 +90,38 @@ static bool char_predicate_range_matches(const unicode_case_property_range *rang
     return start_result == ctx.atom_true && end_result == ctx.atom_true;
 }
 
+static void assert_string_mapping(const uint32_t *input_codes,
+                                  size_t input_length,
+                                  const uint32_t *expected_codes,
+                                  size_t expected_length,
+                                  unsigned prim_id)
+{
+    char *input = utf8_from_codepoints(input_codes, input_length);
+    char *expected = utf8_from_codepoints(expected_codes, expected_length);
+    ASSERT(input != NULL);
+    ASSERT(expected != NULL);
+
+    unsigned arg = make_string_copy(input);
+    ASSERT(arg != TOK_ERROR);
+    unsigned actual = prim_string_normalize(prim_id, 1, &arg);
+    ASSERT(actual != TOK_ERROR);
+    ASSERT(CELL_TYPE(actual) == BT_STRING);
+    ASSERT_STR_EQ(GET_STRING_PTR(actual), expected);
+
+    free(input);
+    free(expected);
+}
+
+static void assert_char_mapping(uint32_t input, uint32_t expected,
+                                unsigned prim_id)
+{
+    unsigned arg = make_char((int)input);
+    unsigned actual = apply_char_primitive(prim_id, 1, &arg);
+    ASSERT(actual != TOK_ERROR);
+    ASSERT(IS_CHAR(actual));
+    ASSERT((uint32_t)GET_CHAR_CODE(actual) == expected);
+}
+
 TEST(unicode_case_folding_fixture)
 {
     for (size_t i = 0; i < UNICODE_CASE_FOLD_ROW_COUNT; i++)
@@ -129,6 +161,27 @@ TEST(unicode_character_property_fixture)
     for (size_t i = 0; i < UNICODE_CASE_LOWERCASE_COUNT; i++)
         ASSERT(char_predicate_range_matches(&unicode_case_lowercase[i],
                                             PCHARLOWER));
+    PASS();
+}
+
+TEST(unicode_targeted_foldcase)
+{
+    uint32_t input[] = {0x1E9E, 0x0130, 0x212A, 0x017F,
+                        0x00B5, 0x03A3, 0x03C2, 0x03C3,
+                        0xFB03};
+    uint32_t expected[] = {'s', 's', 'i', 0x0307, 'k', 's',
+                           0x03BC, 0x03C3, 0x03C3, 0x03C3,
+                           'f', 'f', 'i'};
+    assert_string_mapping(input, 9, expected, 13, PSTRFOLD);
+    PASS();
+}
+
+TEST(unicode_targeted_char_foldcase)
+{
+    assert_char_mapping(0x03C2, 0x03C3, PCHARFOLD);
+    assert_char_mapping(0x212A, 'k', PCHARFOLD);
+    assert_char_mapping(0x017F, 's', PCHARFOLD);
+    assert_char_mapping(0x00B5, 0x03BC, PCHARFOLD);
     PASS();
 }
 
@@ -176,6 +229,8 @@ int main(void)
     RUN_TEST(unicode_case_folding_fixture);
     RUN_TEST(unicode_case_mapping_fixture);
     RUN_TEST(unicode_character_property_fixture);
+    RUN_TEST(unicode_targeted_foldcase);
+    RUN_TEST(unicode_targeted_char_foldcase);
     RUN_TEST(unicode_final_sigma_context);
     TEST_SUMMARY("unicode case");
 }
