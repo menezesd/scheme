@@ -154,6 +154,26 @@ TEST(read_prefixed_integer_rejects_trailing_junk)
     PASS();
 }
 
+TEST(read_exactness_and_radix_prefixes)
+{
+    unsigned x = read_from_string("#d42");
+    ASSERT(CELL_TYPE(x) == BT_NUM);
+    ASSERT_EQ(CELL_ID(x), 42);
+
+    x = read_from_string("#i#x10");
+    ASSERT(IS_INEXACT(x));
+    ASSERT(to_double(x) == 16.0);
+
+    x = read_from_string("#x#i10");
+    ASSERT(IS_INEXACT(x));
+    ASSERT(to_double(x) == 16.0);
+
+    x = read_from_string("#e#b1010");
+    ASSERT(CELL_TYPE(x) == BT_NUM);
+    ASSERT_EQ(CELL_ID(x), 10);
+    PASS();
+}
+
 TEST(read_malformed_rational_as_symbol)
 {
     unsigned x = read_from_string("12abc/2");
@@ -432,6 +452,20 @@ TEST(read_datum_comment_skips_nested_object)
 TEST(read_datum_comment_rejects_missing_datum)
 {
     ASSERT(read_from_string("#;") == TOK_ERROR);
+    PASS();
+}
+
+TEST(read_nested_block_comment)
+{
+    unsigned x = read_from_string("#| outer #| inner |# done |# kept");
+    ASSERT(CELL_TYPE(x) == BT_ATOM);
+    ASSERT_STR_EQ(ctx.atom_table[CELL_ID(x)], "kept");
+    PASS();
+}
+
+TEST(read_block_comment_rejects_unterminated)
+{
+    ASSERT(read_from_string("#| outer #| inner |#") == TOK_ERROR);
     PASS();
 }
 
@@ -838,6 +872,7 @@ int main(void)
     RUN_TEST(read_prefixed_bignum);
     RUN_TEST(read_prefixed_int64_min);
     RUN_TEST(read_prefixed_integer_rejects_trailing_junk);
+    RUN_TEST(read_exactness_and_radix_prefixes);
     RUN_TEST(read_malformed_rational_as_symbol);
     RUN_TEST(read_malformed_denominator_as_symbol);
 
@@ -873,6 +908,8 @@ int main(void)
     RUN_TEST(read_datum_comment_skips_one_object);
     RUN_TEST(read_datum_comment_skips_nested_object);
     RUN_TEST(read_datum_comment_rejects_missing_datum);
+    RUN_TEST(read_nested_block_comment);
+    RUN_TEST(read_block_comment_rejects_unterminated);
     RUN_TEST(read_symbol_with_special_chars);
     RUN_TEST(read_symbol_preserves_utf8_identifier);
     RUN_TEST(read_symbol_ascii_folds_without_mangling_utf8);

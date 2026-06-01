@@ -199,6 +199,8 @@
 (test "list->string" "abc" (list->string '(#\a #\b #\c)))
 (test "string->symbol" 'hello (string->symbol "hello"))
 (test "symbol->string" "hello" (symbol->string 'hello))
+(test "string<? multiple" #t (string<? "a" "b" "c"))
+(test "string-ci=? unicode foldcase" #t (string-ci=? "straße" "STRASSE"))
 
 ;;; ============================================================================
 ;;; Characters
@@ -209,6 +211,7 @@
 (test "char->integer" 97 (char->integer #\a))
 (test "integer->char" #\a (integer->char 97))
 (test "char<?" #t (char<? #\a #\b))
+(test "char<? multiple" #t (char<? #\a #\b #\c))
 (test "char-alphabetic?" #t (char-alphabetic? #\a))
 (test "char-numeric?" #t (char-numeric? #\5))
 (test "char-whitespace?" #t (char-whitespace? #\space))
@@ -890,6 +893,23 @@
 (close-input-port peek-u8-port)
 (test "current-error-port output" #t (output-port? (current-error-port)))
 (test "string port textual" #t (textual-port? (open-input-string "abc")))
+(define compat-bvin (open-input-bytevector #u8(1 2 3)))
+(test "bytevector input port?" #t (input-port? compat-bvin))
+(test "bytevector input binary" #t (binary-port? compat-bvin))
+(test "bytevector input not textual" #f (textual-port? compat-bvin))
+(test "bytevector input open" #t (input-port-open? compat-bvin))
+(test "bytevector input read-u8" 1 (read-u8 compat-bvin))
+(close-input-port compat-bvin)
+(test "bytevector input closed" #f (input-port-open? compat-bvin))
+(define compat-bvout (open-output-bytevector))
+(test "bytevector output port?" #t (output-port? compat-bvout))
+(test "bytevector output binary" #t (binary-port? compat-bvout))
+(test "bytevector output not textual" #f (textual-port? compat-bvout))
+(test "bytevector output open" #t (output-port-open? compat-bvout))
+(write-bytevector #u8(65 66 67) compat-bvout 1 3)
+(test "bytevector output result" #u8(66 67) (get-output-bytevector compat-bvout))
+(close-output-port compat-bvout)
+(test "bytevector output closed" #f (output-port-open? compat-bvout))
 
 ; File/OS helpers
 (define compat-file "/tmp/vesper-compat-test.bin")
@@ -1292,6 +1312,10 @@
         (list (symbol->string (read p)) (symbol->string (read p)))))
 (test "reader datum comment" 'kept
       (read (open-input-string "#;(discard (nested datum)) kept")))
+(test "reader nested block comment" 'kept
+      (read (open-input-string "#| outer #| inner |# done |# kept")))
+(test "reader exactness/radix prefix" 16.0
+      (read (open-input-string "#i#x10")))
 (test "escaped identifier preserves case and spaces" 9
       (let ((|Hello World| 9)) |Hello World|))
 (test "escaped identifier scalar escape" 11

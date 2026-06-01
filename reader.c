@@ -285,6 +285,7 @@ typedef struct {
 
 static void sb_free(string_buffer *sb);
 static inline bool is_delimiter(int c);
+static bool reject_invalid_prefixed_tail(int c, const char *name);
 
 static void sb_init(string_buffer *sb)
 {
@@ -575,6 +576,34 @@ static bool read_datum_comment(void)
     return true;
 }
 
+static bool skip_nested_block_comment(void)
+{
+    int depth = 1;
+    while (depth > 0) {
+        int c = reader_getchar();
+        if (c == EOF) {
+            show_error("unterminated block comment");
+            return false;
+        }
+        if (c == '#') {
+            int next = reader_getchar();
+            if (next == '|') {
+                depth++;
+            } else {
+                reader_ungetc(next);
+            }
+        } else if (c == '|') {
+            int next = reader_getchar();
+            if (next == '#') {
+                depth--;
+            } else {
+                reader_ungetc(next);
+            }
+        }
+    }
+    return true;
+}
+
 static char *sb_finish(string_buffer *sb)
 {
     return sb->data; // Caller takes ownership
@@ -609,6 +638,146 @@ static unsigned read_prefixed_integer(const char *digits, int base, bool neg)
     if (neg)
         bn_neg_ip(bn);
     return store_integer(bn);
+}
+
+typedef enum {
+    READER_EXACTNESS_UNSPECIFIED,
+    READER_EXACTNESS_EXACT,
+    READER_EXACTNESS_INEXACT
+} reader_exactness;
+
+static bool prefix_radix(int c, int *base)
+{
+    switch (c) {
+    case 'b':
+    case 'B':
+        *base = 2;
+        return true;
+    case 'o':
+    case 'O':
+        *base = 8;
+        return true;
+    case 'd':
+    case 'D':
+        *base = 10;
+        return true;
+    case 'x':
+    case 'X':
+        *base = 16;
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool prefix_exactness(int c, reader_exactness *exactness)
+{
+    switch (c) {
+    case 'e':
+    case 'E':
+        *exactness = READER_EXACTNESS_EXACT;
+        return true;
+    case 'i':
+    case 'I':
+        *exactness = READER_EXACTNESS_INEXACT;
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool radix_digit_p(int c, int base)
+{
+    if (base <= 10)
+        return c >= '0' && c < '0' + base;
+    return isxdigit(c) &&
+           (isdigit(c) || ((c | 32) >= 'a' && (c | 32) < 'a' + base - 10));
+}
+
+static unsigned maybe_apply_exactness(unsigned value, reader_exactness exactness)
+{
+    if (exactness == READER_EXACTNESS_INEXACT && is_numeric(value) &&
+        !IS_INEXACT(value) && !IS_COMPLEX(value))
+        return store_inexact(to_double(value));
+    return value;
+}
+
+static unsigned read_prefixed_number(int prefix)
+{
+    int base = 10;
+    reader_exactness exactness = READER_EXACTNESS_UNSPECIFIED;
+    bool have_radix = false;
+
+    if (prefix_radix(prefix, &base)) {
+        have_radix = true;
+    } else if (!prefix_exactness(prefix, &exactness)) {
+        show_error("unknown # syntax: #%c", prefix);
+        return TOK_ERROR;
+    }
+
+    int c = reader_getchar();
+    if (c == '#') {
+        int second = reader_getchar();
+        if (!have_radix && prefix_radix(second, &base)) {
+            have_radix = true;
+            c = reader_getchar();
+        } else if (have_radix && exactness == READER_EXACTNESS_UNSPECIFIED &&
+                   prefix_exactness(second, &exactness)) {
+            c = reader_getchar();
+        } else {
+            show_error("invalid numeric prefix");
+            return TOK_ERROR;
+        }
+    }
+
+    bool neg = false;
+    if (c == '-') {
+        neg = true;
+        c = reader_getchar();
+    } else if (c == '+') {
+        c = reader_getchar();
+    }
+
+    string_buffer sb;
+    sb_init(&sb);
+    if (base == 10) {
+        if (neg)
+            sb_append(&sb, '-');
+        while (!is_delimiter(c)) {
+            sb_append(&sb, c);
+            c = reader_getchar();
+        }
+        reader_ungetc(c);
+        if (sb.len == (neg ? 1U : 0U)) {
+            sb_free(&sb);
+            show_error("invalid decimal literal");
+            return TOK_ERROR;
+        }
+        unsigned value = atom_from_string(sb.data);
+        sb_free(&sb);
+        if (!is_numeric(value)) {
+            show_error("invalid decimal literal");
+            return TOK_ERROR;
+        }
+        return maybe_apply_exactness(value, exactness);
+    }
+
+    while (radix_digit_p(c, base)) {
+        sb_append(&sb, c);
+        c = reader_getchar();
+    }
+    if (reject_invalid_prefixed_tail(c, "prefixed integer")) {
+        sb_free(&sb);
+        return TOK_ERROR;
+    }
+    if (sb.len == 0) {
+        sb_free(&sb);
+        show_error("invalid prefixed integer literal");
+        return TOK_ERROR;
+    }
+    unsigned value = read_prefixed_integer(sb.data, base, neg);
+    sb_free(&sb);
+    return maybe_apply_exactness(value, exactness);
 }
 
 static bool read_byte_value(unsigned obj, uint8_t *out)
@@ -1072,6 +1241,10 @@ unsigned read_token(void)
                 if (!read_datum_comment())
                     return TOK_ERROR;
                 continue;
+            } else if (c == '|') {
+                if (!skip_nested_block_comment())
+                    return TOK_ERROR;
+                continue;
             } else if (c == '!') {
                 if (!read_reader_directive())
                     return TOK_ERROR;
@@ -1082,78 +1255,10 @@ unsigned read_token(void)
                 return ctx.atom_true;
             } else if (c == 'f' || c == 'F') {
                 return ctx.atom_false;
-            } else if (c == 'x' || c == 'X') {
-                // Hexadecimal literal: #xFF
-                string_buffer sb;
-                sb_init(&sb);
-                bool neg = false;
-                c = reader_getchar();
-                if (c == '-') { neg = true; c = reader_getchar(); }
-                else if (c == '+') { c = reader_getchar(); }
-                while (isxdigit(c)) {
-                    sb_append(&sb, c);
-                    c = reader_getchar();
-                }
-                if (reject_invalid_prefixed_tail(c, "hex")) {
-                    sb_free(&sb);
-                    return TOK_ERROR;
-                }
-                if (sb.len == 0) {
-                    sb_free(&sb);
-                    show_error("invalid hex literal: #x");
-                    return TOK_ERROR;
-                }
-                unsigned result = read_prefixed_integer(sb.data, 16, neg);
-                sb_free(&sb);
-                return result;
-            } else if (c == 'o' || c == 'O') {
-                // Octal literal: #o77
-                string_buffer sb;
-                sb_init(&sb);
-                bool neg = false;
-                c = reader_getchar();
-                if (c == '-') { neg = true; c = reader_getchar(); }
-                else if (c == '+') { c = reader_getchar(); }
-                while (c >= '0' && c <= '7') {
-                    sb_append(&sb, c);
-                    c = reader_getchar();
-                }
-                if (reject_invalid_prefixed_tail(c, "octal")) {
-                    sb_free(&sb);
-                    return TOK_ERROR;
-                }
-                if (sb.len == 0) {
-                    sb_free(&sb);
-                    show_error("invalid octal literal: #o");
-                    return TOK_ERROR;
-                }
-                unsigned result = read_prefixed_integer(sb.data, 8, neg);
-                sb_free(&sb);
-                return result;
-            } else if (c == 'b' || c == 'B') {
-                // Binary literal: #b1010
-                string_buffer sb;
-                sb_init(&sb);
-                bool neg = false;
-                c = reader_getchar();
-                if (c == '-') { neg = true; c = reader_getchar(); }
-                else if (c == '+') { c = reader_getchar(); }
-                while (c == '0' || c == '1') {
-                    sb_append(&sb, c);
-                    c = reader_getchar();
-                }
-                if (reject_invalid_prefixed_tail(c, "binary")) {
-                    sb_free(&sb);
-                    return TOK_ERROR;
-                }
-                if (sb.len == 0) {
-                    sb_free(&sb);
-                    show_error("invalid binary literal: #b");
-                    return TOK_ERROR;
-                }
-                unsigned result = read_prefixed_integer(sb.data, 2, neg);
-                sb_free(&sb);
-                return result;
+            } else if (c == 'x' || c == 'X' || c == 'o' || c == 'O' ||
+                       c == 'b' || c == 'B' || c == 'd' || c == 'D' ||
+                       c == 'e' || c == 'E' || c == 'i' || c == 'I') {
+                return read_prefixed_number(c);
             } else if (c == 'u') {
                 // Bytevector literal: #u8(...)
                 c = reader_getchar();

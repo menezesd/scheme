@@ -433,6 +433,22 @@ TEST(writer_escapes_symbol_bar_and_backslash)
     PASS();
 }
 
+TEST(write_simple_rejects_cycles)
+{
+    unsigned cell = alloc_cons(store(1), 0);
+    cell_set_cdr(cell, cell);
+
+    char *buf = NULL;
+    size_t len = 0;
+    FILE *mem = open_memstream(&buf, &len);
+    ASSERT(mem != NULL);
+
+    ASSERT(!write_simple_obj_port_checked(cell, mem));
+    fclose(mem);
+    free(buf);
+    PASS();
+}
+
 TEST(string_port_write_failures_return_false)
 {
     string_port *sp = strport_new();
@@ -1197,6 +1213,7 @@ int main(void)
     RUN_TEST(writer_displays_unicode_character_as_utf8);
     RUN_TEST(writer_escapes_non_roundtripping_symbols);
     RUN_TEST(writer_escapes_symbol_bar_and_backslash);
+    RUN_TEST(write_simple_rejects_cycles);
     RUN_TEST(string_port_write_failures_return_false);
     RUN_TEST(make_string_owned_rejects_null);
 

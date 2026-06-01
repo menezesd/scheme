@@ -121,6 +121,7 @@ static visited_entry visited_table[VISITED_TABLE_SIZE];
 static int next_label = 0;
 static int visited_count = 0;
 static bool writer_emit_shared_labels = true;
+static bool writer_error = false;
 
 // Hash function - good distribution for cell addresses
 static inline unsigned hash_cell(unsigned cell)
@@ -428,6 +429,23 @@ static void write_list_tail_fp(unsigned st, bool with_quotes, FILE *fp)
         return;
     }
 
+    bool simple_tracking = false;
+    visited_entry *simple_entry = NULL;
+    if (!writer_emit_shared_labels && IS_PAIR(st)) {
+        simple_entry = find_visited(st);
+        if (simple_entry && simple_entry->active) {
+            show_error("write-simple: circular structure");
+            writer_error = true;
+            return;
+        }
+        if (!simple_entry)
+            simple_entry = insert_visited(st);
+        if (simple_entry) {
+            simple_entry->active = true;
+            simple_tracking = true;
+        }
+    }
+
     if (IS_PAIR(st)) {
         fprintf(fp, " ");
         write_obj_fp(car(st), with_quotes, fp);
@@ -436,6 +454,9 @@ static void write_list_tail_fp(unsigned st, bool with_quotes, FILE *fp)
         fprintf(fp, " . ");
         write_obj_fp(st, with_quotes, fp);
     }
+
+    if (simple_tracking)
+        simple_entry->active = false;
 }
 
 static void write_obj_fp(unsigned s, bool with_quotes, FILE *fp)
@@ -464,7 +485,8 @@ static void write_obj_fp(unsigned s, bool with_quotes, FILE *fp)
         (type == BT_CONS || type == BT_VECTOR)) {
         simple_entry = find_visited(s);
         if (simple_entry && simple_entry->active) {
-            fprintf(fp, "#<cycle>");
+            show_error("write-simple: circular structure");
+            writer_error = true;
             return;
         }
         if (!simple_entry)
@@ -696,10 +718,17 @@ void write_shared_obj_port(unsigned s, FILE *port)
 
 void write_simple_obj_port(unsigned s, FILE *port)
 {
+    (void)write_simple_obj_port_checked(s, port);
+}
+
+bool write_simple_obj_port_checked(unsigned s, FILE *port)
+{
     reset_visited();
+    writer_error = false;
     writer_emit_shared_labels = false;
     write_obj_fp(s, true, port);
     writer_emit_shared_labels = true;
+    return !writer_error;
 }
 
 void display_obj_port(unsigned s, FILE *port)

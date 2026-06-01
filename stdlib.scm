@@ -68,22 +68,30 @@
 ;; R7RS binary I/O
 (define (write-u8 byte . opt-port)
   (let ((port (if (pair? opt-port) (car opt-port) (current-output-port))))
-    (if (bytevector-output-port? port)
-        (vector-set! port 1 (cons (bytevector byte) (vector-ref port 1)))
-        (write-char (integer->char byte) port))))
+    (cond
+      ((bytevector-output-port-open? port)
+       (vector-set! port 1 (cons (bytevector byte) (vector-ref port 1))))
+      ((bytevector-output-port? port)
+       (error "write-u8: port is closed"))
+      (else
+       (write-char (integer->char byte) port)))))
 
 (define (read-u8 . opt-port)
   (let ((port (if (pair? opt-port) (car opt-port) (current-input-port))))
-    (if (bytevector-input-port? port)
-        (let* ((bv (vector-ref port 1))
-               (pos (vector-ref port 2)))
-          (if (>= pos (bytevector-length bv))
-              (eof-object)
-              (begin
-                (vector-set! port 2 (+ pos 1))
-                (bytevector-u8-ref bv pos))))
-        (let ((ch (read-char port)))
-          (if (eof-object? ch) ch (char->integer ch))))))
+    (cond
+      ((bytevector-input-port-open? port)
+       (let* ((bv (vector-ref port 1))
+              (pos (vector-ref port 2)))
+         (if (>= pos (bytevector-length bv))
+             (eof-object)
+             (begin
+               (vector-set! port 2 (+ pos 1))
+               (bytevector-u8-ref bv pos)))))
+      ((bytevector-input-port? port)
+       (error "read-u8: port is closed"))
+      (else
+       (let ((ch (read-char port)))
+         (if (eof-object? ch) ch (char->integer ch)))))))
 
 ;;; ============================================================================
 ;;; Binary I/O helpers
@@ -105,49 +113,113 @@
   (vector 'bvout '()))
 
 (define (bytevector-output-port? x)
-  (and (vector? x) (> (vector-length x) 0) (eq? (vector-ref x 0) 'bvout)))
+  (and (vector? x) (> (vector-length x) 0)
+       (or (eq? (vector-ref x 0) 'bvout)
+           (eq? (vector-ref x 0) 'bvout-closed))))
+
+(define (bytevector-output-port-open? x)
+  (and (bytevector-output-port? x) (eq? (vector-ref x 0) 'bvout)))
 
 (define (get-output-bytevector port)
-  (apply bytevector-append (reverse (vector-ref port 1))))
+  (if (bytevector-output-port-open? port)
+      (apply bytevector-append (reverse (vector-ref port 1)))
+      (error "get-output-bytevector: port is closed")))
 
 ;; Bytevector input port: vector #(tag bv pos)
 (define (open-input-bytevector bv)
   (vector 'bvin bv 0))
 
 (define (bytevector-input-port? x)
-  (and (vector? x) (> (vector-length x) 0) (eq? (vector-ref x 0) 'bvin)))
+  (and (vector? x) (> (vector-length x) 0)
+       (or (eq? (vector-ref x 0) 'bvin)
+           (eq? (vector-ref x 0) 'bvin-closed))))
+
+(define (bytevector-input-port-open? x)
+  (and (bytevector-input-port? x) (eq? (vector-ref x 0) 'bvin)))
 
 ;; write-bytevector: write all or part of a bytevector to a port
+(define primitive-write-bytevector write-bytevector)
+
 (define (write-bytevector bv . args)
   (let* ((port (if (pair? args) (car args) (current-output-port)))
          (rest (if (pair? args) (cdr args) '()))
          (start (if (pair? rest) (car rest) 0))
          (rest2 (if (pair? rest) (cdr rest) '()))
          (end (if (pair? rest2) (car rest2) (bytevector-length bv))))
-    (if (bytevector-output-port? port)
-        ;; Accumulate chunk
-        (vector-set! port 1 (cons (bytevector-copy bv start end) (vector-ref port 1)))
-        ;; File port: write bytes
-        (let loop ((i start))
-          (when (< i end)
-            (write-char (integer->char (bytevector-u8-ref bv i)) port)
-            (loop (+ i 1)))))))
+    (cond
+      ((bytevector-output-port-open? port)
+       (vector-set! port 1 (cons (bytevector-copy bv start end) (vector-ref port 1))))
+      ((bytevector-output-port? port)
+       (error "write-bytevector: port is closed"))
+      (else
+       (primitive-write-bytevector (bytevector-copy bv start end) port)))))
 
 ;; Wrap read-bytevector to support bytevector input ports
 (let ((prim-read-bytevector read-bytevector))
   (set! read-bytevector
     (lambda (k port)
-      (if (bytevector-input-port? port)
-          (let* ((bv (vector-ref port 1))
-                 (pos (vector-ref port 2))
-                 (available (- (bytevector-length bv) pos)))
-            (if (<= available 0)
-                (eof-object)
-                (let* ((n (min k available))
-                       (result (bytevector-copy bv pos (+ pos n))))
-                  (vector-set! port 2 (+ pos n))
-                  result)))
-          (prim-read-bytevector k port)))))
+      (cond
+        ((bytevector-input-port-open? port)
+         (let* ((bv (vector-ref port 1))
+                (pos (vector-ref port 2))
+                (available (- (bytevector-length bv) pos)))
+           (if (<= available 0)
+               (eof-object)
+               (let* ((n (min k available))
+                      (result (bytevector-copy bv pos (+ pos n))))
+                 (vector-set! port 2 (+ pos n))
+                 result))))
+        ((bytevector-input-port? port)
+         (error "read-bytevector: port is closed"))
+        (else
+         (prim-read-bytevector k port))))))
+
+(let ((primitive-input-port? input-port?)
+      (primitive-output-port? output-port?)
+      (primitive-input-port-open? input-port-open?)
+      (primitive-output-port-open? output-port-open?)
+      (primitive-textual-port? textual-port?)
+      (primitive-binary-port? binary-port?)
+      (primitive-close-input-port close-input-port)
+      (primitive-close-output-port close-output-port))
+  (set! input-port?
+    (lambda (obj)
+      (or (bytevector-input-port? obj)
+          (primitive-input-port? obj))))
+  (set! output-port?
+    (lambda (obj)
+      (or (bytevector-output-port? obj)
+          (primitive-output-port? obj))))
+  (set! input-port-open?
+    (lambda (obj)
+      (if (bytevector-input-port? obj)
+          (bytevector-input-port-open? obj)
+          (primitive-input-port-open? obj))))
+  (set! output-port-open?
+    (lambda (obj)
+      (if (bytevector-output-port? obj)
+          (bytevector-output-port-open? obj)
+          (primitive-output-port-open? obj))))
+  (set! textual-port?
+    (lambda (obj)
+      (and (not (or (bytevector-input-port? obj)
+                    (bytevector-output-port? obj)))
+           (primitive-textual-port? obj))))
+  (set! binary-port?
+    (lambda (obj)
+      (or (bytevector-input-port? obj)
+          (bytevector-output-port? obj)
+          (primitive-binary-port? obj))))
+  (set! close-input-port
+    (lambda (port)
+      (if (bytevector-input-port-open? port)
+          (vector-set! port 0 'bvin-closed)
+          (primitive-close-input-port port))))
+  (set! close-output-port
+    (lambda (port)
+      (if (bytevector-output-port-open? port)
+          (vector-set! port 0 'bvout-closed)
+          (primitive-close-output-port port)))))
 
 ;;; ============================================================================
 ;;; When/Unless macros (R7RS)

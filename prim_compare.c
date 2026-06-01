@@ -145,26 +145,67 @@ slow_path:;
 unsigned char_compare(unsigned argc, unsigned *argv, cmp_op op,
                       bool case_insensitive)
 {
-    REQUIRE_ARGC(argc, 2, 2, "char comparison");
-    int c1, c2;
-    if (!expect_char_value(argv[0], &c1, "char comparison") ||
-        !expect_char_value(argv[1], &c2, "char comparison"))
+    if (argc < 2) {
+        show_error("char comparison: expected at least 2 arguments, got %u",
+                   argc);
         return TOK_ERROR;
-    if (case_insensitive) {
-        c1 = (int)unicode_simple_foldcase((uint32_t)c1);
-        c2 = (int)unicode_simple_foldcase((uint32_t)c2);
     }
-    return scheme_bool(APPLY_CMP_OP(op, c1, c2));
+    int prev;
+    if (!expect_char_value(argv[0], &prev, "char comparison"))
+        return TOK_ERROR;
+    if (case_insensitive)
+        prev = (int)unicode_simple_foldcase((uint32_t)prev);
+
+    for (unsigned i = 1; i < argc; i++) {
+        int curr;
+        if (!expect_char_value(argv[i], &curr, "char comparison"))
+            return TOK_ERROR;
+        if (case_insensitive)
+            curr = (int)unicode_simple_foldcase((uint32_t)curr);
+        if (!APPLY_CMP_OP(op, prev, curr))
+            return ctx.atom_false;
+        prev = curr;
+    }
+    return ctx.atom_true;
 }
 
 unsigned string_compare(unsigned argc, unsigned *argv, cmp_op op,
                         bool case_insensitive)
 {
-    REQUIRE_ARGC(argc, 2, 2, "string comparison");
-    char *s1 = require_string_ptr(argv[0], "string comparison");
-    char *s2 = require_string_ptr(argv[1], "string comparison");
-    if (!s1 || !s2)
+    if (argc < 2) {
+        show_error("string comparison: expected at least 2 arguments, got %u",
+                   argc);
         return TOK_ERROR;
-    int cmp = case_insensitive ? strcasecmp(s1, s2) : strcmp(s1, s2);
-    return scheme_bool(APPLY_CMP_OP(op, cmp, 0));
+    }
+    GC_GUARD;
+    unsigned prev_cell = argv[0];
+    gc_protect(&prev_cell);
+    if (case_insensitive) {
+        prev_cell = prim_string_normalize(PSTRFOLD, 1, &prev_cell);
+        if (prev_cell == TOK_ERROR)
+            return TOK_ERROR;
+    }
+    char *prev = require_string_ptr(prev_cell, "string comparison");
+    if (!prev)
+        return TOK_ERROR;
+
+    for (unsigned i = 1; i < argc; i++) {
+        unsigned curr_cell = argv[i];
+        gc_protect(&curr_cell);
+        if (case_insensitive) {
+            curr_cell = prim_string_normalize(PSTRFOLD, 1, &curr_cell);
+            if (curr_cell == TOK_ERROR)
+                return TOK_ERROR;
+        }
+        char *curr = require_string_ptr(curr_cell, "string comparison");
+        if (!curr)
+            return TOK_ERROR;
+        int cmp = strcmp(prev, curr);
+        if (!APPLY_CMP_OP(op, cmp, 0))
+            return ctx.atom_false;
+        prev_cell = curr_cell;
+        prev = curr;
+        gc_unprotect(1);
+    }
+    return ctx.atom_true;
 }
