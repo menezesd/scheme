@@ -413,6 +413,28 @@ TEST(read_unknown_directive_rejected)
     PASS();
 }
 
+TEST(read_datum_comment_skips_one_object)
+{
+    unsigned x = read_from_string("#;FOO BAR");
+    ASSERT(CELL_TYPE(x) == BT_ATOM);
+    ASSERT_STR_EQ(ctx.atom_table[CELL_ID(x)], "bar");
+    PASS();
+}
+
+TEST(read_datum_comment_skips_nested_object)
+{
+    unsigned x = read_from_string("#;(1 (2 3) #(4 5)) done");
+    ASSERT(CELL_TYPE(x) == BT_ATOM);
+    ASSERT_STR_EQ(ctx.atom_table[CELL_ID(x)], "done");
+    PASS();
+}
+
+TEST(read_datum_comment_rejects_missing_datum)
+{
+    ASSERT(read_from_string("#;") == TOK_ERROR);
+    PASS();
+}
+
 TEST(read_symbol_with_special_chars)
 {
     unsigned x = read_from_string("foo-bar?");
@@ -832,6 +854,9 @@ int main(void)
     RUN_TEST(read_case_directive_persists_for_port);
     RUN_TEST(read_case_directive_can_toggle);
     RUN_TEST(read_unknown_directive_rejected);
+    RUN_TEST(read_datum_comment_skips_one_object);
+    RUN_TEST(read_datum_comment_skips_nested_object);
+    RUN_TEST(read_datum_comment_rejects_missing_datum);
     RUN_TEST(read_symbol_with_special_chars);
     RUN_TEST(read_symbol_preserves_utf8_identifier);
     RUN_TEST(read_symbol_ascii_folds_without_mangling_utf8);

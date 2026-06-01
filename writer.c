@@ -114,11 +114,13 @@ typedef struct {
     unsigned cell; // Cell address (0 = empty slot)
     int label;     // -1 = visited once, >= 0 = assigned label
     bool printed;  // true if we've printed #n= prefix
+    bool active;   // true while simple writer is printing this object
 } visited_entry;
 
 static visited_entry visited_table[VISITED_TABLE_SIZE];
 static int next_label = 0;
 static int visited_count = 0;
+static bool writer_emit_shared_labels = true;
 
 // Hash function - good distribution for cell addresses
 static inline unsigned hash_cell(unsigned cell)
@@ -175,6 +177,7 @@ static visited_entry *insert_visited(unsigned cell)
             visited_table[probe].cell = cell;
             visited_table[probe].label = -1;
             visited_table[probe].printed = false;
+            visited_table[probe].active = false;
             visited_count++;
             return &visited_table[probe];
         }
@@ -454,8 +457,26 @@ static void write_obj_fp(unsigned s, bool with_quotes, FILE *fp)
         return;
     }
 
+    enum lisp_type type = CELL_TYPE(s);
+    bool simple_tracking = false;
+    visited_entry *simple_entry = NULL;
+    if (!writer_emit_shared_labels &&
+        (type == BT_CONS || type == BT_VECTOR)) {
+        simple_entry = find_visited(s);
+        if (simple_entry && simple_entry->active) {
+            fprintf(fp, "#<cycle>");
+            return;
+        }
+        if (!simple_entry)
+            simple_entry = insert_visited(s);
+        if (simple_entry) {
+            simple_entry->active = true;
+            simple_tracking = true;
+        }
+    }
+
     // Check for shared/circular structure
-    visited_entry *entry = find_visited(s);
+    visited_entry *entry = writer_emit_shared_labels ? find_visited(s) : NULL;
     if (entry && entry->label >= 0) {
         if (entry->printed) {
             // Already printed - use reference
@@ -467,7 +488,7 @@ static void write_obj_fp(unsigned s, bool with_quotes, FILE *fp)
         fprintf(fp, "#%d=", entry->label);
     }
 
-    switch (CELL_TYPE(s)) {
+    switch (type) {
     case BT_ATOM:
         // Print #t and #f for boolean atoms
         if (s == ctx.atom_true) {
@@ -636,11 +657,15 @@ static void write_obj_fp(unsigned s, bool with_quotes, FILE *fp)
     default:
         fprintf(fp, "[???]");
     }
+
+    if (simple_tracking)
+        simple_entry->active = false;
 }
 
 void write_obj(unsigned s)
 {
     reset_visited();
+    writer_emit_shared_labels = true;
     mark_shared(s);
     write_obj_fp(s, true, stdout);
 }
@@ -648,6 +673,7 @@ void write_obj(unsigned s)
 void display_obj(unsigned s)
 {
     reset_visited();
+    writer_emit_shared_labels = true;
     mark_shared(s);
     write_obj_fp(s, false, stdout);
 }
@@ -655,13 +681,31 @@ void display_obj(unsigned s)
 void write_obj_port(unsigned s, FILE *port)
 {
     reset_visited();
+    writer_emit_shared_labels = true;
     mark_shared(s);
     write_obj_fp(s, true, port);
+}
+
+void write_shared_obj_port(unsigned s, FILE *port)
+{
+    reset_visited();
+    writer_emit_shared_labels = true;
+    mark_shared(s);
+    write_obj_fp(s, true, port);
+}
+
+void write_simple_obj_port(unsigned s, FILE *port)
+{
+    reset_visited();
+    writer_emit_shared_labels = false;
+    write_obj_fp(s, true, port);
+    writer_emit_shared_labels = true;
 }
 
 void display_obj_port(unsigned s, FILE *port)
 {
     reset_visited();
+    writer_emit_shared_labels = true;
     mark_shared(s);
     write_obj_fp(s, false, port);
 }

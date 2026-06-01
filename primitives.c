@@ -1051,6 +1051,61 @@ static unsigned bytevector_copy_to(unsigned argc, unsigned *argv,
     return 0;
 }
 
+static unsigned string_to_utf8_value(unsigned argc, unsigned *argv,
+                                     const char *name)
+{
+    char *s = require_string_ptr(argv[0], name);
+    if (!s)
+        return TOK_ERROR;
+    int64_t start = 0;
+    int64_t end = 0;
+    if (argc > 1 && !expect_nonneg_int64(argv[1], &start, name))
+        return TOK_ERROR;
+    if (argc > 2 && !expect_nonneg_int64(argv[2], &end, name))
+        return TOK_ERROR;
+    if (argc <= 2) {
+        size_t char_len;
+        if (!utf8_count_chars(s, &char_len, name))
+            return TOK_ERROR;
+        end = (int64_t)char_len;
+    }
+    size_t start_byte, end_byte;
+    if (!utf8_range_offsets(s, start, end, &start_byte, &end_byte, name))
+        return TOK_ERROR;
+    if (end_byte - start_byte > UINT_MAX) {
+        show_error("%s: result too large", name);
+        return TOK_ERROR;
+    }
+    return make_bytevector_copy((const uint8_t *)s + start_byte,
+                                (unsigned)(end_byte - start_byte), name);
+}
+
+static unsigned utf8_to_string_value(unsigned argc, unsigned *argv,
+                                     const char *name)
+{
+    bytevec_data *bv = require_bytevector(argv[0], name);
+    if (!bv)
+        return TOK_ERROR;
+    int64_t start, end;
+    if (!bytevector_bounded_range(argc, argv, 1, 2, bv->len, &start,
+                                  &end, name, "invalid range"))
+        return TOK_ERROR;
+    size_t len = (size_t)(end - start);
+    const char *bytes = (const char *)bv->data + start;
+    size_t offset = 0;
+    int code;
+    while (offset < len) {
+        if (!utf8_decode_next(bytes, len, &offset, &code, name))
+            return TOK_ERROR;
+    }
+    char *copy = checked_string_copy_len(bytes, len);
+    if (!copy) {
+        show_error("%s: out of memory", name);
+        return TOK_ERROR;
+    }
+    return make_string_owned(copy);
+}
+
 static unsigned apply_bytevector_primitive(unsigned prim_id, unsigned argc,
                                            unsigned *argv)
 {
@@ -1415,6 +1470,12 @@ static unsigned apply_string_primitive(unsigned prim_id, unsigned argc,
         return prim_string_normalize(prim_id, argc, argv);
     case PSTRING:
         return make_string_from_chars(argc, argv, "string");
+    case PSTRINGTOUTF8:
+        REQUIRE_ARGC(argc, 1, 3, "string->utf8");
+        return string_to_utf8_value(argc, argv, "string->utf8");
+    case PUTF8TOSTRING:
+        REQUIRE_ARGC(argc, 1, 3, "utf8->string");
+        return utf8_to_string_value(argc, argv, "utf8->string");
     case PSTREQ:
     case PSTRLT:
     case PSTRGT:
@@ -1746,9 +1807,11 @@ static unsigned write_bytevector_to_port(unsigned bv_arg, unsigned port_arg,
     return 0;
 }
 
-static unsigned read_bytevector_into(unsigned bv_arg, unsigned port_arg,
+static unsigned read_bytevector_into(unsigned argc, unsigned *argv,
                                      const char *name)
 {
+    unsigned bv_arg = argv[0];
+    unsigned port_arg = argv[1];
     bytevec_data *bv = require_bytevector(bv_arg, name);
     if (!bv)
         return TOK_ERROR;
@@ -1761,7 +1824,14 @@ static unsigned read_bytevector_into(unsigned bv_arg, unsigned port_arg,
         show_error("%s: port is closed", name);
         return TOK_ERROR;
     }
-    size_t n = fread(bv->data, 1, bv->len, f);
+    int64_t start, end;
+    if (!bytevector_bounded_range(argc, argv, 2, 3, bv->len, &start,
+                                  &end, name, "out of bounds"))
+        return TOK_ERROR;
+    size_t len = (size_t)(end - start);
+    if (len == 0)
+        return store(0);
+    size_t n = fread(bv->data + start, 1, len, f);
     if (ferror(f)) {
         show_error("%s: read failed", name);
         return TOK_ERROR;
@@ -2272,8 +2342,8 @@ static unsigned apply_misc_primitive(unsigned prim_id, unsigned argc,
         REQUIRE_ARGC(argc, 2, 2, "write-bytevector");
         return write_bytevector_to_port(argv[0], argv[1], "write-bytevector");
     case PREADBYTEVECINTO:
-        REQUIRE_ARGC(argc, 2, 2, "read-bytevector!");
-        return read_bytevector_into(argv[0], argv[1], "read-bytevector!");
+        REQUIRE_ARGC(argc, 2, 4, "read-bytevector!");
+        return read_bytevector_into(argc, argv, "read-bytevector!");
     case PFEATURES:
         REQUIRE_ARGC(argc, 0, 0, "features");
         return make_features_list();
@@ -2449,6 +2519,8 @@ unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
     // I/O - delegated to prim_io.c
     case PDISPLAY:
     case PWRITE:
+    case PWRITESHARED:
+    case PWRITESIMPLE:
     case PNEWLINE:
     case PREAD:
     case PREADCHAR:
@@ -2514,6 +2586,8 @@ unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
     case PSTRDOWN:
     case PSTRTITLE:
     case PSTRING:
+    case PSTRINGTOUTF8:
+    case PUTF8TOSTRING:
     case PSTREQ:
     case PSTRLT:
     case PSTRGT:

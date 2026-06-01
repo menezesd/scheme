@@ -468,6 +468,8 @@ static const struct {
     // I/O
     {"display", PDISPLAY},
     {"write", PWRITE},
+    {"write-shared", PWRITESHARED},
+    {"write-simple", PWRITESIMPLE},
     {"newline", PNEWLINE},
     {"read", PREAD},
     {"read-char", PREADCHAR},
@@ -512,6 +514,8 @@ static const struct {
     {"string-upcase", PSTRUP},
     {"string-downcase", PSTRDOWN},
     {"string-titlecase", PSTRTITLE},
+    {"string->utf8", PSTRINGTOUTF8},
+    {"utf8->string", PUTF8TOSTRING},
 
     // String comparisons
     {"string=?", PSTREQ},

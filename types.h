@@ -616,6 +616,10 @@ enum primitive_id {
     PJIFFIESPERSECOND,
     PGETENVS,
     PEMERGENCYEXIT,
+    PWRITESHARED,
+    PWRITESIMPLE,
+    PSTRINGTOUTF8,
+    PUTF8TOSTRING,
     PRIM_COUNT // Total number of primitives
 };
 

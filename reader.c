@@ -481,6 +481,22 @@ static bool read_reader_directive(void)
     return false;
 }
 
+static bool read_datum_comment(void)
+{
+    unsigned skipped = read_obj();
+    if (skipped == TOK_ERROR)
+        return false;
+    if (skipped == TOK_EOF) {
+        show_error("unexpected end of file after #;");
+        return false;
+    }
+    if (skipped == TOK_CLOSE || skipped == TOK_DOT) {
+        show_error("#; must be followed by an object");
+        return false;
+    }
+    return true;
+}
+
 static char *sb_finish(string_buffer *sb)
 {
     return sb->data; // Caller takes ownership
@@ -974,6 +990,10 @@ unsigned read_token(void)
             c = reader_getchar();
             if (c == '(') {
                 return TOK_VECTOR_OPEN;
+            } else if (c == ';') {
+                if (!read_datum_comment())
+                    return TOK_ERROR;
+                continue;
             } else if (c == '!') {
                 if (!read_reader_directive())
                     return TOK_ERROR;

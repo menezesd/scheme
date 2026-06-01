@@ -12,6 +12,12 @@ void display_obj(unsigned s);
 // Write object with quotes to specified port
 void write_obj_port(unsigned s, FILE *port);
 
+// Write object with labels for shared/circular structure
+void write_shared_obj_port(unsigned s, FILE *port);
+
+// Write object without shared-structure labels
+void write_simple_obj_port(unsigned s, FILE *port);
+
 // Write object without outer quotes to specified port
 void display_obj_port(unsigned s, FILE *port);
 

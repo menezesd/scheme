@@ -878,6 +878,10 @@
 (test "input-port-open?" #t (input-port-open? in-str-port))
 (close-input-port in-str-port)
 (test "input-port-open? closed" #f (input-port-open? in-str-port))
+(define crlf-port (open-input-string "alpha\r\nbeta\rgamma\n"))
+(test "read-line crlf" "alpha" (read-line crlf-port))
+(test "read-line cr" "beta" (read-line crlf-port))
+(test "read-line lf" "gamma" (read-line crlf-port))
 (define peek-u8-port (open-input-string "AZ"))
 (test "peek-u8" (char->integer #\A) (peek-u8 peek-u8-port))
 (test "peek-u8 does not consume" (char->integer #\A) (read-u8 peek-u8-port))
@@ -899,6 +903,11 @@
 (test "binary input port predicate" #t (binary-port? compat-in))
 (test "read-bytevector file" #u8(65 66 67) (read-bytevector 3 compat-in))
 (close-input-port compat-in)
+(define compat-in-slice (open-binary-input-file compat-file))
+(define compat-target (bytevector 0 0 0 0 0))
+(test "read-bytevector! range" 2 (read-bytevector! compat-target compat-in-slice 1 3))
+(test "read-bytevector! range target" #u8(0 65 66 0 0) compat-target)
+(close-input-port compat-in-slice)
 (delete-file compat-file)
 (test "delete-file compat file" #f (file-exists? compat-file))
 (define compat-text-file "/tmp/vesper-compat-text.txt")
@@ -974,6 +983,16 @@
                                 (lambda (p) (write-simple "x" p))))
 (test "write-shared" "(1 2)" (call-with-output-string
                                 (lambda (p) (write-shared '(1 2) p))))
+(test "write-shared emits labels" "(#0=(1) #0#)"
+      (call-with-output-string
+        (lambda (p)
+          (let ((x (list 1)))
+            (write-shared (list x x) p)))))
+(test "write-simple repeats shared data" "((1) (1))"
+      (call-with-output-string
+        (lambda (p)
+          (let ((x (list 1)))
+            (write-simple (list x x) p)))))
 (test "exact-nonnegative-integer?" #t (exact-nonnegative-integer? 0))
 (test "exact-rational?" #t (exact-rational? 1/3))
 (test "exact-integer-sqrt" '(5 2)
@@ -1065,6 +1084,10 @@
       (string->utf8 (string (integer->char 233))))
 (test "utf8 decodes two-byte character" (string (integer->char 233))
       (utf8->string #u8(195 169)))
+(test "string->utf8 range" #u8(195 169 240 157 132 158)
+      (string->utf8 (unicode-char 97 233 119070) 1 3))
+(test "utf8->string range" (string (integer->char 233))
+      (utf8->string #u8(65 195 169 66) 1 3))
 (test "environment returns environment" #t (pair? (environment '(scheme base))))
 (test "environment rejects unknown library"
       #t
@@ -1085,6 +1108,11 @@
                (list (error-object-message exn)
                      (error-object-irritants exn))))
         (error "boom" 1 2)))
+(test "raise-continuable returns handler value"
+      'returned
+      (with-exception-handler
+        (lambda (exn) 'returned)
+        (lambda () (raise-continuable 'continuable))))
 (test "syntax-error object kind"
       #t
       (guard (exn
@@ -1250,6 +1278,8 @@
 (test "reader case directive toggles" '("FOO" "bar")
       (let ((p (open-input-string "#!no-fold-case FOO #!fold-case BAR")))
         (list (symbol->string (read p)) (symbol->string (read p)))))
+(test "reader datum comment" 'kept
+      (read (open-input-string "#;(discard (nested datum)) kept")))
 (test "escaped identifier preserves case and spaces" 9
       (let ((|Hello World| 9)) |Hello World|))
 (test "escaped identifier scalar escape" 11

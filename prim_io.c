@@ -82,6 +82,44 @@ static bool write_arg_to_file_port(unsigned arg, FILE *fport, const char *name,
     return flush_file_port(fport, name);
 }
 
+static unsigned write_arg_to_string_port_mode(unsigned arg, string_port *sport,
+                                              const char *name,
+                                              void (*writer)(unsigned, FILE *))
+{
+    char *buf = NULL;
+    size_t buflen = 0;
+    FILE *memfp = open_memstream(&buf, &buflen);
+    if (!memfp) {
+        show_error("%s: out of memory", name);
+        return TOK_ERROR;
+    }
+
+    writer(arg, memfp);
+
+    if (fclose(memfp) != 0) {
+        free(buf);
+        show_error("%s: write failed", name);
+        return TOK_ERROR;
+    }
+    if (!strport_puts(sport, buf)) {
+        free(buf);
+        show_error("%s: string port write failed", name);
+        return TOK_ERROR;
+    }
+    free(buf);
+    return arg;
+}
+
+static bool write_arg_to_file_port_mode(unsigned arg, FILE *fport,
+                                        const char *name,
+                                        void (*writer)(unsigned, FILE *))
+{
+    writer(arg, fport);
+    if (ctx.transcript && fport == ctx.current_output)
+        writer(arg, ctx.transcript);
+    return flush_file_port(fport, name);
+}
+
 static bool write_newline_to_file_port(FILE *fport)
 {
     fprintf(fport, "\n");
@@ -128,6 +166,24 @@ static unsigned write_object_with_optional_port(unsigned argc, unsigned *argv,
     if (ptype == 1)
         return write_arg_to_string_port(arg, sport, name, display);
     if (!write_arg_to_file_port(arg, fport, name, display))
+        return TOK_ERROR;
+    return arg;
+}
+
+static unsigned write_object_mode_with_optional_port(
+    unsigned argc, unsigned *argv, const char *name,
+    void (*writer)(unsigned, FILE *))
+{
+    unsigned arg = argv[0];
+    FILE *fport;
+    string_port *sport;
+    int ptype = extract_optional_port(argc, argv, 2, PORT_OUTPUT, &fport,
+                                      &sport, name);
+    if (ptype == -1)
+        return TOK_ERROR;
+    if (ptype == 1)
+        return write_arg_to_string_port_mode(arg, sport, name, writer);
+    if (!write_arg_to_file_port_mode(arg, fport, name, writer))
         return TOK_ERROR;
     return arg;
 }
@@ -305,6 +361,16 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
     case PWRITE: {
         REQUIRE_ARGC(argc, 1, 2, "write");
         return write_object_with_optional_port(argc, argv, "write", false);
+    }
+    case PWRITESHARED: {
+        REQUIRE_ARGC(argc, 1, 2, "write-shared");
+        return write_object_mode_with_optional_port(argc, argv, "write-shared",
+                                                    write_shared_obj_port);
+    }
+    case PWRITESIMPLE: {
+        REQUIRE_ARGC(argc, 1, 2, "write-simple");
+        return write_object_mode_with_optional_port(argc, argv, "write-simple",
+                                                    write_simple_obj_port);
     }
     case PNEWLINE: {
         REQUIRE_ARGC(argc, 0, 1, "newline");
@@ -524,6 +590,17 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
             }
             if (c == EOF || c == '\n')
                 break;
+            if (c == '\r') {
+                int next = ptype == 1 ? strport_peekc(sport)
+                                      : reader_port_peekc(fport);
+                if (next == '\n') {
+                    if (ptype == 1)
+                        (void)strport_getc(sport);
+                    else
+                        (void)reader_port_getc(fport);
+                }
+                break;
+            }
             if (len + 1 >= cap) {
                 if (!grow_read_line_buffer(&buf, &cap)) {
                     free(buf);
