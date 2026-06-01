@@ -1026,6 +1026,12 @@
 (test "unicode char-foldcase final sigma" (integer->char #x03c3)
       (char-foldcase (integer->char #x03c2)))
 (test "unicode string-upcase expands" "SSFFI" (string-upcase "ßﬃ"))
+(test "unicode string-downcase final sigma"
+      (unicode-char #x03bf #x03c2)
+      (string-downcase (unicode-char #x039f #x03a3)))
+(test "unicode string-titlecase final sigma"
+      (unicode-char #x039f #x03c2)
+      (string-titlecase (unicode-char #x039f #x03a3)))
 (test "unicode string-foldcase expands" "ssi̇ksμσσσffi"
       (string-foldcase "ẞİKſµΣςσﬃ"))
 (test "unicode string-ci uses full foldcase" #t

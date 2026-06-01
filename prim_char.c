@@ -38,6 +38,30 @@ static uint32_t lookup_simple_mapping(const unicode_simple_fold_entry *entries,
     return code;
 }
 
+static bool lookup_full_mapping(const unicode_full_case_entry *entries,
+                                const uint32_t *data, size_t count,
+                                uint32_t code, const uint32_t **mapping,
+                                size_t *length)
+{
+    size_t lo = 0;
+    size_t hi = count;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (entries[mid].code < code)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    if (lo < count && entries[lo].code == code) {
+        *mapping = &data[entries[lo].offset];
+        *length = entries[lo].length;
+        return true;
+    }
+    *mapping = NULL;
+    *length = 0;
+    return false;
+}
+
 uint32_t unicode_simple_foldcase(uint32_t code)
 {
     return lookup_simple_mapping(unicode_simple_fold_table,
@@ -56,26 +80,48 @@ uint32_t unicode_downcase(uint32_t code)
                                  UNICODE_DOWNCASE_COUNT, code);
 }
 
+bool unicode_is_cased(uint32_t code)
+{
+    return unicode_range_contains(unicode_cased_ranges,
+                                  UNICODE_CASED_RANGES_COUNT, code);
+}
+
+bool unicode_is_case_ignorable(uint32_t code)
+{
+    return unicode_range_contains(unicode_case_ignorable_ranges,
+                                  UNICODE_CASE_IGNORABLE_RANGES_COUNT, code);
+}
+
 bool unicode_full_foldcase(uint32_t code, const uint32_t **mapping,
                            size_t *length)
 {
-    size_t lo = 0;
-    size_t hi = UNICODE_FULL_FOLD_COUNT;
-    while (lo < hi) {
-        size_t mid = lo + (hi - lo) / 2;
-        if (unicode_full_fold_table[mid].code < code)
-            lo = mid + 1;
-        else
-            hi = mid;
-    }
-    if (lo < UNICODE_FULL_FOLD_COUNT && unicode_full_fold_table[lo].code == code) {
-        *mapping = &unicode_full_fold_data[unicode_full_fold_table[lo].offset];
-        *length = unicode_full_fold_table[lo].length;
-        return true;
-    }
-    *mapping = NULL;
-    *length = 0;
-    return false;
+    return lookup_full_mapping(unicode_full_fold_table, unicode_full_fold_data,
+                               UNICODE_FULL_FOLD_COUNT, code, mapping,
+                               length);
+}
+
+bool unicode_full_upcase(uint32_t code, const uint32_t **mapping,
+                         size_t *length)
+{
+    return lookup_full_mapping(unicode_full_upper_table, unicode_full_upper_data,
+                               UNICODE_FULL_UPPER_COUNT, code, mapping,
+                               length);
+}
+
+bool unicode_full_downcase(uint32_t code, const uint32_t **mapping,
+                           size_t *length)
+{
+    return lookup_full_mapping(unicode_full_lower_table, unicode_full_lower_data,
+                               UNICODE_FULL_LOWER_COUNT, code, mapping,
+                               length);
+}
+
+bool unicode_full_titlecase(uint32_t code, const uint32_t **mapping,
+                            size_t *length)
+{
+    return lookup_full_mapping(unicode_full_title_table, unicode_full_title_data,
+                               UNICODE_FULL_TITLE_COUNT, code, mapping,
+                               length);
 }
 
 static bool unicode_char_predicate(unsigned prim_id, uint32_t code)

@@ -460,6 +460,9 @@ enum primitive_id {
     PSTRNFKD,
     PSTRNFKC,
     PSTRFOLD,
+    PSTRUP,
+    PSTRDOWN,
+    PSTRTITLE,
     // Vector
     PVECTOR,
     PVECFILL,

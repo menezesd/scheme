@@ -1618,27 +1618,6 @@
 ;;; String Utilities
 ;;; ============================================================================
 
-;; string-upcase - convert string to uppercase
-(define (unicode-upcase-piece ch)
-  (let ((code (char->integer ch)))
-    (cond
-      ((= code 223) "SS")
-      ((= code 64256) "FF")
-      ((= code 64257) "FI")
-      ((= code 64258) "FL")
-      ((= code 64259) "FFI")
-      ((= code 64260) "FFL")
-      ((= code 64261) "ST")
-      ((= code 64262) "ST")
-      (else (string (char-upcase ch))))))
-
-(define (string-upcase s)
-  (apply string-append (map unicode-upcase-piece (string->list s))))
-
-;; string-downcase - convert string to lowercase
-(define (string-downcase s)
-  (list->string (map char-downcase (string->list s))))
-
 (define (unicode-char . codes)
   (list->string (map integer->char codes)))
 

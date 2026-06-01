@@ -13,6 +13,11 @@ test_context
 test_macros
 test_eval
 test_pattern
+test_unicode_norm
+test_unicode_case
+
+# Downloaded Unicode source files
+.unicode/
 
 # IDE/editor
 .vscode/

@@ -50,10 +50,12 @@ unicode-tables:
 	curl -L https://www.unicode.org/Public/$(UNICODE_VERSION)/ucd/DerivedCoreProperties.txt -o .unicode/DerivedCoreProperties.txt
 	curl -L https://www.unicode.org/Public/$(UNICODE_VERSION)/ucd/PropList.txt -o .unicode/PropList.txt
 	curl -L https://www.unicode.org/Public/$(UNICODE_VERSION)/ucd/CaseFolding.txt -o .unicode/CaseFolding.txt
+	curl -L https://www.unicode.org/Public/$(UNICODE_VERSION)/ucd/SpecialCasing.txt -o .unicode/SpecialCasing.txt
 	curl -L https://www.unicode.org/Public/$(UNICODE_VERSION)/ucd/NormalizationTest.txt -o .unicode/NormalizationTest.txt
 	python3 tools/gen_unicode_norm.py .unicode/UnicodeData.txt .unicode/CompositionExclusions.txt .unicode/DerivedNormalizationProps.txt unicode_norm_tables.h
-	python3 tools/gen_unicode_char.py .unicode/UnicodeData.txt .unicode/DerivedCoreProperties.txt .unicode/PropList.txt .unicode/CaseFolding.txt unicode_char_tables.h
+	python3 tools/gen_unicode_char.py .unicode/UnicodeData.txt .unicode/DerivedCoreProperties.txt .unicode/PropList.txt .unicode/CaseFolding.txt .unicode/SpecialCasing.txt unicode_char_tables.h
 	python3 tools/gen_unicode_norm_fixture.py .unicode/NormalizationTest.txt 1000 unicode_norm_test_data.h
+	python3 tools/gen_unicode_case_fixture.py .unicode/UnicodeData.txt .unicode/DerivedCoreProperties.txt .unicode/PropList.txt .unicode/CaseFolding.txt .unicode/SpecialCasing.txt unicode_case_test_data.h
 
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $(OBJS) $(LDFLAGS)
@@ -123,7 +125,7 @@ test-interpreter: $(TARGET)
 	@./$(TARGET) --interpreter < test.scm 2>&1 | grep -E '(^===|PASS|FAIL|^Tests:|passed|FAILED)'
 
 # C unit tests
-TEST_SRCS = test_bignum.c test_reader.c test_context.c test_macros.c test_eval.c test_pattern.c test_unicode_norm.c
+TEST_SRCS = test_bignum.c test_reader.c test_context.c test_macros.c test_eval.c test_pattern.c test_unicode_norm.c test_unicode_case.c
 TEST_BINS = $(TEST_SRCS:.c=)
 
 # Object files needed for interpreter tests (excludes main.o)
@@ -155,6 +157,9 @@ test_pattern: test_pattern.c $(INTERP_OBJS)
 
 test_unicode_norm: test_unicode_norm.c $(INTERP_OBJS) unicode_norm_test_data.h
 	$(CC) $(CFLAGS) -o $@ test_unicode_norm.c $(INTERP_OBJS) $(LDFLAGS)
+
+test_unicode_case: test_unicode_case.c $(INTERP_OBJS) unicode_case_test_data.h
+	$(CC) $(CFLAGS) -o $@ test_unicode_case.c $(INTERP_OBJS) $(LDFLAGS)
 
 # Run property tests
 test-prop: $(TARGET)

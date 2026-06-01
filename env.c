@@ -509,6 +509,9 @@ static const struct {
     {"string-normalize-nfkd", PSTRNFKD},
     {"string-normalize-nfkc", PSTRNFKC},
     {"string-foldcase", PSTRFOLD},
+    {"string-upcase", PSTRUP},
+    {"string-downcase", PSTRDOWN},
+    {"string-titlecase", PSTRTITLE},
 
     // String comparisons
     {"string=?", PSTREQ},

@@ -1409,6 +1409,9 @@ static unsigned apply_string_primitive(unsigned prim_id, unsigned argc,
     case PSTRNFKD:
     case PSTRNFKC:
     case PSTRFOLD:
+    case PSTRUP:
+    case PSTRDOWN:
+    case PSTRTITLE:
         return prim_string_normalize(prim_id, argc, argv);
     case PSTRING:
         return make_string_from_chars(argc, argv, "string");
@@ -2507,6 +2510,9 @@ unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
     case PSTRNFKD:
     case PSTRNFKC:
     case PSTRFOLD:
+    case PSTRUP:
+    case PSTRDOWN:
+    case PSTRTITLE:
     case PSTRING:
     case PSTREQ:
     case PSTRLT:

@@ -579,6 +579,160 @@ static unsigned folded_string_value(unsigned arg, const char *name)
     return make_string_owned(result);
 }
 
+typedef enum {
+    STRING_CASE_UP,
+    STRING_CASE_DOWN,
+    STRING_CASE_TITLE
+} string_case_mode;
+
+static bool final_sigma_context(const codepoint_buffer *input, size_t index)
+{
+    bool before_cased = false;
+    for (size_t i = index; i > 0; i--) {
+        uint32_t prev = input->data[i - 1];
+        if (unicode_is_case_ignorable(prev))
+            continue;
+        before_cased = unicode_is_cased(prev);
+        break;
+    }
+    if (!before_cased)
+        return false;
+
+    for (size_t i = index + 1; i < input->length; i++) {
+        uint32_t next = input->data[i];
+        if (unicode_is_case_ignorable(next))
+            continue;
+        return !unicode_is_cased(next);
+    }
+    return true;
+}
+
+static bool append_case_mapping(codepoint_buffer *out, uint32_t codepoint,
+                                string_case_mode mode,
+                                const codepoint_buffer *input, size_t index)
+{
+    static const uint32_t final_sigma[] = {0x03C2};
+    const uint32_t *mapping;
+    size_t length;
+
+    if (mode == STRING_CASE_DOWN && codepoint == 0x03A3 &&
+        final_sigma_context(input, index)) {
+        mapping = final_sigma;
+        length = 1;
+    } else {
+        bool found;
+        if (mode == STRING_CASE_UP)
+            found = unicode_full_upcase(codepoint, &mapping, &length);
+        else if (mode == STRING_CASE_DOWN)
+            found = unicode_full_downcase(codepoint, &mapping, &length);
+        else
+            found = unicode_full_titlecase(codepoint, &mapping, &length);
+        if (!found) {
+            mapping = &codepoint;
+            length = 1;
+        }
+    }
+
+    for (size_t i = 0; i < length; i++) {
+        if (!cp_buffer_append(out, mapping[i]))
+            return false;
+    }
+    return true;
+}
+
+static bool decode_string_to_codepoints(const char *s, codepoint_buffer *out,
+                                        const char *name)
+{
+    size_t byte_len = strlen(s);
+    size_t offset = 0;
+    while (offset < byte_len) {
+        uint32_t codepoint;
+        if (!utf8_decode_next_codepoint_string(s, byte_len, &offset,
+                                               &codepoint, name))
+            return false;
+        if (!cp_buffer_append(out, codepoint)) {
+            show_error("%s: out of memory", name);
+            return false;
+        }
+    }
+    return true;
+}
+
+static unsigned make_string_from_codepoints(const codepoint_buffer *codepoints,
+                                            const char *name)
+{
+    codepoint_buffer bytes;
+    cp_buffer_init(&bytes);
+    for (size_t i = 0; i < codepoints->length; i++) {
+        if (!utf8_encode_codepoint_string(codepoints->data[i], &bytes)) {
+            cp_buffer_free(&bytes);
+            show_error("%s: invalid Unicode scalar value", name);
+            return TOK_ERROR;
+        }
+    }
+    if (!cp_buffer_append(&bytes, 0)) {
+        cp_buffer_free(&bytes);
+        show_error("%s: out of memory", name);
+        return TOK_ERROR;
+    }
+
+    char *result = checked_malloc_size(bytes.length);
+    if (!result) {
+        cp_buffer_free(&bytes);
+        show_error("%s: out of memory", name);
+        return TOK_ERROR;
+    }
+    for (size_t i = 0; i < bytes.length; i++)
+        result[i] = (char)bytes.data[i];
+
+    cp_buffer_free(&bytes);
+    return make_string_owned(result);
+}
+
+static unsigned cased_string_value(unsigned arg, string_case_mode mode,
+                                   const char *name)
+{
+    char *s = require_string_ptr(arg, name);
+    if (!s)
+        return TOK_ERROR;
+
+    codepoint_buffer input;
+    cp_buffer_init(&input);
+    if (!decode_string_to_codepoints(s, &input, name)) {
+        cp_buffer_free(&input);
+        return TOK_ERROR;
+    }
+
+    codepoint_buffer mapped;
+    cp_buffer_init(&mapped);
+    bool at_word_start = true;
+    for (size_t i = 0; i < input.length; i++) {
+        uint32_t codepoint = input.data[i];
+        string_case_mode char_mode = mode;
+        if (mode == STRING_CASE_TITLE) {
+            if (unicode_is_cased(codepoint)) {
+                char_mode = at_word_start ? STRING_CASE_TITLE : STRING_CASE_DOWN;
+                at_word_start = false;
+            } else if (!unicode_is_case_ignorable(codepoint)) {
+                at_word_start = true;
+            }
+        }
+        if (!append_case_mapping(&mapped, codepoint, char_mode, &input, i)) {
+            cp_buffer_free(&mapped);
+            cp_buffer_free(&input);
+            show_error("%s: out of memory", name);
+            return TOK_ERROR;
+        }
+        if (mode != STRING_CASE_TITLE && unicode_is_cased(codepoint))
+            at_word_start = false;
+    }
+
+    unsigned result = make_string_from_codepoints(&mapped, name);
+    cp_buffer_free(&mapped);
+    cp_buffer_free(&input);
+    return result;
+}
+
 unsigned prim_string_normalize(unsigned prim_id, unsigned argc,
                                unsigned *argv)
 {
@@ -606,6 +760,18 @@ unsigned prim_string_normalize(unsigned prim_id, unsigned argc,
         name = "string-foldcase";
         REQUIRE_ARGC(argc, 1, 1, name);
         return folded_string_value(argv[0], name);
+    case PSTRUP:
+        name = "string-upcase";
+        REQUIRE_ARGC(argc, 1, 1, name);
+        return cased_string_value(argv[0], STRING_CASE_UP, name);
+    case PSTRDOWN:
+        name = "string-downcase";
+        REQUIRE_ARGC(argc, 1, 1, name);
+        return cased_string_value(argv[0], STRING_CASE_DOWN, name);
+    case PSTRTITLE:
+        name = "string-titlecase";
+        REQUIRE_ARGC(argc, 1, 1, name);
+        return cased_string_value(argv[0], STRING_CASE_TITLE, name);
     default:
         show_error("string normalization primitive: unsupported id %u",
                    prim_id);

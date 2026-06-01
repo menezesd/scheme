@@ -1207,8 +1207,16 @@ unsigned apply_char_primitive(unsigned prim_id, unsigned argc,
 uint32_t unicode_simple_foldcase(uint32_t code);
 uint32_t unicode_upcase(uint32_t code);
 uint32_t unicode_downcase(uint32_t code);
+bool unicode_is_cased(uint32_t code);
+bool unicode_is_case_ignorable(uint32_t code);
 bool unicode_full_foldcase(uint32_t code, const uint32_t **mapping,
                            size_t *length);
+bool unicode_full_upcase(uint32_t code, const uint32_t **mapping,
+                         size_t *length);
+bool unicode_full_downcase(uint32_t code, const uint32_t **mapping,
+                           size_t *length);
+bool unicode_full_titlecase(uint32_t code, const uint32_t **mapping,
+                            size_t *length);
 
 // Vector operations (prim_vector.c)
 unsigned apply_vector_primitive(unsigned prim_id, unsigned argc,

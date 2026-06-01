@@ -33,9 +33,11 @@ def parse_unicode_data(path):
         "decimal": [],
         "upper": [],
         "lower": [],
+        "title": [],
     }
     upper_map = {}
     lower_map = {}
+    title_map = {}
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             fields = line.rstrip("\n").split(";")
@@ -49,11 +51,22 @@ def parse_unicode_data(path):
                 add_range(props["upper"], code, code)
             elif category == "Ll":
                 add_range(props["lower"], code, code)
+            elif category == "Lt":
+                add_range(props["title"], code, code)
             if fields[12]:
                 upper_map[code] = int(fields[12], 16)
             if fields[13]:
                 lower_map[code] = int(fields[13], 16)
-    return {key: merge_ranges(value) for key, value in props.items()}, upper_map, lower_map
+            if fields[14]:
+                title_map[code] = int(fields[14], 16)
+            elif fields[12]:
+                title_map[code] = int(fields[12], 16)
+    return (
+        {key: merge_ranges(value) for key, value in props.items()},
+        upper_map,
+        lower_map,
+        title_map,
+    )
 
 
 def parse_property_file(path, wanted):
@@ -94,6 +107,43 @@ def parse_case_folding(path):
     return simple, full
 
 
+def parse_special_casing(path):
+    lower = {}
+    title = {}
+    upper = {}
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            parts = [part.strip() for part in line.split(";")]
+            if len(parts) < 4:
+                continue
+            if len(parts) > 4 and parts[4]:
+                continue
+            code = int(parts[0], 16)
+            lower[code] = [int(part, 16) for part in parts[1].split()]
+            title[code] = [int(part, 16) for part in parts[2].split()]
+            upper[code] = [int(part, 16) for part in parts[3].split()]
+    return lower, title, upper
+
+
+def build_full_case_map(simple_map, special_map):
+    full = {code: [mapped] for code, mapped in simple_map.items()}
+    full.update(special_map)
+    return full
+
+
+def build_full_entries(mappings):
+    data = []
+    entries = []
+    for code, mapping in sorted(mappings.items()):
+        offset = len(data)
+        data.extend(mapping)
+        entries.append((code, offset, len(mapping)))
+    return data, entries
+
+
 def emit_ranges(name, ranges):
     print(f"#define {name.upper()}_COUNT {len(ranges)}")
     print(f"static const unicode_range {name}[] = {{")
@@ -104,26 +154,30 @@ def emit_ranges(name, ranges):
 
 
 def main(argv):
-    if len(argv) != 6:
+    if len(argv) != 7:
         print(
             "usage: gen_unicode_char.py UnicodeData.txt DerivedCoreProperties.txt "
-            "PropList.txt CaseFolding.txt out.h",
+            "PropList.txt CaseFolding.txt SpecialCasing.txt out.h",
             file=sys.stderr,
         )
         return 2
 
-    unicode_data, derived_core, prop_list, case_folding, out_path = argv[1:]
-    category_props, upper_map, lower_map = parse_unicode_data(unicode_data)
-    core_props = parse_property_file(derived_core, ["Alphabetic"])
+    unicode_data, derived_core, prop_list, case_folding, special_casing, out_path = argv[1:]
+    category_props, upper_map, lower_map, title_map = parse_unicode_data(unicode_data)
+    core_props = parse_property_file(
+        derived_core, ["Alphabetic", "Cased", "Case_Ignorable"]
+    )
     prop_props = parse_property_file(prop_list, ["White_Space"])
     simple_fold, full_fold = parse_case_folding(case_folding)
+    special_lower, special_title, special_upper = parse_special_casing(special_casing)
+    full_lower = build_full_case_map(lower_map, special_lower)
+    full_title = build_full_case_map(title_map, special_title)
+    full_upper = build_full_case_map(upper_map, special_upper)
 
-    full_data = []
-    full_entries = []
-    for code, mapping in sorted(full_fold.items()):
-        offset = len(full_data)
-        full_data.extend(mapping)
-        full_entries.append((code, offset, len(mapping)))
+    full_fold_data, full_fold_entries = build_full_entries(full_fold)
+    full_lower_data, full_lower_entries = build_full_entries(full_lower)
+    full_title_data, full_title_entries = build_full_entries(full_title)
+    full_upper_data, full_upper_entries = build_full_entries(full_upper)
 
     with open(out_path, "w", encoding="ascii") as out:
         old_stdout = sys.stdout
@@ -137,14 +191,17 @@ def main(argv):
             print()
             print("typedef struct { uint32_t start; uint32_t end; } unicode_range;")
             print("typedef struct { uint32_t code; uint32_t folded; } unicode_simple_fold_entry;")
-            print("typedef struct { uint32_t code; uint32_t offset; uint8_t length; } unicode_full_fold_entry;")
+            print("typedef struct { uint32_t code; uint32_t offset; uint8_t length; } unicode_full_case_entry;")
             print()
             print("#define UNICODE_CHAR_VERSION \"15.1.0\"")
             emit_ranges("unicode_alphabetic_ranges", core_props["Alphabetic"])
+            emit_ranges("unicode_cased_ranges", core_props["Cased"])
+            emit_ranges("unicode_case_ignorable_ranges", core_props["Case_Ignorable"])
             emit_ranges("unicode_decimal_ranges", category_props["decimal"])
             emit_ranges("unicode_whitespace_ranges", prop_props["White_Space"])
             emit_ranges("unicode_uppercase_ranges", category_props["upper"])
             emit_ranges("unicode_lowercase_ranges", category_props["lower"])
+            emit_ranges("unicode_titlecase_ranges", category_props["title"])
             print(f"#define UNICODE_UPCASE_COUNT {len(upper_map)}")
             print("static const unicode_simple_fold_entry unicode_upcase_table[] = {")
             for code, mapped in sorted(upper_map.items()):
@@ -163,18 +220,36 @@ def main(argv):
                 print(f"    {{0x{code:04X}, 0x{folded:04X}}},")
             print("};")
             print()
-            print(f"#define UNICODE_FULL_FOLD_COUNT {len(full_entries)}")
-            print(f"#define UNICODE_FULL_FOLD_DATA_COUNT {len(full_data)}")
+            print(f"#define UNICODE_FULL_FOLD_COUNT {len(full_fold_entries)}")
+            print(f"#define UNICODE_FULL_FOLD_DATA_COUNT {len(full_fold_data)}")
             print("static const uint32_t unicode_full_fold_data[] = {")
-            for i in range(0, len(full_data), 8):
-                print("    " + ", ".join(f"0x{cp:04X}" for cp in full_data[i:i + 8]) + ",")
+            for i in range(0, len(full_fold_data), 8):
+                print("    " + ", ".join(f"0x{cp:04X}" for cp in full_fold_data[i:i + 8]) + ",")
             print("};")
             print()
-            print("static const unicode_full_fold_entry unicode_full_fold_table[] = {")
-            for code, offset, length in full_entries:
+            print("static const unicode_full_case_entry unicode_full_fold_table[] = {")
+            for code, offset, length in full_fold_entries:
                 print(f"    {{0x{code:04X}, {offset}, {length}}},")
             print("};")
             print()
+            for label, data, entries in (
+                ("lower", full_lower_data, full_lower_entries),
+                ("title", full_title_data, full_title_entries),
+                ("upper", full_upper_data, full_upper_entries),
+            ):
+                macro = label.upper()
+                print(f"#define UNICODE_FULL_{macro}_COUNT {len(entries)}")
+                print(f"#define UNICODE_FULL_{macro}_DATA_COUNT {len(data)}")
+                print(f"static const uint32_t unicode_full_{label}_data[] = {{")
+                for i in range(0, len(data), 8):
+                    print("    " + ", ".join(f"0x{cp:04X}" for cp in data[i:i + 8]) + ",")
+                print("};")
+                print()
+                print(f"static const unicode_full_case_entry unicode_full_{label}_table[] = {{")
+                for code, offset, length in entries:
+                    print(f"    {{0x{code:04X}, {offset}, {length}}},")
+                print("};")
+                print()
             print("#endif")
         finally:
             sys.stdout = old_stdout
