@@ -343,6 +343,54 @@ TEST(writer_handles_bytecode_closure_marker)
     PASS();
 }
 
+TEST(writer_escapes_control_strings_with_scalar_escape)
+{
+    char bytes[] = {'a', 1, 0x7f, 'b', '\0'};
+    unsigned s = make_string_copy(bytes);
+    char *buf = NULL;
+    size_t len = 0;
+    FILE *mem = open_memstream(&buf, &len);
+    ASSERT(mem != NULL);
+
+    write_obj_port(s, mem);
+    fclose(mem);
+    ASSERT_STR_EQ(buf, "\"a\\x01;\\x7F;b\"");
+    free(buf);
+    PASS();
+}
+
+TEST(writer_writes_unicode_character_literal)
+{
+    unsigned ch = make_char(0x1D11E);
+    char *buf = NULL;
+    size_t len = 0;
+    FILE *mem = open_memstream(&buf, &len);
+    ASSERT(mem != NULL);
+
+    write_obj_port(ch, mem);
+    fclose(mem);
+    ASSERT_STR_EQ(buf, "#\\x1D11E");
+    free(buf);
+    PASS();
+}
+
+TEST(writer_displays_unicode_character_as_utf8)
+{
+    unsigned ch = make_char(0x03BB);
+    char *buf = NULL;
+    size_t len = 0;
+    FILE *mem = open_memstream(&buf, &len);
+    ASSERT(mem != NULL);
+
+    display_obj_port(ch, mem);
+    fclose(mem);
+    ASSERT_EQ((unsigned char)buf[0], 0xCE);
+    ASSERT_EQ((unsigned char)buf[1], 0xBB);
+    ASSERT_EQ(buf[2], 0);
+    free(buf);
+    PASS();
+}
+
 TEST(string_port_write_failures_return_false)
 {
     string_port *sp = strport_new();
@@ -1102,6 +1150,9 @@ int main(void)
     RUN_TEST(writer_handles_vector_containing_direct_fixnum);
     RUN_TEST(writer_handles_vm_continuation);
     RUN_TEST(writer_handles_bytecode_closure_marker);
+    RUN_TEST(writer_escapes_control_strings_with_scalar_escape);
+    RUN_TEST(writer_writes_unicode_character_literal);
+    RUN_TEST(writer_displays_unicode_character_as_utf8);
     RUN_TEST(string_port_write_failures_return_false);
     RUN_TEST(make_string_owned_rejects_null);
 

@@ -202,6 +202,21 @@ TEST(read_string_hex_scalar_escape)
     PASS();
 }
 
+TEST(read_string_rejects_invalid_scalar_escapes)
+{
+    ASSERT(read_from_string("\"\\x0;\"") == TOK_ERROR);
+    ASSERT(read_from_string("\"\\xD800;\"") == TOK_ERROR);
+    ASSERT(read_from_string("\"\\x110000;\"") == TOK_ERROR);
+    PASS();
+}
+
+TEST(read_string_rejects_invalid_utf8)
+{
+    const char invalid[] = {'"', (char)0xC0, (char)0x80, '"', '\0'};
+    ASSERT(read_from_string(invalid) == TOK_ERROR);
+    PASS();
+}
+
 TEST(read_empty_string)
 {
     unsigned x = read_from_string("\"\"");
@@ -244,6 +259,62 @@ TEST(read_char_tab)
     unsigned x = read_from_string("#\\tab");
     ASSERT(CELL_TYPE(x) == BT_CHAR);
     ASSERT_EQ(CELL_ID(x), '\t');
+    PASS();
+}
+
+TEST(read_char_named_controls)
+{
+    unsigned x = read_from_string("#\\alarm");
+    ASSERT(CELL_TYPE(x) == BT_CHAR);
+    ASSERT_EQ(CELL_ID(x), '\a');
+    x = read_from_string("#\\backspace");
+    ASSERT(CELL_TYPE(x) == BT_CHAR);
+    ASSERT_EQ(CELL_ID(x), '\b');
+    x = read_from_string("#\\delete");
+    ASSERT(CELL_TYPE(x) == BT_CHAR);
+    ASSERT_EQ(CELL_ID(x), 0x7f);
+    x = read_from_string("#\\escape");
+    ASSERT(CELL_TYPE(x) == BT_CHAR);
+    ASSERT_EQ(CELL_ID(x), 27);
+    x = read_from_string("#\\null");
+    ASSERT(CELL_TYPE(x) == BT_CHAR);
+    ASSERT_EQ(CELL_ID(x), 0);
+    x = read_from_string("#\\return");
+    ASSERT(CELL_TYPE(x) == BT_CHAR);
+    ASSERT_EQ(CELL_ID(x), '\r');
+    PASS();
+}
+
+TEST(read_char_hex_scalar)
+{
+    unsigned x = read_from_string("#\\x1D11E");
+    ASSERT(CELL_TYPE(x) == BT_CHAR);
+    ASSERT_EQ(CELL_ID(x), 0x1D11E);
+    x = read_from_string("#\\x0");
+    ASSERT(CELL_TYPE(x) == BT_CHAR);
+    ASSERT_EQ(CELL_ID(x), 0);
+    PASS();
+}
+
+TEST(read_char_utf8_literal)
+{
+    unsigned x = read_from_string("#\\λ");
+    ASSERT(CELL_TYPE(x) == BT_CHAR);
+    ASSERT_EQ(CELL_ID(x), 0x03BB);
+    PASS();
+}
+
+TEST(read_char_rejects_invalid_scalar)
+{
+    ASSERT(read_from_string("#\\xD800") == TOK_ERROR);
+    ASSERT(read_from_string("#\\x110000") == TOK_ERROR);
+    ASSERT(read_from_string("#\\x1g") == TOK_ERROR);
+    PASS();
+}
+
+TEST(read_char_rejects_multi_char_utf8_literal)
+{
+    ASSERT(read_from_string("#\\λλ") == TOK_ERROR);
     PASS();
 }
 
@@ -630,6 +701,8 @@ int main(void)
     RUN_TEST(read_simple_string);
     RUN_TEST(read_string_with_escapes);
     RUN_TEST(read_string_hex_scalar_escape);
+    RUN_TEST(read_string_rejects_invalid_scalar_escapes);
+    RUN_TEST(read_string_rejects_invalid_utf8);
     RUN_TEST(read_empty_string);
 
     // Characters
@@ -637,6 +710,11 @@ int main(void)
     RUN_TEST(read_char_space);
     RUN_TEST(read_char_newline);
     RUN_TEST(read_char_tab);
+    RUN_TEST(read_char_named_controls);
+    RUN_TEST(read_char_hex_scalar);
+    RUN_TEST(read_char_utf8_literal);
+    RUN_TEST(read_char_rejects_invalid_scalar);
+    RUN_TEST(read_char_rejects_multi_char_utf8_literal);
     RUN_TEST(read_char_rejects_eof);
     RUN_TEST(read_char_rejects_unknown_name);
 

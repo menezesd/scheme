@@ -1185,6 +1185,15 @@
         s))
 (test "utf8 escape string literal" 119070
       (char->integer (string-ref "\x1D11E;" 0)))
+(test "unicode character hex literal" 119070
+      (char->integer #\x1D11E))
+(test "unicode character utf8 literal" 955
+      (char->integer #\λ))
+(test "unicode write char roundtrip" "#\\x1D11E"
+      (write-to-string (integer->char #x1D11E)))
+(test "unicode read written char roundtrip" 119070
+      (char->integer (read (open-input-string
+                            (write-to-string (integer->char #x1D11E))))))
 (test "string-append*" "abc" (string-append* '("a" "b" "c")))
 (test "string*" "a12#t" (string* (list "a" 12 #t)))
 (test "string-compare" 'lt

@@ -307,10 +307,20 @@ static void sb_append(string_buffer *sb, int ch)
     sb->data[sb->len] = '\0';
 }
 
+static bool valid_unicode_scalar(int64_t code)
+{
+    return code >= 0 && code <= 0x10FFFF &&
+           !(code >= 0xD800 && code <= 0xDFFF);
+}
+
+static bool valid_string_scalar(int64_t code)
+{
+    return code > 0 && valid_unicode_scalar(code);
+}
+
 static bool sb_append_utf8(string_buffer *sb, int64_t code)
 {
-    if (code <= 0 || code > 0x10FFFF ||
-        (code >= 0xD800 && code <= 0xDFFF)) {
+    if (!valid_string_scalar(code)) {
         show_error("invalid string character scalar value");
         return false;
     }
@@ -328,6 +338,100 @@ static bool sb_append_utf8(string_buffer *sb, int64_t code)
         sb_append(sb, 0x80 | (int)((code >> 12) & 0x3F));
         sb_append(sb, 0x80 | (int)((code >> 6) & 0x3F));
         sb_append(sb, 0x80 | (int)(code & 0x3F));
+    }
+    return true;
+}
+
+static bool read_hex_scalar_value(const char *digits, int64_t *out,
+                                  const char *name)
+{
+    if (!digits[0]) {
+        show_error("%s: empty scalar value", name);
+        return false;
+    }
+    errno = 0;
+    char *end = NULL;
+    int64_t scalar = strtoll(digits, &end, 16);
+    if (errno == ERANGE || !end || *end != '\0' ||
+        !valid_unicode_scalar(scalar)) {
+        show_error("%s: invalid Unicode scalar value", name);
+        return false;
+    }
+    *out = scalar;
+    return true;
+}
+
+static bool read_utf8_tail_bytes(int first, int64_t *codepoint,
+                                 const char *name)
+{
+    int needed;
+    int value;
+    if (first >= 0xC2 && first <= 0xDF) {
+        needed = 1;
+        value = first & 0x1F;
+    } else if (first >= 0xE0 && first <= 0xEF) {
+        needed = 2;
+        value = first & 0x0F;
+    } else if (first >= 0xF0 && first <= 0xF4) {
+        needed = 3;
+        value = first & 0x07;
+    } else {
+        show_error("%s: invalid UTF-8 leading byte", name);
+        return false;
+    }
+
+    for (int i = 0; i < needed; i++) {
+        int b = reader_getchar();
+        if ((b & 0xC0) != 0x80) {
+            if (b != EOF)
+                reader_ungetc(b);
+            show_error("%s: invalid UTF-8 continuation byte", name);
+            return false;
+        }
+        value = (value << 6) | (b & 0x3F);
+    }
+
+    if ((needed == 2 && value < 0x800) ||
+        (needed == 3 && value < 0x10000) ||
+        !valid_unicode_scalar(value)) {
+        show_error("%s: invalid UTF-8 sequence", name);
+        return false;
+    }
+    *codepoint = value;
+    return true;
+}
+
+static bool validate_utf8_string(const char *s)
+{
+    const unsigned char *p = (const unsigned char *)s;
+    while (*p) {
+        unsigned char first = *p++;
+        if (first < 0x80)
+            continue;
+        int needed;
+        int value;
+        if (first >= 0xC2 && first <= 0xDF) {
+            needed = 1;
+            value = first & 0x1F;
+        } else if (first >= 0xE0 && first <= 0xEF) {
+            needed = 2;
+            value = first & 0x0F;
+        } else if (first >= 0xF0 && first <= 0xF4) {
+            needed = 3;
+            value = first & 0x07;
+        } else {
+            return false;
+        }
+        for (int i = 0; i < needed; i++) {
+            if ((p[i] & 0xC0) != 0x80)
+                return false;
+            value = (value << 6) | (p[i] & 0x3F);
+        }
+        if ((needed == 2 && value < 0x800) ||
+            (needed == 3 && value < 0x10000) ||
+            !valid_string_scalar(value))
+            return false;
+        p += needed;
     }
     return true;
 }
@@ -396,6 +500,11 @@ static inline bool is_delimiter(int c)
            c == EOF;
 }
 
+static inline bool is_ascii_alpha(int c)
+{
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+}
+
 static bool reject_invalid_prefixed_tail(int c, const char *name)
 {
     if (is_delimiter(c)) {
@@ -417,7 +526,12 @@ static bool reject_invalid_prefixed_tail(int c, const char *name)
 static const struct {
     const char *name;
     int value;
-} char_names[] = {{"space", ' '}, {"newline", '\n'}, {"tab", '\t'}, {NULL, 0}};
+} char_names[] = {
+    {"alarm", '\a'},     {"backspace", '\b'}, {"delete", 0x7f},
+    {"escape", 27},      {"newline", '\n'},   {"null", 0},
+    {"return", '\r'},    {"space", ' '},      {"tab", '\t'},
+    {NULL, 0},
+};
 
 static int lookup_char_name(const char *name)
 {
@@ -441,8 +555,43 @@ static unsigned read_character_literal(void)
         return TOK_ERROR;
     }
 
+    if (c == 'x' || c == 'X') {
+        int h = reader_getchar();
+        if (is_delimiter(h)) {
+            reader_ungetc(h);
+            return make_char(c);
+        }
+        if (!isxdigit(h)) {
+            show_error("invalid character scalar literal");
+            return TOK_ERROR;
+        }
+
+        string_buffer hex;
+        sb_init(&hex);
+        do {
+            sb_append(&hex, h);
+            h = reader_getchar();
+        } while (isxdigit(h));
+
+        if (!is_delimiter(h)) {
+            sb_free(&hex);
+            show_error("invalid character scalar literal");
+            return TOK_ERROR;
+        }
+        reader_ungetc(h);
+
+        int64_t scalar;
+        if (!read_hex_scalar_value(hex.data, &scalar,
+                                   "character scalar literal")) {
+            sb_free(&hex);
+            return TOK_ERROR;
+        }
+        sb_free(&hex);
+        return make_char((int)scalar);
+    }
+
     // Try to read a named character
-    if (isalpha(c)) {
+    if (is_ascii_alpha(c)) {
         char buf[CHAR_NAME_BUF_SIZE];
         buf[0] = c;
         int i = 1;
@@ -471,6 +620,20 @@ static unsigned read_character_literal(void)
             show_error("unknown character name: %s", buf);
             return TOK_ERROR;
         }
+    }
+
+    if ((unsigned char)c >= 0x80) {
+        int64_t codepoint;
+        if (!read_utf8_tail_bytes((unsigned char)c, &codepoint,
+                                  "character literal"))
+            return TOK_ERROR;
+        int next = reader_getchar();
+        if (!is_delimiter(next)) {
+            show_error("character literal must contain one character");
+            return TOK_ERROR;
+        }
+        reader_ungetc(next);
+        return make_char((int)codepoint);
     }
 
     return make_char(c);
@@ -516,11 +679,20 @@ static unsigned read_string_literal(void)
                         sb_free(&sb);
                         return TOK_ERROR;
                     }
-                    errno = 0;
-                    char *end = NULL;
-                    int64_t scalar = strtoll(hex.data, &end, 16);
-                    if (errno == ERANGE || !end || *end != '\0' ||
-                        !sb_append_utf8(&sb, scalar)) {
+                    int64_t scalar;
+                    if (!read_hex_scalar_value(hex.data, &scalar,
+                                               "hex scalar escape")) {
+                        sb_free(&hex);
+                        sb_free(&sb);
+                        return TOK_ERROR;
+                    }
+                    if (!valid_string_scalar(scalar)) {
+                        show_error("invalid string character scalar value");
+                        sb_free(&hex);
+                        sb_free(&sb);
+                        return TOK_ERROR;
+                    }
+                    if (!sb_append_utf8(&sb, scalar)) {
                         sb_free(&hex);
                         sb_free(&sb);
                         return TOK_ERROR;
@@ -535,6 +707,12 @@ static unsigned read_string_literal(void)
                     int lo = hex.data[1];
                     c = (hi <= '9' ? hi - '0' : (hi | 32) - 'a' + 10) * 16 +
                         (lo <= '9' ? lo - '0' : (lo | 32) - 'a' + 10);
+                    if (c == 0) {
+                        sb_free(&hex);
+                        show_error("invalid string character scalar value");
+                        sb_free(&sb);
+                        return TOK_ERROR;
+                    }
                     sb_free(&hex);
                     break;
                 }
@@ -568,6 +746,12 @@ static unsigned read_string_literal(void)
             }
         }
         sb_append(&sb, c);
+    }
+
+    if (!validate_utf8_string(sb.data)) {
+        show_error("string literal contains invalid UTF-8");
+        sb_free(&sb);
+        return TOK_ERROR;
     }
 
     unsigned x = alloc();

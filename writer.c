@@ -257,13 +257,74 @@ static void write_escaped_string(FILE *fp, const char *s)
             break;
         default:
             if (*p < 0x20 || *p == 0x7f)
-                fprintf(fp, "\\x%02x", *p);
+                fprintf(fp, "\\x%02X;", *p);
             else
                 fputc(*p, fp);
             break;
         }
     }
     fputc('"', fp);
+}
+
+static void write_utf8_scalar(FILE *fp, int code)
+{
+    if (code < 0 || code > 0x10FFFF ||
+        (code >= 0xD800 && code <= 0xDFFF))
+        return;
+    if (code < 0x80) {
+        fputc(code, fp);
+    } else if (code < 0x800) {
+        fputc(0xC0 | (code >> 6), fp);
+        fputc(0x80 | (code & 0x3F), fp);
+    } else if (code < 0x10000) {
+        fputc(0xE0 | (code >> 12), fp);
+        fputc(0x80 | ((code >> 6) & 0x3F), fp);
+        fputc(0x80 | (code & 0x3F), fp);
+    } else {
+        fputc(0xF0 | (code >> 18), fp);
+        fputc(0x80 | ((code >> 12) & 0x3F), fp);
+        fputc(0x80 | ((code >> 6) & 0x3F), fp);
+        fputc(0x80 | (code & 0x3F), fp);
+    }
+}
+
+static void write_character_literal(FILE *fp, int c)
+{
+    switch (c) {
+    case '\a':
+        fprintf(fp, "#\\alarm");
+        break;
+    case '\b':
+        fprintf(fp, "#\\backspace");
+        break;
+    case 0x7f:
+        fprintf(fp, "#\\delete");
+        break;
+    case 27:
+        fprintf(fp, "#\\escape");
+        break;
+    case '\n':
+        fprintf(fp, "#\\newline");
+        break;
+    case 0:
+        fprintf(fp, "#\\null");
+        break;
+    case '\r':
+        fprintf(fp, "#\\return");
+        break;
+    case ' ':
+        fprintf(fp, "#\\space");
+        break;
+    case '\t':
+        fprintf(fp, "#\\tab");
+        break;
+    default:
+        if (c > 0x20 && c < 0x7f)
+            fprintf(fp, "#\\%c", c);
+        else
+            fprintf(fp, "#\\x%X", (unsigned)c);
+        break;
+    }
 }
 
 static void write_list_tail_fp(unsigned st, bool with_quotes, FILE *fp)
@@ -406,21 +467,9 @@ static void write_obj_fp(unsigned s, bool with_quotes, FILE *fp)
     case BT_CHAR: {
         int c = GET_CHAR_CODE(s);
         if (with_quotes) {
-            switch (c) {
-            case ' ':
-                fprintf(fp, "#\\space");
-                break;
-            case '\n':
-                fprintf(fp, "#\\newline");
-                break;
-            case '\t':
-                fprintf(fp, "#\\tab");
-                break;
-            default:
-                fprintf(fp, "#\\%c", c);
-            }
+            write_character_literal(fp, c);
         } else {
-            fprintf(fp, "%c", c);
+            write_utf8_scalar(fp, c);
         }
         break;
     }
