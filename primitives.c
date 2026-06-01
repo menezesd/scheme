@@ -25,6 +25,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <stdint.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -1629,11 +1630,21 @@ static unsigned file_exists_p(unsigned filename_arg, const char *name)
     char *filename = require_string_ptr(filename_arg, name);
     if (!filename)
         return TOK_ERROR;
-    FILE *f = fopen(filename, "r");
-    bool exists = f != NULL;
-    if (f)
-        fclose(f);
-    return scheme_bool(exists);
+    struct stat st;
+    return scheme_bool(stat(filename, &st) == 0);
+}
+
+static unsigned file_type_p(unsigned filename_arg, const char *name, int type)
+{
+    char *filename = require_string_ptr(filename_arg, name);
+    if (!filename)
+        return TOK_ERROR;
+    struct stat st;
+    if (stat(filename, &st) != 0)
+        return ctx.atom_false;
+    if (type == PFILEREGULARP)
+        return scheme_bool(S_ISREG(st.st_mode));
+    return scheme_bool(S_ISDIR(st.st_mode));
 }
 
 static unsigned delete_file_value(unsigned filename_arg, const char *name)
@@ -1660,6 +1671,43 @@ static unsigned rename_file_value(unsigned old_arg, unsigned new_arg,
         return TOK_ERROR;
     }
     return 0;
+}
+
+static unsigned make_directory_value(unsigned dirname_arg, const char *name)
+{
+    char *dirname = require_string_ptr(dirname_arg, name);
+    if (!dirname)
+        return TOK_ERROR;
+    if (mkdir(dirname, 0777) != 0) {
+        show_error("%s: cannot create directory %s", name, dirname);
+        return TOK_ERROR;
+    }
+    return 0;
+}
+
+static unsigned delete_directory_value(unsigned dirname_arg, const char *name)
+{
+    char *dirname = require_string_ptr(dirname_arg, name);
+    if (!dirname)
+        return TOK_ERROR;
+    if (rmdir(dirname) != 0) {
+        show_error("%s: cannot delete directory %s", name, dirname);
+        return TOK_ERROR;
+    }
+    return 0;
+}
+
+static unsigned temporary_file_path_value(void)
+{
+    char tmpl[] = "/tmp/vesper-XXXXXX";
+    int fd = mkstemp(tmpl);
+    if (fd < 0) {
+        show_error("temporary-file-path: cannot create temporary path");
+        return TOK_ERROR;
+    }
+    close(fd);
+    unlink(tmpl);
+    return make_string_copy(tmpl);
 }
 
 static unsigned current_directory_value(unsigned argc, unsigned *argv,
@@ -2317,9 +2365,21 @@ static unsigned apply_misc_primitive(unsigned prim_id, unsigned argc,
     case PFILEEXISTS:
         REQUIRE_ARGC(argc, 1, 1, "file-exists?");
         return file_exists_p(argv[0], "file-exists?");
+    case PFILEREGULARP:
+        REQUIRE_ARGC(argc, 1, 1, "file-regular?");
+        return file_type_p(argv[0], "file-regular?", PFILEREGULARP);
+    case PFILEDIRECTORYP:
+        REQUIRE_ARGC(argc, 1, 1, "file-directory?");
+        return file_type_p(argv[0], "file-directory?", PFILEDIRECTORYP);
     case PDELETEFILE:
         REQUIRE_ARGC(argc, 1, 1, "delete-file");
         return delete_file_value(argv[0], "delete-file");
+    case PMAKEDIRECTORY:
+        REQUIRE_ARGC(argc, 1, 1, "make-directory");
+        return make_directory_value(argv[0], "make-directory");
+    case PDELETEDIRECTORY:
+        REQUIRE_ARGC(argc, 1, 1, "delete-directory");
+        return delete_directory_value(argv[0], "delete-directory");
     case PRENAMEFILE:
         REQUIRE_ARGC(argc, 2, 2, "rename-file");
         return rename_file_value(argv[0], argv[1], "rename-file");
@@ -2329,6 +2389,9 @@ static unsigned apply_misc_primitive(unsigned prim_id, unsigned argc,
     case PDIRECTORYFILES:
         REQUIRE_ARGC(argc, 1, 1, "directory-files");
         return directory_files_value(argv[0], "directory-files");
+    case PTEMPFILEPATH:
+        REQUIRE_ARGC(argc, 0, 0, "temporary-file-path");
+        return temporary_file_path_value();
     case PGETENV:
         REQUIRE_ARGC(argc, 1, 1, "get-environment-variable");
         return getenv_value(argv[0], "get-environment-variable");
@@ -2673,10 +2736,15 @@ unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
     case POPENBINARYINPUT:
     case PREADBYTEVEC:
     case PFILEEXISTS:
+    case PFILEREGULARP:
+    case PFILEDIRECTORYP:
     case PDELETEFILE:
+    case PMAKEDIRECTORY:
+    case PDELETEDIRECTORY:
     case PRENAMEFILE:
     case PCURRENTDIRECTORY:
     case PDIRECTORYFILES:
+    case PTEMPFILEPATH:
     case PGETENV:
     case PGETENVS:
     case POPENBINARYOUTPUT:

@@ -628,10 +628,15 @@ static const struct {
     {"peek-u8", PPEEKU8},
     // File system
     {"file-exists?", PFILEEXISTS},
+    {"file-regular?", PFILEREGULARP},
+    {"file-directory?", PFILEDIRECTORYP},
     {"delete-file", PDELETEFILE},
+    {"make-directory", PMAKEDIRECTORY},
+    {"delete-directory", PDELETEDIRECTORY},
     {"rename-file", PRENAMEFILE},
     {"current-directory", PCURRENTDIRECTORY},
     {"directory-files", PDIRECTORYFILES},
+    {"temporary-file-path", PTEMPFILEPATH},
     {"get-environment-variable", PGETENV},
 
     // Control

@@ -702,6 +702,141 @@ static unsigned maybe_apply_exactness(unsigned value, reader_exactness exactness
     return value;
 }
 
+static bignum *reader_pow10(uint64_t exp)
+{
+    bignum *ten = bn_from_int(10);
+    if (!ten)
+        return NULL;
+    bignum *result = bn_pow(ten, exp);
+    bn_free(ten);
+    return result;
+}
+
+static unsigned read_exact_decimal_number(const char *s, bool *handled)
+{
+    *handled = false;
+    const char *p = s;
+    bool neg = false;
+    if (*p == '+' || *p == '-') {
+        neg = *p == '-';
+        p++;
+    }
+
+    size_t digits_cap = strlen(p) + 2;
+    char *digits = malloc(digits_cap);
+    if (!digits) {
+        show_error("exact decimal literal: out of memory");
+        return TOK_ERROR;
+    }
+    size_t digits_len = 0;
+    bool saw_digit = false;
+    bool saw_decimal_syntax = false;
+    int64_t frac_digits = 0;
+
+    while (isdigit((unsigned char)*p)) {
+        digits[digits_len++] = *p++;
+        saw_digit = true;
+    }
+    if (*p == '.') {
+        saw_decimal_syntax = true;
+        p++;
+        while (isdigit((unsigned char)*p)) {
+            digits[digits_len++] = *p++;
+            saw_digit = true;
+            frac_digits++;
+        }
+    }
+    if (!saw_digit) {
+        free(digits);
+        return ctx.atom_false;
+    }
+
+    int64_t exponent = 0;
+    if (*p == 'e' || *p == 'E') {
+        saw_decimal_syntax = true;
+        p++;
+        bool exp_neg = false;
+        if (*p == '+' || *p == '-') {
+            exp_neg = *p == '-';
+            p++;
+        }
+        if (!isdigit((unsigned char)*p)) {
+            free(digits);
+            return ctx.atom_false;
+        }
+        while (isdigit((unsigned char)*p)) {
+            if (exponent > (INT64_MAX - 9) / 10) {
+                free(digits);
+                show_error("exact decimal literal: exponent too large");
+                return TOK_ERROR;
+            }
+            exponent = exponent * 10 + (*p++ - '0');
+        }
+        if (exp_neg)
+            exponent = -exponent;
+    }
+    if (*p != '\0') {
+        free(digits);
+        return ctx.atom_false;
+    }
+    if (!saw_decimal_syntax) {
+        free(digits);
+        return ctx.atom_false;
+    }
+    *handled = true;
+
+    digits[digits_len] = '\0';
+    char *num_str = malloc(digits_len + 2);
+    if (!num_str) {
+        free(digits);
+        show_error("exact decimal literal: out of memory");
+        return TOK_ERROR;
+    }
+    size_t offset = 0;
+    if (neg)
+        num_str[offset++] = '-';
+    memcpy(num_str + offset, digits, digits_len + 1);
+    free(digits);
+
+    bignum *num = bn_from_string(num_str, 10);
+    free(num_str);
+    if (!num) {
+        show_error("invalid exact decimal literal");
+        return TOK_ERROR;
+    }
+
+    int64_t scale = frac_digits - exponent;
+    if (scale <= 0) {
+        uint64_t mul_exp = (uint64_t)(-scale);
+        bignum *factor = reader_pow10(mul_exp);
+        if (!factor) {
+            bn_free(num);
+            show_error("exact decimal literal: out of memory");
+            return TOK_ERROR;
+        }
+        bignum *scaled = bn_mul(num, factor);
+        bn_free(num);
+        bn_free(factor);
+        if (!scaled) {
+            show_error("exact decimal literal: out of memory");
+            return TOK_ERROR;
+        }
+        return store_integer(scaled);
+    }
+
+    bignum *den = reader_pow10((uint64_t)scale);
+    if (!den) {
+        bn_free(num);
+        show_error("exact decimal literal: out of memory");
+        return TOK_ERROR;
+    }
+    GC_GUARD;
+    unsigned num_cell = store_integer(num);
+    gc_protect(&num_cell);
+    unsigned den_cell = store_integer(den);
+    return normalize_rational_cells(num_cell, den_cell);
+}
+
 static unsigned read_prefixed_number(int prefix)
 {
     int base = 10;
@@ -753,7 +888,19 @@ static unsigned read_prefixed_number(int prefix)
             show_error("invalid decimal literal");
             return TOK_ERROR;
         }
-        unsigned value = atom_from_string(sb.data);
+        unsigned value;
+        if (exactness == READER_EXACTNESS_EXACT) {
+            bool handled = false;
+            value = read_exact_decimal_number(sb.data, &handled);
+            if (value == TOK_ERROR) {
+                sb_free(&sb);
+                return TOK_ERROR;
+            }
+            if (!handled)
+                value = atom_from_string(sb.data);
+        } else {
+            value = atom_from_string(sb.data);
+        }
         sb_free(&sb);
         if (!is_numeric(value)) {
             show_error("invalid decimal literal");

@@ -171,6 +171,15 @@ TEST(read_exactness_and_radix_prefixes)
     x = read_from_string("#e#b1010");
     ASSERT(CELL_TYPE(x) == BT_NUM);
     ASSERT_EQ(CELL_ID(x), 10);
+
+    x = read_from_string("#e1.50");
+    ASSERT(IS_RATIONAL(x));
+    ASSERT_EQ(CELL_ID(CELL_CAR(x)), 3);
+    ASSERT_EQ(CELL_ID(CELL_CDR(x)), 2);
+
+    x = read_from_string("#e1.25e2");
+    ASSERT(CELL_TYPE(x) == BT_NUM);
+    ASSERT_EQ(CELL_ID(x), 125);
     PASS();
 }
 

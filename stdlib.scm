@@ -1698,16 +1698,77 @@
        (cute-helper (param ...) (arg ... tmp) rest)))))
 
 ;;; ============================================================================
+;;; Sort Utilities
+;;; ============================================================================
+
+(define (merge less? left right)
+  (%require-proper-list "merge" left)
+  (%require-proper-list "merge" right)
+  (cond ((null? left) right)
+        ((null? right) left)
+        ((less? (car right) (car left))
+         (cons (car right) (merge less? left (cdr right))))
+        (else
+         (cons (car left) (merge less? (cdr left) right)))))
+
+(define (list-sort less? lst)
+  (%require-proper-list "list-sort" lst)
+  (let split ((xs lst) (slow lst) (fast lst) (front '()))
+    (if (or (null? fast) (null? (cdr fast)))
+        (let ((left (reverse front))
+              (right slow))
+          (cond ((null? right) left)
+                ((null? (cdr right)) (merge less? left right))
+                (else (merge less?
+                             (list-sort less? left)
+                             (list-sort less? right)))))
+        (split xs (cdr slow) (cddr fast) (cons (car slow) front)))))
+
+(define (stable-sort sequence less?)
+  (if (vector? sequence)
+      (list->vector (list-sort less? (vector->list sequence)))
+      (list-sort less? sequence)))
+
+(define sort stable-sort)
+
+(define (vector-sort less? vec)
+  (list->vector (list-sort less? (vector->list vec))))
+
+(define (vector-sort! less? vec)
+  (let ((sorted (vector-sort less? vec)))
+    (let loop ((i 0))
+      (if (< i (vector-length vec))
+          (begin
+            (vector-set! vec i (vector-ref sorted i))
+            (loop (+ i 1)))
+          vec))))
+
+(define (sort! sequence less?)
+  (if (vector? sequence)
+      (vector-sort! less? sequence)
+      (list-sort less? sequence)))
+
+;;; ============================================================================
 ;;; Format (SRFI-28 basic format strings)
 ;;; ============================================================================
 
 ;; format - formatted output
-;; Supports: ~a (display), ~s (write), ~% (newline), ~~ (tilde)
+;; Supports: ~a, ~s, ~d, ~x, ~o, ~b, ~r, ~c, ~%, ~&, ~_
 ;; First argument can be:
 ;;   #f - return string
 ;;   #t - output to current-output-port, return unspecified
 ;;   port - output to port, return unspecified
 (define (format dest fmt . args)
+  (define (require-arg args directive)
+    (if (null? args)
+        (error (string-append "format: not enough arguments for ~" directive))
+        (car args)))
+
+  (define (format-radix args radix directive port)
+    (let ((arg (require-arg args directive)))
+      (display (number->string arg radix) port)
+      (cdr args)))
+
   (define (format-to-string)
     (let ((out (open-output-string)))
       (format-to-port out)
@@ -1722,24 +1783,33 @@
                     (let ((directive (string-ref fmt (+ i 1))))
                       (cond
                         ((or (char=? directive #\a) (char=? directive #\A))
-                         (if (null? args)
-                             (error "format: not enough arguments for ~a")
-                             (begin
-                               (display (car args) port)
-                               (loop (+ i 2) (cdr args)))))
+                         (display (require-arg args "a") port)
+                         (loop (+ i 2) (cdr args)))
                         ((or (char=? directive #\s) (char=? directive #\S))
-                         (if (null? args)
-                             (error "format: not enough arguments for ~s")
-                             (begin
-                               (write (car args) port)
-                               (loop (+ i 2) (cdr args)))))
+                         (write (require-arg args "s") port)
+                         (loop (+ i 2) (cdr args)))
                         ((or (char=? directive #\d) (char=? directive #\D))
-                         (if (null? args)
-                             (error "format: not enough arguments for ~d")
-                             (begin
-                               (display (car args) port)
-                               (loop (+ i 2) (cdr args)))))
+                         (loop (+ i 2) (format-radix args 10 "d" port)))
+                        ((or (char=? directive #\x) (char=? directive #\X))
+                         (loop (+ i 2) (format-radix args 16 "x" port)))
+                        ((or (char=? directive #\o) (char=? directive #\O))
+                         (loop (+ i 2) (format-radix args 8 "o" port)))
+                        ((or (char=? directive #\b) (char=? directive #\B))
+                         (loop (+ i 2) (format-radix args 2 "b" port)))
+                        ((or (char=? directive #\r) (char=? directive #\R))
+                         (let ((arg (require-arg args "r")))
+                           (display arg port)
+                           (loop (+ i 2) (cdr args))))
+                        ((or (char=? directive #\c) (char=? directive #\C))
+                         (let ((arg (require-arg args "c")))
+                           (if (char? arg)
+                               (write-char arg port)
+                               (error "format: ~c expects a character"))
+                           (loop (+ i 2) (cdr args))))
                         ((char=? directive #\%)
+                         (newline port)
+                         (loop (+ i 2) args))
+                        ((or (char=? directive #\&) (char=? directive #\_))
                          (newline port)
                          (loop (+ i 2) args))
                         ((char=? directive #\~)
@@ -2615,6 +2685,80 @@
       ((and (>= n 65296) (<= n 65305)) (- n 65296))
       (else #f))))
 
+;;; ============================================================================
+;;; Pathname/File Utilities
+;;; ============================================================================
+
+(define (path-separator) "/")
+
+(define (path-absolute? path)
+  (and (> (string-length path) 0)
+       (char=? (string-ref path 0) #\/)))
+
+(define (path-strip-trailing-separators path)
+  (let loop ((end (string-length path)))
+    (if (and (> end 1) (char=? (string-ref path (- end 1)) #\/))
+        (loop (- end 1))
+        (substring path 0 end))))
+
+(define (path-join . parts)
+  (define (empty-part? s) (= (string-length s) 0))
+  (define (trim-left s)
+    (let loop ((i 0))
+      (if (and (< i (string-length s)) (char=? (string-ref s i) #\/))
+          (loop (+ i 1))
+          (substring s i (string-length s)))))
+  (define (trim-right s)
+    (path-strip-trailing-separators s))
+  (let loop ((parts parts) (out ""))
+    (cond ((null? parts) (if (string=? out "") "." out))
+          ((empty-part? (car parts)) (loop (cdr parts) out))
+          ((or (string=? out "") (path-absolute? (car parts)))
+           (loop (cdr parts) (trim-right (car parts))))
+          (else
+           (loop (cdr parts)
+                 (string-append (trim-right out) "/" (trim-left (car parts))))))))
+
+(define (path-basename path)
+  (let* ((p (path-strip-trailing-separators path))
+         (len (string-length p)))
+    (let loop ((i (- len 1)))
+      (cond ((< i 0) p)
+            ((char=? (string-ref p i) #\/) (substring p (+ i 1) len))
+            (else (loop (- i 1)))))))
+
+(define (path-directory path)
+  (let* ((p (path-strip-trailing-separators path))
+         (len (string-length p)))
+    (let loop ((i (- len 1)))
+      (cond ((< i 0) ".")
+            ((= i 0) "/")
+            ((char=? (string-ref p i) #\/) (substring p 0 i))
+            (else (loop (- i 1)))))))
+
+(define (path-extension path)
+  (let ((base (path-basename path)))
+    (let loop ((i (- (string-length base) 1)))
+      (cond ((<= i 0) "")
+            ((char=? (string-ref base i) #\.) (substring base (+ i 1) (string-length base)))
+            (else (loop (- i 1)))))))
+
+(define (path-with-extension path extension)
+  (let* ((base (path-basename path))
+         (dir (path-directory path))
+         (stem
+          (let loop ((i (- (string-length base) 1)))
+            (cond ((<= i 0) base)
+                  ((char=? (string-ref base i) #\.) (substring base 0 i))
+                  (else (loop (- i 1)))))))
+    (path-join dir
+               (string-append stem
+                              (if (and (> (string-length extension) 0)
+                                       (not (char=? (string-ref extension 0) #\.)))
+                                  "."
+                                  "")
+                              extension))))
+
 (define *supported-r7rs-environments*
   '((scheme base)
     (scheme case-lambda)
@@ -2629,6 +2773,7 @@
     (scheme process-context)
     (scheme read)
     (scheme repl)
+    (scheme sort)
     (scheme time)
     (scheme write)))
 

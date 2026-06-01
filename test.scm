@@ -869,6 +869,17 @@
 (hash-table-clear! resize-ht)
 (test "hash-table-clear!" 0 (hash-table-size resize-ht))
 
+; Sorting helpers
+(test "list-sort" '(1 2 3 4) (list-sort < '(4 2 3 1)))
+(test "stable-sort list" '((1 a) (1 c) (2 b))
+      (stable-sort '((1 a) (2 b) (1 c))
+                   (lambda (a b) (< (car a) (car b)))))
+(test "sort vector" '#(1 2 3) (sort '#(3 1 2) <))
+(define vector-sort-target '#(3 1 2))
+(vector-sort! < vector-sort-target)
+(test "vector-sort!" '#(1 2 3) vector-sort-target)
+(test "merge" '(1 2 3 4 5 6) (merge < '(1 3 5) '(2 4 6)))
+
 ; I/O helpers and port predicates
 (define out-str-port (open-output-string))
 (write-string "abc" out-str-port)
@@ -919,6 +930,8 @@
 (write-bytevector (bytevector 65 66 67) compat-out)
 (close-output-port compat-out)
 (test "file-exists? compat file" #t (file-exists? compat-file))
+(test "file-regular? compat file" #t (file-regular? compat-file))
+(test "file-directory? compat file" #f (file-directory? compat-file))
 (define compat-in (open-binary-input-file compat-file))
 (test "binary input port predicate" #t (binary-port? compat-in))
 (test "read-bytevector file" #u8(65 66 67) (read-bytevector 3 compat-in))
@@ -938,6 +951,18 @@
 (delete-file compat-text-file)
 (test "current-directory returns string" #t (string? (current-directory)))
 (test "directory-files returns list" #t (list? (directory-files ".")))
+(define compat-dir "/tmp/vesper-compat-dir")
+(make-directory compat-dir)
+(test "make-directory/file-directory?" #t (file-directory? compat-dir))
+(delete-directory compat-dir)
+(test "delete-directory" #f (file-exists? compat-dir))
+(test "temporary-file-path" #t (string? (temporary-file-path)))
+(test "path-join" "/tmp/vesper/file.txt" (path-join "/tmp/" "vesper" "file.txt"))
+(test "path-basename" "file.txt" (path-basename "/tmp/vesper/file.txt"))
+(test "path-directory" "/tmp/vesper" (path-directory "/tmp/vesper/file.txt"))
+(test "path-extension" "txt" (path-extension "/tmp/vesper/file.txt"))
+(test "path-with-extension" "/tmp/vesper/file.scm"
+      (path-with-extension "/tmp/vesper/file.txt" "scm"))
 (test "current-jiffy integer" #t (integer? (current-jiffy)))
 (test "jiffies-per-second" 1000000000 (jiffies-per-second))
 (test "get-environment-variables returns alist"
@@ -999,6 +1024,9 @@
 (test "symbol=? false" #f (symbol=? 'a 'a 'b))
 (test "symbol=? rejects non-symbol" #f (symbol=? 'a 1))
 (test "vector->string" "bc" (vector->string '#(#\a #\b #\c #\d) 1 3))
+(test "format radix and char" "hex ff oct 377 bin 1010 char A"
+      (format #f "hex ~x oct ~o bin ~b char ~c" 255 255 10 #\A))
+(test "format fresh line" "a\nb" (format #f "a~&b"))
 (test "write-simple" "\"x\"" (call-with-output-string
                                 (lambda (p) (write-simple "x" p))))
 (test "write-shared" "(1 2)" (call-with-output-string
@@ -1316,6 +1344,10 @@
       (read (open-input-string "#| outer #| inner |# done |# kept")))
 (test "reader exactness/radix prefix" 16.0
       (read (open-input-string "#i#x10")))
+(test "reader exact decimal" 3/2
+      (read (open-input-string "#e1.50")))
+(test "reader exact decimal exponent" 125
+      (read (open-input-string "#e1.25e2")))
 (test "escaped identifier preserves case and spaces" 9
       (let ((|Hello World| 9)) |Hello World|))
 (test "escaped identifier scalar escape" 11
