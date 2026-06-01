@@ -41,6 +41,7 @@ static FILE *reader_port = NULL;
 static int reader_line = 1;
 static int reader_col = 0;
 static const char *reader_filename = "<stdin>";
+static bool reader_fold_case = true;
 
 #define READER_PUSHBACK_CAP 16
 
@@ -63,6 +64,7 @@ static reader_char_state saved_pushback[READER_PUSHBACK_CAP];
 static int saved_pushback_len = 0;
 static reader_char_state saved_history[READER_PUSHBACK_CAP];
 static int saved_history_len = 0;
+static bool saved_reader_fold_case = true;
 
 static void reader_record_history(reader_char_state state)
 {
@@ -246,6 +248,8 @@ void reader_reset_position(void)
     saved_reader_col = 0;
     saved_pushback_len = 0;
     saved_history_len = 0;
+    reader_fold_case = true;
+    saved_reader_fold_case = true;
 }
 
 // Get current reader position for error messages
@@ -277,6 +281,9 @@ typedef struct {
     size_t len;
     size_t cap;
 } string_buffer;
+
+static void sb_free(string_buffer *sb);
+static inline bool is_delimiter(int c);
 
 static void sb_init(string_buffer *sb)
 {
@@ -438,9 +445,40 @@ static bool validate_utf8_string(const char *s)
 
 static void sb_append_token_char(string_buffer *sb, int c)
 {
-    if (c >= 'A' && c <= 'Z')
+    if (reader_fold_case && c >= 'A' && c <= 'Z')
         c = c - 'A' + 'a';
     sb_append(sb, c);
+}
+
+static bool read_reader_directive(void)
+{
+    string_buffer sb;
+    sb_init(&sb);
+    int c = reader_getchar();
+    while (!is_delimiter(c)) {
+        sb_append(&sb, c);
+        c = reader_getchar();
+    }
+    if (!is_delimiter(c)) {
+        sb_free(&sb);
+        show_error("reader directive: invalid syntax");
+        return false;
+    }
+    reader_ungetc(c);
+
+    if (strcmp(sb.data, "fold-case") == 0) {
+        reader_fold_case = true;
+        sb_free(&sb);
+        return true;
+    }
+    if (strcmp(sb.data, "no-fold-case") == 0) {
+        reader_fold_case = false;
+        sb_free(&sb);
+        return true;
+    }
+    show_error("unknown reader directive: #!%s", sb.data);
+    sb_free(&sb);
+    return false;
 }
 
 static char *sb_finish(string_buffer *sb)
@@ -936,6 +974,10 @@ unsigned read_token(void)
             c = reader_getchar();
             if (c == '(') {
                 return TOK_VECTOR_OPEN;
+            } else if (c == '!') {
+                if (!read_reader_directive())
+                    return TOK_ERROR;
+                continue;
             } else if (c == '\\') {
                 return read_character_literal();
             } else if (c == 't' || c == 'T') {
@@ -1394,6 +1436,7 @@ unsigned read_obj_port(FILE *port)
     reader_char_state old_history[READER_PUSHBACK_CAP];
     int old_pushback_len = reader_pushback_len;
     int old_history_len = reader_history_len;
+    bool old_fold_case = reader_fold_case;
     memcpy(old_pushback, reader_pushback, sizeof(old_pushback));
     memcpy(old_history, reader_history, sizeof(old_history));
 
@@ -1407,11 +1450,13 @@ unsigned read_obj_port(FILE *port)
         memcpy(reader_history, saved_history, sizeof(reader_history));
         reader_pushback_len = saved_pushback_len;
         reader_history_len = saved_history_len;
+        reader_fold_case = saved_reader_fold_case;
     } else {
         reader_line = 1;
         reader_col = 0;
         reader_pushback_len = 0;
         reader_history_len = 0;
+        reader_fold_case = true;
     }
     reset_datum_labels();
     unsigned result = read_obj();
@@ -1427,10 +1472,12 @@ unsigned read_obj_port(FILE *port)
     memcpy(saved_history, reader_history, sizeof(saved_history));
     saved_pushback_len = reader_pushback_len;
     saved_history_len = reader_history_len;
+    saved_reader_fold_case = reader_fold_case;
 
     reader_port = old_port;
     reader_line = old_line;
     reader_col = old_col;
+    reader_fold_case = old_fold_case;
     memcpy(reader_pushback, old_pushback, sizeof(reader_pushback));
     memcpy(reader_history, old_history, sizeof(reader_history));
     reader_pushback_len = old_pushback_len;
@@ -1484,6 +1531,7 @@ void reader_forget_port(FILE *port)
         saved_reader_col = 0;
         saved_pushback_len = 0;
         saved_history_len = 0;
+        saved_reader_fold_case = true;
     }
     if (reader_port == port) {
         reader_pushback_len = 0;

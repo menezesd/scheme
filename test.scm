@@ -1243,6 +1243,13 @@
       (let ((λ 42)) λ))
 (test "unicode identifier ascii-folds only ascii" 7
       (let ((fooλ 7)) Fooλ))
+(test "reader no-fold-case directive" "FOO"
+      (symbol->string (read (open-input-string "#!no-fold-case FOO"))))
+(test "reader fold-case directive" "foo"
+      (symbol->string (read (open-input-string "#!fold-case FOO"))))
+(test "reader case directive toggles" '("FOO" "bar")
+      (let ((p (open-input-string "#!no-fold-case FOO #!fold-case BAR")))
+        (list (symbol->string (read p)) (symbol->string (read p)))))
 (test "escaped identifier preserves case and spaces" 9
       (let ((|Hello World| 9)) |Hello World|))
 (test "escaped identifier scalar escape" 11

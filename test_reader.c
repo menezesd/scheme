@@ -6,6 +6,7 @@
 #include "types.h"
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 
 // ============================================================================
 // Helper: Read from string
@@ -349,6 +350,66 @@ TEST(read_symbol_case_insensitive)
     unsigned x = read_from_string("FOO");
     ASSERT(CELL_TYPE(x) == BT_ATOM);
     ASSERT_STR_EQ(ctx.atom_table[CELL_ID(x)], "foo");
+    PASS();
+}
+
+TEST(read_fold_case_directive)
+{
+    unsigned x = read_from_string("#!fold-case FOO");
+    ASSERT(CELL_TYPE(x) == BT_ATOM);
+    ASSERT_STR_EQ(ctx.atom_table[CELL_ID(x)], "foo");
+    PASS();
+}
+
+TEST(read_no_fold_case_directive)
+{
+    unsigned x = read_from_string("#!no-fold-case FOO");
+    ASSERT(CELL_TYPE(x) == BT_ATOM);
+    ASSERT_STR_EQ(ctx.atom_table[CELL_ID(x)], "FOO");
+    PASS();
+}
+
+TEST(read_case_directive_persists_for_port)
+{
+    const char *src = "#!no-fold-case FOO BAR";
+    FILE *f = fmemopen((void *)src, strlen(src), "r");
+    ASSERT(f != NULL);
+
+    unsigned first = read_obj_port(f);
+    ASSERT(CELL_TYPE(first) == BT_ATOM);
+    ASSERT_STR_EQ(ctx.atom_table[CELL_ID(first)], "FOO");
+
+    unsigned second = read_obj_port(f);
+    ASSERT(CELL_TYPE(second) == BT_ATOM);
+    ASSERT_STR_EQ(ctx.atom_table[CELL_ID(second)], "BAR");
+
+    reader_forget_port(f);
+    fclose(f);
+    PASS();
+}
+
+TEST(read_case_directive_can_toggle)
+{
+    const char *src = "#!no-fold-case FOO #!fold-case BAR";
+    FILE *f = fmemopen((void *)src, strlen(src), "r");
+    ASSERT(f != NULL);
+
+    unsigned first = read_obj_port(f);
+    ASSERT(CELL_TYPE(first) == BT_ATOM);
+    ASSERT_STR_EQ(ctx.atom_table[CELL_ID(first)], "FOO");
+
+    unsigned second = read_obj_port(f);
+    ASSERT(CELL_TYPE(second) == BT_ATOM);
+    ASSERT_STR_EQ(ctx.atom_table[CELL_ID(second)], "bar");
+
+    reader_forget_port(f);
+    fclose(f);
+    PASS();
+}
+
+TEST(read_unknown_directive_rejected)
+{
+    ASSERT(read_from_string("#!wat FOO") == TOK_ERROR);
     PASS();
 }
 
@@ -766,6 +827,11 @@ int main(void)
     // Symbols
     RUN_TEST(read_symbol);
     RUN_TEST(read_symbol_case_insensitive);
+    RUN_TEST(read_fold_case_directive);
+    RUN_TEST(read_no_fold_case_directive);
+    RUN_TEST(read_case_directive_persists_for_port);
+    RUN_TEST(read_case_directive_can_toggle);
+    RUN_TEST(read_unknown_directive_rejected);
     RUN_TEST(read_symbol_with_special_chars);
     RUN_TEST(read_symbol_preserves_utf8_identifier);
     RUN_TEST(read_symbol_ascii_folds_without_mangling_utf8);
