@@ -436,6 +436,13 @@ static bool validate_utf8_string(const char *s)
     return true;
 }
 
+static void sb_append_token_char(string_buffer *sb, int c)
+{
+    if (c >= 'A' && c <= 'Z')
+        c = c - 'A' + 'a';
+    sb_append(sb, c);
+}
+
 static char *sb_finish(string_buffer *sb)
 {
     return sb->data; // Caller takes ownership
@@ -760,6 +767,93 @@ static unsigned read_string_literal(void)
     return x;
 }
 
+static unsigned read_escaped_identifier(void)
+{
+    string_buffer sb;
+    sb_init(&sb);
+
+    for (;;) {
+        int c = reader_getchar();
+        if (c == EOF) {
+            show_error("unterminated escaped identifier");
+            sb_free(&sb);
+            return TOK_ERROR;
+        }
+        if (c == '|')
+            break;
+        if (c == '\\') {
+            c = reader_getchar();
+            switch (c) {
+            case 'a':
+                c = '\a';
+                break;
+            case 'b':
+                c = '\b';
+                break;
+            case 'n':
+                c = '\n';
+                break;
+            case 'r':
+                c = '\r';
+                break;
+            case 't':
+                c = '\t';
+                break;
+            case '\\':
+                c = '\\';
+                break;
+            case '|':
+                c = '|';
+                break;
+            case 'x': {
+                string_buffer hex;
+                sb_init(&hex);
+                int h = reader_getchar();
+                while (isxdigit(h)) {
+                    sb_append(&hex, h);
+                    h = reader_getchar();
+                }
+                if (h != ';') {
+                    sb_free(&hex);
+                    show_error("escaped identifier: invalid hex scalar escape");
+                    sb_free(&sb);
+                    return TOK_ERROR;
+                }
+                int64_t scalar;
+                if (!read_hex_scalar_value(hex.data, &scalar,
+                                           "escaped identifier")) {
+                    sb_free(&hex);
+                    sb_free(&sb);
+                    return TOK_ERROR;
+                }
+                if (!valid_string_scalar(scalar) ||
+                    !sb_append_utf8(&sb, scalar)) {
+                    sb_free(&hex);
+                    sb_free(&sb);
+                    return TOK_ERROR;
+                }
+                sb_free(&hex);
+                continue;
+            }
+            default:
+                show_error("escaped identifier: unknown escape sequence");
+                sb_free(&sb);
+                return TOK_ERROR;
+            }
+        }
+        sb_append(&sb, c);
+    }
+
+    if (!validate_utf8_string(sb.data)) {
+        show_error("escaped identifier contains invalid UTF-8");
+        sb_free(&sb);
+        return TOK_ERROR;
+    }
+    unsigned res = atom_from_string(sb.data);
+    sb_free(&sb);
+    return res;
+}
+
 // Read a number starting with decimal point (e.g., .5)
 static unsigned read_decimal_number(void)
 {
@@ -1050,13 +1144,15 @@ unsigned read_token(void)
         }
         case '"':
             return read_string_literal();
+        case '|':
+            return read_escaped_identifier();
         default: {
             // Symbol or number
             string_buffer sb;
             sb_init(&sb);
             bool is_number = isdigit(c) || c == '-' || c == '+';
             bool delimiter_unread = false;
-            sb_append(&sb, tolower(c));
+            sb_append_token_char(&sb, c);
 
             for (;;) {
                 c = reader_getchar();
@@ -1066,7 +1162,7 @@ unsigned read_token(void)
                     if (isdigit(c2) || c2 == 'e' || c2 == 'E') {
                         // It's a decimal number
                         sb_append(&sb, '.');
-                        sb_append(&sb, tolower(c2));
+                        sb_append_token_char(&sb, c2);
                         continue;
                     } else if (is_delimiter(c2)) {
                         // End of number followed by dot (for dotted pairs)
@@ -1083,10 +1179,15 @@ unsigned read_token(void)
                     break;
                 // R5RS: . + - @ are valid subsequent characters in identifiers
                 // The . as dotted-pair marker is handled in the switch above
-                sb_append(&sb, tolower(c));
+                sb_append_token_char(&sb, c);
             }
             if (!delimiter_unread)
                 reader_ungetc(c);
+            if (!validate_utf8_string(sb.data)) {
+                show_error("symbol contains invalid UTF-8");
+                sb_free(&sb);
+                return TOK_ERROR;
+            }
             unsigned res = atom_from_string(sb.data);
             sb_free(&sb);
             return res;

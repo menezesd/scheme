@@ -1140,6 +1140,51 @@
               ((error-object? exn) #t)
               (else #f))
         (record-a-x record-b-instance)))
+(test "record rejects duplicate fields"
+      #t
+      (guard (exn
+              ((error-object? exn) #t)
+              (else #f))
+        (let ()
+          (define-record-type bad-record
+            (make-bad-record x)
+            bad-record?
+            (x bad-x)
+            (x bad-x2))
+          #f)))
+(test "record rejects duplicate constructor fields"
+      #t
+      (guard (exn
+              ((error-object? exn) #t)
+              (else #f))
+        (let ()
+          (define-record-type bad-record
+            (make-bad-record x x)
+            bad-record?
+            (x bad-x))
+          #f)))
+(test "record rejects unknown constructor field"
+      #t
+      (guard (exn
+              ((error-object? exn) #t)
+              (else #f))
+        (let ()
+          (define-record-type bad-record
+            (make-bad-record y)
+            bad-record?
+            (x bad-x))
+          #f)))
+(test "record rejects duplicate generated binding"
+      #t
+      (guard (exn
+              ((error-object? exn) #t)
+              (else #f))
+        (let ()
+          (define-record-type bad-record
+            (make-bad-record x)
+            bad-record?
+            (x make-bad-record))
+          #f)))
 
 (section "Vector/String Additions")
 
@@ -1194,6 +1239,18 @@
 (test "unicode read written char roundtrip" 119070
       (char->integer (read (open-input-string
                             (write-to-string (integer->char #x1D11E))))))
+(test "unicode identifier preserves utf8" 42
+      (let ((λ 42)) λ))
+(test "unicode identifier ascii-folds only ascii" 7
+      (let ((fooλ 7)) Fooλ))
+(test "escaped identifier preserves case and spaces" 9
+      (let ((|Hello World| 9)) |Hello World|))
+(test "escaped identifier scalar escape" 11
+      (let ((|\x3BB;| 11)) λ))
+(test "write escaped symbol roundtrip" "Hello World"
+      (symbol->string (read (open-input-string
+                             (write-to-string
+                              (string->symbol "Hello World"))))))
 (test "string-append*" "abc" (string-append* '("a" "b" "c")))
 (test "string*" "a12#t" (string* (list "a" 12 #t)))
 (test "string-compare" 'lt

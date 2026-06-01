@@ -391,6 +391,48 @@ TEST(writer_displays_unicode_character_as_utf8)
     PASS();
 }
 
+TEST(writer_escapes_non_roundtripping_symbols)
+{
+    unsigned sym = atom_from_string("Hello World");
+    char *buf = NULL;
+    size_t len = 0;
+    FILE *mem = open_memstream(&buf, &len);
+    ASSERT(mem != NULL);
+
+    write_obj_port(sym, mem);
+    fclose(mem);
+    ASSERT_STR_EQ(buf, "|Hello World|");
+    free(buf);
+
+    sym = alloc();
+    CELL_TYPE(sym) = BT_ATOM;
+    CELL_ID(sym) = intern("123");
+    buf = NULL;
+    len = 0;
+    mem = open_memstream(&buf, &len);
+    ASSERT(mem != NULL);
+    write_obj_port(sym, mem);
+    fclose(mem);
+    ASSERT_STR_EQ(buf, "|123|");
+    free(buf);
+    PASS();
+}
+
+TEST(writer_escapes_symbol_bar_and_backslash)
+{
+    unsigned sym = atom_from_string("a|b\\c");
+    char *buf = NULL;
+    size_t len = 0;
+    FILE *mem = open_memstream(&buf, &len);
+    ASSERT(mem != NULL);
+
+    write_obj_port(sym, mem);
+    fclose(mem);
+    ASSERT_STR_EQ(buf, "|a\\|b\\\\c|");
+    free(buf);
+    PASS();
+}
+
 TEST(string_port_write_failures_return_false)
 {
     string_port *sp = strport_new();
@@ -1153,6 +1195,8 @@ int main(void)
     RUN_TEST(writer_escapes_control_strings_with_scalar_escape);
     RUN_TEST(writer_writes_unicode_character_literal);
     RUN_TEST(writer_displays_unicode_character_as_utf8);
+    RUN_TEST(writer_escapes_non_roundtripping_symbols);
+    RUN_TEST(writer_escapes_symbol_bar_and_backslash);
     RUN_TEST(string_port_write_failures_return_false);
     RUN_TEST(make_string_owned_rejects_null);
 

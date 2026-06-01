@@ -360,6 +360,51 @@ TEST(read_symbol_with_special_chars)
     PASS();
 }
 
+TEST(read_symbol_preserves_utf8_identifier)
+{
+    unsigned x = read_from_string("λ");
+    ASSERT(CELL_TYPE(x) == BT_ATOM);
+    ASSERT_STR_EQ(ctx.atom_table[CELL_ID(x)], "λ");
+    PASS();
+}
+
+TEST(read_symbol_ascii_folds_without_mangling_utf8)
+{
+    unsigned x = read_from_string("Fooλ");
+    ASSERT(CELL_TYPE(x) == BT_ATOM);
+    ASSERT_STR_EQ(ctx.atom_table[CELL_ID(x)], "fooλ");
+    PASS();
+}
+
+TEST(read_symbol_rejects_invalid_utf8)
+{
+    const char invalid[] = {(char)0xC0, (char)0x80, '\0'};
+    ASSERT(read_from_string(invalid) == TOK_ERROR);
+    PASS();
+}
+
+TEST(read_escaped_identifier)
+{
+    unsigned x = read_from_string("|Hello World|");
+    ASSERT(CELL_TYPE(x) == BT_ATOM);
+    ASSERT_STR_EQ(ctx.atom_table[CELL_ID(x)], "Hello World");
+    x = read_from_string("|\\x3BB;|");
+    ASSERT(CELL_TYPE(x) == BT_ATOM);
+    ASSERT_STR_EQ(ctx.atom_table[CELL_ID(x)], "λ");
+    x = read_from_string("|a\\|b\\\\c|");
+    ASSERT(CELL_TYPE(x) == BT_ATOM);
+    ASSERT_STR_EQ(ctx.atom_table[CELL_ID(x)], "a|b\\c");
+    PASS();
+}
+
+TEST(read_escaped_identifier_rejects_invalid_escape)
+{
+    ASSERT(read_from_string("|abc") == TOK_ERROR);
+    ASSERT(read_from_string("|\\q|") == TOK_ERROR);
+    ASSERT(read_from_string("|\\xD800;|") == TOK_ERROR);
+    PASS();
+}
+
 // ============================================================================
 // Reader Tests - Booleans
 // ============================================================================
@@ -722,6 +767,11 @@ int main(void)
     RUN_TEST(read_symbol);
     RUN_TEST(read_symbol_case_insensitive);
     RUN_TEST(read_symbol_with_special_chars);
+    RUN_TEST(read_symbol_preserves_utf8_identifier);
+    RUN_TEST(read_symbol_ascii_folds_without_mangling_utf8);
+    RUN_TEST(read_symbol_rejects_invalid_utf8);
+    RUN_TEST(read_escaped_identifier);
+    RUN_TEST(read_escaped_identifier_rejects_invalid_escape);
 
     // Booleans
     RUN_TEST(read_true);

@@ -1361,6 +1361,73 @@
   (cond ((assq field bindings) => cdr)
         (else #f)))
 
+(define (record-any pred lst)
+  (cond ((null? lst) #f)
+        ((pred (car lst)) #t)
+        (else (record-any pred (cdr lst)))))
+
+(define (record-duplicates? lst)
+  (cond ((null? lst) #f)
+        ((memq (car lst) (cdr lst)) #t)
+        (else (record-duplicates? (cdr lst)))))
+
+(define (record-field-spec-name spec)
+  (if (and (pair? spec) (symbol? (car spec)))
+      (car spec)
+      (error "define-record-type: invalid field spec" spec)))
+
+(define (record-field-spec-accessor spec)
+  (if (and (pair? spec) (pair? (cdr spec)) (symbol? (cadr spec))
+           (or (null? (cddr spec))
+               (and (pair? (cddr spec)) (null? (cdddr spec))
+                    (symbol? (caddr spec)))))
+      (cadr spec)
+      (error "define-record-type: invalid field spec" spec)))
+
+(define (record-field-spec-mutator spec)
+  (if (and (pair? spec) (pair? (cdr spec)) (pair? (cddr spec))
+           (null? (cdddr spec)) (symbol? (caddr spec)))
+      (caddr spec)
+      #f))
+
+(define (record-remove-false lst)
+  (cond ((null? lst) '())
+        ((car lst) (cons (car lst) (record-remove-false (cdr lst))))
+        (else (record-remove-false (cdr lst)))))
+
+(define (validate-record-type-spec type-name constructor-name constructor-fields
+                                   predicate-name field-specs)
+  (if (not (symbol? type-name))
+      (error "define-record-type: type name must be a symbol" type-name))
+  (if (not (symbol? constructor-name))
+      (error "define-record-type: constructor name must be a symbol" constructor-name))
+  (if (not (symbol? predicate-name))
+      (error "define-record-type: predicate name must be a symbol" predicate-name))
+  (if (record-any (lambda (field) (not (symbol? field))) constructor-fields)
+      (error "define-record-type: constructor fields must be symbols"
+             constructor-fields))
+  (if (record-duplicates? constructor-fields)
+      (error "define-record-type: duplicate constructor field"
+             constructor-fields))
+  (let ((field-names (map record-field-spec-name field-specs)))
+    (if (record-duplicates? field-names)
+        (error "define-record-type: duplicate field name" field-names))
+    (for-each
+     (lambda (field)
+       (if (not (memq field field-names))
+           (error "define-record-type: constructor field is not a record field"
+                  field)))
+     constructor-fields)
+    (let* ((accessors (map record-field-spec-accessor field-specs))
+           (mutators (record-remove-false
+                      (map record-field-spec-mutator field-specs)))
+           (bindings (append (list type-name constructor-name predicate-name)
+                             accessors
+                             mutators)))
+      (if (record-duplicates? bindings)
+          (error "define-record-type: duplicate generated binding" bindings))))
+  #t)
+
 (define-syntax define-record-type
   (syntax-rules ()
     ((define-record-type type-name
@@ -1368,6 +1435,11 @@
        predicate-name
        field-spec ...)
      (begin
+       (validate-record-type-spec 'type-name
+                                  'constructor-name
+                                  '(constructor-field ...)
+                                  'predicate-name
+                                  '(field-spec ...))
        ;; Generate a unique type tag for this definition.
        (define type-tag (list 'type-name))
 

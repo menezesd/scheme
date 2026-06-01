@@ -30,6 +30,7 @@
 #include <inttypes.h>
 #include <math.h>
 #include <stdlib.h>
+#include <string.h>
 
 // ============================================================================
 // Type Names for Error Messages
@@ -266,6 +267,76 @@ static void write_escaped_string(FILE *fp, const char *s)
     fputc('"', fp);
 }
 
+static bool symbol_looks_numeric(const char *s)
+{
+    if (!s[0])
+        return false;
+    if ((s[0] == '+' || s[0] == '-') && s[1])
+        s++;
+    if (s[0] == '.' && s[1] == '\0')
+        return false;
+    return (s[0] >= '0' && s[0] <= '9') ||
+           (s[0] == '.' && s[1] >= '0' && s[1] <= '9');
+}
+
+static bool symbol_needs_escape(const char *s)
+{
+    if (!s[0] || symbol_looks_numeric(s))
+        return true;
+    if (strcmp(s, ".") == 0)
+        return true;
+    unsigned char first = (unsigned char)s[0];
+    if (first == '#' || first == '"' || first == '\'' || first == '`' ||
+        first == ',' || first == '(' || first == ')' || first == ';')
+        return true;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        if (*p <= 0x20 || *p == 0x7f || *p == '"' || *p == '\'' ||
+            *p == '`' || *p == ',' || *p == '(' || *p == ')' ||
+            *p == ';' || *p == '|' || *p == '\\')
+            return true;
+        if (*p >= 'A' && *p <= 'Z')
+            return true;
+    }
+    return false;
+}
+
+static void write_escaped_symbol(FILE *fp, const char *s)
+{
+    fputc('|', fp);
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        switch (*p) {
+        case '|':
+            fputs("\\|", fp);
+            break;
+        case '\\':
+            fputs("\\\\", fp);
+            break;
+        case '\n':
+            fputs("\\n", fp);
+            break;
+        case '\t':
+            fputs("\\t", fp);
+            break;
+        case '\r':
+            fputs("\\r", fp);
+            break;
+        case '\a':
+            fputs("\\a", fp);
+            break;
+        case '\b':
+            fputs("\\b", fp);
+            break;
+        default:
+            if (*p < 0x20 || *p == 0x7f)
+                fprintf(fp, "\\x%02X;", *p);
+            else
+                fputc(*p, fp);
+            break;
+        }
+    }
+    fputc('|', fp);
+}
+
 static void write_utf8_scalar(FILE *fp, int code)
 {
     if (code < 0 || code > 0x10FFFF ||
@@ -404,7 +475,11 @@ static void write_obj_fp(unsigned s, bool with_quotes, FILE *fp)
         } else if (s == ctx.atom_false) {
             fprintf(fp, "#f");
         } else {
-            fprintf(fp, "%s", ctx.atom_table[CELL_ID(s)]);
+            const char *name = ctx.atom_table[CELL_ID(s)];
+            if (symbol_needs_escape(name))
+                write_escaped_symbol(fp, name);
+            else
+                fprintf(fp, "%s", name);
         }
         break;
     case BT_NUM:
