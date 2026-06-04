@@ -39,7 +39,8 @@ static bool all_complex_args_exact(unsigned argc, unsigned *argv)
 static bool require_exact_integer_pair(unsigned xa, unsigned xb,
                                        const char *name)
 {
-    if (IS_EXACT_INT(xa) && IS_EXACT_INT(xb))
+    if (IS_EXACT_INT(xa) && IS_EXACT_INT(xb) && is_numeric(xa) &&
+        is_numeric(xb))
         return true;
 
     show_error("%s: expected exact integer", name);
@@ -1067,6 +1068,7 @@ unsigned prim_abs(unsigned argc, unsigned *argv)
         gc_protect(&denom_cell);
         if (is_negative_number(num_cell)) {
             num_cell = negate_number(num_cell);
+            RETURN_IF_ERROR(num_cell);
             gc_protect(&num_cell);
         }
         return normalize_rational_cells(num_cell, denom_cell);

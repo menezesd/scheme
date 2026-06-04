@@ -245,6 +245,8 @@ static unsigned magnitude_value(unsigned x, const char *name)
         GC_GUARD;
         gc_protect(&x);
         unsigned abs_num = negate_number(num);
+        if (abs_num == TOK_ERROR)
+            return TOK_ERROR;
         gc_protect(&abs_num);
         unsigned denom = CELL_CDR(x);
         return normalize_rational_cells(abs_num, denom);

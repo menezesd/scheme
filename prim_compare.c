@@ -37,7 +37,11 @@ static bool compare_exact_reals(unsigned a, unsigned b, int *cmp_out)
         return false;
     }
 
-    *cmp_out = compare_exact_integers(left, right);
+    if (!compare_exact_integers(left, right, cmp_out)) {
+        gc_unprotect(7);
+        show_error("comparison: invalid exact integer");
+        return false;
+    }
     gc_unprotect(7);
     return true;
 }

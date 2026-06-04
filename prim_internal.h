@@ -904,26 +904,30 @@ static inline unsigned binary_ge(unsigned a, unsigned b)
 // Comparison Helpers
 // ============================================================================
 
-// Compare two exact integers, returns -1, 0, or 1
-static inline int compare_exact_integers(unsigned a, unsigned b)
+// Compare two exact integers. Returns false if either operand cannot be
+// converted to a valid bignum.
+static inline bool compare_exact_integers(unsigned a, unsigned b, int *cmp_out)
 {
     if (IS_FIXNUM(a) && IS_FIXNUM(b)) {
         int32_t va = FIXNUM_VALUE(a);
         int32_t vb = FIXNUM_VALUE(b);
-        return (va < vb) ? -1 : (va > vb) ? 1 : 0;
+        *cmp_out = (va < vb) ? -1 : (va > vb) ? 1 : 0;
+        return true;
     }
     if (IS_FIXNUM(a) && IS_NUM(b)) {
         int64_t va = FIXNUM_VALUE(a);
         int64_t vb = CELL_ID(b);
-        return (va < vb) ? -1 : (va > vb) ? 1 : 0;
+        *cmp_out = (va < vb) ? -1 : (va > vb) ? 1 : 0;
+        return true;
     }
     if (IS_NUM(a) && IS_FIXNUM(b)) {
         int64_t va = CELL_ID(a);
         int64_t vb = FIXNUM_VALUE(b);
-        return (va < vb) ? -1 : (va > vb) ? 1 : 0;
+        *cmp_out = (va < vb) ? -1 : (va > vb) ? 1 : 0;
+        return true;
     }
     if (!IS_CELL(a) || !IS_CELL(b))
-        return 0;
+        return false;
 
     enum lisp_type ta = CELL_TYPE(a);
     enum lisp_type tb = CELL_TYPE(b);
@@ -931,16 +935,22 @@ static inline int compare_exact_integers(unsigned a, unsigned b)
     if (ta == BT_NUM && tb == BT_NUM) {
         int64_t va = CELL_ID(a);
         int64_t vb = CELL_ID(b);
-        return (va < vb) ? -1 : (va > vb) ? 1 : 0;
+        *cmp_out = (va < vb) ? -1 : (va > vb) ? 1 : 0;
+        return true;
     }
 
     // At least one is bignum
     bignum *ba = to_bignum(a);
     bignum *bb = to_bignum(b);
-    int cmp = bn_cmp(ba, bb);
+    if (!ba || !bb) {
+        bn_free(ba);
+        bn_free(bb);
+        return false;
+    }
+    *cmp_out = bn_cmp(ba, bb);
     bn_free(ba);
     bn_free(bb);
-    return cmp;
+    return true;
 }
 
 // ============================================================================

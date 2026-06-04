@@ -803,6 +803,12 @@ unsigned normalize_rational(int64_t num, int64_t denom)
         if (num == INT64_MIN || denom == INT64_MIN) {
             bignum *bn_num = bn_from_int(num);
             bignum *bn_denom = bn_from_int(denom);
+            if (!bn_num || !bn_denom) {
+                bn_free(bn_num);
+                bn_free(bn_denom);
+                show_error("rational: out of memory");
+                return TOK_ERROR;
+            }
             if (bn_sign(bn_denom) < 0) {
                 bn_neg_ip(bn_num);
                 bn_neg_ip(bn_denom);
@@ -876,8 +882,10 @@ unsigned negate_number(unsigned x)
         // Handle INT64_MIN overflow
         if (val == INT64_MIN) {
             bignum *bn = bn_from_int(val);
-            if (!bn)
-                lisp_panic("negate_number: out of memory");
+            if (!bn) {
+                show_error("negate_number: out of memory");
+                return TOK_ERROR;
+            }
             bn_neg_ip(bn);
             return store_integer(bn);
         }
@@ -888,8 +896,10 @@ unsigned negate_number(unsigned x)
         if (!orig)
             return x;
         bignum *bn = bn_neg(orig);
-        if (!bn)
-            lisp_panic("negate_number: out of memory");
+        if (!bn) {
+            show_error("negate_number: out of memory");
+            return TOK_ERROR;
+        }
         return store_integer(bn);
     }
     default:
@@ -931,6 +941,12 @@ unsigned normalize_rational_cells(unsigned num_cell, unsigned denom_cell)
 
     // Compute GCD and reduce
     bignum *g = bn_gcd(num, denom);
+    if (!g) {
+        bn_free(num);
+        bn_free(denom);
+        show_error("rational: out of memory");
+        return TOK_ERROR;
+    }
     bignum *reduced_num = bn_div(num, g, NULL);
     bignum *reduced_denom = bn_div(denom, g, NULL);
     bn_free(num);
@@ -939,7 +955,8 @@ unsigned normalize_rational_cells(unsigned num_cell, unsigned denom_cell)
     if (!reduced_num || !reduced_denom) {
         bn_free(reduced_num);
         bn_free(reduced_denom);
-        lisp_panic("normalize_rational_cells: out of memory");
+        show_error("rational: out of memory");
+        return TOK_ERROR;
     }
 
     // Check if denominator is 1 - return integer

@@ -196,6 +196,12 @@ TEST(malformed_bignum_payload_is_safe)
     ASSERT_EQ(apply_primitive_argv(PINTEGERP, 1, args), ctx.atom_false);
     ASSERT_EQ(apply_primitive_argv(PRATIONALP, 1, args), ctx.atom_false);
     ASSERT(apply_primitive_argv(PNUM2STR, 1, args) == TOK_ERROR);
+    unsigned cmp_args[2] = {bad, store(0)};
+    ASSERT(apply_primitive_argv(PEQUAL, 2, cmp_args) == TOK_ERROR);
+    ASSERT(apply_primitive_argv(PLT, 2, cmp_args) == TOK_ERROR);
+    ASSERT(apply_primitive_argv(PMOD, 2, cmp_args) == TOK_ERROR);
+    ASSERT(apply_primitive_argv(PQUOTIENT, 2, cmp_args) == TOK_ERROR);
+    ASSERT(apply_primitive_argv(PREMAINDER, 2, cmp_args) == TOK_ERROR);
 
     CELL_PTR(bad) = (void *)(uintptr_t)1;
     ASSERT(!is_negative_number(bad));
@@ -205,6 +211,11 @@ TEST(malformed_bignum_payload_is_safe)
     ASSERT_EQ(apply_primitive_argv(PINTEGERP, 1, args), ctx.atom_false);
     ASSERT_EQ(apply_primitive_argv(PRATIONALP, 1, args), ctx.atom_false);
     ASSERT(apply_primitive_argv(PNUM2STR, 1, args) == TOK_ERROR);
+    ASSERT(apply_primitive_argv(PEQUAL, 2, cmp_args) == TOK_ERROR);
+    ASSERT(apply_primitive_argv(PLT, 2, cmp_args) == TOK_ERROR);
+    ASSERT(apply_primitive_argv(PMOD, 2, cmp_args) == TOK_ERROR);
+    ASSERT(apply_primitive_argv(PQUOTIENT, 2, cmp_args) == TOK_ERROR);
+    ASSERT(apply_primitive_argv(PREMAINDER, 2, cmp_args) == TOK_ERROR);
 
     FILE *mem = tmpfile();
     ASSERT(mem != NULL);
