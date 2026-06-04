@@ -175,6 +175,12 @@ TEST(bignum_helpers_accept_direct_fixnum)
 
     ASSERT(get_bignum(MAKE_FIXNUM(1)) == NULL);
     ASSERT(to_bignum(TOK_ERROR) == NULL);
+
+    unsigned bad = alloc();
+    CELL_TYPE(bad) = BT_BIGNUM;
+    CELL_PTR(bad) = NULL;
+    ASSERT(get_bignum(bad) == NULL);
+    ASSERT(to_bignum(bad) == NULL);
     PASS();
 }
 

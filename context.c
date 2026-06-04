@@ -625,11 +625,8 @@ bignum *to_bignum(unsigned x)
         return bn_from_int(CELL_ID(x));
     } else if (IS_BIGNUM(x)) {
         bignum *bn = get_bignum(x);
-        if (!bn) {
-            // This shouldn't happen - indicates GC corruption
-            fprintf(stderr, "Warning: NULL bignum pointer in cell %u\n", x);
-            return bn_from_int(0);
-        }
+        if (!bn)
+            return NULL;
         return bn_copy(bn);
     }
     return NULL;
