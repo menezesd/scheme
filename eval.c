@@ -545,6 +545,11 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
                 return;
             }
             const char *filename = GET_STRING_PTR(filename_arg);
+            if (!string_is_registered(filename)) {
+                show_error("load: invalid string");
+                tramp_error();
+                return;
+            }
             const char *old_filename = reader_get_filename();
             char *filename_copy = checked_string_copy(filename);
             if (!filename_copy) {
@@ -679,7 +684,7 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
     }
 
     // Handle bytecode VM closures (for CPS/bytecode interop)
-    if (IS_PAIR(fn) && IS_CELL(car(fn)) && CELL_TYPE(car(fn)) == BT_CLOSURE) {
+    if (is_bytecode_closure_object(fn)) {
         GC_GUARD;
         gc_protect(&fn);
         gc_protect(&args);

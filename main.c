@@ -17,6 +17,7 @@
 
 // Global flag for bytecode mode (default: true for performance)
 static bool use_bytecode = true;
+static const char *stdlib_path = NULL;
 
 // ============================================================================
 // File Loading Utilities
@@ -192,28 +193,35 @@ static bool load_from_port(FILE *f, unsigned *env, bool warn_on_error,
 // Standard Library Loading
 // ============================================================================
 
-static void load_stdlib(unsigned *env)
+static bool load_stdlib(unsigned *env)
 {
-    // Try external file first (for development)
-    FILE *f = fopen("./stdlib.scm", "r");
-    if (f) {
-        bool loaded = load_from_port(f, env, false, "stdlib.scm");
+    if (stdlib_path) {
+        FILE *f = fopen(stdlib_path, "r");
+        if (!f) {
+            fprintf(stderr, "Error: cannot open stdlib: %s\n", stdlib_path);
+            return false;
+        }
+        bool loaded = load_from_port(f, env, false, stdlib_path);
         reader_forget_port(f);
-        if (fclose(f) != 0 || !loaded)
-            fprintf(stderr, "Warning: could not load external stdlib\n");
-        return;
+        if (fclose(f) != 0 || !loaded) {
+            fprintf(stderr, "Error: could not load stdlib: %s\n", stdlib_path);
+            return false;
+        }
+        return true;
     }
 
-    // Fall back to embedded stdlib
-    f = fmemopen((void *)stdlib_scm, stdlib_scm_len, "r");
+    FILE *f = fmemopen((void *)stdlib_scm, stdlib_scm_len, "r");
     if (!f) {
-        fprintf(stderr, "Warning: could not load embedded stdlib\n");
-        return;
+        fprintf(stderr, "Error: could not load embedded stdlib\n");
+        return false;
     }
     bool loaded = load_from_port(f, env, true, "<stdlib>");
     reader_forget_port(f);
-    if (fclose(f) != 0 || !loaded)
-        fprintf(stderr, "Warning: could not load embedded stdlib\n");
+    if (fclose(f) != 0 || !loaded) {
+        fprintf(stderr, "Error: could not load embedded stdlib\n");
+        return false;
+    }
+    return true;
 }
 
 // ============================================================================
@@ -287,6 +295,8 @@ static void print_usage(const char *prog)
     fprintf(stderr, "Options:\n");
     fprintf(stderr,
             "  --interpreter  Use CPS interpreter instead of bytecode VM\n");
+    fprintf(stderr,
+            "  --stdlib PATH   Load stdlib from PATH instead of embedded copy\n");
     fprintf(stderr, "  --help         Show this help message\n");
 }
 
@@ -301,6 +311,13 @@ int main(int argc, char **argv)
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--interpreter") == 0) {
             use_bytecode = false;
+        } else if (strcmp(argv[i], "--stdlib") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "--stdlib requires a path\n");
+                print_usage(argv[0]);
+                return 1;
+            }
+            stdlib_path = argv[++i];
         } else if (strcmp(argv[i], "--help") == 0 ||
                    strcmp(argv[i], "-h") == 0) {
             print_usage(argv[0]);
@@ -337,7 +354,8 @@ int main(int argc, char **argv)
     set_alloc_gc_root(&env);
 
     // Load standard library
-    load_stdlib(&env);
+    if (!load_stdlib(&env))
+        return 1;
 
     if (!use_bytecode) {
         fprintf(

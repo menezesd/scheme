@@ -284,8 +284,10 @@ static bool pattern_contains_var(unsigned pattern, unsigned var)
 // Look up a pattern variable in bindings
 static unsigned syntax_lookup(unsigned var, unsigned bindings)
 {
-    for (; bindings; bindings = cdr(bindings)) {
+    for (; IS_PAIR(bindings); bindings = cdr(bindings)) {
         unsigned binding = car(bindings);
+        if (!IS_PAIR(binding))
+            continue;
         unsigned pvar = car(binding);
         if (IS_ATOM(pvar) && IS_ATOM(var) && CELL_ID(pvar) == CELL_ID(var)) {
             return cdr(binding);
@@ -300,9 +302,10 @@ static unsigned find_ellipsis_binding(unsigned var, unsigned bindings)
     unsigned cons_match =
         0; // Remember first cons pattern match (lower priority)
 
-    FORLIST(b, bindings)
-    {
+    for (unsigned b = bindings; IS_PAIR(b); b = cdr(b)) {
         unsigned binding = car(b);
+        if (!IS_PAIR(binding))
+            continue;
         unsigned pvar = car(binding);
         unsigned val = cdr(binding);
 
@@ -339,8 +342,11 @@ static unsigned collect_ellipsis_vars(unsigned tmpl, unsigned bindings,
         unsigned binding = find_ellipsis_binding(tmpl, bindings);
         if (binding && IS_PAIR(cdr(binding))) {
             // Check if already collected
-            for (unsigned c = collected; c; c = cdr(c)) {
-                unsigned collected_var = car(car(c));
+            for (unsigned c = collected; IS_PAIR(c); c = cdr(c)) {
+                unsigned collected_binding = car(c);
+                if (!IS_PAIR(collected_binding))
+                    continue;
+                unsigned collected_var = car(collected_binding);
                 unsigned binding_var = car(binding);
                 if (IS_ATOM(collected_var) && IS_ATOM(binding_var) &&
                     CELL_ID(collected_var) == CELL_ID(binding_var))
@@ -376,8 +382,20 @@ static bool ellipsis_vars_iteration_count(unsigned ellipsis_vars,
     unsigned expected = 0;
 
     for (unsigned ev = ellipsis_vars; ev; ev = cdr(ev)) {
+        if (!IS_PAIR(ev)) {
+            show_error("syntax-rules: invalid ellipsis bindings");
+            return false;
+        }
         unsigned binding = car(ev);
+        if (!IS_PAIR(binding)) {
+            show_error("syntax-rules: invalid ellipsis bindings");
+            return false;
+        }
         unsigned values = cdr(binding);
+        if (!proper_list_silent(values)) {
+            show_error("syntax-rules: invalid ellipsis bindings");
+            return false;
+        }
         unsigned count = list_length(values);
         if (!have_count) {
             expected = count;
@@ -2998,6 +3016,56 @@ unsigned syntax_expand(unsigned tmpl, unsigned bindings, unsigned mark,
 // Transformer Application
 // ============================================================================
 
+static bool syntax_transformer_well_formed(unsigned transformer, unsigned input,
+                                           unsigned *syn_data_out,
+                                           unsigned *closure_env_out,
+                                           int64_t *ellipsis_id_out,
+                                           unsigned *literals_out,
+                                           unsigned *rules_out)
+{
+    if (!IS_SYNTAX(transformer) || !IS_PAIR(input))
+        return false;
+
+    unsigned syn_data = car(transformer);
+    if (!IS_PAIR(syn_data))
+        return false;
+
+    unsigned ellipsis_cell = car(syn_data);
+    int64_t ellipsis_id = 0;
+    if (IS_FIXNUM(ellipsis_cell)) {
+        ellipsis_id = FIXNUM_VALUE(ellipsis_cell);
+    } else if (IS_CELL(ellipsis_cell)) {
+        ellipsis_id = CELL_ID(ellipsis_cell);
+    } else {
+        return false;
+    }
+    if (!IS_PAIR(cdr(syn_data)))
+        return false;
+
+    unsigned literals = cadr(syn_data);
+    unsigned rules = cddr(syn_data);
+    if (!proper_list_silent(literals) || !proper_list_silent(rules))
+        return false;
+
+    for (unsigned r = rules; r; r = cdr(r)) {
+        unsigned rule = car(r);
+        if (!IS_PAIR(rule))
+            return false;
+
+        unsigned rule_head = car(rule);
+        unsigned cpat_cell = IS_PAIR(rule_head) ? car(rule_head) : rule_head;
+        if (!is_compiled_pattern_object(cpat_cell))
+            return false;
+    }
+
+    *syn_data_out = syn_data;
+    *closure_env_out = cdr(transformer);
+    *ellipsis_id_out = ellipsis_id;
+    *literals_out = literals;
+    *rules_out = rules;
+    return true;
+}
+
 unsigned apply_syntax(unsigned transformer, unsigned input, unsigned use_env)
 {
     // Protect parameters that may be in nursery - GC can run during expansion
@@ -3007,15 +3075,22 @@ unsigned apply_syntax(unsigned transformer, unsigned input, unsigned use_env)
 
     // Extract transformer structure:
     // CAR = (ellipsis_cell . (literals . rules)), CDR = closure_env
-    unsigned syn_data = car(transformer);
-    unsigned closure_env = cdr(transformer);
-    unsigned ellipsis_cell = car(syn_data);
-    int64_t ellipsis_id = CELL_ID(ellipsis_cell);
-    unsigned literals = cadr(syn_data);
+    unsigned syn_data = 0;
+    unsigned closure_env = 0;
+    int64_t ellipsis_id = 0;
+    unsigned literals = 0;
+    unsigned rules = 0;
+    if (!syntax_transformer_well_formed(transformer, input, &syn_data,
+                                        &closure_env, &ellipsis_id, &literals,
+                                        &rules)) {
+        gc_unprotect(3);
+        show_error("syntax transformer: invalid structure");
+        return TOK_ERROR;
+    }
+    gc_protect(&syn_data);
     gc_protect(&literals);
     gc_protect(&closure_env);
 
-    unsigned rules = cddr(syn_data);
     gc_protect(&rules);
 
     unsigned tmpl = 0;

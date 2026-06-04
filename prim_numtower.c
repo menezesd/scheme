@@ -105,12 +105,12 @@ static unsigned prim_inexact_to_exact(unsigned x)
 
 static unsigned rational_component(unsigned x, bool numerator, const char *name)
 {
-    if (IS_FIXNUM(x))
-        return numerator ? x : store(1);
-    if (!IS_CELL(x)) {
+    if (!is_numeric(x)) {
         show_error("%s: not a rational", name);
         return TOK_ERROR;
     }
+    if (IS_FIXNUM(x))
+        return numerator ? x : store(1);
 
     switch (CELL_TYPE(x)) {
     case BT_NUM:

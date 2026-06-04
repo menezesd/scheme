@@ -26,6 +26,7 @@
 
 #include "writer.h"
 #include "bignum.h"
+#include "bytecode.h"
 #include "context.h"
 #include <inttypes.h>
 #include <math.h>
@@ -186,11 +187,6 @@ static visited_entry *insert_visited(unsigned cell)
     return NULL; // Table full
 }
 
-static bool is_bytecode_closure_object(unsigned s)
-{
-    return IS_PAIR(s) && IS_CELL(car(s)) && CELL_TYPE(car(s)) == BT_CLOSURE;
-}
-
 // First pass: mark all cells that are visited more than once
 static void mark_shared(unsigned s)
 {
@@ -225,6 +221,8 @@ static void mark_shared(unsigned s)
     } else if (type == BT_VECTOR) {
         unsigned len = vector_len(s);
         unsigned *data = vector_data_ptr(s);
+        if (len != 0 && !data)
+            return;
         for (unsigned i = 0; i < len; i++) {
             mark_shared(data[i]);
         }
@@ -343,8 +341,7 @@ static void write_escaped_symbol(FILE *fp, const char *s)
 
 static void write_utf8_scalar(FILE *fp, int code)
 {
-    if (code < 0 || code > 0x10FFFF ||
-        (code >= 0xD800 && code <= 0xDFFF))
+    if (!is_valid_unicode_scalar(code))
         return;
     if (code < 0x80) {
         fputc(code, fp);
@@ -575,13 +572,17 @@ static void write_obj_fp(unsigned s, bool with_quotes, FILE *fp)
         fprintf(fp, "i");
         break;
     }
-    case BT_STRING:
+    case BT_STRING: {
+        char *str = GET_STRING_PTR(s);
+        if (!string_is_registered(str))
+            break;
         if (with_quotes) {
-            write_escaped_string(fp, GET_STRING_PTR(s));
+            write_escaped_string(fp, str);
         } else {
-            fprintf(fp, "%s", GET_STRING_PTR(s));
+            fprintf(fp, "%s", str);
         }
         break;
+    }
     case BT_CHAR: {
         int c = GET_CHAR_CODE(s);
         if (with_quotes) {
@@ -595,6 +596,10 @@ static void write_obj_fp(unsigned s, bool with_quotes, FILE *fp)
         fprintf(fp, "#(");
         unsigned len = vector_len(s);
         unsigned *data = vector_data_ptr(s);
+        if (len != 0 && !data) {
+            fprintf(fp, ")");
+            break;
+        }
         for (unsigned i = 0; i < len; i++) {
             if (i > 0)
                 fprintf(fp, " ");
@@ -606,9 +611,11 @@ static void write_obj_fp(unsigned s, bool with_quotes, FILE *fp)
     case BT_BYTEVEC: {
         bytevec_data *bv = (bytevec_data *)CELL_PTR(s);
         fprintf(fp, "#u8(");
-        for (unsigned i = 0; i < bv->len; i++) {
-            if (i > 0) fprintf(fp, " ");
-            fprintf(fp, "%u", bv->data[i]);
+        if (bytevec_data_well_formed(bv)) {
+            for (unsigned i = 0; i < bv->len; i++) {
+                if (i > 0) fprintf(fp, " ");
+                fprintf(fp, "%u", bv->data[i]);
+            }
         }
         fprintf(fp, ")");
         break;

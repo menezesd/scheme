@@ -8,7 +8,11 @@
 
 static bool integer_predicate(unsigned arg)
 {
-    if (IS_FIXNUM(arg) || IS_NUM(arg) || IS_BIGNUM(arg))
+    if (IS_FIXNUM(arg))
+        return true;
+    if (!is_numeric(arg))
+        return false;
+    if (IS_NUM(arg) || IS_BIGNUM(arg))
         return true;
     if (IS_INEXACT(arg)) {
         double d = to_double(arg);
@@ -25,10 +29,10 @@ static bool real_predicate(unsigned arg)
 static bool procedure_predicate(unsigned arg)
 {
     // Check for bytecode closures: cons cell with BT_CLOSURE marker in car.
-    if (IS_PAIR(arg) && IS_CELL(car(arg)) && CELL_TYPE(car(arg)) == BT_CLOSURE)
+    if (is_bytecode_closure_object(arg))
         return true;
     return IS_FUNCTION(arg) || IS_BUILTIN(arg) || IS_CONT(arg) ||
-           (IS_CELL(arg) && CELL_TYPE(arg) == BT_VMCONT);
+           is_vm_continuation_object(arg);
 }
 
 static bool proper_list_predicate(unsigned arg)
@@ -65,6 +69,8 @@ static bool inexact_predicate(unsigned arg)
 }
 static bool rational_predicate(unsigned arg)
 {
+    if (!is_numeric(arg))
+        return false;
     return IS_FIXNUM(arg) || IS_NUM(arg) || IS_BIGNUM(arg) || IS_RATIONAL(arg);
 }
 static bool pair_predicate(unsigned arg) { return IS_PAIR(arg); }
@@ -80,7 +86,6 @@ static bool boolean_predicate(unsigned arg)
 static const type_predicate_entry type_predicates[] = {
     {PSYMP, symbol_predicate},
     {PNUMP, numeric_predicate},
-    {PNUMBERP, numeric_predicate},
     {PINTEGERP, integer_predicate},
     {PREALP, real_predicate},
     {PEXACTP, exact_predicate},

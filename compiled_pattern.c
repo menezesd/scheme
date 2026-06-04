@@ -52,6 +52,14 @@ static void pattern_unregister(compiled_pattern *pat)
 
 static void compiled_pattern_destroy_unregistered(compiled_pattern *pat);
 
+static vector_data *pattern_vector_data(unsigned value)
+{
+    if (!IS_VECTOR(value))
+        return NULL;
+    vector_data *vd = GET_VECTOR_PTR(value);
+    return vector_data_well_formed(vd) ? vd : NULL;
+}
+
 compiled_pattern *compiled_pattern_new(void)
 {
     compiled_pattern *pat = checked_calloc_array(1, sizeof(compiled_pattern));
@@ -301,10 +309,27 @@ void minor_gc_update_active_pattern_state(void)
     update_match_state_roots(active_match_state, collect_to_old);
 }
 
-// Mark a pattern as reachable
+bool compiled_pattern_is_registered(const compiled_pattern *needle)
+{
+    for (compiled_pattern *pat = compiled_pattern_registry; pat;
+         pat = pat->gc_next) {
+        if (pat == needle)
+            return true;
+    }
+    return false;
+}
+
+bool is_compiled_pattern_object(unsigned value)
+{
+    return IS_CELL(value) && CELL_TYPE(value) == BT_COMPILED_PATTERN &&
+           compiled_pattern_is_registered(
+               (const compiled_pattern *)CELL_PTR(value));
+}
+
+// Mark a registered pattern as reachable.
 void gc_mark_pattern(compiled_pattern *pat)
 {
-    if (!pat || pat->gc_marked)
+    if (!compiled_pattern_is_registered(pat) || pat->gc_marked)
         return;
     pat->gc_marked = true;
 }
@@ -368,6 +393,11 @@ static const char *opcode_names[] = {
     [PAT_CHECK_ATOM] = "CHECK_ATOM",
     [PAT_CHECK_VECTOR] = "CHECK_VECTOR",
     [PAT_CHECK_VECLEN] = "CHECK_VECLEN",
+    [PAT_CHECK_VECLEN_MIN] = "CHECK_VECLEN_MIN",
+    [PAT_VEC_ELLIPSIS_INIT] = "VEC_ELLIPSIS_INIT",
+    [PAT_VEC_ELLIPSIS_NEXT] = "VEC_ELLIPSIS_NEXT",
+    [PAT_INPUT_VEC_ITER] = "INPUT_VEC_ITER",
+    [PAT_INPUT_VECREF_END] = "INPUT_VECREF_END",
     [PAT_MATCH_ATOM_ID] = "MATCH_ATOM_ID",
     [PAT_MATCH_LITERAL] = "MATCH_LITERAL",
     [PAT_BIND_VAR] = "BIND_VAR",
@@ -381,8 +411,56 @@ static const char *opcode_names[] = {
     [PAT_SUCCESS] = "SUCCESS",
 };
 
+static bool pattern_jump_target_is_valid(compiled_pattern *pat,
+                                         unsigned target)
+{
+    return target <= pat->code_len;
+}
+
+static bool pattern_bytecode_is_well_formed(compiled_pattern *pat)
+{
+    if (!pat || !pat->code || pat->code_len == 0)
+        return false;
+
+    for (unsigned i = 0; i < pat->code_len; i++) {
+        pat_instruction *instr = &pat->code[i];
+
+        if (instr->opcode >= PAT_OPCODE_COUNT)
+            return false;
+
+        switch (instr->opcode) {
+        case PAT_MATCH_LITERAL:
+            if (instr->operand >= pat->const_len)
+                return false;
+            break;
+
+        case PAT_BIND_VAR:
+            if (instr->operand >= pat->var_count)
+                return false;
+            break;
+
+        case PAT_CHOICE_POINT:
+        case PAT_VEC_ELLIPSIS_NEXT:
+        case PAT_JUMP:
+            if (!pattern_jump_target_is_valid(pat, instr->operand))
+                return false;
+            break;
+
+        default:
+            break;
+        }
+    }
+
+    return true;
+}
+
 void pattern_disassemble(compiled_pattern *pat)
 {
+    if (!pat) {
+        printf("=== Compiled Pattern: <null> ===\n");
+        return;
+    }
+
     printf("=== Compiled Pattern ===\n");
     printf("Variables (%u):\n", pat->var_count);
     for (unsigned i = 0; i < pat->var_count; i++) {
@@ -398,7 +476,7 @@ void pattern_disassemble(compiled_pattern *pat)
     for (unsigned i = 0; i < pat->code_len; i++) {
         unsigned op = pat->code[i].opcode;
         unsigned operand = pat->code[i].operand;
-        const char *name = (op < sizeof(opcode_names) / sizeof(opcode_names[0]))
+        const char *name = (op < PAT_OPCODE_COUNT)
                                ? opcode_names[op]
                                : "???";
         printf("  %3u: %-16s %u\n", i, name ? name : "???", operand);
@@ -545,6 +623,10 @@ static void compile_pattern_node(unsigned pattern, pattern_compile_ctx *pctx)
             unsigned elem_pattern = data[ellipsis_pos - 1];
             unsigned pre_count = ellipsis_pos - 1;
             unsigned post_count = len - ellipsis_pos - 1;
+            if (pre_count > UINT16_MAX || post_count > UINT16_MAX) {
+                pattern_emit(pctx->pattern, PAT_CHECK_NULL, 0);  // Force fail
+                return;
+            }
 
             // Check minimum length
             pattern_emit(pctx->pattern, PAT_CHECK_VECLEN_MIN,
@@ -888,7 +970,7 @@ static unsigned build_bindings_alist(pat_match_state *state)
 
 unsigned execute_pattern(compiled_pattern *pat, unsigned input)
 {
-    if (!pat) {
+    if (!pattern_bytecode_is_well_formed(pat)) {
         show_error("pattern match: invalid compiled pattern");
         return TOK_ERROR;
     }
@@ -913,11 +995,21 @@ unsigned execute_pattern(compiled_pattern *pat, unsigned input)
 
         switch (instr->opcode) {
         case PAT_INPUT_CAR:
+            if (!IS_PAIR(state.input)) {
+                if (!backtrack(&state))
+                    failed = true;
+                break;
+            }
             push_input(&state, state.input);
             state.input = car(state.input);
             break;
 
         case PAT_INPUT_CDR:
+            if (!IS_PAIR(state.input)) {
+                if (!backtrack(&state))
+                    failed = true;
+                break;
+            }
             push_input(&state, state.input);
             state.input = cdr(state.input);
             break;
@@ -928,19 +1020,26 @@ unsigned execute_pattern(compiled_pattern *pat, unsigned input)
 
         case PAT_INPUT_ADVANCE:
             // Advance to cdr without pushing (for ellipsis consumption)
+            if (!IS_PAIR(state.input)) {
+                if (!backtrack(&state))
+                    failed = true;
+                break;
+            }
             state.input = cdr(state.input);
             break;
 
         case PAT_INPUT_VECREF:
-            if (!IS_VECTOR(state.input) ||
-                instr->operand >= vector_len(state.input)) {
+        {
+            vector_data *vd = pattern_vector_data(state.input);
+            if (!vd || instr->operand >= vd->len) {
                 if (!backtrack(&state))
                     failed = true;
                 break;
             }
             push_input(&state, state.input);
-            state.input = vector_data_ptr(state.input)[instr->operand];
+            state.input = vd->data[instr->operand];
             break;
+        }
 
         case PAT_CHECK_PAIR:
             if (!IS_PAIR(state.input)) {
@@ -964,19 +1063,21 @@ unsigned execute_pattern(compiled_pattern *pat, unsigned input)
             break;
 
         case PAT_CHECK_VECTOR:
-            if (!IS_VECTOR(state.input)) {
+            if (!pattern_vector_data(state.input)) {
                 if (!backtrack(&state))
                     failed = true;
             }
             break;
 
         case PAT_CHECK_VECLEN:
-            if (!IS_VECTOR(state.input) ||
-                vector_len(state.input) != instr->operand) {
+        {
+            vector_data *vd = pattern_vector_data(state.input);
+            if (!vd || vd->len != instr->operand) {
                 if (!backtrack(&state))
                     failed = true;
             }
             break;
+        }
 
         case PAT_MATCH_ATOM_ID:
             if (!IS_ATOM(state.input) ||
@@ -1090,19 +1191,27 @@ unsigned execute_pattern(compiled_pattern *pat, unsigned input)
             break;
 
         case PAT_CHECK_VECLEN_MIN:
-            if (!IS_VECTOR(state.input) ||
-                vector_len(state.input) < instr->operand) {
+        {
+            vector_data *vd = pattern_vector_data(state.input);
+            if (!vd || vd->len < instr->operand) {
                 if (!backtrack(&state))
                     failed = true;
             }
             break;
+        }
 
         case PAT_VEC_ELLIPSIS_INIT: {
             // Setup vector ellipsis iteration
             // operand = pre_count | (post_count << 16)
+            vector_data *vd = pattern_vector_data(state.input);
+            if (!vd) {
+                if (!backtrack(&state))
+                    failed = true;
+                break;
+            }
             unsigned pre_count = instr->operand & 0xFFFF;
             unsigned post_count = instr->operand >> 16;
-            unsigned len = vector_len(state.input);
+            unsigned len = vd->len;
             // Validate bounds to prevent underflow
             if (pre_count + post_count > len) {
                 if (!backtrack(&state))
@@ -1128,33 +1237,39 @@ unsigned execute_pattern(compiled_pattern *pat, unsigned input)
         case PAT_INPUT_VEC_ITER: {
             // Access current ellipsis iteration element
             // idx is incremented before access, so ranges from 1 to vec_iter_count
+            vector_data *vd = pattern_vector_data(state.vec_iter_vec);
+            if (!vd || state.vec_iter_idx == 0) {
+                if (!backtrack(&state))
+                    failed = true;
+                break;
+            }
             unsigned idx = state.vec_iter_pre + state.vec_iter_idx - 1;
-            if (state.vec_iter_idx == 0 ||
-                idx >= vector_len(state.vec_iter_vec)) {
+            if (idx >= vd->len) {
                 if (!backtrack(&state))
                     failed = true;
                 break;
             }
             push_input(&state, state.input);
-            state.input = vector_data_ptr(state.vec_iter_vec)[idx];
+            state.input = vd->data[idx];
             break;
         }
 
         case PAT_INPUT_VECREF_END: {
             // Access element from end of vector (operand = offset from end)
-            if (!IS_VECTOR(state.input)) {
+            vector_data *vd = pattern_vector_data(state.input);
+            if (!vd) {
                 if (!backtrack(&state))
                     failed = true;
                 break;
             }
-            unsigned len = vector_len(state.input);
+            unsigned len = vd->len;
             if (instr->operand >= len) {
                 if (!backtrack(&state))
                     failed = true;
                 break;
             }
             push_input(&state, state.input);
-            state.input = vector_data_ptr(state.input)[len - 1 - instr->operand];
+            state.input = vd->data[len - 1 - instr->operand];
             break;
         }
 

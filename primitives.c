@@ -20,7 +20,9 @@
  */
 
 #include "primitives.h"
+#include "feature_table.h"
 #include "prim_internal.h"
+#include "utf8.h"
 #include <dirent.h>
 #include <errno.h>
 #include <limits.h>
@@ -83,8 +85,10 @@ static char *exact_integer_to_string(unsigned num, int radix)
         }
         return checked_string_copy(buf);
     }
-    if (IS_BIGNUM(num))
-        return bn_to_string(get_bignum(num), radix);
+    if (IS_BIGNUM(num)) {
+        bignum *bn = get_bignum(num);
+        return bn ? bn_to_string(bn, radix) : NULL;
+    }
     return NULL;
 }
 
@@ -127,11 +131,11 @@ static bool parse_optional_radix(unsigned argc, unsigned *argv,
         int64_t radix64;
         if (!expect_exact_int64(argv[1], &radix64, name))
             return false;
+        if (radix64 < 2 || radix64 > 36) {
+            show_error("%s: radix must be between 2 and 36", name);
+            return false;
+        }
         *radix = (int)radix64;
-    }
-    if (*radix < 2 || *radix > 36) {
-        show_error("%s: radix must be between 2 and 36", name);
-        return false;
     }
     return true;
 }
@@ -139,8 +143,10 @@ static bool parse_optional_radix(unsigned argc, unsigned *argv,
 static bytevec_data *bytevector_data_new(unsigned len)
 {
     bytevec_data *bv = checked_malloc_flex(sizeof(bytevec_data), len, 1);
-    if (bv)
+    if (bv) {
         bv->len = len;
+        bytevec_register(bv);
+    }
     return bv;
 }
 
@@ -244,7 +250,7 @@ static unsigned read_bytevector_from_port(unsigned count_arg,
     }
     if (!bytevector_length_fits((uint64_t)count, name, "count"))
         return TOK_ERROR;
-    FILE *f = GET_PORT_PTR(port_arg);
+    FILE *f = file_port_file(port_arg);
     if (!f) {
         show_error("%s: port is closed", name);
         return TOK_ERROR;
@@ -338,28 +344,9 @@ static bool char_list_length(unsigned lst, unsigned *len_out,
 static bool utf8_encode_char(int code, char out[4], size_t *len,
                              const char *name)
 {
-    if (code <= 0 || code > 0x10FFFF || (code >= 0xD800 && code <= 0xDFFF)) {
+    if (!scheme_utf8_encode_scalar((uint32_t)code, out, len)) {
         show_error("%s: character cannot be stored in a string", name);
         return false;
-    }
-    if (code <= 0x7F) {
-        out[0] = (char)code;
-        *len = 1;
-    } else if (code <= 0x7FF) {
-        out[0] = (char)(0xC0 | (code >> 6));
-        out[1] = (char)(0x80 | (code & 0x3F));
-        *len = 2;
-    } else if (code <= 0xFFFF) {
-        out[0] = (char)(0xE0 | (code >> 12));
-        out[1] = (char)(0x80 | ((code >> 6) & 0x3F));
-        out[2] = (char)(0x80 | (code & 0x3F));
-        *len = 3;
-    } else {
-        out[0] = (char)(0xF0 | (code >> 18));
-        out[1] = (char)(0x80 | ((code >> 12) & 0x3F));
-        out[2] = (char)(0x80 | ((code >> 6) & 0x3F));
-        out[3] = (char)(0x80 | (code & 0x3F));
-        *len = 4;
     }
     return true;
 }
@@ -367,98 +354,35 @@ static bool utf8_encode_char(int code, char out[4], size_t *len,
 static bool utf8_decode_next(const char *s, size_t byte_len, size_t *offset,
                              int *code, const char *name)
 {
-    if (*offset >= byte_len) {
-        show_error("%s: invalid UTF-8 offset", name);
+    uint32_t scalar;
+    const char *error_msg = NULL;
+    if (!scheme_utf8_decode_next(s, byte_len, offset, &scalar, &error_msg)) {
+        show_error("%s: %s", name, error_msg);
         return false;
     }
-
-    const unsigned char *bytes = (const unsigned char *)s;
-    unsigned char b0 = bytes[*offset];
-    if (b0 == 0) {
-        show_error("%s: null character in string", name);
-        return false;
-    }
-    if (b0 < 0x80) {
-        *code = b0;
-        (*offset)++;
-        return true;
-    }
-
-    size_t needed;
-    int value;
-    if (b0 >= 0xC2 && b0 <= 0xDF) {
-        needed = 2;
-        value = b0 & 0x1F;
-    } else if (b0 >= 0xE0 && b0 <= 0xEF) {
-        needed = 3;
-        value = b0 & 0x0F;
-    } else if (b0 >= 0xF0 && b0 <= 0xF4) {
-        needed = 4;
-        value = b0 & 0x07;
-    } else {
-        show_error("%s: invalid UTF-8 leading byte", name);
-        return false;
-    }
-
-    if (byte_len - *offset < needed) {
-        show_error("%s: truncated UTF-8 sequence", name);
-        return false;
-    }
-    for (size_t i = 1; i < needed; i++) {
-        unsigned char b = bytes[*offset + i];
-        if ((b & 0xC0) != 0x80) {
-            show_error("%s: invalid UTF-8 continuation byte", name);
-            return false;
-        }
-        value = (value << 6) | (b & 0x3F);
-    }
-
-    if ((needed == 3 && value < 0x800) ||
-        (needed == 4 && value < 0x10000) ||
-        value > 0x10FFFF || (value >= 0xD800 && value <= 0xDFFF)) {
-        show_error("%s: invalid UTF-8 sequence", name);
-        return false;
-    }
-
-    *code = value;
-    *offset += needed;
+    *code = (int)scalar;
     return true;
 }
 
 static bool utf8_count_chars(const char *s, size_t *chars,
                              const char *name)
 {
-    size_t byte_len = strlen(s);
-    size_t offset = 0;
-    size_t count = 0;
-    while (offset < byte_len) {
-        int code;
-        if (!utf8_decode_next(s, byte_len, &offset, &code, name))
-            return false;
-        count++;
-    }
-    *chars = count;
-    return true;
+    const char *error_msg = NULL;
+    if (scheme_utf8_count_chars(s, chars, &error_msg))
+        return true;
+    show_error("%s: %s", name, error_msg);
+    return false;
 }
 
 static bool utf8_byte_offset_for_index(const char *s, size_t char_index,
                                        bool allow_end, size_t *byte_offset,
                                        const char *name)
 {
-    size_t byte_len = strlen(s);
-    size_t offset = 0;
-    size_t count = 0;
-    while (offset < byte_len && count < char_index) {
-        int code;
-        if (!utf8_decode_next(s, byte_len, &offset, &code, name))
-            return false;
-        count++;
-    }
-    if (count == char_index && (allow_end || offset < byte_len)) {
-        *byte_offset = offset;
+    const char *error_msg = NULL;
+    if (scheme_utf8_byte_offset_for_index(s, char_index, allow_end,
+                                          byte_offset, &error_msg))
         return true;
-    }
-    show_error("%s: index out of bounds", name);
+    show_error("%s: %s", name, error_msg);
     return false;
 }
 
@@ -656,8 +580,10 @@ static unsigned fill_string_range(unsigned argc, unsigned *argv,
         pos += encoded_len;
     }
     memcpy(pos, s + end_byte, old_byte_len - end_byte + 1);
+    string_unregister(s);
     free(s);
     CELL_PTR(argv[0]) = result;
+    string_register(result);
     return 0;
 }
 
@@ -714,8 +640,12 @@ static unsigned make_string_from_symbol(unsigned sym, const char *name)
 static unsigned length_value(unsigned value, const char *name)
 {
     if (IS_STRING(value)) {
+        char *s = require_string_ptr(value, name);
+        if (!s) {
+            return TOK_ERROR;
+        }
         size_t len;
-        if (!utf8_count_chars(GET_STRING_PTR(value), &len, name))
+        if (!utf8_count_chars(s, &len, name))
             return TOK_ERROR;
         return store(len);
     }
@@ -870,6 +800,11 @@ static unsigned string_set_value(unsigned str, unsigned index,
     if (!utf8_decode_next(s, old_byte_len, &end_byte, &old_code, name))
         return TOK_ERROR;
     size_t removed = end_byte - start_byte;
+    if (old_byte_len < removed ||
+        encoded_len > SIZE_MAX - (old_byte_len - removed) - 1) {
+        show_error("%s: result too large", name);
+        return TOK_ERROR;
+    }
     size_t new_len = old_byte_len - removed + encoded_len;
     char *result = checked_malloc_flex(0, new_len + 1, 1);
     if (!result) {
@@ -880,8 +815,10 @@ static unsigned string_set_value(unsigned str, unsigned index,
     memcpy(result + start_byte, encoded, encoded_len);
     memcpy(result + start_byte + encoded_len, s + end_byte,
            old_byte_len - end_byte + 1);
+    string_unregister(s);
     free(s);
     CELL_PTR(str) = result;
+    string_register(result);
     return 0;
 }
 
@@ -918,7 +855,12 @@ static bytevec_data *require_bytevector(unsigned value, const char *name)
         show_error("%s: not a bytevector", name);
         return NULL;
     }
-    return (bytevec_data *)CELL_PTR(value);
+    bytevec_data *bv = (bytevec_data *)CELL_PTR(value);
+    if (!bytevec_data_well_formed(bv)) {
+        show_error("%s: invalid bytevector", name);
+        return NULL;
+    }
+    return bv;
 }
 
 static bool bytevector_index(unsigned value, const bytevec_data *bv,
@@ -1236,7 +1178,10 @@ static unsigned number_to_string_value(unsigned num, int radix,
     if (IS_FIXNUM(num) || IS_NUM(num) || IS_BIGNUM(num)) {
         char *s = exact_integer_to_string(num, radix);
         if (!s) {
-            show_error("%s: out of memory", name);
+            show_error("%s: %s", name,
+                       IS_BIGNUM(num) && !get_bignum(num)
+                           ? "invalid bignum"
+                           : "out of memory");
             return TOK_ERROR;
         }
         return make_string_owned(s);
@@ -1843,7 +1788,7 @@ static unsigned write_bytevector_to_port(unsigned bv_arg, unsigned port_arg,
         show_error("%s: not an output port", name);
         return TOK_ERROR;
     }
-    FILE *f = GET_PORT_PTR(port_arg);
+    FILE *f = file_port_file(port_arg);
     if (!f) {
         show_error("%s: port is closed", name);
         return TOK_ERROR;
@@ -1867,7 +1812,7 @@ static unsigned read_bytevector_into(unsigned argc, unsigned *argv,
         show_error("%s: not an input port", name);
         return TOK_ERROR;
     }
-    FILE *f = GET_PORT_PTR(port_arg);
+    FILE *f = file_port_file(port_arg);
     if (!f) {
         show_error("%s: port is closed", name);
         return TOK_ERROR;
@@ -1891,17 +1836,12 @@ static unsigned read_bytevector_into(unsigned argc, unsigned *argv,
 
 static unsigned make_features_list(void)
 {
-    static const char *features[] = {
-        "vesper", "r5rs", "r7rs-small-subset", "srfi-1", "srfi-2",
-        "srfi-8", "srfi-9", "srfi-26", "srfi-27", "srfi-28",
-        "bytevectors", "exact-rationals", "complex", "unicode-normalization",
-        "unicode-case-folding", "unicode-character-properties", "full-unicode-absent",
-        NULL};
-
     GC_GUARD;
     unsigned result = 0;
     gc_protect(&result);
-    for (int i = 0; features[i]; i++) {
+    const char *const *features = feature_names();
+    size_t feature_count = feature_name_count();
+    for (size_t i = 0; i < feature_count; i++) {
         unsigned sym = atom_from_string(features[i]);
         gc_protect(&sym);
         result = alloc_cons(sym, result);
@@ -1932,8 +1872,11 @@ static uint64_t scheme_hash(unsigned key)
     case BT_NUM:
     case BT_CHAR:
         return (uint64_t)CELL_ID(key) * PRIM_FNV_PRIME;
-    case BT_STRING:
-        return hash_string_bytes(GET_STRING_PTR(key));
+    case BT_STRING: {
+        char *s = GET_STRING_PTR(key);
+        return string_is_registered(s) ? hash_string_bytes(s)
+                                       : PRIM_FNV_OFFSET_BASIS;
+    }
     default:
         return (uint64_t)key * PRIM_FNV_PRIME;
     }
@@ -1942,6 +1885,78 @@ static uint64_t scheme_hash(unsigned key)
 static uint64_t hash_combine(uint64_t a, uint64_t b)
 {
     return (a ^ (b + 0x9e3779b97f4a7c15ull + (a << 6) + (a >> 2)));
+}
+
+#define HASH_RECURSION_MARKER 0x4f1bbcdc9a1322d5ull
+#define HASH_SEEN_STACK_MAX 1024
+
+static bool hash_seen_contains(const unsigned *seen, unsigned seen_len,
+                               unsigned key)
+{
+    for (unsigned i = 0; i < seen_len; i++) {
+        if (seen[i] == key)
+            return true;
+    }
+    return false;
+}
+
+static uint64_t hash_key_for_table_seen(hash_table_data *ht, unsigned key,
+                                        unsigned *seen, unsigned seen_len)
+{
+    if (IS_FIXNUM(key) || !IS_CELL(key))
+        return scheme_hash(key);
+
+    bool track_path = CELL_TYPE(key) == BT_CONS || CELL_TYPE(key) == BT_VECTOR;
+    if (track_path) {
+        if (hash_seen_contains(seen, seen_len, key))
+            return HASH_RECURSION_MARKER;
+        if (seen_len >= HASH_SEEN_STACK_MAX)
+            return HASH_RECURSION_MARKER;
+        seen[seen_len++] = key;
+    }
+
+    switch (CELL_TYPE(key)) {
+    case BT_RATIONAL:
+    case BT_COMPLEX:
+    case BT_CONS:
+        return hash_combine(hash_key_for_table_seen(ht, car(key), seen,
+                                                    seen_len),
+                            hash_key_for_table_seen(ht, cdr(key), seen,
+                                                    seen_len));
+    case BT_VECTOR: {
+        uint64_t h = PRIM_FNV_OFFSET_BASIS;
+        unsigned len = vector_len(key);
+        unsigned *data = vector_data_ptr(key);
+        for (unsigned i = 0; i < len; i++)
+            h = hash_combine(h, hash_key_for_table_seen(ht, data[i], seen,
+                                                        seen_len));
+        return h;
+    }
+    case BT_BYTEVEC: {
+        bytevec_data *bv = (bytevec_data *)CELL_PTR(key);
+        if (!bytevec_data_well_formed(bv))
+            return PRIM_FNV_OFFSET_BASIS;
+        uint64_t h = PRIM_FNV_OFFSET_BASIS;
+        for (unsigned i = 0; i < bv->len; i++) {
+            h ^= bv->data[i];
+            h *= PRIM_FNV_PRIME;
+        }
+        return h;
+    }
+    case BT_BIGNUM: {
+        bignum *bn = get_bignum(key);
+        if (!bn)
+            return (uint64_t)key * PRIM_FNV_PRIME;
+        char *s = bn_to_string(bn, 10);
+        if (!s)
+            return (uint64_t)key * PRIM_FNV_PRIME;
+        uint64_t h = hash_string_bytes(s);
+        free(s);
+        return h;
+    }
+    default:
+        return scheme_hash(key);
+    }
 }
 
 static uint64_t hash_key_for_table(hash_table_data *ht, unsigned key)
@@ -1955,42 +1970,8 @@ static uint64_t hash_key_for_table(hash_table_data *ht, unsigned key)
                    ? scheme_hash(key)
                    : (uint64_t)key * PRIM_FNV_PRIME;
 
-    if (IS_FIXNUM(key) || !IS_CELL(key))
-        return scheme_hash(key);
-    switch (CELL_TYPE(key)) {
-    case BT_RATIONAL:
-    case BT_COMPLEX:
-    case BT_CONS:
-        return hash_combine(hash_key_for_table(ht, car(key)),
-                            hash_key_for_table(ht, cdr(key)));
-    case BT_VECTOR: {
-        uint64_t h = PRIM_FNV_OFFSET_BASIS;
-        unsigned len = vector_len(key);
-        unsigned *data = vector_data_ptr(key);
-        for (unsigned i = 0; i < len; i++)
-            h = hash_combine(h, hash_key_for_table(ht, data[i]));
-        return h;
-    }
-    case BT_BYTEVEC: {
-        bytevec_data *bv = (bytevec_data *)CELL_PTR(key);
-        uint64_t h = PRIM_FNV_OFFSET_BASIS;
-        for (unsigned i = 0; i < bv->len; i++) {
-            h ^= bv->data[i];
-            h *= PRIM_FNV_PRIME;
-        }
-        return h;
-    }
-    case BT_BIGNUM: {
-        char *s = bn_to_string(get_bignum(key), 10);
-        if (!s)
-            return (uint64_t)key * PRIM_FNV_PRIME;
-        uint64_t h = hash_string_bytes(s);
-        free(s);
-        return h;
-    }
-    default:
-        return scheme_hash(key);
-    }
+    unsigned seen[HASH_SEEN_STACK_MAX];
+    return hash_key_for_table_seen(ht, key, seen, 0);
 }
 
 static bool hash_key_equal(hash_table_data *ht, unsigned a, unsigned b)
@@ -2037,7 +2018,12 @@ static hash_table_data *require_hash_table(unsigned value, const char *name)
         show_error("%s: not a hash table", name);
         return NULL;
     }
-    return GET_HASHTABLE_PTR(value);
+    hash_table_data *ht = GET_HASHTABLE_PTR(value);
+    if (!hash_table_data_well_formed(ht)) {
+        show_error("%s: invalid hash table", name);
+        return NULL;
+    }
+    return ht;
 }
 
 static unsigned make_hash_table_value(hash_equiv equiv, unsigned argc,
@@ -2060,6 +2046,7 @@ static unsigned make_hash_table_value(hash_equiv equiv, unsigned argc,
         show_error("%s: out of memory", name);
         return TOK_ERROR;
     }
+    hash_table_register(ht);
     return make_pointer_cell(BT_HASHTABLE, ht);
 }
 
@@ -2328,11 +2315,9 @@ static unsigned apply_misc_primitive(unsigned prim_id, unsigned argc,
     case PEMERGENCYEXIT: {
         REQUIRE_ARGC(argc, 0, 1, "emergency-exit");
         int code = 0;
-        if (argc == 1) {
-            int64_t code64;
-            if (!expect_exact_int64(argv[0], &code64, "emergency-exit"))
+        if (argc == 1 &&
+            !expect_exit_code(argv[0], &code, "emergency-exit")) {
                 return TOK_ERROR;
-            code = (int)code64;
         }
         _Exit(code);
     }
@@ -2562,7 +2547,6 @@ unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
     // Type predicates - delegated to prim_type.c
     case PSYMP:
     case PNUMP:
-    case PNUMBERP:
     case PINTEGERP:
     case PREALP:
     case PEXACTP:

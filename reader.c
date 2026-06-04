@@ -316,15 +316,9 @@ static void sb_append(string_buffer *sb, int ch)
     sb->data[sb->len] = '\0';
 }
 
-static bool valid_unicode_scalar(int64_t code)
-{
-    return code >= 0 && code <= 0x10FFFF &&
-           !(code >= 0xD800 && code <= 0xDFFF);
-}
-
 static bool valid_string_scalar(int64_t code)
 {
-    return code > 0 && valid_unicode_scalar(code);
+    return code > 0 && is_valid_unicode_scalar(code);
 }
 
 static bool sb_append_utf8(string_buffer *sb, int64_t code)
@@ -362,7 +356,7 @@ static bool read_hex_scalar_value(const char *digits, int64_t *out,
     char *end = NULL;
     int64_t scalar = strtoll(digits, &end, 16);
     if (errno == ERANGE || !end || *end != '\0' ||
-        !valid_unicode_scalar(scalar)) {
+        !is_valid_unicode_scalar(scalar)) {
         show_error("%s: invalid Unicode scalar value", name);
         return false;
     }
@@ -402,7 +396,7 @@ static bool read_utf8_tail_bytes(int first, int64_t *codepoint,
 
     if ((needed == 2 && value < 0x800) ||
         (needed == 3 && value < 0x10000) ||
-        !valid_unicode_scalar(value)) {
+        !is_valid_unicode_scalar(value)) {
         show_error("%s: invalid UTF-8 sequence", name);
         return false;
     }
@@ -722,8 +716,13 @@ static unsigned read_exact_decimal_number(const char *s, bool *handled)
         p++;
     }
 
-    size_t digits_cap = strlen(p) + 2;
-    char *digits = malloc(digits_cap);
+    size_t input_len = strlen(p);
+    if (input_len > SIZE_MAX - 2) {
+        show_error("exact decimal literal: too large");
+        return TOK_ERROR;
+    }
+    size_t digits_cap = input_len + 2;
+    char *digits = checked_malloc_size(digits_cap);
     if (!digits) {
         show_error("exact decimal literal: out of memory");
         return TOK_ERROR;
@@ -786,7 +785,7 @@ static unsigned read_exact_decimal_number(const char *s, bool *handled)
     *handled = true;
 
     digits[digits_len] = '\0';
-    char *num_str = malloc(digits_len + 2);
+    char *num_str = checked_malloc_size(digits_len + 2);
     if (!num_str) {
         free(digits);
         show_error("exact decimal literal: out of memory");
@@ -1211,7 +1210,9 @@ static unsigned read_string_literal(void)
 
     unsigned x = alloc();
     CELL_TYPE(x) = BT_STRING;
-    CELL_PTR(x) = sb_finish(&sb);
+    char *s = sb_finish(&sb);
+    CELL_PTR(x) = s;
+    string_register(s);
     return x;
 }
 
@@ -1454,6 +1455,7 @@ unsigned read_token(void)
                             return TOK_ERROR;
                         }
                         bv->len = count;
+                        bytevec_register(bv);
                         unsigned i = 0;
                         for (unsigned p = list; p && IS_PAIR(p); p = cdr(p)) {
                             uint8_t byte_value;

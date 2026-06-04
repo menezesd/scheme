@@ -99,6 +99,46 @@ unsigned instruction_size(unsigned op)
     }
 }
 
+static bool instruction_fits(const unsigned *code, unsigned len, unsigned ip,
+                             unsigned *size_out)
+{
+    if (!code || ip >= len)
+        return false;
+    unsigned size = instruction_size(code[ip]);
+    if (size == 0 || size > len - ip)
+        return false;
+    if (size_out)
+        *size_out = size;
+    return true;
+}
+
+static bool code_is_well_formed(const unsigned *code, unsigned len)
+{
+    for (unsigned i = 0; i < len;) {
+        unsigned size;
+        if (!instruction_fits(code, len, i, &size))
+            return false;
+        i += size;
+    }
+    return true;
+}
+
+static bool instruction_starts_at(const unsigned *code, unsigned len,
+                                  unsigned target)
+{
+    for (unsigned i = 0; i < len;) {
+        if (i == target)
+            return true;
+        unsigned size;
+        if (!instruction_fits(code, len, i, &size))
+            return false;
+        if (i > target || size > len - i)
+            return false;
+        i += size;
+    }
+    return target == len;
+}
+
 static void mark_jump_targets(const unsigned *code, unsigned len,
                               bool *is_jump_target)
 {
@@ -167,6 +207,8 @@ static void cse_pass(code_object *code)
 
     unsigned *c = code->code;
     unsigned len = code->code_len;
+    if (!code_is_well_formed(c, len))
+        return;
 
     // Allocate new code buffer (max same size as original)
     unsigned *new_code = checked_malloc_array(len, sizeof(unsigned));
@@ -350,6 +392,9 @@ static void cse_pass(code_object *code)
 void peephole_optimize(code_object *code)
 {
     if (!code || code->code_len < 2)
+        return;
+
+    if (!code_is_well_formed(code->code, code->code_len))
         return;
 
     // Run CSE pass first (handles instruction size changes separately)
@@ -660,8 +705,9 @@ void peephole_optimize(code_object *code)
             const unsigned max_chain = 10; // Prevent infinite loops
 
             // Follow chain of unconditional JUMPs
-            while (target < len && c[target] == OP_JUMP &&
-                   visited_count < max_chain) {
+            while (target < len && instruction_starts_at(c, len, target) &&
+                   instruction_fits(c, len, target, NULL) &&
+                   c[target] == OP_JUMP && visited_count < max_chain) {
                 target = c[target + 1];
                 visited_count++;
             }
@@ -826,7 +872,27 @@ static const char *opcode_names[] = {
     [OP_GT_JUMPIFNOT] = "GT_JUMPIFNOT",
     [OP_LE_JUMPIFNOT] = "LE_JUMPIFNOT",
     [OP_GE_JUMPIFNOT] = "GE_JUMPIFNOT",
+    [OP_RETURN_LOCALS] = "RETURN_LOCALS",
+    [OP_LOCAL_GET] = "LOCAL_GET",
+    [OP_LOCAL_SET] = "LOCAL_SET",
+    [OP_LOCAL_SET_VOID] = "LOCAL_SET_VOID",
+    [OP_LOCAL_GET0] = "LOCAL_GET0",
+    [OP_LOCAL_GET1] = "LOCAL_GET1",
+    [OP_LOCAL_GET2] = "LOCAL_GET2",
+    [OP_LOCAL_GET3] = "LOCAL_GET3",
+    [OP_ADD_INT] = "ADD_INT",
+    [OP_SUB_INT] = "SUB_INT",
+    [OP_MUL_INT] = "MUL_INT",
+    [OP_LT_INT_JUMPIFNOT] = "LT_INT_JUMPIFNOT",
+    [OP_NUMEQ_INT_JUMPIFNOT] = "NUMEQ_INT_JUMPIFNOT",
 };
+
+static const char *disassemble_atom_name(unsigned atom_id)
+{
+    if (atom_id < ctx.atom_table_cap && ctx.atom_table[atom_id])
+        return ctx.atom_table[atom_id];
+    return "<invalid-atom>";
+}
 
 void disassemble(code_object *code, const char *name)
 {
@@ -852,8 +918,15 @@ void disassemble(code_object *code, const char *name)
     printf("code:\n");
     unsigned ip = 0;
     while (ip < code->code_len) {
+        unsigned start = ip;
+        unsigned size;
         printf("  %04u: ", ip);
-        unsigned op = code->code[ip++];
+        if (!instruction_fits(code->code, code->code_len, ip, &size)) {
+            printf("<truncated> opcode=%u\n", code->code[ip]);
+            break;
+        }
+        unsigned op = code->code[ip];
+        ip += size;
 
         if (op < sizeof(opcode_names) / sizeof(opcode_names[0]) &&
             opcode_names[op]) {
@@ -867,34 +940,37 @@ void disassemble(code_object *code, const char *name)
         switch (op) {
         case OP_CONST:
         case OP_CLOSURE:
-            printf(" %u", code->code[ip++]);
+            printf(" %u", code->code[start + 1]);
             break;
         case OP_LOOKUP:
         case OP_LOOKUP_ADD1:
         case OP_LOOKUP_SUB1:
-            printf(" %s", ctx.atom_table[code->code[ip++]]);
-            if (code->code[ip] != 0xFFFFFFFF)
-                printf(" [d=%u o=%u]", code->code[ip], code->code[ip + 1]);
+            printf(" %s", disassemble_atom_name(code->code[start + 1]));
+            if (code->code[start + 2] != 0xFFFFFFFF)
+                printf(" [d=%u o=%u]", code->code[start + 2],
+                       code->code[start + 3]);
             else
                 printf(" [uncached]");
-            ip += 2;
             break;
         case OP_DEFINE:
         case OP_SET:
         case OP_SET_VOID:
         case OP_DEFSYNTAX:
-            printf(" %s", ctx.atom_table[code->code[ip++]]);
+            printf(" %s", disassemble_atom_name(code->code[start + 1]));
             break;
         case OP_DEFINE_ALIAS:
-            printf(" %s %s", ctx.atom_table[code->code[ip]],
-                   ctx.atom_table[code->code[ip + 1]]);
-            ip += 2;
+            printf(" %s %s", disassemble_atom_name(code->code[start + 1]),
+                   disassemble_atom_name(code->code[start + 2]));
             break;
         case OP_CALL:
         case OP_TAILCALL:
         case OP_VALUES:
         case OP_LETREC_MARK:
-            printf(" %u", code->code[ip++]);
+        case OP_RETURN_LOCALS:
+        case OP_LOCAL_GET:
+        case OP_LOCAL_SET:
+        case OP_LOCAL_SET_VOID:
+            printf(" %u", code->code[start + 1]);
             break;
         case OP_JUMP:
         case OP_JUMPIF:
@@ -908,11 +984,13 @@ void disassemble(code_object *code, const char *name)
         case OP_GT_JUMPIFNOT:
         case OP_LE_JUMPIFNOT:
         case OP_GE_JUMPIFNOT:
-            printf(" -> %u", code->code[ip++]);
+        case OP_NUMEQ_INT_JUMPIFNOT:
+        case OP_LT_INT_JUMPIFNOT:
+            printf(" -> %u", code->code[start + 1]);
             break;
         case OP_PRIM:
-            printf(" %u argc=%u", code->code[ip], code->code[ip + 1]);
-            ip += 2;
+            printf(" %u argc=%u", code->code[start + 1],
+                   code->code[start + 2]);
             break;
         default:
             // No operands

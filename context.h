@@ -163,6 +163,9 @@ unsigned store_integer(bignum *bn);
 // Free bignums during GC
 void free_bignum_cell(unsigned x);
 
+// Validate the malloc-backed hash table payload before walking buckets.
+bool hash_table_data_well_formed(const hash_table_data *ht);
+
 // ============================================================================
 // Fixnum Boxing
 // ============================================================================
@@ -183,6 +186,8 @@ static inline unsigned ensure_boxed(unsigned val)
 // Create a character cell
 unsigned make_char(int c);
 
+bool is_valid_unicode_scalar(int64_t code);
+
 // Create a vector with given length and fill value
 unsigned make_vector(unsigned len, unsigned fill);
 
@@ -191,6 +196,10 @@ unsigned vector_len(unsigned vec);
 
 // Get pointer to vector data
 unsigned *vector_data_ptr(unsigned vec);
+
+// Validate malloc-backed vector and bytevector payloads before walking them.
+bool vector_data_well_formed(const vector_data *vd);
+bool bytevec_data_well_formed(const bytevec_data *bv);
 
 // ============================================================================
 // Continuation Helpers
@@ -344,6 +353,28 @@ bool checked_array_size(unsigned count, size_t elem_size, size_t *size_out);
 bool checked_add_size(size_t a, size_t b, size_t *out);
 bool checked_flex_size(size_t base_size, size_t count, size_t elem_size,
                        size_t *size_out);
+
+void file_port_register(file_port *port);
+void file_port_unregister(file_port *port);
+bool file_port_is_registered(const file_port *port);
+void string_port_register(string_port *port);
+void string_port_unregister(string_port *port);
+bool string_port_is_registered(const string_port *port);
+void hash_table_register(hash_table_data *table);
+void hash_table_unregister(hash_table_data *table);
+bool hash_table_is_registered(const hash_table_data *table);
+void bignum_register(bignum *bn);
+void bignum_unregister(bignum *bn);
+bool bignum_is_registered(const bignum *bn);
+void string_register(char *string);
+void string_unregister(char *string);
+bool string_is_registered(const char *string);
+void vector_register(vector_data *vector);
+void vector_unregister(vector_data *vector);
+bool vector_is_registered(const vector_data *vector);
+void bytevec_register(bytevec_data *bytevec);
+void bytevec_unregister(bytevec_data *bytevec);
+bool bytevec_is_registered(const bytevec_data *bytevec);
 unsigned checked_grow_capacity(unsigned cap, size_t elem_size,
                                const char *error_msg);
 bool checked_grow_capacity_size(size_t cap, size_t elem_size,

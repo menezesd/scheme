@@ -171,6 +171,8 @@ unsigned code_current_pos(code_object *code)
 
 void code_patch(code_object *code, unsigned pos, unsigned val)
 {
+    if (!code || pos >= code->code_len)
+        lisp_panic("code_patch: position out of bounds");
     code->code[pos] = val;
 }
 
@@ -220,13 +222,30 @@ static void mark_code_object(code_object *code)
     }
 }
 
+bool code_object_is_registered(const code_object *needle)
+{
+    for (code_object *code = code_object_registry; code; code = code->gc_next) {
+        if (code == needle)
+            return true;
+    }
+    return false;
+}
+
+static void mark_registered_code_object(code_object *code)
+{
+    if (code_object_is_registered(code))
+        mark_code_object(code);
+}
+
 static void mark_vm_continuation_code(vm_continuation *cont)
 {
-    if (!cont)
+    if (!vm_continuation_is_registered(cont))
         return;
-    mark_code_object(cont->code);
+    mark_registered_code_object(cont->code);
+    if (!cont->frames || cont->fp > VM_MAX_FRAMES_SIZE)
+        return;
     for (unsigned i = 0; i < cont->fp; i++) {
-        mark_code_object(cont->frames[i].code);
+        mark_registered_code_object(cont->frames[i].code);
     }
 }
 
@@ -244,8 +263,8 @@ void gc_sweep_code_objects(void)
     for (unsigned i = ctx.mmin; i < ctx.hptr; i++) {
         if (CELL_TYPE(i) == BT_CLOSURE) {
             code_object *code = (code_object *)CELL_PTR(i);
-            mark_code_object(code);
-        } else if (CELL_TYPE(i) == BT_VMCONT) {
+            mark_registered_code_object(code);
+        } else if (is_vm_continuation_object(i)) {
             mark_vm_continuation_code((vm_continuation *)CELL_PTR(i));
         }
     }
@@ -254,8 +273,8 @@ void gc_sweep_code_objects(void)
         for (unsigned i = ctx.nursery_start; i < ctx.nursery_ptr; i++) {
             if (CELL_TYPE(i) == BT_CLOSURE) {
                 code_object *code = (code_object *)CELL_PTR(i);
-                mark_code_object(code);
-            } else if (CELL_TYPE(i) == BT_VMCONT) {
+                mark_registered_code_object(code);
+            } else if (is_vm_continuation_object(i)) {
                 mark_vm_continuation_code((vm_continuation *)CELL_PTR(i));
             }
         }

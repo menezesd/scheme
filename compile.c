@@ -262,7 +262,7 @@ static bool is_foldable_primitive(int64_t prim_id)
     // Type predicates
     case PCONSP:
     case PNULLP:
-    case PNUMBERP:
+    case PNUMP:
     case PSTRINGP:
     case PSYMP:
     case PBOOLP:

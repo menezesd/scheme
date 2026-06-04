@@ -91,8 +91,10 @@ static unsigned random_seed_value(unsigned x, const char *name)
     } else if (IS_NUM(x)) {
         seed = (uint64_t)CELL_ID(x);
     } else if (IS_BIGNUM(x)) {
-        if (bn_to_uint64(get_bignum(x), &seed) != 0) {
-            show_error("%s: integer out of range", name);
+        bignum *bn = get_bignum(x);
+        if (!bn || bn_to_uint64(bn, &seed) != 0) {
+            show_error("%s: %s", name,
+                       bn ? "integer out of range" : "invalid bignum");
             return TOK_ERROR;
         }
     } else {

@@ -41,7 +41,13 @@ static unsigned write_arg_to_string_port(unsigned arg, string_port *sport,
     }
 
     if (display && IS_STRING(arg)) {
-        fprintf(memfp, "%s", GET_STRING_PTR(arg));
+        char *s = require_string_ptr(arg, name);
+        if (!s) {
+            fclose(memfp);
+            free(buf);
+            return TOK_ERROR;
+        }
+        fprintf(memfp, "%s", s);
     } else if (display) {
         display_obj_port(arg, memfp);
     } else {
@@ -66,9 +72,12 @@ static bool write_arg_to_file_port(unsigned arg, FILE *fport, const char *name,
                                    bool display)
 {
     if (display && IS_STRING(arg)) {
-        fprintf(fport, "%s", GET_STRING_PTR(arg));
+        char *s = require_string_ptr(arg, name);
+        if (!s)
+            return false;
+        fprintf(fport, "%s", s);
         if (ctx.transcript && fport == ctx.current_output)
-            fprintf(ctx.transcript, "%s", GET_STRING_PTR(arg));
+            fprintf(ctx.transcript, "%s", s);
     } else if (display) {
         display_obj_port(arg, fport);
         if (ctx.transcript && fport == ctx.current_output)
@@ -686,22 +695,15 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         }
 
         buf[len] = '\0';
-        unsigned result = alloc();
-        CELL_TYPE(result) = BT_STRING;
-        CELL_PTR(result) = buf; // Transfer ownership
-        return result;
+        return make_string_owned(buf);
     }
     case PEXIT: {
         // (exit) or (exit code)
         REQUIRE_ARGC(argc, 0, 1, "exit");
         int code = 0;
-        if (argc == 1) {
-            unsigned arg = argv[0];
-            int64_t code64;
-            if (!expect_exact_int64(arg, &code64, "exit")) {
+        if (argc == 1 &&
+            !expect_exit_code(argv[0], &code, "exit")) {
                 return TOK_ERROR;
-            }
-            code = (int)code64;
         }
         exit(code);
     }

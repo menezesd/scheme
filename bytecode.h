@@ -240,6 +240,7 @@ typedef struct code_object {
 
 // Global registry of all code objects (for GC)
 extern code_object *code_object_registry;
+bool code_object_is_registered(const code_object *needle);
 
 // ============================================================================
 // VM Closure
@@ -257,6 +258,13 @@ extern code_object *code_object_registry;
 // Accessor macros for closures - code_object* stored in separate cell's ptr
 #define GET_CLOSURE_CODE(c) ((code_object *)CELL_PTR(CELL_CAR(c)))
 #define GET_CLOSURE_ENV(c) (CELL_CDR(c))
+
+static inline bool is_bytecode_closure_object(unsigned c)
+{
+    return IS_PAIR(c) && IS_CELL(CELL_CAR(c)) &&
+           CELL_TYPE(CELL_CAR(c)) == BT_CLOSURE &&
+           code_object_is_registered((const code_object *)CELL_PTR(CELL_CAR(c)));
+}
 
 // ============================================================================
 // VM Call Frame
@@ -300,9 +308,17 @@ typedef struct {
     unsigned letrec_frame;     // The frame that was being initialized
 } vm_continuation;
 
+void vm_continuation_register(vm_continuation *cont);
+void vm_continuation_unregister(vm_continuation *cont);
+bool vm_continuation_is_registered(const vm_continuation *cont);
+bool is_vm_continuation_object(unsigned value);
+
 // ============================================================================
 // VM State
 // ============================================================================
+
+#define VM_MAX_STACK_SIZE (1024 * 1024)
+#define VM_MAX_FRAMES_SIZE (64 * 1024)
 
 /**
  * Virtual machine execution state.

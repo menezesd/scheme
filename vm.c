@@ -14,6 +14,7 @@
 
 #include "bytecode.h"
 #include "compiled_pattern.h"
+#include "compile_internal.h"
 #include "context.h"
 #include "env.h"
 #include "eval.h"
@@ -21,9 +22,11 @@
 #include "macros.h"
 #include "prim_internal.h"
 #include "primitives.h"
+#include "utf8.h"
 #include "writer.h"
 #include <limits.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -35,8 +38,8 @@
 
 #define INITIAL_STACK_SIZE 1024
 #define INITIAL_FRAMES_SIZE 256
-#define MAX_STACK_SIZE (1024 * 1024)
-#define MAX_FRAMES_SIZE (64 * 1024)
+#define MAX_STACK_SIZE VM_MAX_STACK_SIZE
+#define MAX_FRAMES_SIZE VM_MAX_FRAMES_SIZE
 
 static void protect_and_box2(unsigned *a, unsigned *b)
 {
@@ -78,7 +81,12 @@ static vector_data *vm_expect_vector_data(vm_state *vm, unsigned vec,
         VM_ERROR(vm, msg);
         return NULL;
     }
-    return GET_VECTOR_PTR(vec);
+    vector_data *vd = GET_VECTOR_PTR(vec);
+    if (!vector_data_well_formed(vd)) {
+        VM_ERROR(vm, msg);
+        return NULL;
+    }
+    return vd;
 }
 
 static bool vm_expect_vector_index(vm_state *vm, unsigned vec, unsigned idx,
@@ -125,11 +133,93 @@ static bool vm_integer_is_odd(vm_state *vm, unsigned n, const char *error_msg,
     }
     if (IS_BIGNUM(n)) {
         bignum *bn = get_bignum(n);
+        if (!bn) {
+            VM_ERROR(vm, error_msg);
+            return false;
+        }
         *odd_out = bn->len > 0 && (bn->limbs[0] & 1) != 0;
         return true;
     }
     VM_ERROR(vm, error_msg);
     return false;
+}
+
+static bool vm_is_jump_opcode(unsigned op)
+{
+    switch (op) {
+    case OP_JUMP:
+    case OP_JUMPIF:
+    case OP_JUMPIFNOT:
+    case OP_JUMPIFNULL:
+    case OP_JUMPIFNOTNULL:
+    case OP_JUMPIFZERO:
+    case OP_JUMPIFNOTZERO:
+    case OP_NUMEQ_JUMPIFNOT:
+    case OP_LT_JUMPIFNOT:
+    case OP_GT_JUMPIFNOT:
+    case OP_LE_JUMPIFNOT:
+    case OP_GE_JUMPIFNOT:
+    case OP_NUMEQ_INT_JUMPIFNOT:
+    case OP_LT_INT_JUMPIFNOT:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool vm_instruction_starts_at(const code_object *code, unsigned target)
+{
+    if (!code || target > code->code_len)
+        return false;
+    for (unsigned i = 0; i < code->code_len;) {
+        if (i == target)
+            return true;
+        unsigned size = instruction_size(code->code[i]);
+        if (size == 0 || size > code->code_len - i)
+            return false;
+        i += size;
+    }
+    return target == code->code_len;
+}
+
+static bool vm_code_is_well_formed(const code_object *code)
+{
+    if (!code || !code->code || code->code_len == 0)
+        return false;
+    for (unsigned i = 0; i < code->code_len;) {
+        unsigned op = code->code[i];
+        if (op >= OP_COUNT)
+            return false;
+        unsigned size = instruction_size(op);
+        if (size == 0 || size > code->code_len - i)
+            return false;
+        if (vm_is_jump_opcode(op)) {
+            unsigned target = code->code[i + 1];
+            if (target > code->code_len ||
+                !vm_instruction_starts_at(code, target))
+                return false;
+        }
+        i += size;
+    }
+    return true;
+}
+
+static bool vm_get_const(code_object *code, unsigned idx, unsigned *val_out)
+{
+    if (!code || idx >= code->const_len)
+        return false;
+    *val_out = code->constants[idx];
+    return true;
+}
+
+static bool vm_local_index(vm_state *vm, unsigned slot, unsigned *idx_out)
+{
+    if (slot > UINT_MAX - vm->bp || vm->bp + slot >= vm->sp) {
+        VM_ERROR(vm, "local slot out of bounds");
+        return false;
+    }
+    *idx_out = vm->bp + slot;
+    return true;
 }
 
 static unsigned vm_unbox_fixnum_if_possible(unsigned val)
@@ -236,11 +326,76 @@ static unsigned vm_store_bignum_neg(vm_state *vm, const bignum *bn,
 // Perform a variable lookup with inline cache. On cache hit (depth/offset are
 // valid and verified), walks depth frames and offset values — O(depth+offset).
 // On miss, does a full lookup and fills the cache in the bytecode.
-static inline unsigned vm_deref_binding_value(unsigned val)
+static bool vm_try_deref_binding_value(unsigned val, unsigned *out)
 {
-    if (IS_BINDING_REF(val))
-        return car(CELL_CAR(val));
-    return val;
+    if (IS_BINDING_REF(val)) {
+        unsigned target = CELL_CAR(val);
+        if (!IS_PAIR(target))
+            return false;
+        *out = car(target);
+        return true;
+    }
+    *out = val;
+    return true;
+}
+
+static bool vm_try_env_frame(unsigned env_cell, unsigned *frame_out,
+                             unsigned *next_out)
+{
+    if (!IS_PAIR(env_cell))
+        return false;
+    unsigned frame = car(env_cell);
+    if (!IS_PAIR(frame))
+        return false;
+    *frame_out = frame;
+    *next_out = cdr(env_cell);
+    return true;
+}
+
+static bool vm_try_lookup_frame(int64_t sym_id, unsigned vars, unsigned vals,
+                                unsigned *value_out, unsigned *val_cell_out,
+                                unsigned *offset_out)
+{
+    unsigned offset = 0;
+
+    while (vars) {
+        if (IS_ATOM(vars)) {
+            if (!IS_PAIR(vals))
+                return false;
+            if (CELL_ID(vars) == sym_id) {
+                if (!vm_try_deref_binding_value(car(vals), value_out))
+                    return false;
+                if (val_cell_out)
+                    *val_cell_out = vals;
+                if (offset_out)
+                    *offset_out = offset;
+                return true;
+            }
+            break;
+        }
+
+        if (!IS_PAIR(vars) || !IS_PAIR(vals))
+            return false;
+
+        unsigned var = car(vars);
+        if (!IS_ATOM(var))
+            return false;
+        if (CELL_ID(var) == sym_id) {
+            if (!vm_try_deref_binding_value(car(vals), value_out))
+                return false;
+            if (val_cell_out)
+                *val_cell_out = vals;
+            if (offset_out)
+                *offset_out = offset;
+            return true;
+        }
+
+        vars = cdr(vars);
+        vals = cdr(vals);
+        offset++;
+    }
+
+    return false;
 }
 
 static inline unsigned ic_lookup(int64_t sym_id, unsigned env,
@@ -252,22 +407,36 @@ static inline unsigned ic_lookup(int64_t sym_id, unsigned env,
     if (cached_depth != IC_UNCACHED) {
         // Try cached path: walk depth frames, offset values, verify sym_id
         unsigned e = env;
-        for (unsigned d = 0; d < cached_depth && e; d++)
-            e = cdr(e);
-        if (e) {
-            unsigned frame = car(e);
+        unsigned frame = 0;
+        unsigned next = 0;
+        bool cache_valid = true;
+        for (unsigned d = 0; d <= cached_depth; d++) {
+            if (!vm_try_env_frame(e, &frame, &next)) {
+                cache_valid = false;
+                break;
+            }
+            if (d < cached_depth)
+                e = next;
+        }
+        if (cache_valid) {
             unsigned vars = car(frame);
             unsigned vals = cdr(frame);
             for (unsigned o = 0; o < cached_offset && vars; o++) {
+                if (!IS_PAIR(vars) || !IS_PAIR(vals)) {
+                    cache_valid = false;
+                    break;
+                }
                 vars = cdr(vars);
                 vals = cdr(vals);
             }
-            if (vars && vals) {
-                int64_t var_id = (CELL_TYPE(vars) == BT_ATOM)
-                                     ? CELL_ID(vars)
-                                     : CELL_ID(car(vars));
-                if (var_id == sym_id)
-                    return vm_deref_binding_value(car(vals)); // Verified hit
+            if (cache_valid && vars) {
+                unsigned value = 0;
+                unsigned found_offset = 0;
+                if (vm_try_lookup_frame(sym_id, vars, vals, &value, NULL,
+                                        &found_offset) &&
+                    found_offset == 0) {
+                    return value; // Verified hit
+                }
             }
         }
         // Cache stale — fall through to full lookup
@@ -275,25 +444,23 @@ static inline unsigned ic_lookup(int64_t sym_id, unsigned env,
 
     // Full lookup and fill cache
     unsigned depth = 0;
-    for (unsigned e = env; e; e = cdr(e), depth++) {
-        unsigned frame = car(e);
+    for (unsigned e = env; e; depth++) {
+        unsigned frame = 0;
+        unsigned next = 0;
+        if (!vm_try_env_frame(e, &frame, &next))
+            return TOK_ERROR;
         unsigned vars = car(frame);
         unsigned vals = cdr(frame);
+        unsigned value = 0;
+        unsigned val_cell = 0;
         unsigned offset = 0;
-        for (; vars; vars = cdr(vars), vals = cdr(vals), offset++) {
-            bool match = false;
-            if (CELL_TYPE(vars) == BT_ATOM) {
-                match = (CELL_ID(vars) == sym_id);
-                if (!match) break;
-            } else {
-                match = (CELL_ID(car(vars)) == sym_id);
-            }
-            if (match) {
-                cache_slot[0] = depth;
-                cache_slot[1] = offset;
-                return vm_deref_binding_value(car(vals));
-            }
+        if (vm_try_lookup_frame(sym_id, vars, vals, &value, &val_cell,
+                                &offset)) {
+            cache_slot[0] = depth;
+            cache_slot[1] = offset;
+            return value;
         }
+        e = next;
     }
     return TOK_ERROR;
 }
@@ -382,10 +549,15 @@ static bool vm_resize_frames(vm_state *vm, unsigned new_cap,
  */
 unsigned vm_call_closure(unsigned closure, unsigned args)
 {
+    if (!is_bytecode_closure_object(closure)) {
+        show_error("invalid bytecode closure");
+        return TOK_ERROR;
+    }
+
     code_object *code = GET_CLOSURE_CODE(closure);
     unsigned closure_env = GET_CLOSURE_ENV(closure);
 
-    if (!code || !code->code) {
+    if (!vm_code_is_well_formed(code)) {
         show_error("invalid bytecode closure");
         return TOK_ERROR;
     }
@@ -413,6 +585,11 @@ unsigned vm_call_closure(unsigned closure, unsigned args)
             vm_push(&vm, car(a));
     } else {
         // Bind parameters to arguments
+        if (code->params >= code->const_len) {
+            show_error("invalid bytecode closure parameter metadata");
+            vm_free(&vm);
+            return TOK_ERROR;
+        }
         unsigned params = code->constants[code->params];
         unsigned frame;
         {
@@ -607,6 +784,7 @@ static unsigned capture_continuation(vm_state *vm)
 
     CELL_TYPE(cell) = BT_VMCONT;
     CELL_PTR(cell) = cont;
+    vm_continuation_register(cont);
 
     return cell;
 }
@@ -618,26 +796,55 @@ static void restore_continuation(vm_state *vm, unsigned cont_cell,
     LISP_ASSERT_TYPE(cont_cell, BT_VMCONT);
 
     vm_continuation *cont = (vm_continuation *)CELL_PTR(cont_cell);
-    LISP_ASSERT_MSG(cont != NULL, "restore_continuation: null continuation");
+    if (!vm_continuation_is_registered(cont)) {
+        VM_ERROR(vm, "restore_continuation: invalid continuation");
+        return;
+    }
+
+    if (!vm_code_is_well_formed(cont->code) ||
+        !vm_instruction_starts_at(cont->code, cont->ip)) {
+        VM_ERROR(vm, "restore_continuation: invalid execution state");
+        return;
+    }
+    if (cont->sp >= MAX_STACK_SIZE || cont->sp == UINT_MAX) {
+        VM_ERROR(vm, "restore_continuation: stack size overflow");
+        return;
+    }
+    if (cont->fp > MAX_FRAMES_SIZE) {
+        VM_ERROR(vm, "restore_continuation: frame size overflow");
+        return;
+    }
+    if (cont->sp > 0 && !cont->stack) {
+        VM_ERROR(vm, "restore_continuation: missing stack");
+        return;
+    }
+    if (cont->fp > 0 && !cont->frames) {
+        VM_ERROR(vm, "restore_continuation: missing frames");
+        return;
+    }
 
     // Restore letrec values if this continuation has them saved
     // This must happen before restoring the environment
     if (cont->letrec_saved && cont->letrec_saved_len > 0 && cont->letrec_frame) {
+        if (!IS_PAIR(cont->letrec_frame) || !IS_PAIR(car(cont->letrec_frame))) {
+            VM_ERROR(vm, "restore_continuation: invalid letrec frame");
+            return;
+        }
         unsigned frame = car(cont->letrec_frame);
         unsigned vals = cdr(frame);
 
         // Restore the saved values to the frame
         for (unsigned i = 0; i < cont->letrec_saved_len && vals;
              i++, vals = cdr(vals)) {
+            if (!IS_PAIR(vals)) {
+                VM_ERROR(vm, "restore_continuation: invalid letrec values");
+                return;
+            }
             cell_set_car(vals, cont->letrec_saved[i]);
         }
     }
 
     // Restore stack (with return value on top)
-    if (cont->sp == UINT_MAX) {
-        VM_ERROR(vm, "restore_continuation: stack size overflow");
-        return;
-    }
     if (vm->stack_cap < cont->sp + 1) {
         unsigned new_cap = cont->sp + 1;
         if (!vm_resize_stack(vm, new_cap,
@@ -684,6 +891,19 @@ static bool vm_require_proper_list(vm_state *vm, unsigned list,
     return true;
 }
 
+static bool vm_push_arg(vm_state *vm, unsigned val, unsigned *argc)
+{
+    if (*argc == UINT_MAX) {
+        VM_ERROR(vm, "argument count overflow");
+        return false;
+    }
+    vm_push(vm, val);
+    if (vm->error)
+        return false;
+    (*argc)++;
+    return true;
+}
+
 // Maximum middle arguments for apply (proc arg1 ... argN list)
 // Most apply calls have few middle args; use heap allocation for more
 #define MAX_APPLY_MIDDLE_ARGS 64
@@ -702,9 +922,18 @@ static bool vm_handle_apply(vm_state *vm, unsigned argc, unsigned *argv,
     unsigned last_list = argv[argc - 1];
     if (!vm_require_proper_list(vm, last_list, "apply: expected proper list"))
         return false;
+    unsigned last_count = 0;
+    if (!list_length_checked(last_list, &last_count, "apply")) {
+        VM_ERROR(vm, "apply: argument count overflow");
+        return false;
+    }
 
     // Copy middle args before popping (they'll be overwritten)
     unsigned middle_count = (argc > 2) ? argc - 2 : 0;
+    if (middle_count > UINT_MAX - last_count) {
+        VM_ERROR(vm, "apply: argument count overflow");
+        return false;
+    }
 
     // Use stack allocation for small counts, heap for large
     unsigned middle_args_stack[MAX_APPLY_MIDDLE_ARGS];
@@ -735,8 +964,10 @@ static bool vm_handle_apply(vm_state *vm, unsigned argc, unsigned *argv,
     // Push middle args then append last list
     unsigned apply_argc = 0;
     for (unsigned i = 0; i < middle_count; i++) {
-        vm_push(vm, middle_args[i]);
-        apply_argc++;
+        if (!vm_push_arg(vm, middle_args[i], &apply_argc)) {
+            free(middle_args_heap);
+            return false;
+        }
     }
 
     // Free heap allocation if used
@@ -747,8 +978,8 @@ static bool vm_handle_apply(vm_state *vm, unsigned argc, unsigned *argv,
     // Append the last list's elements
     FORLIST(a, last_list)
     {
-        vm_push(vm, car(a));
-        apply_argc++;
+        if (!vm_push_arg(vm, car(a), &apply_argc))
+            return false;
     }
 
     vm_apply(vm, proc, apply_argc, tail);
@@ -756,14 +987,19 @@ static bool vm_handle_apply(vm_state *vm, unsigned argc, unsigned *argv,
 }
 
 // Box any fixnum values in the top N stack slots (for passing to primitives/closures)
-static void vm_box_stack_args(vm_state *vm, unsigned argc)
+static bool vm_box_stack_args(vm_state *vm, unsigned argc)
 {
+    if (argc > vm->sp) {
+        VM_ERROR(vm, "stack underflow");
+        return false;
+    }
     for (unsigned i = 0; i < argc; i++) {
         unsigned idx = vm->sp - argc + i;
         if (IS_FIXNUM(vm->stack[idx])) {
             vm->stack[idx] = store((int64_t)FIXNUM_VALUE(vm->stack[idx]));
         }
     }
+    return true;
 }
 
 static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
@@ -771,8 +1007,10 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
     // Ensure all arguments are boxed cell indices before binding.
     // Protect fn across boxing since store() can trigger GC.
     gc_protect(&fn);
-    vm_box_stack_args(vm, argc);
+    bool boxed_args = vm_box_stack_args(vm, argc);
     gc_unprotect(1);
+    if (!boxed_args)
+        return;
     if (IS_BUILTIN(fn)) {
         int64_t prim_id = CELL_ID(fn);
 
@@ -820,12 +1058,12 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
     }
 
     // Check for VM closure: cons cell with BT_CLOSURE marker in car
-    if (IS_PAIR(fn) && IS_CELL(car(fn)) && CELL_TYPE(car(fn)) == BT_CLOSURE) {
+    if (is_bytecode_closure_object(fn)) {
         code_object *code = GET_CLOSURE_CODE(fn);
         unsigned closure_env = GET_CLOSURE_ENV(fn);
 
         // Check code object validity
-        if (!code || !code->code) {
+        if (!vm_code_is_well_formed(code)) {
             VM_ERROR(vm, "closure has invalid code object");
             return;
         }
@@ -843,9 +1081,14 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
         // For tail calls: if the CURRENT function uses locals, clean them up
         // by shifting args down to overwrite the old locals
         if (tail && vm->fp > 0 && vm->code->use_locals) {
+            if (argc > vm->sp || vm->bp > vm->stack_cap ||
+                argc > vm->stack_cap - vm->bp) {
+                VM_ERROR(vm, "tail call stack window out of bounds");
+                return;
+            }
             // Shift new args down to overwrite old locals at bp
-            for (unsigned i = 0; i < argc; i++)
-                vm->stack[vm->bp + i] = vm->stack[vm->sp - argc + i];
+            memmove(&vm->stack[vm->bp], &vm->stack[vm->sp - argc],
+                    argc * sizeof(unsigned));
             vm->sp = vm->bp + argc;
         }
 
@@ -870,6 +1113,10 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
             }
         } else {
             // Environment frame path (original): build frame from stack values
+            if (code->params >= code->const_len) {
+                VM_ERROR(vm, "closure has invalid parameter metadata");
+                return;
+            }
             gc_protect(&closure_env);
             unsigned params = code->constants[code->params];
             gc_protect(&params);
@@ -878,8 +1125,8 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
             if (!code->has_rest) {
                 unsigned vals = 0;
                 gc_protect(&vals);
-                for (int i = (int)argc - 1; i >= 0; i--) {
-                    vals = alloc_cons(vm->stack[vm->sp - argc + i], vals);
+                for (unsigned i = argc; i > 0; i--) {
+                    vals = alloc_cons(vm->stack[vm->sp - argc + i - 1], vals);
                 }
                 vm->sp -= argc;
                 unsigned frame = alloc_cons(params, vals);
@@ -889,8 +1136,8 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
             } else {
                 unsigned args = 0;
                 gc_protect(&args);
-                for (int i = (int)argc - 1; i >= 0; i--) {
-                    args = alloc_cons(vm->stack[vm->sp - argc + i], args);
+                for (unsigned i = argc; i > 0; i--) {
+                    args = alloc_cons(vm->stack[vm->sp - argc + i - 1], args);
                 }
                 vm->sp -= argc;
                 unsigned frame = bind_params(params, args);
@@ -937,8 +1184,8 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
         // Build argument list in correct order by iterating in reverse
         unsigned args = 0;
         gc_protect(&args);
-        for (int i = (int)argc - 1; i >= 0; i--) {
-            args = alloc_cons(vm->stack[vm->sp - argc + i], args);
+        for (unsigned i = argc; i > 0; i--) {
+            args = alloc_cons(vm->stack[vm->sp - argc + i - 1], args);
         }
 
         vm->sp -= argc;
@@ -981,6 +1228,10 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
 
     if (IS_CELL(fn) && CELL_TYPE(fn) == BT_VMCONT) {
         // VM continuation invocation
+        if (!is_vm_continuation_object(fn)) {
+            VM_ERROR(vm, "invalid continuation");
+            return;
+        }
         unsigned value = values_from_argv(argc, &vm->stack[vm->sp - argc]);
         vm->sp -= argc;
         restore_continuation(vm, fn, value);
@@ -1002,6 +1253,12 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
     LISP_ASSERT_MSG(code->code != NULL, "vm_run: null bytecode array");
     LISP_ASSERT_FMT(code->code_len > 0, "vm_run: empty bytecode (len=%u)",
                     code->code_len);
+    if (!vm_code_is_well_formed(code)) {
+        vm->error = true;
+        vm->error_msg = "invalid bytecode";
+        show_error("VM error: %s", vm->error_msg);
+        return TOK_ERROR;
+    }
 
     vm->code = code;
     vm->ip = 0;
@@ -1038,7 +1295,12 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
         // Fast paths for most common opcodes (skip switch dispatch overhead)
         if (op == OP_CONST) {
             unsigned idx = vm->code->code[vm->ip++];
-            unsigned val = vm_unbox_fixnum_if_possible(vm->code->constants[idx]);
+            unsigned const_val;
+            if (!vm_get_const(vm->code, idx, &const_val)) {
+                VM_ERROR(vm, "constant index out of bounds");
+                break;
+            }
+            unsigned val = vm_unbox_fixnum_if_possible(const_val);
             if (__builtin_expect(vm->sp < vm->stack_cap, 1)) {
                 vm->stack[vm->sp++] = val;
             } else {
@@ -1070,7 +1332,12 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
         case OP_CONST: {
             // Fallback (shouldn't reach here normally)
             unsigned idx = vm->code->code[vm->ip++];
-            unsigned val = vm_unbox_fixnum_if_possible(vm->code->constants[idx]);
+            unsigned const_val;
+            if (!vm_get_const(vm->code, idx, &const_val)) {
+                VM_ERROR(vm, "constant index out of bounds");
+                break;
+            }
+            unsigned val = vm_unbox_fixnum_if_possible(const_val);
             vm_push(vm, val);
             break;
         }
@@ -1189,36 +1456,71 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
         // Stack locals — direct access without environment lookup
         case OP_LOCAL_GET: {
             unsigned slot = vm->code->code[vm->ip++];
-            vm_push(vm, vm->stack[vm->bp + slot]);
+            unsigned idx;
+            if (!vm_local_index(vm, slot, &idx))
+                break;
+            vm_push(vm, vm->stack[idx]);
             break;
         }
-        case OP_LOCAL_GET0:
-            vm_push(vm, vm->stack[vm->bp]);
+        case OP_LOCAL_GET0: {
+            unsigned idx;
+            if (!vm_local_index(vm, 0, &idx))
+                break;
+            vm_push(vm, vm->stack[idx]);
             break;
-        case OP_LOCAL_GET1:
-            vm_push(vm, vm->stack[vm->bp + 1]);
+        }
+        case OP_LOCAL_GET1: {
+            unsigned idx;
+            if (!vm_local_index(vm, 1, &idx))
+                break;
+            vm_push(vm, vm->stack[idx]);
             break;
-        case OP_LOCAL_GET2:
-            vm_push(vm, vm->stack[vm->bp + 2]);
+        }
+        case OP_LOCAL_GET2: {
+            unsigned idx;
+            if (!vm_local_index(vm, 2, &idx))
+                break;
+            vm_push(vm, vm->stack[idx]);
             break;
-        case OP_LOCAL_GET3:
-            vm_push(vm, vm->stack[vm->bp + 3]);
+        }
+        case OP_LOCAL_GET3: {
+            unsigned idx;
+            if (!vm_local_index(vm, 3, &idx))
+                break;
+            vm_push(vm, vm->stack[idx]);
             break;
+        }
         case OP_LOCAL_SET: {
             unsigned slot = vm->code->code[vm->ip++];
+            unsigned idx;
+            if (!vm_local_index(vm, slot, &idx))
+                break;
             unsigned val = vm_pop(vm);
-            vm->stack[vm->bp + slot] = val;
+            if (vm->error)
+                break;
+            vm->stack[idx] = val;
             vm_push(vm, val);
             break;
         }
         case OP_LOCAL_SET_VOID: {
             unsigned slot = vm->code->code[vm->ip++];
-            vm->stack[vm->bp + slot] = vm_pop(vm);
+            unsigned idx;
+            if (!vm_local_index(vm, slot, &idx))
+                break;
+            unsigned val = vm_pop(vm);
+            if (vm->error)
+                break;
+            vm->stack[idx] = val;
             break;
         }
 
         case OP_CLOSURE: {
             unsigned child_idx = vm->code->code[vm->ip++];
+            if (child_idx >= vm->code->children_len ||
+                !vm_code_is_well_formed(vm->code->children[child_idx])) {
+                VM_ERROR(vm, "closure child index out of bounds");
+                break;
+            }
             code_object *child = vm->code->children[child_idx];
 
             // Create code pointer cell (stores code_object* in ptr field)
@@ -1292,7 +1594,8 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             unsigned argc = vm->code->code[vm->ip++];
 
             // Ensure all args are boxed cell indices for primitives
-            vm_box_stack_args(vm, argc);
+            if (!vm_box_stack_args(vm, argc))
+                break;
 
             // Get pointer to arguments on stack (no list building needed)
             unsigned *argv = &vm->stack[vm->sp - argc];
@@ -1317,7 +1620,11 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 if (!ctx.load_callback) {
                     VM_ERROR_BREAK(vm, "load: callback not set");
                 }
-                char *filename = checked_string_copy(GET_STRING_PTR(filename_cell));
+                char *filename_arg = require_string_ptr(filename_cell, "load");
+                if (!filename_arg) {
+                    VM_ERROR_BREAK(vm, ctx.last_error);
+                }
+                char *filename = checked_string_copy(filename_arg);
                 if (!filename) {
                     VM_ERROR_BREAK(vm, "load: out of memory");
                 }
@@ -1346,8 +1653,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 gc_protect(&producer);
 
                 // Call producer with 0 args - handle different closure types
-                if (IS_PAIR(producer) && IS_CELL(car(producer)) &&
-                    CELL_TYPE(car(producer)) == BT_CLOSURE) {
+                if (is_bytecode_closure_object(producer)) {
                     // Bytecode closure - use vm_call_closure
                     result = vm_call_closure(producer, 0);
                 } else if (IS_FUNCTION(producer)) {
@@ -1387,9 +1693,11 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                     unsigned consumer_argc = 0;
                     FORLIST(v, vals)
                     {
-                        vm_push(vm, car(v));
-                        consumer_argc++;
+                        if (!vm_push_arg(vm, car(v), &consumer_argc))
+                            break;
                     }
+                    if (vm->error)
+                        break;
                     vm_apply(vm, consumer, consumer_argc, false);
                 } else {
                     // Single value - pass as single argument
@@ -1478,9 +1786,11 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             unsigned argc = 0;
             FORLIST(a, args_list)
             {
-                vm_push(vm, car(a));
-                argc++;
+                if (!vm_push_arg(vm, car(a), &argc))
+                    break;
             }
+            if (vm->error)
+                break;
 
             vm_apply(vm, proc, argc, false);
             break;
@@ -1526,7 +1836,8 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
         case OP_VALUES: {
             unsigned n = vm->code->code[vm->ip++];
             // Box fixnums before building value list
-            vm_box_stack_args(vm, n);
+            if (!vm_box_stack_args(vm, n))
+                break;
             unsigned value = values_from_argv(n, &vm->stack[vm->sp - n]);
             vm->sp -= n;
             vm_push(vm, value);
@@ -1553,9 +1864,11 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 unsigned argc = 0;
                 FORLIST(v, vals)
                 {
-                    vm_push(vm, car(v));
-                    argc++;
+                    if (!vm_push_arg(vm, car(v), &argc))
+                        break;
                 }
+                if (vm->error)
+                    break;
                 vm_apply(vm, consumer, argc, false);
             } else {
                 vm_push(vm, result);
@@ -1669,7 +1982,8 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 unsigned result = bn ? vm_store_bignum_add_one(vm, bn)
                                      : TOK_ERROR;
                 if (result == TOK_ERROR) {
-                    VM_ERROR_BREAK(vm, "add1: out of memory");
+                    VM_ERROR_BREAK(vm, get_bignum(n) ? "add1: out of memory"
+                                                     : "add1: not a number");
                 }
                 vm_push(vm, result);
             } else {
@@ -1713,7 +2027,8 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 unsigned result = bn ? vm_store_bignum_sub_one(vm, bn)
                                      : TOK_ERROR;
                 if (result == TOK_ERROR) {
-                    VM_ERROR_BREAK(vm, "sub1: out of memory");
+                    VM_ERROR_BREAK(vm, get_bignum(n) ? "sub1: out of memory"
+                                                     : "sub1: not a number");
                 }
                 vm_push(vm, result);
             } else {
@@ -2230,7 +2545,15 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 vm_push(vm, ctx.atom_true);
                 break;
             }
-            bool is_int = IS_NUM(val) || IS_BIGNUM(val);
+            bool is_int = false;
+            if (val != 0 && is_numeric(val)) {
+                if (IS_NUM(val) || IS_BIGNUM(val)) {
+                    is_int = true;
+                } else if (IS_INEXACT(val)) {
+                    double d = to_double(val);
+                    is_int = isfinite(d) && floor(d) == d;
+                }
+            }
             vm_push(vm, is_int ? ctx.atom_true : ctx.atom_false);
             break;
         }
@@ -2242,7 +2565,20 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 VM_ERROR_BREAK(vm, "length: not a proper list");
             }
             if (IS_STRING(val)) {
-                vm_push(vm, store(strlen(GET_STRING_PTR(val))));
+                char *s = require_string_ptr(val, "length");
+                if (!s) {
+                    VM_ERROR_BREAK(vm, ctx.last_error);
+                }
+                size_t len;
+                const char *error_msg = NULL;
+                if (!scheme_utf8_count_chars(s, &len, &error_msg)) {
+                    if (error_msg)
+                        snprintf(ctx.last_error, sizeof(ctx.last_error),
+                                 "length: %s", error_msg);
+                    VM_ERROR_BREAK(vm, error_msg ? ctx.last_error
+                                                 : "length: invalid string");
+                }
+                vm_push(vm, store(len));
                 break;
             }
             if (IS_VECTOR(val)) {
@@ -2422,8 +2758,11 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                     vm_push(vm, store(-val));
                 }
             } else if (IS_BIGNUM(n)) {
-                unsigned result =
-                    vm_store_bignum_neg(vm, get_bignum(n), "-: out of memory");
+                bignum *bn = get_bignum(n);
+                if (!bn) {
+                    VM_ERROR_BREAK(vm, "-: not a number");
+                }
+                unsigned result = vm_store_bignum_neg(vm, bn, "-: out of memory");
                 if (result == TOK_ERROR) {
                     VM_ERROR_BREAK(vm, "-: out of memory");
                 }
@@ -2478,6 +2817,9 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 }
             } else if (IS_BIGNUM(n)) {
                 bignum *bn = get_bignum(n);
+                if (!bn) {
+                    VM_ERROR_BREAK(vm, "abs: not a number");
+                }
                 if (bn->sign) {
                     unsigned result =
                         vm_store_bignum_neg(vm, bn, "abs: out of memory");
@@ -2527,6 +2869,9 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 positive = CELL_ID(n) > 0;
             } else if (IS_BIGNUM(n)) {
                 bignum *bn = get_bignum(n);
+                if (!bn) {
+                    VM_ERROR_BREAK(vm, "positive?: not a real number");
+                }
                 positive = !bn->sign && bn->len > 0;
             } else if (IS_INEXACT(n)) {
                 positive = to_double(n) > 0;
@@ -2548,7 +2893,11 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             if (IS_NUM(n)) {
                 negative = CELL_ID(n) < 0;
             } else if (IS_BIGNUM(n)) {
-                negative = bn_sign(get_bignum(n)) < 0;
+                bignum *bn = get_bignum(n);
+                if (!bn) {
+                    VM_ERROR_BREAK(vm, "negative?: not a real number");
+                }
+                negative = bn_sign(bn) < 0;
             } else if (IS_INEXACT(n)) {
                 negative = to_double(n) < 0;
             } else if (IS_RATIONAL(n)) {

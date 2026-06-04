@@ -28,6 +28,7 @@
 #include "bytecode.h"
 #include "compiled_pattern.h"
 #include "env.h"
+#include "feature_table.h"
 #include "reader.h"
 #include <ctype.h>
 #include <errno.h>
@@ -59,9 +60,270 @@ lisp_context ctx = {.hptr = HEAP_RESERVED,
 tramp_state tramp;
 unsigned gensym_counter = 0;
 
+typedef struct ptr_registry_node {
+    void *ptr;
+    struct ptr_registry_node *next;
+} ptr_registry_node;
+
+typedef struct sized_ptr_registry_node {
+    void *ptr;
+    unsigned len;
+    struct sized_ptr_registry_node *next;
+} sized_ptr_registry_node;
+
+static ptr_registry_node *vm_continuation_registry = NULL;
+static ptr_registry_node *file_port_registry = NULL;
+static ptr_registry_node *string_port_registry = NULL;
+static ptr_registry_node *hash_table_registry = NULL;
+static ptr_registry_node *bignum_registry = NULL;
+static ptr_registry_node *string_registry = NULL;
+static sized_ptr_registry_node *vector_registry = NULL;
+static sized_ptr_registry_node *bytevec_registry = NULL;
+
 // Error recovery for fatal errors
 jmp_buf panic_jmp;
 bool panic_jmp_set = false;
+
+static void ptr_registry_register(ptr_registry_node **registry, void *ptr,
+                                  const char *malloc_error)
+{
+    if (!ptr)
+        return;
+    for (ptr_registry_node *node = *registry; node; node = node->next) {
+        if (node->ptr == ptr)
+            return;
+    }
+
+    ptr_registry_node *node = checked_malloc_size(sizeof(*node));
+    LISP_ASSERT_MSG(node != NULL, malloc_error);
+    node->ptr = ptr;
+    node->next = *registry;
+    *registry = node;
+}
+
+static void ptr_registry_unregister(ptr_registry_node **registry, void *ptr)
+{
+    ptr_registry_node **prev = registry;
+    while (*prev) {
+        ptr_registry_node *node = *prev;
+        if (node->ptr == ptr) {
+            *prev = node->next;
+            free(node);
+            return;
+        }
+        prev = &node->next;
+    }
+}
+
+static bool ptr_registry_contains(const ptr_registry_node *registry,
+                                  const void *ptr)
+{
+    if (!ptr)
+        return false;
+    for (const ptr_registry_node *node = registry; node; node = node->next) {
+        if (node->ptr == ptr)
+            return true;
+    }
+    return false;
+}
+
+static void sized_ptr_registry_register(sized_ptr_registry_node **registry,
+                                        void *ptr, unsigned len,
+                                        const char *malloc_error)
+{
+    if (!ptr)
+        return;
+    for (sized_ptr_registry_node *node = *registry; node; node = node->next) {
+        if (node->ptr == ptr)
+            return;
+    }
+
+    sized_ptr_registry_node *node = checked_malloc_size(sizeof(*node));
+    LISP_ASSERT_MSG(node != NULL, malloc_error);
+    node->ptr = ptr;
+    node->len = len;
+    node->next = *registry;
+    *registry = node;
+}
+
+static void sized_ptr_registry_unregister(sized_ptr_registry_node **registry,
+                                          void *ptr)
+{
+    sized_ptr_registry_node **prev = registry;
+    while (*prev) {
+        sized_ptr_registry_node *node = *prev;
+        if (node->ptr == ptr) {
+            *prev = node->next;
+            free(node);
+            return;
+        }
+        prev = &node->next;
+    }
+}
+
+static const sized_ptr_registry_node *
+sized_ptr_registry_find(const sized_ptr_registry_node *registry,
+                        const void *ptr)
+{
+    if (!ptr)
+        return NULL;
+    for (const sized_ptr_registry_node *node = registry; node;
+         node = node->next) {
+        if (node->ptr == ptr)
+            return node;
+    }
+    return NULL;
+}
+
+void vm_continuation_register(vm_continuation *cont)
+{
+    if (!cont)
+        return;
+    ptr_registry_register(&vm_continuation_registry, cont,
+                          "vm_continuation_register: malloc failed");
+}
+
+void vm_continuation_unregister(vm_continuation *cont)
+{
+    ptr_registry_unregister(&vm_continuation_registry, cont);
+}
+
+bool vm_continuation_is_registered(const vm_continuation *cont)
+{
+    return ptr_registry_contains(vm_continuation_registry, cont);
+}
+
+bool is_vm_continuation_object(unsigned value)
+{
+    return IS_CELL(value) && CELL_TYPE(value) == BT_VMCONT &&
+           vm_continuation_is_registered((const vm_continuation *)CELL_PTR(value));
+}
+
+void file_port_register(file_port *port)
+{
+    if (!port)
+        return;
+    ptr_registry_register(&file_port_registry, port,
+                          "file_port_register: malloc failed");
+}
+
+void file_port_unregister(file_port *port)
+{
+    ptr_registry_unregister(&file_port_registry, port);
+}
+
+bool file_port_is_registered(const file_port *port)
+{
+    return ptr_registry_contains(file_port_registry, port);
+}
+
+void string_port_register(string_port *port)
+{
+    if (!port)
+        return;
+    ptr_registry_register(&string_port_registry, port,
+                          "string_port_register: malloc failed");
+}
+
+void string_port_unregister(string_port *port)
+{
+    ptr_registry_unregister(&string_port_registry, port);
+}
+
+bool string_port_is_registered(const string_port *port)
+{
+    return ptr_registry_contains(string_port_registry, port);
+}
+
+void hash_table_register(hash_table_data *table)
+{
+    if (!table)
+        return;
+    ptr_registry_register(&hash_table_registry, table,
+                          "hash_table_register: malloc failed");
+}
+
+void hash_table_unregister(hash_table_data *table)
+{
+    ptr_registry_unregister(&hash_table_registry, table);
+}
+
+bool hash_table_is_registered(const hash_table_data *table)
+{
+    return ptr_registry_contains(hash_table_registry, table);
+}
+
+void bignum_register(bignum *bn)
+{
+    if (!bn)
+        return;
+    ptr_registry_register(&bignum_registry, bn,
+                          "bignum_register: malloc failed");
+}
+
+void bignum_unregister(bignum *bn)
+{
+    ptr_registry_unregister(&bignum_registry, bn);
+}
+
+bool bignum_is_registered(const bignum *bn)
+{
+    return ptr_registry_contains(bignum_registry, bn);
+}
+
+void string_register(char *string)
+{
+    if (!string)
+        return;
+    ptr_registry_register(&string_registry, string,
+                          "string_register: malloc failed");
+}
+
+void string_unregister(char *string)
+{
+    ptr_registry_unregister(&string_registry, string);
+}
+
+bool string_is_registered(const char *string)
+{
+    return ptr_registry_contains(string_registry, string);
+}
+
+void vector_register(vector_data *vector)
+{
+    if (!vector)
+        return;
+    sized_ptr_registry_register(&vector_registry, vector, vector->len,
+                                "vector_register: malloc failed");
+}
+
+void vector_unregister(vector_data *vector)
+{
+    sized_ptr_registry_unregister(&vector_registry, vector);
+}
+
+bool vector_is_registered(const vector_data *vector)
+{
+    return sized_ptr_registry_find(vector_registry, vector) != NULL;
+}
+
+void bytevec_register(bytevec_data *bytevec)
+{
+    if (!bytevec)
+        return;
+    sized_ptr_registry_register(&bytevec_registry, bytevec, bytevec->len,
+                                "bytevec_register: malloc failed");
+}
+
+void bytevec_unregister(bytevec_data *bytevec)
+{
+    sized_ptr_registry_unregister(&bytevec_registry, bytevec);
+}
+
+bool bytevec_is_registered(const bytevec_data *bytevec)
+{
+    return sized_ptr_registry_find(bytevec_registry, bytevec) != NULL;
+}
 
 void init_heap(void)
 {
@@ -343,6 +605,7 @@ unsigned store_bignum(bignum *bn)
     unsigned p = alloc();
     CELL_TYPE(p) = BT_BIGNUM;
     CELL_PTR(p) = bn;
+    bignum_register(bn);
     return p;
 }
 
@@ -350,7 +613,8 @@ bignum *get_bignum(unsigned x)
 {
     if (!IS_CELL(x) || CELL_TYPE(x) != BT_BIGNUM)
         return NULL;
-    return (bignum *)CELL_PTR(x);
+    bignum *bn = (bignum *)CELL_PTR(x);
+    return bignum_is_registered(bn) ? bn : NULL;
 }
 
 bignum *to_bignum(unsigned x)
@@ -387,10 +651,20 @@ void free_bignum_cell(unsigned x)
 {
     if (CELL_TYPE(x) == BT_BIGNUM) {
         bignum *bn = get_bignum(x);
-        if (bn)
+        if (bn) {
+            bignum_unregister(bn);
             bn_free(bn);
+        }
         CELL_ID(x) = 0;
     }
+}
+
+bool hash_table_data_well_formed(const hash_table_data *ht)
+{
+    return hash_table_is_registered(ht) && ht->capacity > 0 && ht->buckets &&
+           (ht->equiv == HASH_EQ || ht->equiv == HASH_EQV ||
+            ht->equiv == HASH_EQUAL) &&
+           ht->size <= ht->capacity;
 }
 
 static void free_external_cell_data(unsigned x)
@@ -400,48 +674,69 @@ static void free_external_cell_data(unsigned x)
     } else if (CELL_TYPE(x) == BT_HASHTABLE) {
         hash_table_data *ht = (hash_table_data *)CELL_PTR(x);
         if (ht) {
-            for (unsigned i = 0; i < ht->capacity; i++) {
-                hash_entry *entry = ht->buckets[i];
-                while (entry) {
-                    hash_entry *next = entry->next;
-                    free(entry);
-                    entry = next;
+            if (hash_table_data_well_formed(ht)) {
+                for (unsigned i = 0; i < ht->capacity; i++) {
+                    hash_entry *entry = ht->buckets[i];
+                    while (entry) {
+                        hash_entry *next = entry->next;
+                        free(entry);
+                        entry = next;
+                    }
                 }
             }
-            free(ht->buckets);
-            free(ht);
+            if (hash_table_is_registered(ht)) {
+                hash_table_unregister(ht);
+                free(ht->buckets);
+                free(ht);
+            }
         }
         CELL_PTR(x) = NULL;
     } else if (CELL_TYPE(x) == BT_VECTOR) {
         vector_data *vd = (vector_data *)CELL_PTR(x);
-        if (vd)
+        if (vector_is_registered(vd)) {
+            vector_unregister(vd);
             free(vd);
+        }
         CELL_PTR(x) = NULL;
-    } else if (CELL_TYPE(x) == BT_STRING || CELL_TYPE(x) == BT_BYTEVEC) {
-        if (CELL_PTR(x))
-            free(CELL_PTR(x));
+    } else if (CELL_TYPE(x) == BT_STRING) {
+        char *s = (char *)CELL_PTR(x);
+        if (string_is_registered(s)) {
+            string_unregister(s);
+            free(s);
+        }
+        CELL_PTR(x) = NULL;
+    } else if (CELL_TYPE(x) == BT_BYTEVEC) {
+        bytevec_data *bv = (bytevec_data *)CELL_PTR(x);
+        if (bytevec_is_registered(bv)) {
+            bytevec_unregister(bv);
+            free(bv);
+        }
         CELL_PTR(x) = NULL;
     } else if (CELL_TYPE(x) == BT_STRINPORT ||
                CELL_TYPE(x) == BT_STROUTPORT) {
         string_port *sp = (string_port *)CELL_PTR(x);
-        if (sp) {
+        if (string_port_is_registered(sp)) {
+            string_port_unregister(sp);
             free(sp->data);
             free(sp);
         }
         CELL_PTR(x) = NULL;
     } else if (CELL_TYPE(x) == BT_INPORT || CELL_TYPE(x) == BT_OUTPORT) {
         file_port *port = (file_port *)CELL_PTR(x);
-        if (port) {
+        if (file_port_is_registered(port)) {
             if (port->file && port->owns_file) {
                 reader_forget_port(port->file);
                 fclose(port->file);
             }
+            file_port_unregister(port);
             free(port);
         }
         CELL_PTR(x) = NULL;
     } else if (CELL_TYPE(x) == BT_VMCONT) {
-        if (CELL_PTR(x))
+        if (CELL_PTR(x)) {
+            vm_continuation_unregister((vm_continuation *)CELL_PTR(x));
             free(CELL_PTR(x));
+        }
         CELL_PTR(x) = NULL;
     }
 }
@@ -449,15 +744,29 @@ static void free_external_cell_data(unsigned x)
 static void collect_vm_continuation_roots(vm_continuation *cont,
                                           unsigned (*collector)(unsigned))
 {
-    for (unsigned i = 0; i < cont->sp; i++) {
+    if (!vm_continuation_is_registered(cont))
+        return;
+
+    unsigned sp = (cont->stack && cont->sp <= VM_MAX_STACK_SIZE)
+                      ? cont->sp
+                      : 0;
+    unsigned fp = (cont->frames && cont->fp <= VM_MAX_FRAMES_SIZE)
+                      ? cont->fp
+                      : 0;
+    unsigned letrec_saved_len =
+        (cont->letrec_saved && cont->letrec_saved_len <= VM_MAX_STACK_SIZE)
+            ? cont->letrec_saved_len
+            : 0;
+
+    for (unsigned i = 0; i < sp; i++) {
         cont->stack[i] = collector(cont->stack[i]);
     }
     cont->env = collector(cont->env);
-    for (unsigned i = 0; i < cont->fp; i++) {
+    for (unsigned i = 0; i < fp; i++) {
         cont->frames[i].env = collector(cont->frames[i].env);
     }
     cont->letrec_frame = collector(cont->letrec_frame);
-    for (unsigned i = 0; i < cont->letrec_saved_len; i++) {
+    for (unsigned i = 0; i < letrec_saved_len; i++) {
         cont->letrec_saved[i] = collector(cont->letrec_saved[i]);
     }
 }
@@ -542,8 +851,10 @@ bool is_negative_number(unsigned x)
     switch (CELL_TYPE(x)) {
     case BT_NUM:
         return CELL_ID(x) < 0;
-    case BT_BIGNUM:
-        return bn_sign(get_bignum(x)) < 0;
+    case BT_BIGNUM: {
+        bignum *bn = get_bignum(x);
+        return bn && bn_sign(bn) < 0;
+    }
     default:
         return false;
     }
@@ -573,7 +884,10 @@ unsigned negate_number(unsigned x)
         return store(-val);
     }
     case BT_BIGNUM: {
-        bignum *bn = bn_neg(get_bignum(x));
+        bignum *orig = get_bignum(x);
+        if (!orig)
+            return x;
+        bignum *bn = bn_neg(orig);
         if (!bn)
             lisp_panic("negate_number: out of memory");
         return store_integer(bn);
@@ -667,6 +981,57 @@ unsigned store_complex(unsigned real_part, unsigned imag_part)
     return p;
 }
 
+static bool exact_integer_cell_well_formed(unsigned x)
+{
+    if (IS_FIXNUM(x) || IS_NUM(x))
+        return true;
+    if (IS_BIGNUM(x))
+        return get_bignum(x) != NULL;
+    return false;
+}
+
+static bool exact_integer_cell_is_zero(unsigned x)
+{
+    if (IS_FIXNUM(x))
+        return FIXNUM_VALUE(x) == 0;
+    if (IS_NUM(x))
+        return CELL_ID(x) == 0;
+    if (IS_BIGNUM(x)) {
+        bignum *bn = get_bignum(x);
+        return bn && bn_is_zero(bn);
+    }
+    return false;
+}
+
+static bool numeric_cell_well_formed(unsigned x, bool allow_complex,
+                                     unsigned depth)
+{
+    if (depth == 0 || x == 0)
+        return false;
+    if (IS_FIXNUM(x))
+        return true;
+    if (!IS_CELL(x))
+        return false;
+
+    switch (CELL_TYPE(x)) {
+    case BT_NUM:
+    case BT_INEXACT:
+        return true;
+    case BT_BIGNUM:
+        return get_bignum(x) != NULL;
+    case BT_RATIONAL:
+        return exact_integer_cell_well_formed(CELL_CAR(x)) &&
+               exact_integer_cell_well_formed(CELL_CDR(x)) &&
+               !exact_integer_cell_is_zero(CELL_CDR(x));
+    case BT_COMPLEX:
+        return allow_complex &&
+               numeric_cell_well_formed(CELL_CAR(x), false, depth - 1) &&
+               numeric_cell_well_formed(CELL_CDR(x), false, depth - 1);
+    default:
+        return false;
+    }
+}
+
 double to_double(unsigned x)
 {
     if (x == 0)
@@ -702,11 +1067,15 @@ double to_double(unsigned x)
         return u.d;
     }
     case BT_RATIONAL: {
+        if (!numeric_cell_well_formed(x, false, 4))
+            return 0.0;
         double num = to_double(CELL_CAR(x));
         double denom = to_double(CELL_CDR(x));
         return num / denom;
     }
     case BT_COMPLEX:
+        if (!numeric_cell_well_formed(x, true, 4))
+            return 0.0;
         // For complex, just return the real part as double
         return to_double(CELL_CAR(x));
     default:
@@ -716,20 +1085,12 @@ double to_double(unsigned x)
 
 bool is_numeric(unsigned x)
 {
-    if (x == 0)
-        return false;
-    if (IS_FIXNUM(x))
-        return true;
-    if (!IS_CELL(x))
-        return false;
-    enum lisp_type t = CELL_TYPE(x);
-    return t == BT_NUM || t == BT_BIGNUM || t == BT_INEXACT ||
-           t == BT_RATIONAL || t == BT_COMPLEX;
+    return numeric_cell_well_formed(x, true, 4);
 }
 
 static unsigned parse_real_number_slice(const char *start, size_t len)
 {
-    char *slice = strndup(start, len);
+    char *slice = checked_string_copy_len(start, len);
     if (!slice) {
         show_error("out of memory");
         return TOK_ERROR;
@@ -741,12 +1102,12 @@ static unsigned parse_real_number_slice(const char *start, size_t len)
 
 bool is_exact(unsigned x)
 {
-    if (x == 0)
+    if (!is_numeric(x))
         return false;
+
     if (IS_FIXNUM(x))
         return true;
-    if (!IS_CELL(x))
-        return false;
+
     switch (CELL_TYPE(x)) {
     case BT_NUM:
     case BT_BIGNUM:
@@ -773,6 +1134,12 @@ unsigned make_char(int c)
     return p;
 }
 
+bool is_valid_unicode_scalar(int64_t code)
+{
+    return code >= 0 && code <= 0x10FFFF &&
+           !(code >= 0xD800 && code <= 0xDFFF);
+}
+
 unsigned make_vector(unsigned len, unsigned fill)
 {
     GC_GUARD;
@@ -789,6 +1156,7 @@ unsigned make_vector(unsigned len, unsigned fill)
         return TOK_ERROR;
     }
     vd->len = len;
+    vector_register(vd);
 
     unsigned p = alloc();
     CELL_TYPE(p) = BT_VECTOR;
@@ -802,13 +1170,34 @@ unsigned make_vector(unsigned len, unsigned fill)
 unsigned vector_len(unsigned vec)
 {
     vector_data *vd = (vector_data *)CELL_PTR(vec);
-    return vd->len;
+    return vector_data_well_formed(vd) ? vd->len : 0;
 }
 
 unsigned *vector_data_ptr(unsigned vec)
 {
     vector_data *vd = (vector_data *)CELL_PTR(vec);
-    return vd->data;
+    return vector_data_well_formed(vd) ? vd->data : NULL;
+}
+
+bool vector_data_well_formed(const vector_data *vd)
+{
+    const sized_ptr_registry_node *node =
+        sized_ptr_registry_find(vector_registry, vd);
+    if (!node)
+        return false;
+    return node->len == vd->len &&
+           checked_flex_size(sizeof(vector_data), vd->len, sizeof(unsigned),
+                             NULL);
+}
+
+bool bytevec_data_well_formed(const bytevec_data *bv)
+{
+    const sized_ptr_registry_node *node =
+        sized_ptr_registry_find(bytevec_registry, bv);
+    if (!node)
+        return false;
+    return node->len == bv->len &&
+           checked_flex_size(sizeof(bytevec_data), bv->len, 1, NULL);
 }
 
 // ============================================================================
@@ -1182,7 +1571,8 @@ unsigned atom_from_string(const char *s)
                 // Parsed successfully up to slash
                 if (errno == ERANGE) {
                     // Overflow - parse as bignum
-                    char *num_str = strndup(s, (size_t)(slash - s));
+                    char *num_str =
+                        checked_string_copy_len(s, (size_t)(slash - s));
                     if (!num_str)
                         return TOK_ERROR;
                     bignum *bn = bn_from_string(num_str, 10);
@@ -1195,7 +1585,8 @@ unsigned atom_from_string(const char *s)
                 }
             } else {
                 // Didn't parse to slash - might be bignum
-                char *num_str = strndup(s, (size_t)(slash - s));
+                char *num_str =
+                    checked_string_copy_len(s, (size_t)(slash - s));
                 if (!num_str)
                     return TOK_ERROR;
                 bignum *bn = bn_from_string(num_str, 10);
@@ -1335,7 +1726,7 @@ bool lambda_params_bind_id(unsigned params, int64_t id)
 
 bool atom_list_contains_id(unsigned list, int64_t id)
 {
-    for (; list; list = cdr(list)) {
+    for (; IS_PAIR(list); list = cdr(list)) {
         if (IS_ATOM(car(list)) && CELL_ID(car(list)) == id)
             return true;
     }
@@ -1379,16 +1770,11 @@ bool assoc_list_has_atom_key_id(unsigned assoc_list, int64_t id)
 
 bool feature_id_available(int64_t id)
 {
-    static const char *features[] = {
-        "vesper", "r5rs", "r7rs-small-subset", "srfi-1", "srfi-2",
-        "srfi-8", "srfi-9", "srfi-26", "srfi-27", "srfi-28",
-        "bytevectors", "exact-rationals", "complex", "unicode-normalization",
-        "unicode-case-folding", "unicode-character-properties", "full-unicode-absent",
-        NULL};
-
     if (id < 0 || (unsigned)id >= ctx.atom_table_cap || !ctx.atom_table[id])
         return false;
-    for (int i = 0; features[i]; i++) {
+    const char *const *features = feature_names();
+    size_t feature_count = feature_name_count();
+    for (size_t i = 0; i < feature_count; i++) {
         if (strcmp(ctx.atom_table[id], features[i]) == 0)
             return true;
     }
@@ -1408,6 +1794,8 @@ bool cond_expand_requirement_satisfied(unsigned requirement)
     unsigned args = cdr(requirement);
     if (op == ctx.kw_and_feature) {
         for (; args; args = cdr(args)) {
+            if (!IS_PAIR(args))
+                return false;
             if (!cond_expand_requirement_satisfied(car(args)))
                 return false;
         }
@@ -1415,6 +1803,8 @@ bool cond_expand_requirement_satisfied(unsigned requirement)
     }
     if (op == ctx.kw_or_feature) {
         for (; args; args = cdr(args)) {
+            if (!IS_PAIR(args))
+                return false;
             if (cond_expand_requirement_satisfied(car(args)))
                 return true;
         }
@@ -1788,9 +2178,12 @@ static bool equal_seen_add(equal_seen_set *seen, unsigned a, unsigned b)
                                                &new_cap)) {
             return false;
         }
+        size_t alloc_size;
+        if (!checked_flex_size(0, new_cap, sizeof(*seen->items),
+                               &alloc_size))
+            return false;
         equal_seen_pair *new_items =
-            checked_realloc_size(seen->items,
-                                 new_cap * sizeof(*seen->items));
+            checked_realloc_size(seen->items, alloc_size);
         if (!new_items)
             return false;
         seen->items = new_items;
@@ -1826,7 +2219,7 @@ static bool deep_equal_seen(unsigned a, unsigned b, equal_seen_set *seen)
     case BT_BIGNUM: {
         bignum *ba = get_bignum(a);
         bignum *bb = get_bignum(b);
-        return bn_cmp(ba, bb) == 0;
+        return ba && bb && bn_cmp(ba, bb) == 0;
     }
     case BT_RATIONAL:
     case BT_COMPLEX:
@@ -1836,11 +2229,17 @@ static bool deep_equal_seen(unsigned a, unsigned b, equal_seen_set *seen)
             return false;
         return deep_equal_seen(car(a), car(b), seen) &&
                deep_equal_seen(cdr(a), cdr(b), seen);
-    case BT_STRING:
-        return strcmp(GET_STRING_PTR(a), GET_STRING_PTR(b)) == 0;
+    case BT_STRING: {
+        char *sa = GET_STRING_PTR(a);
+        char *sb = GET_STRING_PTR(b);
+        return string_is_registered(sa) && string_is_registered(sb) &&
+               strcmp(sa, sb) == 0;
+    }
     case BT_BYTEVEC: {
         bytevec_data *ba = (bytevec_data *)CELL_PTR(a);
         bytevec_data *bb = (bytevec_data *)CELL_PTR(b);
+        if (!bytevec_data_well_formed(ba) || !bytevec_data_well_formed(bb))
+            return false;
         return ba->len == bb->len &&
                memcmp(ba->data, bb->data, ba->len) == 0;
     }
@@ -1862,6 +2261,8 @@ static bool deep_equal_seen(unsigned a, unsigned b, equal_seen_set *seen)
             return false;
         unsigned *da = vector_data_ptr(a);
         unsigned *db = vector_data_ptr(b);
+        if ((len_a != 0 && !da) || (len_b != 0 && !db))
+            return false;
         for (unsigned i = 0; i < len_a; i++) {
             if (!deep_equal_seen(da[i], db[i], seen))
                 return false;
@@ -1926,7 +2327,9 @@ unsigned collect(unsigned x)
         CELL_CAR(x) = xx;
         if (CELL_TYPE(xx) == BT_HASHTABLE) {
             hash_table_data *ht = (hash_table_data *)CELL_PTR(xx);
-            for (unsigned i = 0; ht && i < ht->capacity; i++) {
+            if (!hash_table_data_well_formed(ht))
+                return xx;
+            for (unsigned i = 0; i < ht->capacity; i++) {
                 for (hash_entry *entry = ht->buckets[i]; entry;
                      entry = entry->next) {
                     entry->key = collect(entry->key);
@@ -1960,6 +2363,8 @@ unsigned collect(unsigned x)
         CELL_CAR(x) = xx;
         // Now safe to collect elements - cycles will see BROKENHEART
         vector_data *vd = (vector_data *)CELL_PTR(xx);
+        if (!vector_data_well_formed(vd))
+            return xx;
         for (unsigned i = 0; i < vd->len; i++) {
             vd->data[i] = collect(vd->data[i]);
         }
@@ -1996,8 +2401,9 @@ unsigned collect(unsigned x)
         CELL_PTR(xx) = CELL_PTR(x);
         CELL_TYPE(x) = BT_BROKENHEART;
         CELL_CAR(x) = xx;
-        collect_vm_continuation_roots((vm_continuation *)CELL_PTR(xx),
-                                      collect);
+        if (is_vm_continuation_object(xx))
+            collect_vm_continuation_roots((vm_continuation *)CELL_PTR(xx),
+                                          collect);
         return xx;
     }
 
@@ -2207,7 +2613,9 @@ unsigned collect_to_old(unsigned x)
         CELL_CAR(x) = xx;
         if (CELL_TYPE(xx) == BT_HASHTABLE) {
             hash_table_data *ht = (hash_table_data *)CELL_PTR(xx);
-            for (unsigned i = 0; ht && i < ht->capacity; i++) {
+            if (!hash_table_data_well_formed(ht))
+                return xx;
+            for (unsigned i = 0; i < ht->capacity; i++) {
                 for (hash_entry *entry = ht->buckets[i]; entry;
                      entry = entry->next) {
                     entry->key = collect_to_old(entry->key);
@@ -2241,6 +2649,8 @@ unsigned collect_to_old(unsigned x)
         CELL_CAR(x) = xx;
         // Collect vector elements
         vector_data *vd = (vector_data *)CELL_PTR(xx);
+        if (!vector_data_well_formed(vd))
+            return xx;
         for (unsigned i = 0; i < vd->len; i++) {
             vd->data[i] = collect_to_old(vd->data[i]);
         }
@@ -2283,8 +2693,9 @@ unsigned collect_to_old(unsigned x)
         CELL_PTR(xx) = CELL_PTR(x);
         CELL_TYPE(x) = BT_BROKENHEART;
         CELL_CAR(x) = xx;
-        collect_vm_continuation_roots((vm_continuation *)CELL_PTR(xx),
-                                      collect_to_old);
+        if (is_vm_continuation_object(xx))
+            collect_vm_continuation_roots((vm_continuation *)CELL_PTR(xx),
+                                          collect_to_old);
         return xx;
     }
 
@@ -2366,12 +2777,16 @@ unsigned minor_gc(unsigned root)
                     CELL_CDR(cell) = collect_to_old(CELL_CDR(cell));
                 } else if (t == BT_VECTOR) {
                     vector_data *vd = (vector_data *)CELL_PTR(cell);
+                    if (!vector_data_well_formed(vd))
+                        continue;
                     for (unsigned j = 0; j < vd->len; j++) {
                         vd->data[j] = collect_to_old(vd->data[j]);
                     }
                 } else if (t == BT_HASHTABLE) {
                     hash_table_data *ht = (hash_table_data *)CELL_PTR(cell);
-                    for (unsigned j = 0; ht && j < ht->capacity; j++) {
+                    if (!hash_table_data_well_formed(ht))
+                        continue;
+                    for (unsigned j = 0; j < ht->capacity; j++) {
                         for (hash_entry *entry = ht->buckets[j]; entry;
                              entry = entry->next) {
                             entry->key = collect_to_old(entry->key);

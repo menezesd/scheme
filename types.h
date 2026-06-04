@@ -468,7 +468,6 @@ enum primitive_id {
     PVECFILL,
     // Additional R3RS
     PINTEGERP,
-    PNUMBERP,
     PREALP,
     PEXACTP,
     PINEXACTP,
@@ -759,7 +758,8 @@ static inline int32_t FIXNUM_VALUE(unsigned v)
 #define GET_STRING_PTR(c) ((char *)CELL_PTR(c))
 #define GET_VECTOR_PTR(c) ((vector_data *)CELL_PTR(c))
 #define GET_FILE_PORT_PTR(c) ((file_port *)CELL_PTR(c))
-#define GET_PORT_PTR(c) (GET_FILE_PORT_PTR(c)->file)
+#define GET_PORT_PTR(c)                                                        \
+    (GET_FILE_PORT_PTR(c) ? GET_FILE_PORT_PTR(c)->file : NULL)
 #define GET_STRPORT_PTR(c) ((string_port *)CELL_PTR(c))
 #define GET_HASHTABLE_PTR(c) ((hash_table_data *)CELL_PTR(c))
 #define GET_CHAR_CODE(c) ((int)CELL_ID(c))

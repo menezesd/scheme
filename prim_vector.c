@@ -8,7 +8,7 @@
 
 static bool require_vector(unsigned value, const char *name)
 {
-    if (IS_VECTOR(value))
+    if (IS_VECTOR(value) && vector_data_well_formed(GET_VECTOR_PTR(value)))
         return true;
     show_error("%s: not a vector", name);
     return false;

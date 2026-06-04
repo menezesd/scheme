@@ -4,6 +4,7 @@
  */
 
 #include "prim_internal.h"
+#include "utf8.h"
 #include "unicode_norm_tables.h"
 
 #define STRING_APPEND_STACK_LENGTHS 64
@@ -68,83 +69,28 @@ unsigned prim_string_append(unsigned argc, unsigned *argv)
     return make_string_owned(result);
 }
 
-static bool utf8_decode_next_string(const char *s, size_t byte_len,
-                                    size_t *offset, const char *name)
-{
-    uint32_t ignored;
-    return utf8_decode_next_codepoint_string(s, byte_len, offset, &ignored,
-                                             name);
-}
-
 static bool utf8_decode_next_codepoint_string(const char *s, size_t byte_len,
                                               size_t *offset,
                                               uint32_t *codepoint,
                                               const char *name)
 {
-    if (*offset >= byte_len) {
-        show_error("%s: invalid UTF-8 offset", name);
+    const char *error_msg = NULL;
+    if (!scheme_utf8_decode_next(s, byte_len, offset, codepoint,
+                                 &error_msg)) {
+        show_error("%s: %s", name, error_msg);
         return false;
     }
-    const unsigned char *bytes = (const unsigned char *)s;
-    unsigned char b0 = bytes[*offset];
-    size_t needed;
-    int value;
-    if (b0 == 0) {
-        show_error("%s: null character in string", name);
-        return false;
-    } else if (b0 < 0x80) {
-        (*offset)++;
-        *codepoint = b0;
-        return true;
-    } else if (b0 >= 0xC2 && b0 <= 0xDF) {
-        needed = 2;
-        value = b0 & 0x1F;
-    } else if (b0 >= 0xE0 && b0 <= 0xEF) {
-        needed = 3;
-        value = b0 & 0x0F;
-    } else if (b0 >= 0xF0 && b0 <= 0xF4) {
-        needed = 4;
-        value = b0 & 0x07;
-    } else {
-        show_error("%s: invalid UTF-8 leading byte", name);
-        return false;
-    }
-    if (byte_len - *offset < needed) {
-        show_error("%s: truncated UTF-8 sequence", name);
-        return false;
-    }
-    for (size_t i = 1; i < needed; i++) {
-        unsigned char b = bytes[*offset + i];
-        if ((b & 0xC0) != 0x80) {
-            show_error("%s: invalid UTF-8 continuation byte", name);
-            return false;
-        }
-        value = (value << 6) | (b & 0x3F);
-    }
-    if ((needed == 3 && value < 0x800) ||
-        (needed == 4 && value < 0x10000) ||
-        value > 0x10FFFF || (value >= 0xD800 && value <= 0xDFFF)) {
-        show_error("%s: invalid UTF-8 sequence", name);
-        return false;
-    }
-    *offset += needed;
-    *codepoint = (uint32_t)value;
     return true;
 }
 
 static bool utf8_count_chars_string(const char *s, size_t *chars,
                                     const char *name)
 {
-    size_t byte_len = strlen(s);
-    size_t offset = 0;
-    size_t count = 0;
-    while (offset < byte_len) {
-        if (!utf8_decode_next_string(s, byte_len, &offset, name))
-            return false;
-        count++;
-    }
-    *chars = count;
-    return true;
+    const char *error_msg = NULL;
+    if (scheme_utf8_count_chars(s, chars, &error_msg))
+        return true;
+    show_error("%s: %s", name, error_msg);
+    return false;
 }
 
 static bool utf8_byte_offset_for_index_string(const char *s,
@@ -152,19 +98,12 @@ static bool utf8_byte_offset_for_index_string(const char *s,
                                               size_t *byte_offset,
                                               const char *name)
 {
-    size_t byte_len = strlen(s);
-    size_t offset = 0;
-    size_t count = 0;
-    while (offset < byte_len && count < char_index) {
-        if (!utf8_decode_next_string(s, byte_len, &offset, name))
-            return false;
-        count++;
-    }
-    if (count != char_index) {
-        show_error("%s: index out of bounds", name);
+    const char *error_msg = NULL;
+    if (!scheme_utf8_byte_offset_for_index(s, char_index, true,
+                                           byte_offset, &error_msg)) {
+        show_error("%s: %s", name, error_msg);
         return false;
     }
-    *byte_offset = offset;
     return true;
 }
 
@@ -242,13 +181,15 @@ static bool cp_buffer_reserve(codepoint_buffer *buf, size_t needed)
         new_cap *= 2;
     }
     uint32_t *new_data;
+    size_t alloc_size;
+    if (!checked_flex_size(0, new_cap, sizeof(uint32_t), &alloc_size))
+        return false;
     if (buf->data == buf->stack) {
-        new_data = checked_malloc_flex(0, new_cap, sizeof(uint32_t));
+        new_data = checked_malloc_size(alloc_size);
         if (new_data)
             memcpy(new_data, buf->stack, buf->length * sizeof(uint32_t));
     } else {
-        new_data = checked_realloc_size(buf->data,
-                                        new_cap * sizeof(uint32_t));
+        new_data = checked_realloc_size(buf->data, alloc_size);
     }
     if (!new_data)
         return false;
@@ -268,25 +209,15 @@ static bool cp_buffer_append(codepoint_buffer *buf, uint32_t codepoint)
 static bool utf8_encode_codepoint_string(uint32_t codepoint,
                                          codepoint_buffer *bytes)
 {
-    if (codepoint == 0 || codepoint > 0x10FFFF ||
-        (codepoint >= 0xD800 && codepoint <= 0xDFFF))
+    char encoded[4];
+    size_t encoded_len;
+    if (!scheme_utf8_encode_scalar(codepoint, encoded, &encoded_len))
         return false;
-    if (codepoint < 0x80) {
-        return cp_buffer_append(bytes, codepoint);
+    for (size_t i = 0; i < encoded_len; i++) {
+        if (!cp_buffer_append(bytes, (uint8_t)encoded[i]))
+            return false;
     }
-    if (codepoint < 0x800) {
-        return cp_buffer_append(bytes, 0xC0 | (codepoint >> 6)) &&
-               cp_buffer_append(bytes, 0x80 | (codepoint & 0x3F));
-    }
-    if (codepoint < 0x10000) {
-        return cp_buffer_append(bytes, 0xE0 | (codepoint >> 12)) &&
-               cp_buffer_append(bytes, 0x80 | ((codepoint >> 6) & 0x3F)) &&
-               cp_buffer_append(bytes, 0x80 | (codepoint & 0x3F));
-    }
-    return cp_buffer_append(bytes, 0xF0 | (codepoint >> 18)) &&
-           cp_buffer_append(bytes, 0x80 | ((codepoint >> 12) & 0x3F)) &&
-           cp_buffer_append(bytes, 0x80 | ((codepoint >> 6) & 0x3F)) &&
-           cp_buffer_append(bytes, 0x80 | (codepoint & 0x3F));
+    return true;
 }
 
 static const unicode_decomp_entry *find_decomp(uint32_t codepoint)

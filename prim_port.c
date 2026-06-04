@@ -9,7 +9,7 @@
 static void close_string_port(unsigned port)
 {
     string_port *sp = GET_STRPORT_PTR(port);
-    if (sp)
+    if (string_port_is_registered(sp))
         strport_free(sp);
     CELL_ID(port) = 0;
 }
@@ -30,14 +30,15 @@ static unsigned close_port_arg(unsigned port, bool input)
     }
 
     file_port *fp = GET_FILE_PORT_PTR(port);
-    FILE *f = fp ? fp->file : NULL;
+    FILE *f = file_port_well_formed(fp) ? fp->file : NULL;
     bool close_failed = false;
     if (f)
         reader_forget_port(f);
     if (f && fp->owns_file)
         close_failed = fclose(f) != 0;
-    if (fp)
+    if (file_port_well_formed(fp)) {
         fp->file = NULL;
+    }
     if (close_failed) {
         show_error("%s: close failed", name);
         return TOK_ERROR;
@@ -63,9 +64,9 @@ static bool string_port_predicate(unsigned value)
 static bool port_open_predicate(unsigned value)
 {
     if (IS_INPORT(value) || IS_OUTPORT(value))
-        return GET_PORT_PTR(value) != NULL;
+        return file_port_file(value) != NULL;
     if (IS_STRINPORT(value) || IS_STROUTPORT(value))
-        return GET_STRPORT_PTR(value) != NULL;
+        return string_port_well_formed(GET_STRPORT_PTR(value));
     return false;
 }
 static bool input_port_open_predicate(unsigned value)
@@ -82,7 +83,7 @@ static bool textual_port_predicate(unsigned value)
         return true;
     if (IS_INPORT(value) || IS_OUTPORT(value)) {
         file_port *fp = GET_FILE_PORT_PTR(value);
-        return fp && !fp->binary;
+        return file_port_well_formed(fp) && !fp->binary;
     }
     return false;
 }
@@ -90,7 +91,7 @@ static bool binary_port_predicate(unsigned value)
 {
     if (IS_INPORT(value) || IS_OUTPORT(value)) {
         file_port *fp = GET_FILE_PORT_PTR(value);
-        return fp && fp->binary;
+        return file_port_well_formed(fp) && fp->binary;
     }
     return false;
 }
@@ -124,7 +125,7 @@ static unsigned output_string_value(unsigned port, const char *name)
         return TOK_ERROR;
     }
     string_port *sp = GET_STRPORT_PTR(port);
-    if (!sp) {
+    if (!string_port_well_formed(sp)) {
         show_error("%s: port is closed", name);
         return TOK_ERROR;
     }
@@ -143,7 +144,7 @@ static unsigned set_current_port(unsigned port, bool input)
     const char *direction = input ? "input" : "output";
 
     if ((input && IS_INPORT(port)) || (!input && IS_OUTPORT(port))) {
-        FILE *f = GET_PORT_PTR(port);
+        FILE *f = file_port_file(port);
         if (!f) {
             show_error("%s: port is closed", name);
             return TOK_ERROR;
@@ -159,7 +160,7 @@ static unsigned set_current_port(unsigned port, bool input)
     }
 
     if ((input && IS_STRINPORT(port)) || (!input && IS_STROUTPORT(port))) {
-        if (!GET_STRPORT_PTR(port)) {
+        if (!string_port_well_formed(GET_STRPORT_PTR(port))) {
             show_error("%s: port is closed", name);
             return TOK_ERROR;
         }
@@ -178,7 +179,7 @@ static unsigned set_current_port(unsigned port, bool input)
 static unsigned set_current_error_port(unsigned port)
 {
     if (IS_OUTPORT(port)) {
-        FILE *f = GET_PORT_PTR(port);
+        FILE *f = file_port_file(port);
         if (!f) {
             show_error("set-current-error-port!: port is closed");
             return TOK_ERROR;
@@ -188,7 +189,7 @@ static unsigned set_current_error_port(unsigned port)
         return port;
     }
     if (IS_STROUTPORT(port)) {
-        if (!GET_STRPORT_PTR(port)) {
+        if (!string_port_well_formed(GET_STRPORT_PTR(port))) {
             show_error("set-current-error-port!: port is closed");
             return TOK_ERROR;
         }
@@ -203,7 +204,7 @@ static unsigned set_current_error_port(unsigned port)
 static bool flush_output_port_arg(unsigned port)
 {
     if (IS_OUTPORT(port)) {
-        FILE *fport = GET_PORT_PTR(port);
+        FILE *fport = file_port_file(port);
         if (!fport) {
             show_error("flush-output-port: port is closed");
             return false;
@@ -213,7 +214,7 @@ static bool flush_output_port_arg(unsigned port)
 
     if (IS_STROUTPORT(port)) {
         string_port *sport = GET_STRPORT_PTR(port);
-        if (!sport) {
+        if (!string_port_well_formed(sport)) {
             show_error("flush-output-port: port is closed");
             return false;
         }

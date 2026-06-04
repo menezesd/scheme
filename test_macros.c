@@ -1,9 +1,11 @@
 // Unit tests for macro module
 #define _POSIX_C_SOURCE 200809L
+#include "compiled_pattern.h"
 #include "context.h"
 #include "macros.h"
 #include "test_framework.h"
 #include "types.h"
+#include <stdint.h>
 
 // ============================================================================
 // Helper: Create patterns and templates from atoms
@@ -72,6 +74,21 @@ TEST(match_literal_fails)
     unsigned bindings =
         syntax_match(pattern, input, literals, 0, ctx.kw_ellipsis);
     ASSERT(bindings == TOK_ERROR);
+    PASS();
+}
+
+TEST(match_malformed_literal_list_treats_as_empty)
+{
+    unsigned pattern = atom("x");
+    unsigned input = store(42);
+    unsigned bindings =
+        syntax_match(pattern, input, store(1), 0, ctx.kw_ellipsis);
+
+    ASSERT(bindings != TOK_ERROR);
+    ASSERT(IS_PAIR(bindings));
+    ASSERT(IS_PAIR(car(bindings)));
+    ASSERT_EQ(car(car(bindings)), pattern);
+    ASSERT_EQ(cdr(car(bindings)), input);
     PASS();
 }
 
@@ -313,6 +330,81 @@ TEST(expand_vector)
     PASS();
 }
 
+TEST(expand_malformed_binding_list_ignores_bindings)
+{
+    unsigned x = atom("x");
+    unsigned result = syntax_expand(x, store(1), 0, ctx.kw_ellipsis);
+
+    ASSERT_EQ(result, x);
+    PASS();
+}
+
+TEST(expand_malformed_binding_entry_ignores_entry)
+{
+    unsigned x = atom("x");
+    unsigned bindings = alloc_cons(store(1), 0);
+    unsigned result = syntax_expand(x, bindings, 0, ctx.kw_ellipsis);
+
+    ASSERT_EQ(result, x);
+    PASS();
+}
+
+TEST(apply_syntax_rejects_non_syntax_transformer)
+{
+    unsigned input = alloc_cons(atom("m"), 0);
+    unsigned result = apply_syntax(store(1), input, 0);
+
+    ASSERT_EQ(result, TOK_ERROR);
+    PASS();
+}
+
+TEST(apply_syntax_rejects_malformed_input)
+{
+    unsigned transformer = alloc_cons(store(1), 0);
+    CELL_TYPE(transformer) = BT_SYNTAX;
+    unsigned result = apply_syntax(transformer, store(2), 0);
+
+    ASSERT_EQ(result, TOK_ERROR);
+    PASS();
+}
+
+TEST(apply_syntax_rejects_malformed_rules)
+{
+    unsigned ellipsis = atom("...");
+    unsigned syn_data = alloc_cons(ellipsis, alloc_cons(0, store(1)));
+    unsigned transformer = alloc_cons(syn_data, 0);
+    CELL_TYPE(transformer) = BT_SYNTAX;
+    unsigned input = alloc_cons(atom("m"), 0);
+
+    unsigned result = apply_syntax(transformer, input, 0);
+
+    ASSERT_EQ(result, TOK_ERROR);
+    PASS();
+}
+
+TEST(apply_syntax_rejects_unregistered_compiled_pattern)
+{
+    unsigned input = alloc_cons(atom("m"), 0);
+
+    unsigned cpat_cell = alloc();
+    CELL_TYPE(cpat_cell) = BT_COMPILED_PATTERN;
+    CELL_PTR(cpat_cell) = (void *)(uintptr_t)1;
+
+    unsigned rule = alloc_cons(cpat_cell, alloc_cons(store(1), 0));
+    unsigned rules = alloc_cons(rule, 0);
+    unsigned ellipsis = atom("...");
+    unsigned syn_data = alloc_cons(ellipsis, alloc_cons(0, rules));
+    unsigned transformer = alloc_cons(syn_data, 0);
+    CELL_TYPE(transformer) = BT_SYNTAX;
+
+    unsigned result = apply_syntax(transformer, input, 0);
+
+    ASSERT_EQ(result, TOK_ERROR);
+    CELL_TYPE(cpat_cell) = BT_FREE;
+    CELL_PTR(cpat_cell) = NULL;
+    PASS();
+}
+
 // ============================================================================
 // Main
 // ============================================================================
@@ -331,6 +423,7 @@ int main(void)
     RUN_TEST(match_atom_binds_value);
     RUN_TEST(match_literal_exact);
     RUN_TEST(match_literal_fails);
+    RUN_TEST(match_malformed_literal_list_treats_as_empty);
     RUN_TEST(match_direct_fixnum_literal);
     RUN_TEST(match_underscore);
 
@@ -355,6 +448,12 @@ int main(void)
     RUN_TEST(expand_list);
     RUN_TEST(expand_nested_list);
     RUN_TEST(expand_vector);
+    RUN_TEST(expand_malformed_binding_list_ignores_bindings);
+    RUN_TEST(expand_malformed_binding_entry_ignores_entry);
+    RUN_TEST(apply_syntax_rejects_non_syntax_transformer);
+    RUN_TEST(apply_syntax_rejects_malformed_input);
+    RUN_TEST(apply_syntax_rejects_malformed_rules);
+    RUN_TEST(apply_syntax_rejects_unregistered_compiled_pattern);
 
     TEST_SUMMARY("macros");
 }

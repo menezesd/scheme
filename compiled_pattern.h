@@ -47,7 +47,7 @@ enum pat_opcode {
     PAT_CHECK_VECLEN_MIN,// Fail if vector_len(input) < operand
 
     // Vector ellipsis iteration
-    PAT_VEC_ELLIPSIS_INIT,  // Setup iteration: operand = pre_count
+    PAT_VEC_ELLIPSIS_INIT,  // Setup iteration: pre | (post << 16)
     PAT_VEC_ELLIPSIS_NEXT,  // If done, jump to operand; else advance
     PAT_INPUT_VEC_ITER,     // Push input, set input = vec[pre_count + iter_idx]
     PAT_INPUT_VECREF_END,   // Push input, set input = vec[len - 1 - operand]
@@ -70,6 +70,7 @@ enum pat_opcode {
     // Control flow
     PAT_JUMP,            // ip = operand
     PAT_SUCCESS,         // Pattern matched successfully
+    PAT_OPCODE_COUNT,
 };
 
 // ============================================================================
@@ -187,6 +188,8 @@ typedef struct {
 // Allocation and cleanup
 compiled_pattern *compiled_pattern_new(void);
 void compiled_pattern_free(compiled_pattern *pat);
+bool compiled_pattern_is_registered(const compiled_pattern *needle);
+bool is_compiled_pattern_object(unsigned value);
 
 // Bytecode emission
 void pattern_emit(compiled_pattern *pat, unsigned opcode, unsigned operand);

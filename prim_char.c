@@ -202,7 +202,7 @@ static unsigned integer_to_char_value(unsigned arg, const char *name)
     int64_t code;
     if (!expect_exact_int64(arg, &code, name))
         return TOK_ERROR;
-    if (code < 0 || code > 0x10FFFF) {
+    if (!is_valid_unicode_scalar(code)) {
         show_error("%s: code point out of range", name);
         return TOK_ERROR;
     }
