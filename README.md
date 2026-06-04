@@ -21,13 +21,22 @@ compiler, semispace garbage collector, hygienic macros, and full numeric tower.
 
 ```bash
 make          # Build the interpreter
-make debug    # Build with debug symbols and sanitizers
+make debug    # Build with debug symbols
+make sanitize # Build with AddressSanitizer/UBSan
+make ubsan    # Build with UBSan only
 make test     # Run Scheme test suite
 make test-interpreter # Run Scheme test suite with CPS interpreter
 make test-c   # Run C unit tests
+make test-sanitize # Run bounded AddressSanitizer/UBSan smoke tests
+make test-ubsan # Run bounded UBSan-only smoke tests
 make test-all # Run all tests
 make clean    # Remove build artifacts
 ```
+
+On some Apple Clang/macOS combinations, ASan can hang before `main` while the
+sanitizer runtime initializes shadow memory. `make test-sanitize` reports that
+case as a bounded skip; `make test-ubsan` still provides runtime undefined
+behavior checks on those systems.
 
 ### Requirements
 
@@ -54,6 +63,13 @@ make clean    # Remove build artifacts
 
 ```bash
 ./vesper script.scm
+```
+
+Vesper normally loads its embedded standard library. For development, an
+external standard library can be selected explicitly:
+
+```bash
+./vesper --stdlib ./stdlib.scm script.scm
 ```
 
 ### Interpreter Mode
