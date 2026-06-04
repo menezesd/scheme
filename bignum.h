@@ -73,7 +73,15 @@ bignum *bn_mod(const bignum *a, const bignum *b);
 bignum *bn_neg(const bignum *a);
 bignum *bn_abs(const bignum *a);
 
-// In-place operations for efficiency
+// Checked in-place operations for efficiency. Return false on allocation
+// failure, leaving the destination valid but not always unchanged.
+bool bn_add_ip_checked(bignum *a, const bignum *b);
+bool bn_sub_ip_checked(bignum *a, const bignum *b);
+bool bn_mul_limb_ip_checked(bignum *a, limb_t b);
+bool bn_add_limb_ip_checked(bignum *a, limb_t b);
+
+// Legacy in-place operations. These abort on allocation failure because their
+// void signatures cannot report errors.
 void bn_add_ip(bignum *a, const bignum *b);
 void bn_sub_ip(bignum *a, const bignum *b);
 void bn_mul_limb_ip(bignum *a, limb_t b);

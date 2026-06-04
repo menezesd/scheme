@@ -74,6 +74,22 @@ static unsigned compiled_eval_string(const char *src, unsigned env)
     return result;
 }
 
+static void assert_eval_compiled_equal(const char *src)
+{
+    unsigned eval_env = default_environment();
+    unsigned compiled_env = default_environment();
+    unsigned eval_result = eval_string(src, eval_env);
+    ASSERT(eval_result != TOK_ERROR);
+
+    GC_GUARD;
+    gc_protect(&eval_result);
+    unsigned compiled_result = compiled_eval_string(src, compiled_env);
+    ASSERT(compiled_result != TOK_ERROR);
+    gc_protect(&compiled_result);
+
+    ASSERT(deep_equal(eval_result, compiled_result));
+}
+
 static unsigned read_expr_from_string(const char *src)
 {
     FILE *old_stdin = stdin;
@@ -1773,6 +1789,32 @@ TEST(eval_equal_handles_cycles)
     PASS();
 }
 
+TEST(eval_hash_table_handles_cyclic_equal_keys)
+{
+    unsigned env = default_environment();
+    unsigned result = eval_string(
+        "(let ((h (make-hash-table)) "
+        "      (x (cons 1 '())) "
+        "      (y (cons 1 '()))) "
+        "  (set-cdr! x x) "
+        "  (set-cdr! y y) "
+        "  (hash-table-set! h x 42) "
+        "  (hash-table-ref h y))",
+        env);
+    ASSERT(is_int(result, 42));
+
+    result = eval_string("(let ((h (make-hash-table)) "
+                         "      (x (make-vector 1 #f)) "
+                         "      (y (make-vector 1 #f))) "
+                         "  (vector-set! x 0 x) "
+                         "  (vector-set! y 0 y) "
+                         "  (hash-table-set! h x 43) "
+                         "  (hash-table-ref h y))",
+                         env);
+    ASSERT(is_int(result, 43));
+    PASS();
+}
+
 TEST(eval_append)
 {
     unsigned env = default_environment();
@@ -1843,6 +1885,25 @@ TEST(eval_bytevector_rejects_out_of_range_constructor)
     unsigned env = default_environment();
     unsigned result = eval_string("(bytevector 256)", env);
     ASSERT(result == TOK_ERROR);
+    PASS();
+}
+
+TEST(eval_exit_rejects_out_of_range_code)
+{
+    unsigned env = default_environment();
+    ASSERT(eval_string("(exit 9223372036854775807)", env) == TOK_ERROR);
+    ASSERT(eval_string("(emergency-exit 9223372036854775807)", env) ==
+           TOK_ERROR);
+    PASS();
+}
+
+TEST(compiled_exit_rejects_out_of_range_code)
+{
+    unsigned env = default_environment();
+    ASSERT(compiled_eval_string("(exit 9223372036854775807)", env) ==
+           TOK_ERROR);
+    ASSERT(compiled_eval_string("(emergency-exit 9223372036854775807)", env) ==
+           TOK_ERROR);
     PASS();
 }
 
@@ -2089,6 +2150,26 @@ TEST(eval_number_to_string_exact_non_int64)
     PASS();
 }
 
+TEST(eval_radix_rejects_out_of_range_values)
+{
+    unsigned env = default_environment();
+    ASSERT(eval_string("(number->string 10 9223372036854775807)", env) ==
+           TOK_ERROR);
+    ASSERT(eval_string("(string->number \"10\" 9223372036854775807)", env) ==
+           TOK_ERROR);
+    PASS();
+}
+
+TEST(compiled_radix_rejects_out_of_range_values)
+{
+    unsigned env = default_environment();
+    ASSERT(compiled_eval_string("(number->string 10 9223372036854775807)",
+                                env) == TOK_ERROR);
+    ASSERT(compiled_eval_string("(string->number \"10\" 9223372036854775807)",
+                                env) == TOK_ERROR);
+    PASS();
+}
+
 TEST(eval_arithmetic_shift_negative_left)
 {
     unsigned env = default_environment();
@@ -2221,6 +2302,22 @@ TEST(eval_string_to_number_radix_rejects_invalid)
     PASS();
 }
 
+TEST(eval_integer_to_char_rejects_surrogates)
+{
+    unsigned env = default_environment();
+    ASSERT(eval_string("(integer->char #xd800)", env) == TOK_ERROR);
+    ASSERT(eval_string("(integer->char #xdfff)", env) == TOK_ERROR);
+    PASS();
+}
+
+TEST(compiled_integer_to_char_rejects_surrogates)
+{
+    unsigned env = default_environment();
+    ASSERT(compiled_eval_string("(integer->char #xd800)", env) == TOK_ERROR);
+    ASSERT(compiled_eval_string("(integer->char #xdfff)", env) == TOK_ERROR);
+    PASS();
+}
+
 TEST(eval_complex_reader_accepts_implicit_imaginary_unit)
 {
     unsigned env = default_environment();
@@ -2274,6 +2371,17 @@ TEST(eval_integer_rejects_infinity)
     unsigned env = default_environment();
     unsigned result = eval_string("(integer? 1e999)", env);
     ASSERT(result == ctx.atom_false);
+    PASS();
+}
+
+TEST(compiled_integer_predicate_matches_eval)
+{
+    unsigned env = default_environment();
+    ASSERT(eval_string("(integer? 1.0)", env) == ctx.atom_true);
+    ASSERT(compiled_eval_string("(integer? 1.0)", env) == ctx.atom_true);
+    ASSERT(eval_string("(integer? 1.5)", env) == ctx.atom_false);
+    ASSERT(compiled_eval_string("(integer? 1.5)", env) == ctx.atom_false);
+    ASSERT(compiled_eval_string("(integer? 1e999)", env) == ctx.atom_false);
     PASS();
 }
 
@@ -2375,6 +2483,28 @@ TEST(compiled_constant_folding_releases_gc_roots)
     PASS();
 }
 
+TEST(compiled_number_predicate_constant_folds)
+{
+    unsigned env = default_environment();
+    unsigned expr = read_expr_from_string("(number? 1)");
+    ASSERT(expr != TOK_ERROR);
+
+    GC_GUARD;
+    gc_protect(&expr);
+    gc_protect(&env);
+    code_object *code = compile_toplevel(expr, env);
+    ASSERT(code != NULL);
+    ASSERT_EQ(code_count_opcode(code, OP_NUMBERP), 0);
+    ASSERT_EQ(code_count_opcode(code, OP_CALL), 0);
+
+    vm_state vm;
+    vm_init(&vm);
+    unsigned result = vm_run(&vm, code, env);
+    vm_free(&vm);
+    ASSERT(result == ctx.atom_true);
+    PASS();
+}
+
 TEST(compiled_lookup_add1_int64_max)
 {
     unsigned env = default_environment();
@@ -2419,6 +2549,38 @@ TEST(compiled_modulo_int64_min_by_negative_one)
     eval_string("(define y -1)", env);
     unsigned result = compiled_eval_string("(modulo x y)", env);
     ASSERT(is_int(result, 0));
+    PASS();
+}
+
+TEST(eval_compiled_parity_bignum_promotion)
+{
+    assert_eval_compiled_equal(
+        "(let ((x 9223372036854775807) "
+        "      (y -9223372036854775808)) "
+        "  (list (+ x 1) (- y 1) (* x 4) (/ y -1)))");
+    PASS();
+}
+
+TEST(eval_compiled_parity_exact_rationals)
+{
+    assert_eval_compiled_equal(
+        "(let ((x 12345678901234567890/7) "
+        "      (y 98765432109876543210/11)) "
+        "  (list (+ x y) (- y x) (* x y) (/ y x)))");
+    PASS();
+}
+
+TEST(eval_compiled_parity_macro_introduced_bindings)
+{
+    assert_eval_compiled_equal(
+        "(let-syntax ((swap-list "
+        "              (syntax-rules () "
+        "                ((_ a b) "
+        "                 (let ((tmp a)) "
+        "                   (let ((a b) (b tmp)) "
+        "                     (list a b))))))) "
+        "  (let ((tmp 'outer) (a 'left) (b 'right)) "
+        "    (list tmp (swap-list a b))))");
     PASS();
 }
 
@@ -2670,6 +2832,8 @@ TEST(compiled_length_accepts_string)
     unsigned env = default_environment();
     unsigned result = compiled_eval_string("(length \"abc\")", env);
     ASSERT(is_int(result, 3));
+    result = compiled_eval_string("(length \"A\\x03bb;B\")", env);
+    ASSERT(is_int(result, 3));
     PASS();
 }
 
@@ -2757,6 +2921,32 @@ TEST(compiled_equal_handles_cycles)
                                   "  (equal? x y))",
                                   env);
     ASSERT(is_bool(result, 1));
+    PASS();
+}
+
+TEST(compiled_hash_table_handles_cyclic_equal_keys)
+{
+    unsigned env = default_environment();
+    unsigned result = compiled_eval_string(
+        "(let ((h (make-hash-table)) "
+        "      (x (cons 1 '())) "
+        "      (y (cons 1 '()))) "
+        "  (set-cdr! x x) "
+        "  (set-cdr! y y) "
+        "  (hash-table-set! h x 42) "
+        "  (hash-table-ref h y))",
+        env);
+    ASSERT(is_int(result, 42));
+
+    result = compiled_eval_string("(let ((h (make-hash-table)) "
+                                  "      (x (make-vector 1 #f)) "
+                                  "      (y (make-vector 1 #f))) "
+                                  "  (vector-set! x 0 x) "
+                                  "  (vector-set! y 0 y) "
+                                  "  (hash-table-set! h x 43) "
+                                  "  (hash-table-ref h y))",
+                                  env);
+    ASSERT(is_int(result, 43));
     PASS();
 }
 
@@ -4830,6 +5020,7 @@ int main(void)
     RUN_TEST(eval_length);
     RUN_TEST(eval_rejects_circular_list_operations);
     RUN_TEST(eval_equal_handles_cycles);
+    RUN_TEST(eval_hash_table_handles_cyclic_equal_keys);
     RUN_TEST(eval_append);
     RUN_TEST(eval_gc_stats_shape);
     RUN_TEST(eval_string_to_symbol_preserves_numeric_text);
@@ -4838,6 +5029,8 @@ int main(void)
 
     // Bytevectors
     RUN_TEST(eval_bytevector_rejects_out_of_range_constructor);
+    RUN_TEST(eval_exit_rejects_out_of_range_code);
+    RUN_TEST(compiled_exit_rejects_out_of_range_code);
     RUN_TEST(eval_make_bytevector_rejects_out_of_range_fill);
     RUN_TEST(eval_bytevector_set_rejects_out_of_range);
     RUN_TEST(eval_read_bytevector_zero_returns_empty);
@@ -4857,6 +5050,8 @@ int main(void)
     RUN_TEST(eval_inexact_to_exact_positive_int64_boundary);
     RUN_TEST(eval_number_to_string_int64_min_radix);
     RUN_TEST(eval_number_to_string_exact_non_int64);
+    RUN_TEST(eval_radix_rejects_out_of_range_values);
+    RUN_TEST(compiled_radix_rejects_out_of_range_values);
     RUN_TEST(eval_arithmetic_shift_negative_left);
     RUN_TEST(eval_arithmetic_shift_int64_min_count);
     RUN_TEST(eval_arithmetic_shift_large_left_promotes);
@@ -4869,20 +5064,27 @@ int main(void)
     RUN_TEST(eval_sqrt_preserves_exact_bignum_squares);
     RUN_TEST(eval_string_to_number_radix_bignum);
     RUN_TEST(eval_string_to_number_radix_rejects_invalid);
+    RUN_TEST(eval_integer_to_char_rejects_surrogates);
+    RUN_TEST(compiled_integer_to_char_rejects_surrogates);
     RUN_TEST(eval_complex_reader_accepts_implicit_imaginary_unit);
     RUN_TEST(eval_complex_reader_preserves_exact_components);
     RUN_TEST(eval_complex_reader_rejects_nested_imaginary_suffix);
     RUN_TEST(eval_integer_rejects_infinity);
+    RUN_TEST(compiled_integer_predicate_matches_eval);
     RUN_TEST(eval_exact_rejects_non_numbers);
     RUN_TEST(eval_numtower_rejects_non_numbers);
     RUN_TEST(eval_exact_tiny_complex_imag_part_is_not_zero);
     RUN_TEST(eval_math_rejects_non_numbers);
     RUN_TEST(compiled_div_fixnum_boundary);
     RUN_TEST(compiled_constant_folding_releases_gc_roots);
+    RUN_TEST(compiled_number_predicate_constant_folds);
     RUN_TEST(compiled_lookup_add1_int64_max);
     RUN_TEST(compiled_lookup_sub1_int64_min);
     RUN_TEST(compiled_div_int64_min_by_negative_one);
     RUN_TEST(compiled_modulo_int64_min_by_negative_one);
+    RUN_TEST(eval_compiled_parity_bignum_promotion);
+    RUN_TEST(eval_compiled_parity_exact_rationals);
+    RUN_TEST(eval_compiled_parity_macro_introduced_bindings);
     RUN_TEST(compiled_letrec_tail_call_many_args);
     RUN_TEST(compiled_let_forms_preserve_enclosing_tail_context);
     RUN_TEST(compiled_cond_arrow_preserves_tail_context);
@@ -4910,6 +5112,7 @@ int main(void)
     RUN_TEST(compiled_listp_rejects_circular_list);
     RUN_TEST(compiled_rejects_circular_list_operations);
     RUN_TEST(compiled_equal_handles_cycles);
+    RUN_TEST(compiled_hash_table_handles_cyclic_equal_keys);
     RUN_TEST(compiled_vector_ref_rejects_non_vector);
     RUN_TEST(compiled_call_rejects_fixnum_operator);
     RUN_TEST(compiled_rejects_improper_application);

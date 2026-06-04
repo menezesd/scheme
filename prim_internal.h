@@ -44,9 +44,7 @@ typedef enum {
 static inline void classify_arg_value(unsigned x, numeric_level *level,
                                       bool *all_exact)
 {
-    if (x == 0)
-        return;
-    if (IS_FIXNUM(x) || !IS_CELL(x))
+    if (!is_numeric(x) || IS_FIXNUM(x) || !IS_CELL(x))
         return;
 
     switch (CELL_TYPE(x)) {
@@ -125,6 +123,11 @@ static inline void get_complex_parts(unsigned x, double *real, double *imag)
         *imag = 0.0;
         return;
     }
+    if (!is_numeric(x)) {
+        *real = 0.0;
+        *imag = 0.0;
+        return;
+    }
     if (IS_COMPLEX(x)) {
         *real = to_double(CELL_CAR(x));
         *imag = to_double(CELL_CDR(x));
@@ -138,6 +141,13 @@ static inline void get_complex_parts(unsigned x, double *real, double *imag)
 static inline void get_complex_cells(unsigned x, unsigned *real, unsigned *imag)
 {
     if (x == 0) {
+        *real = store(0);
+        gc_protect(real);
+        *imag = store(0);
+        gc_unprotect(1);
+        return;
+    }
+    if (!is_numeric(x)) {
         *real = store(0);
         gc_protect(real);
         *imag = store(0);
@@ -158,6 +168,8 @@ static inline void get_complex_cells(unsigned x, unsigned *real, unsigned *imag)
 // Check if a complex number (or any number) is exact
 static inline bool is_complex_exact(unsigned x)
 {
+    if (!is_numeric(x))
+        return false;
     if (IS_COMPLEX(x)) {
         return is_exact(CELL_CAR(x)) && is_exact(CELL_CDR(x));
     }
@@ -344,7 +356,12 @@ static inline unsigned add_cells(unsigned a, unsigned b)
     bignum *ba, *bb;
     if (!to_bignum_pair(a, b, &ba, &bb, "+"))
         return TOK_ERROR;
-    bn_add_ip(ba, bb);
+    if (!bn_add_ip_checked(ba, bb)) {
+        bn_free(ba);
+        bn_free(bb);
+        show_error("+: out of memory");
+        return TOK_ERROR;
+    }
     bn_free(bb);
     return store_integer(ba);
 }
@@ -365,7 +382,12 @@ static inline unsigned subtract_cells(unsigned a, unsigned b)
     bignum *ba, *bb;
     if (!to_bignum_pair(a, b, &ba, &bb, "-"))
         return TOK_ERROR;
-    bn_sub_ip(ba, bb);
+    if (!bn_sub_ip_checked(ba, bb)) {
+        bn_free(ba);
+        bn_free(bb);
+        show_error("-: out of memory");
+        return TOK_ERROR;
+    }
     bn_free(bb);
     return store_integer(ba);
 }
@@ -377,13 +399,17 @@ static inline bool is_zero_cell(unsigned x)
         return FIXNUM_VALUE(x) == 0;
     if (IS_NUM(x))
         return CELL_ID(x) == 0;
-    if (IS_BIGNUM(x))
-        return bn_is_zero(get_bignum(x));
+    if (IS_BIGNUM(x)) {
+        bignum *bn = get_bignum(x);
+        return bn && bn_is_zero(bn);
+    }
     return false;
 }
 
 static inline bool is_zero_number(unsigned x)
 {
+    if (!is_numeric(x))
+        return false;
     if (is_zero_cell(x))
         return true;
     if (IS_RATIONAL(x))
@@ -408,9 +434,10 @@ static inline bool expect_exact_int64(unsigned val, int64_t *out,
         return true;
     }
     if (IS_BIGNUM(val)) {
-        if (bn_to_int64(get_bignum(val), out) == 0)
+        bignum *bn = get_bignum(val);
+        if (bn && bn_to_int64(bn, out) == 0)
             return true;
-        show_error("%s: integer too large", name);
+        show_error("%s: %s", name, bn ? "integer too large" : "invalid bignum");
         return false;
     }
     show_error("%s: expected exact integer", name);
@@ -439,6 +466,19 @@ static inline bool expect_nonneg_int64(unsigned val, int64_t *out,
         show_error("%s: expected non-negative integer", name);
         return false;
     }
+    return true;
+}
+
+static inline bool expect_exit_code(unsigned val, int *out, const char *name)
+{
+    int64_t code64;
+    if (!expect_exact_int64(val, &code64, name))
+        return false;
+    if (code64 < INT_MIN || code64 > INT_MAX) {
+        show_error("%s: exit code out of range", name);
+        return false;
+    }
+    *out = (int)code64;
     return true;
 }
 
@@ -505,7 +545,7 @@ static inline bool expect_char_value(unsigned val, int *out, const char *name)
         return false;
     }
     int64_t code = CELL_ID(val);
-    if (code < 0 || code > 0x10FFFF) {
+    if (!is_valid_unicode_scalar(code)) {
         show_error("%s: invalid character code", name);
         return false;
     }
@@ -519,7 +559,12 @@ static inline char *require_string_ptr(unsigned value, const char *name)
         show_error("%s: not a string", name);
         return NULL;
     }
-    return GET_STRING_PTR(value);
+    char *s = GET_STRING_PTR(value);
+    if (!string_is_registered(s)) {
+        show_error("%s: invalid string", name);
+        return NULL;
+    }
+    return s;
 }
 
 static inline unsigned make_pointer_cell(enum lisp_type type, void *ptr)
@@ -540,7 +585,19 @@ static inline file_port *file_port_new(FILE *file, bool binary, bool input,
     port->binary = binary;
     port->input = input;
     port->owns_file = owns_file;
+    file_port_register(port);
     return port;
+}
+
+static inline bool file_port_well_formed(const file_port *port)
+{
+    return file_port_is_registered(port);
+}
+
+static inline FILE *file_port_file(unsigned value)
+{
+    file_port *port = GET_FILE_PORT_PTR(value);
+    return file_port_well_formed(port) ? port->file : NULL;
 }
 
 static inline unsigned make_file_port_cell(FILE *file, bool binary, bool input,
@@ -664,7 +721,12 @@ static inline unsigned binary_add(unsigned a, unsigned b)
         bignum *ba, *bb;
         if (!bn_from_int_pair(va, vb, &ba, &bb, "+"))
             return TOK_ERROR;
-        bn_add_ip(ba, bb);
+        if (!bn_add_ip_checked(ba, bb)) {
+            bn_free(ba);
+            bn_free(bb);
+            show_error("+: out of memory");
+            return TOK_ERROR;
+        }
         bn_free(bb);
         return store_integer(ba);
     }
@@ -687,7 +749,12 @@ static inline unsigned binary_sub(unsigned a, unsigned b)
         bignum *ba, *bb;
         if (!bn_from_int_pair(va, vb, &ba, &bb, "-"))
             return TOK_ERROR;
-        bn_sub_ip(ba, bb);
+        if (!bn_sub_ip_checked(ba, bb)) {
+            bn_free(ba);
+            bn_free(bb);
+            show_error("-: out of memory");
+            return TOK_ERROR;
+        }
         bn_free(bb);
         return store_integer(ba);
     }
@@ -892,6 +959,7 @@ static inline string_port *strport_alloc_with_data(char *data, size_t len,
     sp->len = len;
     sp->cap = cap;
     sp->pos = 0;
+    string_port_register(sp);
     return sp;
 }
 
@@ -982,6 +1050,7 @@ static inline int strport_peekc(string_port *sp)
 static inline void strport_free(string_port *sp)
 {
     if (sp) {
+        string_port_unregister(sp);
         free(sp->data);
         free(sp);
     }
@@ -994,6 +1063,12 @@ static inline void strport_free(string_port *sp)
 // Port direction for extract_port
 typedef enum { PORT_INPUT, PORT_OUTPUT } port_dir;
 
+static inline bool string_port_well_formed(const string_port *sp)
+{
+    return string_port_is_registered(sp) && sp->data && sp->cap > 0 &&
+           sp->len < sp->cap && sp->pos <= sp->len;
+}
+
 static inline int extract_current_port_cell(unsigned current_cell, port_dir dir,
                                             FILE **file_out,
                                             string_port **strport_out,
@@ -1004,7 +1079,7 @@ static inline int extract_current_port_cell(unsigned current_cell, port_dir dir,
                             : IS_STROUTPORT(current_cell);
     if (is_strport) {
         *strport_out = GET_STRPORT_PTR(current_cell);
-        if (!*strport_out) {
+        if (!string_port_well_formed(*strport_out)) {
             show_error("%s: current port is closed", fn_name);
             return -1;
         }
@@ -1014,7 +1089,7 @@ static inline int extract_current_port_cell(unsigned current_cell, port_dir dir,
     bool is_fileport =
         (dir == PORT_INPUT) ? IS_INPORT(current_cell) : IS_OUTPORT(current_cell);
     if (is_fileport) {
-        *file_out = GET_PORT_PTR(current_cell);
+        *file_out = file_port_file(current_cell);
         if (!*file_out) {
             show_error("%s: current port is closed", fn_name);
             return -1;
@@ -1034,7 +1109,7 @@ static inline int extract_explicit_port_cell(unsigned p, port_dir dir,
     bool is_strport = (dir == PORT_INPUT) ? IS_STRINPORT(p) : IS_STROUTPORT(p);
     if (is_strport) {
         *strport_out = GET_STRPORT_PTR(p);
-        if (!*strport_out) {
+        if (!string_port_well_formed(*strport_out)) {
             show_error("%s: port is closed", fn_name);
             return -1;
         }
@@ -1048,7 +1123,7 @@ static inline int extract_explicit_port_cell(unsigned p, port_dir dir,
         return -1;
     }
 
-    *file_out = GET_PORT_PTR(p);
+    *file_out = file_port_file(p);
     if (!*file_out) {
         show_error("%s: port is closed", fn_name);
         return -1;
@@ -1133,7 +1208,7 @@ static inline bool extract_input_port(unsigned args, FILE **port_out,
             show_error("%s: argument must be input port", fn_name);
             return false;
         }
-        *port_out = GET_PORT_PTR(p);
+        *port_out = file_port_file(p);
         if (!*port_out) {
             show_error("%s: port is closed", fn_name);
             return false;
@@ -1156,6 +1231,7 @@ static inline unsigned make_string_owned(char *s)
     unsigned p = alloc();
     CELL_TYPE(p) = BT_STRING;
     CELL_PTR(p) = s;
+    string_register(s);
     return p;
 }
 

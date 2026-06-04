@@ -159,7 +159,11 @@ static bool bignum_add_args_ip(bignum *result, unsigned argc, unsigned *argv,
             show_error("%s: out of memory", name);
             return false;
         }
-        bn_add_ip(result, operand);
+        if (!bn_add_ip_checked(result, operand)) {
+            bn_free(operand);
+            show_error("%s: out of memory", name);
+            return false;
+        }
         bn_free(operand);
     }
     return true;
@@ -204,7 +208,11 @@ static bool bignum_subtract_args_ip(bignum *result, unsigned argc,
             show_error("%s: out of memory", name);
             return false;
         }
-        bn_sub_ip(result, operand);
+        if (!bn_sub_ip_checked(result, operand)) {
+            bn_free(operand);
+            show_error("%s: out of memory", name);
+            return false;
+        }
         bn_free(operand);
     }
     return true;
@@ -349,7 +357,12 @@ slow_path:;
                     show_error("+: out of memory");
                     return TOK_ERROR;
                 }
-                bn_add_ip(result, operand);
+                if (!bn_add_ip_checked(result, operand)) {
+                    bn_free(result);
+                    bn_free(operand);
+                    show_error("+: out of memory");
+                    return TOK_ERROR;
+                }
                 bn_free(operand);
                 if (!bignum_add_args_ip(result, argc, argv, i + 1, "+")) {
                     bn_free(result);
@@ -611,15 +624,49 @@ slow_path:;
             show_error("-: invalid integer operand");
             return TOK_ERROR;
         }
-        if (argc == 1)
+        if (argc == 1) {
+            if (res == INT64_MIN) {
+                bignum *result = bn_from_int(res);
+                if (!result) {
+                    show_error("-: out of memory");
+                    return TOK_ERROR;
+                }
+                bn_neg_ip(result);
+                return store_integer(result);
+            }
             return store(-res);
+        }
         for (unsigned i = 1; i < argc; i++) {
             int64_t x;
             if (!exact_int64_value(argv[i], &x)) {
                 show_error("-: invalid integer operand");
                 return TOK_ERROR;
             }
-            res -= x;
+            int64_t new_res;
+            if (__builtin_sub_overflow(res, x, &new_res)) {
+                bignum *result = bn_from_int(res);
+                bignum *operand = bn_from_int(x);
+                if (!result || !operand) {
+                    bn_free(result);
+                    bn_free(operand);
+                    show_error("-: out of memory");
+                    return TOK_ERROR;
+                }
+                if (!bn_sub_ip_checked(result, operand)) {
+                    bn_free(result);
+                    bn_free(operand);
+                    show_error("-: out of memory");
+                    return TOK_ERROR;
+                }
+                bn_free(operand);
+                if (!bignum_subtract_args_ip(result, argc, argv, i + 1,
+                                             "-")) {
+                    bn_free(result);
+                    return TOK_ERROR;
+                }
+                return store_integer(result);
+            }
+            res = new_res;
         }
         return store(res);
     }

@@ -150,6 +150,58 @@ TEST(bn_mul_negative)
     PASS();
 }
 
+static bignum *bn_make_all_ones(size_t limbs)
+{
+    bignum *one = bn_from_int(1);
+    if (!one)
+        return NULL;
+    bignum *high = bn_lshift(one, LIMB_BITS * limbs);
+    bignum *result = high ? bn_sub(high, one) : NULL;
+    bn_free(high);
+    bn_free(one);
+    return result;
+}
+
+static void assert_all_ones_square_shape(const bignum *prod, size_t limbs)
+{
+    ASSERT(prod != NULL);
+    ASSERT(prod->len == limbs * 2);
+    ASSERT(prod->limbs[0] == 1);
+    for (size_t i = 1; i < limbs; i++)
+        ASSERT(prod->limbs[i] == 0);
+    ASSERT(prod->limbs[limbs] == LIMB_MAX - 1);
+    for (size_t i = limbs + 1; i < limbs * 2; i++)
+        ASSERT(prod->limbs[i] == LIMB_MAX);
+}
+
+TEST(bn_mul_karatsuba_threshold)
+{
+    bignum *a = bn_make_all_ones(KARATSUBA_THRESHOLD);
+    ASSERT(a != NULL);
+    ASSERT(a->len == KARATSUBA_THRESHOLD);
+
+    bignum *prod = bn_mul(a, a);
+    assert_all_ones_square_shape(prod, KARATSUBA_THRESHOLD);
+
+    bn_free(prod);
+    bn_free(a);
+    PASS();
+}
+
+TEST(bn_mul_toom3_threshold)
+{
+    bignum *a = bn_make_all_ones(TOOM3_THRESHOLD);
+    ASSERT(a != NULL);
+    ASSERT(a->len == TOOM3_THRESHOLD);
+
+    bignum *prod = bn_mul(a, a);
+    assert_all_ones_square_shape(prod, TOOM3_THRESHOLD);
+
+    bn_free(prod);
+    bn_free(a);
+    PASS();
+}
+
 TEST(bn_div_simple)
 {
     bignum *a = bn_from_int(100);
@@ -455,6 +507,49 @@ TEST(bn_add_ip_large)
     PASS();
 }
 
+TEST(bn_checked_in_place_ops)
+{
+    bignum *a = bn_from_int(100);
+    bignum *b = bn_from_int(250);
+    ASSERT(bn_add_ip_checked(a, b));
+
+    bignum *expected = bn_from_int(350);
+    ASSERT_EQ(bn_cmp(a, expected), 0);
+    bn_free(expected);
+
+    ASSERT(bn_sub_ip_checked(a, b));
+    expected = bn_from_int(100);
+    ASSERT_EQ(bn_cmp(a, expected), 0);
+    bn_free(expected);
+
+    ASSERT(bn_mul_limb_ip_checked(a, 42));
+    expected = bn_from_int(4200);
+    ASSERT_EQ(bn_cmp(a, expected), 0);
+    bn_free(expected);
+
+    ASSERT(bn_add_limb_ip_checked(a, 1));
+    expected = bn_from_int(4201);
+    ASSERT_EQ(bn_cmp(a, expected), 0);
+    bn_free(expected);
+
+    bn_free(a);
+    bn_free(b);
+    PASS();
+}
+
+TEST(bn_checked_add_limb_negative)
+{
+    bignum *a = bn_from_int(-100);
+    ASSERT(bn_add_limb_ip_checked(a, 25));
+
+    bignum *expected = bn_from_int(-75);
+    ASSERT_EQ(bn_cmp(a, expected), 0);
+
+    bn_free(a);
+    bn_free(expected);
+    PASS();
+}
+
 // ============================================================================
 // Main
 // ============================================================================
@@ -473,6 +568,8 @@ int main(void)
     RUN_TEST(bn_sub_to_negative);
     RUN_TEST(bn_mul_simple);
     RUN_TEST(bn_mul_negative);
+    RUN_TEST(bn_mul_karatsuba_threshold);
+    RUN_TEST(bn_mul_toom3_threshold);
     RUN_TEST(bn_div_simple);
     RUN_TEST(bn_div_with_remainder);
     RUN_TEST(bn_mod_simple);
@@ -498,6 +595,8 @@ int main(void)
     RUN_TEST(bn_add_limb_ip_test);
     RUN_TEST(bn_neg_ip_test);
     RUN_TEST(bn_add_ip_large);
+    RUN_TEST(bn_checked_in_place_ops);
+    RUN_TEST(bn_checked_add_limb_negative);
 
     TEST_SUMMARY("bignum");
 }
