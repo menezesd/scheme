@@ -1513,20 +1513,20 @@
                                   '(constructor-field ...)
                                   'predicate-name
                                   '(field-spec ...))
-       ;; Generate a unique type tag for this definition.
-       (define type-tag (list 'type-name))
-
-       ;; Constructor: creates a vector with type tag and fields
+       ;; The constructor closure itself is a unique, stable type tag.  Avoid
+       ;; an introduced top-level helper binding here: repeated macro uses
+       ;; would otherwise share that binding and overwrite an earlier tag.
        (define-record-constructor constructor-name
-         type-tag
          (constructor-field ...)
          field-spec ...)
 
        ;; Predicate: checks if value is a vector with matching type tag
-       (define (predicate-name obj)
-         (and (vector? obj)
-              (> (vector-length obj) 0)
-              (eq? (vector-ref obj 0) type-tag)))
+       (define predicate-name
+         (let ((record-type-tag constructor-name))
+           (lambda (obj)
+             (and (vector? obj)
+                  (> (vector-length obj) 0)
+                  (eq? (vector-ref obj 0) record-type-tag)))))
 
        ;; Generate field accessors and mutators
        (define-record-fields type-name predicate-name 1 field-spec ...)))))
@@ -1534,12 +1534,11 @@
 (define-syntax define-record-constructor
   (syntax-rules ()
     ((define-record-constructor constructor-name
-       type-tag
        (constructor-field ...)
        field-spec ...)
      (define (constructor-name constructor-field ...)
        (list->vector
-         (cons type-tag
+         (cons constructor-name
                (define-record-constructor-values
                  (list (cons 'constructor-field constructor-field) ...)
                  field-spec ...)))))))
@@ -2716,8 +2715,12 @@
           ((or (string=? out "") (path-absolute? (car parts)))
            (loop (cdr parts) (trim-right (car parts))))
           (else
-           (loop (cdr parts)
-                 (string-append (trim-right out) "/" (trim-left (car parts))))))))
+           (let ((left (trim-right out))
+                 (right (trim-left (car parts))))
+             (loop (cdr parts)
+                   (if (string=? left "/")
+                       (string-append left right)
+                       (string-append left "/" right))))))))
 
 (define (path-basename path)
   (let* ((p (path-strip-trailing-separators path))

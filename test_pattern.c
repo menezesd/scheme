@@ -169,6 +169,25 @@ TEST(compiled_pattern_free_unregisters)
     PASS();
 }
 
+TEST(compiled_pattern_free_is_idempotent)
+{
+    compiled_pattern *cpat = compiled_pattern_new();
+    ASSERT(cpat != NULL);
+    compiled_pattern_free(cpat);
+    compiled_pattern_free(cpat);
+    PASS();
+}
+
+TEST(pattern_register_is_idempotent)
+{
+    compiled_pattern *cpat = compiled_pattern_new();
+    ASSERT(cpat != NULL);
+    pattern_register(cpat);
+    compiled_pattern_free(cpat);
+    ASSERT(!pattern_registry_contains(cpat));
+    PASS();
+}
+
 TEST(gc_sweep_patterns_preserves_heap_references)
 {
     unsigned pat = atom("x");
@@ -596,6 +615,8 @@ int main(void)
     RUN_TEST(compile_literal);
     RUN_TEST(compile_ellipsis);
     RUN_TEST(compiled_pattern_free_unregisters);
+    RUN_TEST(compiled_pattern_free_is_idempotent);
+    RUN_TEST(pattern_register_is_idempotent);
     RUN_TEST(gc_sweep_patterns_preserves_heap_references);
     RUN_TEST(writer_handles_compiled_pattern_cell);
 

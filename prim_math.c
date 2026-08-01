@@ -68,11 +68,15 @@ static unsigned random_integer_value(unsigned x, const char *name)
         return TOK_ERROR;
     }
 
-    uint64_t limit = UINT64_MAX - (UINT64_MAX % (uint64_t)n);
+    // Reject the small prefix that would make the 2^64-sized generator
+    // domain unevenly divisible by n.  Computing the threshold in unsigned
+    // arithmetic also handles powers of two (where a naive UINT64_MAX-based
+    // limit rejects one otherwise valid sample).
+    uint64_t threshold = -(uint64_t)n % (uint64_t)n;
     uint64_t r;
     do {
         r = xoshiro256ss();
-    } while (r >= limit);
+    } while (r < threshold);
     return store((int64_t)(r % (uint64_t)n));
 }
 
@@ -98,7 +102,8 @@ static unsigned random_seed_value(unsigned x, const char *name)
             return TOK_ERROR;
         }
     } else {
-        seed = (uint64_t)time(NULL);
+        show_error("%s: expected exact integer seed", name);
+        return TOK_ERROR;
     }
 
     for (int i = 0; i < 4; i++) {
@@ -193,7 +198,7 @@ static unsigned log_value(unsigned arg, const char *name)
     if (IS_COMPLEX(arg)) {
         double real, imag;
         get_complex_parts(arg, &real, &imag);
-        double mag = sqrt(real * real + imag * imag);
+        double mag = hypot(real, imag);
         double angle = atan2(imag, real);
         return make_complex_inexact(log(mag), angle);
     }
@@ -378,21 +383,38 @@ static bignum *bn_exact_nth_root(const bignum *base, int64_t n)
     if (base->sign)
         return NULL; // No real nth root of negative for even n
 
-    // Initial guess using floating point
-    double d = 0;
-    for (size_t i = base->len; i > 0; i--) {
-        d = d * 4294967296.0 + base->limbs[i - 1];
+    /*
+     * Start Newton's method from a bignum estimate instead of converting the
+     * entire operand to double.  Large operands turn that conversion into
+     * infinity, and converting infinity to int64_t is undefined behavior.
+     *
+     * If base has L significant bits, 2^ceil(L/n) is an upper bound on its
+     * nth root.  It is also close enough for Newton's method to converge
+     * quickly, without imposing a floating-point size limit on exact roots.
+     */
+    if ((uint64_t)n > SIZE_MAX || base->len > SIZE_MAX / LIMB_BITS)
+        return NULL;
+    limb_t high_limb = base->limbs[base->len - 1];
+    if (high_limb == 0)
+        return NULL;
+    size_t high_bits = 0;
+    while (high_limb) {
+        high_bits++;
+        high_limb >>= 1;
     }
-    double guess_d = pow(d, 1.0 / n);
-    bignum *guess = bn_from_int((int64_t)guess_d);
+    size_t bit_length = (base->len - 1) * LIMB_BITS + high_bits;
+    size_t root_degree = (size_t)n;
+    if (bit_length > SIZE_MAX - (root_degree - 1))
+        return NULL;
+    size_t root_bits = (bit_length + root_degree - 1) / root_degree;
+
+    bignum *one = bn_from_int(1);
+    if (!one)
+        return NULL;
+    bignum *guess = bn_lshift(one, root_bits);
+    bn_free(one);
     if (!guess)
         return NULL;
-    if (bn_is_zero(guess)) {
-        bn_free(guess);
-        guess = bn_from_int(1);
-        if (!guess)
-            return NULL;
-    }
 
     // Newton iteration: x_new = ((n-1)*x + base/x^(n-1)) / n
     bignum *n_bn = bn_from_int(n);
@@ -514,9 +536,15 @@ static unsigned sqrt_value(unsigned arg, const char *name)
     if (IS_COMPLEX(arg)) {
         double a, b;
         get_complex_parts(arg, &a, &b);
-        double r = sqrt(a * a + b * b);
-        double real = sqrt((r + a) / 2);
-        double imag = (b >= 0 ? 1 : -1) * sqrt((r - a) / 2);
+        double r = hypot(a, b);
+        double real, imag;
+        if (a >= 0) {
+            real = sqrt(r / 2 + a / 2);
+            imag = b / (2 * real);
+        } else {
+            imag = (b >= 0 ? 1 : -1) * sqrt(r / 2 - a / 2);
+            real = b / (2 * imag);
+        }
         return make_complex_inexact(real, imag);
     }
 
@@ -593,7 +621,7 @@ static unsigned inexact_expt_value(unsigned base_arg, unsigned exp_arg)
         double b_real, b_imag;
         get_complex_parts(base_arg, &b_real, &b_imag);
 
-        double mag = sqrt(b_real * b_real + b_imag * b_imag);
+        double mag = hypot(b_real, b_imag);
         double angle = atan2(b_imag, b_real);
         double log_real = log(mag);
         double log_imag = angle;

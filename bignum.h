@@ -19,8 +19,6 @@ typedef uint64_t dlimb_t; // Double limb for multiplication
 #define LIMB_MAX UINT32_MAX
 #define KARATSUBA_THRESHOLD                                                    \
     32 // Use Karatsuba for numbers with >= this many limbs
-#define TOOM3_THRESHOLD                                                        \
-    100 // Use Toom-Cook-3 for numbers with >= this many limbs
 
 typedef struct {
     limb_t *limbs; // Array of limbs (little-endian)

@@ -236,6 +236,9 @@ typedef struct code_object {
     // GC integration: linked list of all code objects
     struct code_object *gc_next;
     bool gc_marked; // True if reachable during current GC
+    bool gc_updating; // True while recursively updating GC references
+    bool optimizing;  // True while recursively optimizing this code graph
+    bool disassembling; // True while recursively printing this code graph
 } code_object;
 
 // Global registry of all code objects (for GC)
@@ -408,6 +411,7 @@ void gc_update_vm_roots(vm_state *vm);
 void gc_update_vm_roots_minor(vm_state *vm, unsigned (*collector)(unsigned));
 void gc_update_all_code_objects(
     void); // Update all code object constants during GC
+void minor_gc_update_all_code_objects(void);
 void code_register(code_object *code); // Add code object to GC registry
 void gc_sweep_code_objects(void);      // Free unreachable code objects after GC
 vm_state *get_active_vm(void);         // Get currently running VM (for GC)

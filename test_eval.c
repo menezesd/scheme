@@ -10,6 +10,7 @@
 #include "compile_internal.h"
 #include "env.h"
 #include "eval.h"
+#include "eval_internal.h"
 #include "macros.h"
 #include "reader.h"
 #include "test_framework.h"
@@ -490,6 +491,15 @@ TEST(eval_cond_else)
     PASS();
 }
 
+TEST(cond_expand_rejects_recursive_requirement)
+{
+    const char *src = "(cond-expand (#0=(and #0#) 1) (else 2))";
+    unsigned env = default_environment();
+    ASSERT(is_int(eval_string(src, env), 2));
+    ASSERT(is_int(compiled_eval_string(src, env), 2));
+    PASS();
+}
+
 // ============================================================================
 // Lambda Tests
 // ============================================================================
@@ -747,6 +757,16 @@ TEST(eval_define_variable)
     eval_string("(define x 42)", env);
     unsigned result = eval_string("x", env);
     ASSERT(is_int(result, 42));
+    PASS();
+}
+
+TEST(cps_define_continuation_propagates_invalid_environment)
+{
+    unsigned name = atom_from_string("cps-invalid-define");
+    tramp.mode = TRAMP_DONE;
+    handle_cont_define(store(1), name, store(2), 0);
+    ASSERT_EQ(tramp.mode, TRAMP_ERROR);
+    tramp.mode = TRAMP_DONE;
     PASS();
 }
 
@@ -1286,6 +1306,28 @@ TEST(eval_read_string_port_preserves_unread_delimiter)
     PASS();
 }
 
+TEST(textual_port_operations_use_utf8_character_boundaries)
+{
+    const char *src =
+        "(let ((p (open-input-string \"λx\"))) "
+        "  (and (char=? (peek-char p) (integer->char 955)) "
+        "       (char=? (read-char p) (integer->char 955)) "
+        "       (string=? (read-string 1 p) \"x\")))";
+    unsigned env = default_environment();
+    ASSERT(is_bool(eval_string(src, env), 1));
+    ASSERT(is_bool(compiled_eval_string(src, env), 1));
+
+    const char *read_string_src =
+        "(let ((p (open-input-string \"λx\"))) (read-string 1 p))";
+    unsigned result = eval_string(read_string_src, env);
+    ASSERT(IS_STRING(result));
+    ASSERT_STR_EQ(GET_STRING_PTR(result), "λ");
+    result = compiled_eval_string(read_string_src, env);
+    ASSERT(IS_STRING(result));
+    ASSERT_STR_EQ(GET_STRING_PTR(result), "λ");
+    PASS();
+}
+
 TEST(eval_read_file_port_preserves_unread_delimiter)
 {
     const char *path = "/tmp/vesper-read-delimiter-test.scm";
@@ -1305,6 +1347,79 @@ TEST(eval_read_file_port_preserves_unread_delimiter)
         env);
     remove(path);
     ASSERT(is_bool(result, 1));
+    PASS();
+}
+
+TEST(file_textual_port_operations_peek_utf8_without_consuming)
+{
+    const char *path = "/tmp/vesper-read-utf8-char-test.scm";
+    FILE *f = fopen(path, "wb");
+    ASSERT(f != NULL);
+    ASSERT(fwrite("\xF0\x9D\x84\x9Ex1", 1, 6, f) == 6);
+    fclose(f);
+
+    const char *src =
+        "(let ((p (open-input-file \"/tmp/vesper-read-utf8-char-test.scm\"))) "
+        "  (let ((ok (and (char=? (peek-char p) (integer->char 119070)) "
+        "                 (char=? (read-char p) (integer->char 119070)) "
+        "                 (string=? (read-string 1 p) \"x\") "
+        "                 (= (read p) 1)))) "
+        "    (close-input-port p) ok))";
+    unsigned env = default_environment();
+    ASSERT(is_bool(eval_string(src, env), 1));
+    ASSERT(is_bool(compiled_eval_string(src, env), 1));
+    remove(path);
+    PASS();
+}
+
+TEST(read_line_rejects_invalid_utf8_file_content)
+{
+    const char *path = "/tmp/vesper-read-line-invalid-utf8-test.scm";
+    FILE *f = fopen(path, "wb");
+    ASSERT(f != NULL);
+    ASSERT(fwrite("a\0b\n", 1, 4, f) == 4);
+    fclose(f);
+
+    const char *src =
+        "(read-line (open-input-file "
+        "\"/tmp/vesper-read-line-invalid-utf8-test.scm\"))";
+    unsigned env = default_environment();
+    ASSERT(eval_string(src, env) == TOK_ERROR);
+    ASSERT(compiled_eval_string(src, env) == TOK_ERROR);
+
+    f = fopen(path, "wb");
+    ASSERT(f != NULL);
+    ASSERT(fwrite("\xC0\x80\n", 1, 3, f) == 3);
+    fclose(f);
+    ASSERT(eval_string(src, env) == TOK_ERROR);
+    ASSERT(compiled_eval_string(src, env) == TOK_ERROR);
+    remove(path);
+    PASS();
+}
+
+TEST(string_operations_reject_null_character)
+{
+    unsigned env = default_environment();
+    ASSERT(eval_string("(string #\\null)", env) == TOK_ERROR);
+    ASSERT(compiled_eval_string("(string #\\null)", env) == TOK_ERROR);
+    ASSERT(eval_string("(list->string (list #\\null))", env) == TOK_ERROR);
+    ASSERT(eval_string("(make-string 1 #\\null)", env) == TOK_ERROR);
+    ASSERT(eval_string("(utf8->string #u8(0))", env) == TOK_ERROR);
+    ASSERT(eval_string("(let ((p (open-output-string))) "
+                       "(write-char #\\null p))",
+                       env) == TOK_ERROR);
+
+    const char *path = "/tmp/vesper-read-string-null-test.scm";
+    FILE *f = fopen(path, "wb");
+    ASSERT(f != NULL);
+    ASSERT(fwrite("a\0b", 1, 3, f) == 3);
+    fclose(f);
+    const char *src =
+        "(read-string 3 (open-input-file "
+        "\"/tmp/vesper-read-string-null-test.scm\"))";
+    ASSERT(eval_string(src, env) == TOK_ERROR);
+    ASSERT(compiled_eval_string(src, env) == TOK_ERROR);
+    remove(path);
     PASS();
 }
 
@@ -1351,6 +1466,30 @@ TEST(eval_read_bytevector_preserves_unread_delimiter)
     PASS();
 }
 
+TEST(read_bytevector_into_preserves_unread_delimiter)
+{
+    const char *path = "/tmp/vesper-read-bytevector-into-delimiter-test.bin";
+    FILE *f = fopen(path, "wb");
+    ASSERT(f != NULL);
+    ASSERT(fwrite("1)A", 1, 3, f) == 3);
+    fclose(f);
+
+    const char *src =
+        "(let ((p (open-binary-input-file "
+        "          \"/tmp/vesper-read-bytevector-into-delimiter-test.bin\")) "
+        "      (bv (bytevector 0 0))) "
+        "  (let ((n (read p)) (got (read-bytevector! bv p))) "
+        "    (close-input-port p) "
+        "    (and (= n 1) (= got 2) "
+        "         (= (bytevector-u8-ref bv 0) 41) "
+        "         (= (bytevector-u8-ref bv 1) 65))))";
+    unsigned env = default_environment();
+    ASSERT(is_bool(eval_string(src, env), 1));
+    ASSERT(is_bool(compiled_eval_string(src, env), 1));
+    remove(path);
+    PASS();
+}
+
 TEST(gc_preserves_current_output_string_port)
 {
     unsigned env = default_environment();
@@ -1364,6 +1503,54 @@ TEST(gc_preserves_current_output_string_port)
     ctx.current_output_cell = 0;
     ctx.current_output = stdout;
     ASSERT_STR_EQ(GET_STRING_PTR(result), "xy");
+    PASS();
+}
+
+TEST(write_string_uses_utf8_character_indices)
+{
+    const char *src =
+        "(let ((p (open-output-string))) "
+        "  (write-string \"λx\" p 1 2) "
+        "  (get-output-string p))";
+    unsigned env = default_environment();
+    unsigned result = eval_string(src, env);
+    ASSERT(IS_STRING(result));
+    ASSERT_STR_EQ(GET_STRING_PTR(result), "x");
+
+    result = compiled_eval_string(src, env);
+    ASSERT(IS_STRING(result));
+    ASSERT_STR_EQ(GET_STRING_PTR(result), "x");
+    PASS();
+}
+
+TEST(write_char_encodes_utf8_scalars)
+{
+    const char *src =
+        "(let ((p (open-output-string))) "
+        "  (write-char (integer->char 955) p) "
+        "  (get-output-string p))";
+    unsigned env = default_environment();
+    unsigned result = eval_string(src, env);
+    ASSERT(IS_STRING(result));
+    ASSERT_STR_EQ(GET_STRING_PTR(result), "λ");
+    result = compiled_eval_string(src, env);
+    ASSERT(IS_STRING(result));
+    ASSERT_STR_EQ(GET_STRING_PTR(result), "λ");
+
+    const char *path = "/tmp/vesper-write-utf8-char-test.scm";
+    const char *file_src =
+        "(let ((out (open-output-file \"/tmp/vesper-write-utf8-char-test.scm\"))) "
+        "  (write-char (integer->char 119070) out) "
+        "  (close-output-port out) "
+        "  (let ((in (open-input-file \"/tmp/vesper-write-utf8-char-test.scm\"))) "
+        "    (let ((s (read-string 1 in))) (close-input-port in) s)))";
+    result = eval_string(file_src, env);
+    ASSERT(IS_STRING(result));
+    ASSERT_STR_EQ(GET_STRING_PTR(result), "𝄞");
+    result = compiled_eval_string(file_src, env);
+    ASSERT(IS_STRING(result));
+    ASSERT_STR_EQ(GET_STRING_PTR(result), "𝄞");
+    remove(path);
     PASS();
 }
 
@@ -1451,6 +1638,49 @@ TEST(eval_write_to_string_escapes_strings)
         eval_string("(write-to-string \"a\\\"b\\\\c\\n\\t\\r\")", env);
     ASSERT(IS_STRING(result));
     ASSERT_STR_EQ(GET_STRING_PTR(result), "\"a\\\"b\\\\c\\n\\t\\r\"");
+    PASS();
+}
+
+TEST(eval_write_large_acyclic_list)
+{
+    const char *src =
+        "(let ((p (open-output-string))) "
+        "  (let loop ((n 100000) (xs '())) "
+        "    (if (= n 0) "
+        "        (begin (write xs p) (write-simple xs p) "
+        "               (string-length (get-output-string p))) "
+        "        (loop (- n 1) (cons 'x xs)))))";
+    unsigned eval_env = default_environment();
+    unsigned result = eval_string(src, eval_env);
+    ASSERT(IS_NUM(result));
+    ASSERT_EQ(CELL_ID(result), 400002);
+
+    unsigned compiled_env = default_environment();
+    result = compiled_eval_string(src, compiled_env);
+    ASSERT(IS_NUM(result));
+    ASSERT_EQ(CELL_ID(result), 400002);
+    PASS();
+}
+
+TEST(write_simple_rejects_cyclic_data)
+{
+    unsigned cycle = read_expr_from_string("#0=(x . #0#)");
+    ASSERT(cycle != TOK_ERROR);
+    char *output = NULL;
+    size_t output_len = 0;
+    FILE *port = open_memstream(&output, &output_len);
+    ASSERT(port != NULL);
+    ASSERT(!write_simple_obj_port_checked(cycle, port));
+    ASSERT(fclose(port) == 0);
+    free(output);
+
+    unsigned env = default_environment();
+    ASSERT(eval_string("(let ((p (open-output-string))) "
+                       "(write-simple '#0=(x . #0#) p))",
+                       env) == TOK_ERROR);
+    ASSERT(compiled_eval_string("(let ((p (open-output-string))) "
+                                "(write-simple '#0=(x . #0#) p))",
+                                env) == TOK_ERROR);
     PASS();
 }
 
@@ -1654,6 +1884,60 @@ TEST(eval_quasiquote_rejects_improper_splice_value)
     PASS();
 }
 
+TEST(eval_quasiquote_rejects_circular_splice_value)
+{
+    unsigned env = default_environment();
+    unsigned result = eval_string("(let ((x (cons 1 '()))) "
+                                  "  (set-cdr! x x) "
+                                  "  `(,@x))",
+                                  env);
+    ASSERT(result == TOK_ERROR);
+    PASS();
+}
+
+TEST(eval_quasiquote_rejects_circular_template)
+{
+    unsigned env = default_environment();
+    ASSERT(eval_string("`#1=(a . #1#)", env) == TOK_ERROR);
+    ASSERT(eval_string("`#1=#(#1#)", env) == TOK_ERROR);
+    PASS();
+}
+
+TEST(eval_syntax_rules_rejects_circular_pattern_and_template)
+{
+    unsigned env = default_environment();
+    ASSERT(eval_string(
+               "(begin "
+               "  (define-syntax m "
+               "    (syntax-rules () ((m #1=(x . #1#)) 1))) "
+               "  (m 1))",
+               env) == TOK_ERROR);
+    ASSERT(eval_string(
+               "(begin "
+               "  (define-syntax m "
+               "    (syntax-rules () ((m) #1=(x . #1#)))) "
+               "  (m))",
+               env) == TOK_ERROR);
+    ASSERT(eval_string(
+               "(begin "
+               "  (define-syntax m "
+               "    (syntax-rules () ((m) #1=#(#1#)))) "
+               "  (m))",
+               env) == TOK_ERROR);
+    PASS();
+}
+
+TEST(eval_syntax_rules_rejects_circular_invocation)
+{
+    unsigned env = default_environment();
+    ASSERT(eval_string(
+               "(begin "
+               "  (define-syntax m (syntax-rules () ((m x) x))) "
+               "  #1=(m 1 . #1#))",
+               env) == TOK_ERROR);
+    PASS();
+}
+
 TEST(eval_quasiquote_rejects_malformed_subforms)
 {
     unsigned env = default_environment();
@@ -1756,6 +2040,10 @@ TEST(eval_rejects_circular_list_operations)
     ASSERT(eval_string("(let ((x (cons 1 '()))) "
                        "  (set-cdr! x x) "
                        "  (apply + x))",
+                       env) == TOK_ERROR);
+    ASSERT(eval_string("(let ((x (cons 1 '()))) "
+                       "  (set-cdr! x x) "
+                       "  (call/cc (lambda (k) (apply k x))))",
                        env) == TOK_ERROR);
     PASS();
 }
@@ -2257,6 +2545,50 @@ TEST(eval_magnitude_preserves_bignum)
     PASS();
 }
 
+TEST(eval_complex_large_components_stay_finite)
+{
+    const char *src =
+        "(let ((z (make-rectangular 1e308 1e308))) "
+        "  (and (finite? (magnitude z)) "
+        "       (finite? (real-part (log z))) "
+        "       (finite? (real-part (sqrt z))) "
+        "       (finite? (real-part (expt z 1.0)))))";
+
+    unsigned result = eval_string(src, default_environment());
+    ASSERT(is_bool(result, 1));
+
+    result = compiled_eval_string(src, default_environment());
+    ASSERT(is_bool(result, 1));
+    PASS();
+}
+
+TEST(eval_complex_division_scales_finite_components)
+{
+    const char *src =
+        "(let ((z (make-rectangular 1e308 1e308))) "
+        "  (let ((inverse (/ z)) "
+        "        (identity (/ z z)) "
+        "        (small-inverse (/ (make-rectangular 1e-300 1e-300))) "
+        "        (mixed (/ (make-rectangular 1e300 -1e300) "
+        "                  (make-rectangular 1e-300 1e-300))) "
+        "        (infinite-divisor (/ (make-rectangular 1.0 2.0) "
+        "                             (make-rectangular (exp 1000) 1.0)))) "
+        "    (and (finite? (real-part inverse)) "
+        "         (not (= (real-part inverse) 0.0)) "
+        "         (= identity 1) "
+        "         (finite? (real-part small-inverse)) "
+        "         (= (real-part mixed) 0.0) "
+        "         (infinite? (imag-part mixed)) "
+        "         (= infinite-divisor 0.0))))";
+
+    unsigned result = eval_string(src, default_environment());
+    ASSERT(is_bool(result, 1));
+
+    result = compiled_eval_string(src, default_environment());
+    ASSERT(is_bool(result, 1));
+    PASS();
+}
+
 TEST(eval_sqrt_preserves_exact_bignum_squares)
 {
     unsigned env = default_environment();
@@ -2280,6 +2612,43 @@ TEST(eval_sqrt_preserves_exact_bignum_squares)
         env);
     ASSERT(IS_STRING(result));
     ASSERT_STR_EQ(GET_STRING_PTR(result), "1/5000000000000000000");
+    PASS();
+}
+
+TEST(eval_sqrt_preserves_exact_very_large_bignum_squares)
+{
+    unsigned env = default_environment();
+    unsigned result = eval_string(
+        "(let ((x (expt 10 4000))) (= (sqrt x) (expt 10 2000)))", env);
+    ASSERT(is_bool(result, 1));
+
+    result = compiled_eval_string(
+        "(let ((x (expt 10 4000))) (= (sqrt x) (expt 10 2000)))", env);
+    ASSERT(is_bool(result, 1));
+    PASS();
+}
+
+TEST(eval_exact_to_inexact_huge_bignum_overflows_to_infinity)
+{
+    const char *src =
+        "(let ((x (exact->inexact (expt 2 2000)))) "
+        "  (and (infinite? x) (not (nan? x))))";
+    unsigned env = default_environment();
+    ASSERT(is_bool(eval_string(src, env), 1));
+    ASSERT(is_bool(compiled_eval_string(src, env), 1));
+    PASS();
+}
+
+TEST(eval_exact_to_inexact_huge_rational_stays_finite)
+{
+    const char *src =
+        "(let* ((x (expt 10 4000)) "
+        "       (r (/ (+ x 1) (+ x 2))) "
+        "       (d (exact->inexact r))) "
+        "  (and (not (infinite? d)) (not (nan? d)) (= d 1.0)))";
+    unsigned env = default_environment();
+    ASSERT(is_bool(eval_string(src, env), 1));
+    ASSERT(is_bool(compiled_eval_string(src, env), 1));
     PASS();
 }
 
@@ -2371,6 +2740,16 @@ TEST(eval_integer_rejects_infinity)
     unsigned env = default_environment();
     unsigned result = eval_string("(integer? 1e999)", env);
     ASSERT(result == ctx.atom_false);
+    PASS();
+}
+
+TEST(eval_rational_accessors_reject_infinity)
+{
+    unsigned env = default_environment();
+    ASSERT(eval_string("(numerator 1e999)", env) == TOK_ERROR);
+    ASSERT(eval_string("(denominator 1e999)", env) == TOK_ERROR);
+    ASSERT(compiled_eval_string("(numerator 1e999)", env) == TOK_ERROR);
+    ASSERT(compiled_eval_string("(denominator 1e999)", env) == TOK_ERROR);
     PASS();
 }
 
@@ -2705,6 +3084,21 @@ TEST(compiled_add1_sub1_preserves_type_error)
     PASS();
 }
 
+TEST(compiled_lookup_add1_sub1_halt_on_type_error)
+{
+    unsigned env = default_environment();
+    ASSERT(compiled_eval_string("(define fused-add1-error \"x\")", env) !=
+           TOK_ERROR);
+    ASSERT(compiled_eval_string(
+               "(begin (+ fused-add1-error 1) 42)", env) == TOK_ERROR);
+
+    ASSERT(compiled_eval_string("(define fused-sub1-error \"x\")", env) !=
+           TOK_ERROR);
+    ASSERT(compiled_eval_string(
+               "(begin (- fused-sub1-error 1) 42)", env) == TOK_ERROR);
+    PASS();
+}
+
 TEST(compiled_add1_sub1_support_non_integer_numbers)
 {
     unsigned env = default_environment();
@@ -2891,6 +3285,10 @@ TEST(compiled_rejects_circular_list_operations)
     ASSERT(compiled_eval_string("(let ((x (cons 1 '()))) "
                                 "  (set-cdr! x x) "
                                 "  (apply + x))",
+                                env) == TOK_ERROR);
+    ASSERT(compiled_eval_string("(let ((x (cons 1 '()))) "
+                                "  (set-cdr! x x) "
+                                "  (call/cc (lambda (k) (apply k x))))",
                                 env) == TOK_ERROR);
     PASS();
 }
@@ -3315,6 +3713,68 @@ TEST(compiled_quasiquote_rejects_improper_splice_value)
     unsigned env = default_environment();
     unsigned result = compiled_eval_string("`(,@(cons 1 2) x)", env);
     ASSERT(result == TOK_ERROR);
+    PASS();
+}
+
+TEST(compiled_quasiquote_rejects_circular_splice_value)
+{
+    unsigned env = default_environment();
+    unsigned result = compiled_eval_string("(let ((x (cons 1 '()))) "
+                                           "  (set-cdr! x x) "
+                                           "  `(,@x))",
+                                           env);
+    ASSERT(result == TOK_ERROR);
+    PASS();
+}
+
+TEST(compiled_quasiquote_rejects_circular_template)
+{
+    unsigned env = default_environment();
+    ASSERT(compiled_eval_string("`#1=(a . #1#)", env) == TOK_ERROR);
+    ASSERT(compiled_eval_string("`#1=#(#1#)", env) == TOK_ERROR);
+    PASS();
+}
+
+TEST(compiled_syntax_rules_rejects_circular_pattern_and_template)
+{
+    unsigned env = default_environment();
+    ASSERT(compiled_eval_string(
+               "(begin "
+               "  (define-syntax m "
+               "    (syntax-rules () ((m #1=(x . #1#)) 1))) "
+               "  (m 1))",
+               env) == TOK_ERROR);
+    ASSERT(compiled_eval_string(
+               "(begin "
+               "  (define-syntax m "
+               "    (syntax-rules () ((m) #1=(x . #1#)))) "
+               "  (m))",
+               env) == TOK_ERROR);
+    ASSERT(compiled_eval_string(
+               "(begin "
+               "  (define-syntax m "
+               "    (syntax-rules () ((m) #1=#(#1#)))) "
+               "  (m))",
+               env) == TOK_ERROR);
+    PASS();
+}
+
+TEST(compiled_syntax_rules_rejects_circular_invocation)
+{
+    unsigned env = default_environment();
+    ASSERT(compiled_eval_string(
+               "(begin "
+               "  (define-syntax m (syntax-rules () ((m x) x))) "
+               "  #1=(m 1 . #1#))",
+               env) == TOK_ERROR);
+    PASS();
+}
+
+TEST(compiled_legacy_macro_rejects_circular_invocation)
+{
+    unsigned env = default_environment();
+    ASSERT(eval_string("(define-macro (m . args) 1)", env) != TOK_ERROR);
+    ASSERT(compiled_eval_string("#1=(m . #1#)", env) == TOK_ERROR);
     PASS();
 }
 
@@ -4431,6 +4891,102 @@ TEST(compiled_syntax_rules_vector_template_repeats_compound_elements)
     PASS();
 }
 
+TEST(syntax_rules_expands_large_flat_template_without_stack_overflow)
+{
+    static const char prefix[] =
+        "(let-syntax ((m (syntax-rules () ((_ ) (quote (";
+    static const char suffix[] = ")))))) (m))";
+    const size_t count = 100000;
+    size_t prefix_len = strlen(prefix);
+    size_t suffix_len = strlen(suffix);
+    char *src = malloc(prefix_len + 2 * count + suffix_len + 1);
+    ASSERT(src != NULL);
+
+    size_t pos = 0;
+    memcpy(src + pos, prefix, prefix_len);
+    pos += prefix_len;
+    for (size_t i = 0; i < count; i++) {
+        src[pos++] = 'x';
+        src[pos++] = ' ';
+    }
+    memcpy(src + pos, suffix, suffix_len + 1);
+
+    unsigned eval_env = default_environment();
+    unsigned result = eval_string(src, eval_env);
+    unsigned length;
+    ASSERT(list_length_checked(result, &length, "test"));
+    ASSERT_EQ(length, count);
+    unsigned compiled_env = default_environment();
+    result = compiled_eval_string(src, compiled_env);
+    ASSERT(list_length_checked(result, &length, "test"));
+    ASSERT_EQ(length, count);
+    free(src);
+    PASS();
+}
+
+TEST(syntax_rules_expands_large_flat_executable_template_without_stack_overflow)
+{
+    static const char prefix[] =
+        "(let-syntax ((m (syntax-rules () ((_ ) (begin ";
+    static const char suffix[] = "7))))) (m))";
+    const size_t count = 100000;
+    size_t prefix_len = strlen(prefix);
+    size_t suffix_len = strlen(suffix);
+    char *src = malloc(prefix_len + 2 * count + suffix_len + 1);
+    ASSERT(src != NULL);
+
+    size_t pos = 0;
+    memcpy(src + pos, prefix, prefix_len);
+    pos += prefix_len;
+    for (size_t i = 0; i < count; i++) {
+        src[pos++] = '0';
+        src[pos++] = ' ';
+    }
+    memcpy(src + pos, suffix, suffix_len + 1);
+
+    unsigned eval_env = default_environment();
+    ASSERT(is_int(eval_string(src, eval_env), 7));
+    unsigned compiled_env = default_environment();
+    ASSERT(is_int(compiled_eval_string(src, compiled_env), 7));
+    free(src);
+    PASS();
+}
+
+TEST(syntax_rules_matches_large_flat_pattern_without_stack_overflow)
+{
+    static const char prefix[] = "(let-syntax ((m (syntax-rules () ((m ";
+    static const char middle[] = ") 7)))) (m ";
+    static const char suffix[] = "))";
+    const size_t count = 100000;
+    size_t prefix_len = strlen(prefix);
+    size_t middle_len = strlen(middle);
+    size_t suffix_len = strlen(suffix);
+    char *src = malloc(prefix_len + 4 * count + middle_len + suffix_len + 1);
+    ASSERT(src != NULL);
+
+    size_t pos = 0;
+    memcpy(src + pos, prefix, prefix_len);
+    pos += prefix_len;
+    for (size_t i = 0; i < count; i++) {
+        src[pos++] = '_';
+        src[pos++] = ' ';
+    }
+    memcpy(src + pos, middle, middle_len);
+    pos += middle_len;
+    for (size_t i = 0; i < count; i++) {
+        src[pos++] = '0';
+        src[pos++] = ' ';
+    }
+    memcpy(src + pos, suffix, suffix_len + 1);
+
+    unsigned eval_env = default_environment();
+    ASSERT(is_int(eval_string(src, eval_env), 7));
+    unsigned compiled_env = default_environment();
+    ASSERT(is_int(compiled_eval_string(src, compiled_env), 7));
+    free(src);
+    PASS();
+}
+
 TEST(eval_macro_set_target_is_referentially_transparent)
 {
     unsigned env = default_environment();
@@ -4919,6 +5475,7 @@ int main(void)
     RUN_TEST(eval_if_false);
     RUN_TEST(eval_cond_first);
     RUN_TEST(eval_cond_else);
+    RUN_TEST(cond_expand_rejects_recursive_requirement);
 
     // Lambda
     RUN_TEST(eval_lambda_call);
@@ -4934,6 +5491,7 @@ int main(void)
 
     // Define
     RUN_TEST(eval_define_variable);
+    RUN_TEST(cps_define_continuation_propagates_invalid_environment);
     RUN_TEST(eval_define_function);
     RUN_TEST(eval_define_recursive);
 
@@ -4984,17 +5542,26 @@ int main(void)
     RUN_TEST(gc_preserves_continuations);
     RUN_TEST(gc_preserves_current_input_string_port);
     RUN_TEST(eval_read_string_port_preserves_unread_delimiter);
+    RUN_TEST(textual_port_operations_use_utf8_character_boundaries);
     RUN_TEST(eval_read_file_port_preserves_unread_delimiter);
+    RUN_TEST(file_textual_port_operations_peek_utf8_without_consuming);
+    RUN_TEST(read_line_rejects_invalid_utf8_file_content);
+    RUN_TEST(string_operations_reject_null_character);
     RUN_TEST(eval_read_rejects_reader_token_sentinels);
     RUN_TEST(compiled_read_rejects_reader_token_sentinels);
     RUN_TEST(eval_read_bytevector_preserves_unread_delimiter);
+    RUN_TEST(read_bytevector_into_preserves_unread_delimiter);
     RUN_TEST(gc_preserves_current_output_string_port);
+    RUN_TEST(write_string_uses_utf8_character_indices);
+    RUN_TEST(write_char_encodes_utf8_scalars);
     RUN_TEST(eval_newline_rejects_closed_current_output_port);
     RUN_TEST(eval_flush_rejects_closed_output_port);
     RUN_TEST(eval_io_rejects_nil_port_argument);
     RUN_TEST(eval_close_port_rejects_wrong_direction);
     RUN_TEST(eval_set_current_port_rejects_closed_port);
     RUN_TEST(eval_write_to_string_escapes_strings);
+    RUN_TEST(eval_write_large_acyclic_list);
+    RUN_TEST(write_simple_rejects_cyclic_data);
     RUN_TEST(compiled_write_to_string_hides_bytecode_closure);
     RUN_TEST(eval_open_output_file_append_argument_is_truthy);
     RUN_TEST(eval_open_output_file_false_argument_truncates);
@@ -5011,6 +5578,10 @@ int main(void)
     RUN_TEST(eval_quasiquote_rejects_top_level_splicing);
     RUN_TEST(eval_quasiquote_splicing_preserves_dotted_tail);
     RUN_TEST(eval_quasiquote_rejects_improper_splice_value);
+    RUN_TEST(eval_quasiquote_rejects_circular_splice_value);
+    RUN_TEST(eval_quasiquote_rejects_circular_template);
+    RUN_TEST(eval_syntax_rules_rejects_circular_pattern_and_template);
+    RUN_TEST(eval_syntax_rules_rejects_circular_invocation);
     RUN_TEST(eval_quasiquote_rejects_malformed_subforms);
     RUN_TEST(eval_quasiquote_allows_data_in_unquote_expression);
 
@@ -5062,6 +5633,9 @@ int main(void)
     RUN_TEST(eval_magnitude_preserves_rational);
     RUN_TEST(eval_magnitude_preserves_bignum);
     RUN_TEST(eval_sqrt_preserves_exact_bignum_squares);
+    RUN_TEST(eval_sqrt_preserves_exact_very_large_bignum_squares);
+    RUN_TEST(eval_exact_to_inexact_huge_bignum_overflows_to_infinity);
+    RUN_TEST(eval_exact_to_inexact_huge_rational_stays_finite);
     RUN_TEST(eval_string_to_number_radix_bignum);
     RUN_TEST(eval_string_to_number_radix_rejects_invalid);
     RUN_TEST(eval_integer_to_char_rejects_surrogates);
@@ -5070,6 +5644,7 @@ int main(void)
     RUN_TEST(eval_complex_reader_preserves_exact_components);
     RUN_TEST(eval_complex_reader_rejects_nested_imaginary_suffix);
     RUN_TEST(eval_integer_rejects_infinity);
+    RUN_TEST(eval_rational_accessors_reject_infinity);
     RUN_TEST(compiled_integer_predicate_matches_eval);
     RUN_TEST(eval_exact_rejects_non_numbers);
     RUN_TEST(eval_numtower_rejects_non_numbers);
@@ -5095,6 +5670,7 @@ int main(void)
     RUN_TEST(compiled_divide_by_one_preserves_type_error);
     RUN_TEST(compiled_double_not_returns_boolean);
     RUN_TEST(compiled_add1_sub1_preserves_type_error);
+    RUN_TEST(compiled_lookup_add1_sub1_halt_on_type_error);
     RUN_TEST(compiled_add1_sub1_support_non_integer_numbers);
     RUN_TEST(compiled_zerop_preserves_type_error);
     RUN_TEST(compiled_if_numeq_preserves_type_error);
@@ -5128,6 +5704,11 @@ int main(void)
     RUN_TEST(compiled_quasiquote_rejects_top_level_splicing);
     RUN_TEST(compiled_quasiquote_splicing_preserves_dotted_tail);
     RUN_TEST(compiled_quasiquote_rejects_improper_splice_value);
+    RUN_TEST(compiled_quasiquote_rejects_circular_splice_value);
+    RUN_TEST(compiled_quasiquote_rejects_circular_template);
+    RUN_TEST(compiled_syntax_rules_rejects_circular_pattern_and_template);
+    RUN_TEST(compiled_syntax_rules_rejects_circular_invocation);
+    RUN_TEST(compiled_legacy_macro_rejects_circular_invocation);
     RUN_TEST(compiled_quasiquote_rejects_malformed_subforms);
     RUN_TEST(compiled_quasiquote_allows_data_in_unquote_expression);
     RUN_TEST(compiled_local_set_returns_assigned_value);
@@ -5163,6 +5744,13 @@ int main(void)
     RUN_TEST(compiled_syntax_rules_ellipsis_allows_tail_patterns);
     RUN_TEST(eval_syntax_rules_vector_template_repeats_compound_elements);
     RUN_TEST(compiled_syntax_rules_vector_template_repeats_compound_elements);
+    RUN_TEST(
+        syntax_rules_expands_large_flat_executable_template_without_stack_overflow);
+    RUN_TEST(
+        syntax_rules_matches_large_flat_pattern_without_stack_overflow);
+    RUN_TEST(syntax_rules_expands_large_flat_template_without_stack_overflow);
+    RUN_TEST(eval_complex_large_components_stay_finite);
+    RUN_TEST(eval_complex_division_scales_finite_components);
     RUN_TEST(eval_macro_set_target_is_referentially_transparent);
     RUN_TEST(compiled_macro_set_target_is_referentially_transparent);
     RUN_TEST(eval_macro_hygiene_renames_nested_syntax_rules_templates);

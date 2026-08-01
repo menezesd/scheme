@@ -391,11 +391,16 @@ static void cse_pass(code_object *code)
 // Peephole optimization with proper jump target fixup
 void peephole_optimize(code_object *code)
 {
-    if (!code || code->code_len < 2)
+    if (!code || code->optimizing || code->code_len < 2 ||
+        code->code_len > code->code_cap ||
+        code->children_len > code->children_cap || !code->code ||
+        (code->children_len != 0 && !code->children))
         return;
 
     if (!code_is_well_formed(code->code, code->code_len))
         return;
+
+    code->optimizing = true;
 
     // Run CSE pass first (handles instruction size changes separately)
     cse_pass(code);
@@ -405,8 +410,10 @@ void peephole_optimize(code_object *code)
 
     // Collect all jump targets - needed to avoid unsafe fusions
     bool *is_jump_target = calloc_array_plus_one(len, sizeof(bool));
-    if (!is_jump_target)
+    if (!is_jump_target) {
+        code->optimizing = false;
         return;
+    }
     mark_jump_targets(c, len, is_jump_target);
 
     // First pass: identify which bytes to remove and build offset map
@@ -414,6 +421,7 @@ void peephole_optimize(code_object *code)
     unsigned *offset_map = checked_malloc_array(len, sizeof(unsigned));
     if (!offset_map) {
         free(is_jump_target);
+        code->optimizing = false;
         return;
     }
 
@@ -421,6 +429,7 @@ void peephole_optimize(code_object *code)
     if (!remove) {
         free(offset_map);
         free(is_jump_target);
+        code->optimizing = false;
         return;
     }
 
@@ -770,6 +779,7 @@ void peephole_optimize(code_object *code)
     for (unsigned i = 0; i < code->children_len; i++) {
         peephole_optimize(code->children[i]);
     }
+    code->optimizing = false;
 }
 
 // ============================================================================
@@ -896,6 +906,25 @@ static const char *disassemble_atom_name(unsigned atom_id)
 
 void disassemble(code_object *code, const char *name)
 {
+    if (!code) {
+        printf("=== %s: <null> ===\n", name ? name : "<anonymous>");
+        return;
+    }
+    if (code->disassembling) {
+        printf("=== %s: <cycle> ===\n", name ? name : "<anonymous>");
+        return;
+    }
+    if (code->code_len > code->code_cap ||
+        code->const_len > code->const_cap ||
+        code->children_len > code->children_cap ||
+        (code->code_len != 0 && !code->code) ||
+        (code->const_len != 0 && !code->constants) ||
+        (code->children_len != 0 && !code->children)) {
+        printf("=== %s: <invalid> ===\n", name ? name : "<anonymous>");
+        return;
+    }
+
+    code->disassembling = true;
     printf("=== %s ===\n", name ? name : "<anonymous>");
     printf("arity: %u%s\n", code->arity, code->has_rest ? "+" : "");
 
@@ -1004,6 +1033,10 @@ void disassemble(code_object *code, const char *name)
         char child_name[64];
         snprintf(child_name, sizeof(child_name), "%s/lambda%u",
                  name ? name : "<anon>", i);
-        disassemble(code->children[i], child_name);
+        if (code_object_is_registered(code->children[i]))
+            disassemble(code->children[i], child_name);
+        else
+            printf("=== %s: <invalid child> ===\n", child_name);
     }
+    code->disassembling = false;
 }

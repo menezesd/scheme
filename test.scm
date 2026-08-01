@@ -120,6 +120,8 @@
 (test "procedure? true" #t (procedure? +))
 (test "boolean? true" #t (boolean? #t))
 (test "boolean? false" #f (boolean? 0))
+(test "#true boolean alias" #t #true)
+(test "#false boolean alias" #f #false)
 
 ;;; ============================================================================
 ;;; Equality
@@ -889,6 +891,18 @@
 (test "write-string range" "cde" (get-output-string out-str-port2))
 (define in-str-port (open-input-string "abcdef"))
 (test "read-string" "abc" (read-string 3 in-str-port))
+(define unicode-in-str-port (open-input-string "λx"))
+(test "peek-char unicode" #\λ (peek-char unicode-in-str-port))
+(test "read-char unicode" #\λ (read-char unicode-in-str-port))
+(test "read-string unicode character count" "x"
+      (read-string 1 unicode-in-str-port))
+(define unicode-out-str-port (open-output-string))
+(write-char #\λ unicode-out-str-port)
+(test "write-char unicode" "λ" (get-output-string unicode-out-str-port))
+(define unicode-range-out-str-port (open-output-string))
+(write-string "λx" unicode-range-out-str-port 1 2)
+(test "write-string unicode range" "x"
+      (get-output-string unicode-range-out-str-port))
 (test "input-port-open?" #t (input-port-open? in-str-port))
 (close-input-port in-str-port)
 (test "input-port-open? closed" #f (input-port-open? in-str-port))
@@ -943,6 +957,19 @@
 (close-input-port compat-in-slice)
 (delete-file compat-file)
 (test "delete-file compat file" #f (file-exists? compat-file))
+(define compat-transcript-file "/tmp/vesper-compat-transcript.txt")
+(transcript-on compat-transcript-file)
+(display "transcript text")
+(write #t)
+(write-char #\!)
+(write-string " more")
+(newline)
+(transcript-off)
+(define compat-transcript-in (open-input-file compat-transcript-file))
+(test "transcript captures output" "transcript text#t! more"
+      (read-line compat-transcript-in))
+(close-input-port compat-transcript-in)
+(delete-file compat-transcript-file)
 (define compat-text-file "/tmp/vesper-compat-text.txt")
 (define compat-text-out (open-output-file compat-text-file))
 (test "text output port predicate" #t (textual-port? compat-text-out))
@@ -956,13 +983,21 @@
 (test "make-directory/file-directory?" #t (file-directory? compat-dir))
 (delete-directory compat-dir)
 (test "delete-directory" #f (file-exists? compat-dir))
-(test "temporary-file-path" #t (string? (temporary-file-path)))
+(test "temporary-file-path"
+      #t
+      (let ((path (temporary-file-path)))
+        (and (string? path) (not (file-exists? path)))))
 (test "path-join" "/tmp/vesper/file.txt" (path-join "/tmp/" "vesper" "file.txt"))
+(test "path-join root" "/vesper" (path-join "/" "vesper"))
+(test "path-join repeated root" "/vesper" (path-join "/" "/" "vesper"))
 (test "path-basename" "file.txt" (path-basename "/tmp/vesper/file.txt"))
 (test "path-directory" "/tmp/vesper" (path-directory "/tmp/vesper/file.txt"))
 (test "path-extension" "txt" (path-extension "/tmp/vesper/file.txt"))
 (test "path-with-extension" "/tmp/vesper/file.scm"
       (path-with-extension "/tmp/vesper/file.txt" "scm"))
+(test "path-with-extension root" "/file.scm"
+      (path-with-extension "/file.txt" "scm"))
+(test "current-second inexact" #t (inexact? (current-second)))
 (test "current-jiffy integer" #t (integer? (current-jiffy)))
 (test "jiffies-per-second" 1000000000 (jiffies-per-second))
 (test "get-environment-variables returns alist"

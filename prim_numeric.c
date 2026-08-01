@@ -219,25 +219,82 @@ static bool bignum_subtract_args_ip(bignum *result, unsigned argc,
     return true;
 }
 
+static double rescale_complex_quotient_component(double component,
+                                                 double numerator_scale,
+                                                 double divisor_scale)
+{
+    if (component == 0.0)
+        return component;
+
+    int numerator_exp, divisor_exp;
+    double numerator_mantissa = frexp(numerator_scale, &numerator_exp);
+    double divisor_mantissa = frexp(divisor_scale, &divisor_exp);
+    return scalbn(component * (numerator_mantissa / divisor_mantissa),
+                  numerator_exp - divisor_exp);
+}
+
 static unsigned inexact_complex_div_value(unsigned argc, unsigned *argv)
 {
     double real, imag;
-    get_complex_parts(argv[0], &real, &imag);
+    unsigned start;
     if (argc == 1) {
-        double d = real * real + imag * imag;
-        CHECK_DIV_ZERO_DBL(d, "/");
-        return make_complex_inexact(real / d, -imag / d);
+        real = 1.0;
+        imag = 0.0;
+        start = 0;
+    } else {
+        get_complex_parts(argv[0], &real, &imag);
+        start = 1;
     }
 
-    for (unsigned i = 1; i < argc; i++) {
+    for (unsigned i = start; i < argc; i++) {
         double r, im;
         get_complex_parts(argv[i], &r, &im);
-        double d = r * r + im * im;
-        CHECK_DIV_ZERO_DBL(d, "/");
-        double nr = (real * r + imag * im) / d;
-        double ni = (imag * r - real * im) / d;
-        real = nr;
-        imag = ni;
+        if (r == 0.0 && im == 0.0)
+            ERROR_RETURN("/: division by zero");
+
+        /*
+         * Normalize both operands before combining their components.  This
+         * keeps the products in [-1, 1], so it cannot overflow or underflow
+         * before the final exponent-aware rescaling.  In particular, this
+         * preserves a zero component when enormous intermediate terms cancel.
+         */
+        double numerator_scale = fmax(fabs(real), fabs(imag));
+        if (numerator_scale == 0.0) {
+            real = 0.0;
+            imag = 0.0;
+            continue;
+        }
+        double divisor_scale = fmax(fabs(r), fabs(im));
+        if (isfinite(numerator_scale) && isinf(divisor_scale)) {
+            real = 0.0;
+            imag = 0.0;
+            continue;
+        }
+        if (!isfinite(numerator_scale) || !isfinite(divisor_scale)) {
+            // Preserve IEEE-754 propagation for NaN and infinite numerators.
+            double divisor_norm = r * r + im * im;
+            double new_real = (real * r + imag * im) / divisor_norm;
+            double new_imag = (imag * r - real * im) / divisor_norm;
+            real = new_real;
+            imag = new_imag;
+            continue;
+        }
+        double real_normalized = real / numerator_scale;
+        double imag_normalized = imag / numerator_scale;
+        double divisor_real_normalized = r / divisor_scale;
+        double divisor_imag_normalized = im / divisor_scale;
+        double divisor_norm = divisor_real_normalized * divisor_real_normalized +
+                              divisor_imag_normalized * divisor_imag_normalized;
+        double new_real = (real_normalized * divisor_real_normalized +
+                           imag_normalized * divisor_imag_normalized) /
+                          divisor_norm;
+        double new_imag = (imag_normalized * divisor_real_normalized -
+                           real_normalized * divisor_imag_normalized) /
+                          divisor_norm;
+        real = rescale_complex_quotient_component(new_real, numerator_scale,
+                                                   divisor_scale);
+        imag = rescale_complex_quotient_component(new_imag, numerator_scale,
+                                                   divisor_scale);
     }
     return make_complex_inexact(real, imag);
 }
@@ -1048,6 +1105,10 @@ unsigned prim_abs(unsigned argc, unsigned *argv)
     }
     case BT_BIGNUM: {
         bignum *bn = get_bignum(x);
+        if (!bn) {
+            show_error("abs: invalid bignum");
+            return TOK_ERROR;
+        }
         bignum *result = bn_abs(bn);
         if (!result) {
             show_error("abs: out of memory");

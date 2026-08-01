@@ -45,6 +45,7 @@
 // ============================================================================
 
 #define MAX_EVAL_MACRO_EXPANSION_DEPTH 1000
+#define MAX_QUASIQUOTE_SYNTAX_DEPTH 1024
 
 static void eval_step(void);
 static void apply_cont_step(void);
@@ -71,12 +72,18 @@ void eval_reset_macro_expansion_depth(void)
 // Quasiquote Expansion
 // ============================================================================
 
-static bool qq_syntax_valid(unsigned x, unsigned env, int depth)
+static bool qq_syntax_valid(unsigned x, unsigned env, int depth,
+                            unsigned structural_depth)
 {
+    if (structural_depth >= MAX_QUASIQUOTE_SYNTAX_DEPTH) {
+        show_error("quasiquote: template nesting too deep");
+        return false;
+    }
     if (IS_VECTOR(x)) {
         unsigned len = vector_len(x);
         for (unsigned i = 0; i < len; i++) {
-            if (!qq_syntax_valid(vector_data_ptr(x)[i], env, depth))
+            if (!qq_syntax_valid(vector_data_ptr(x)[i], env, depth,
+                                 structural_depth + 1))
                 return false;
         }
         return true;
@@ -84,6 +91,10 @@ static bool qq_syntax_valid(unsigned x, unsigned env, int depth)
 
     if (!IS_PAIR(x))
         return true;
+    if (pair_chain_is_circular(x)) {
+        show_error("quasiquote: circular template");
+        return false;
+    }
 
     unsigned head = car(x);
     if (IS_KEYWORD(head, ctx.kw_unquote) &&
@@ -92,7 +103,8 @@ static bool qq_syntax_valid(unsigned x, unsigned env, int depth)
             return false;
         if (depth == 1)
             return true;
-        return qq_syntax_valid(cadr(x), env, depth - 1);
+        return qq_syntax_valid(cadr(x), env, depth - 1,
+                               structural_depth + 1);
     }
     if (IS_KEYWORD(head, ctx.kw_unquote_splicing) &&
         !is_keyword_shadowed(ctx.kw_unquote_splicing, env)) {
@@ -100,20 +112,22 @@ static bool qq_syntax_valid(unsigned x, unsigned env, int depth)
             return false;
         if (depth == 1)
             return true;
-        return qq_syntax_valid(cadr(x), env, depth - 1);
+        return qq_syntax_valid(cadr(x), env, depth - 1,
+                               structural_depth + 1);
     }
     if (IS_KEYWORD(head, ctx.kw_quasiquote) &&
         !is_keyword_shadowed(ctx.kw_quasiquote, env)) {
         return syntax_arity_checked(x, 1, 1, "quasiquote") &&
-               qq_syntax_valid(cadr(x), env, depth + 1);
+               qq_syntax_valid(cadr(x), env, depth + 1,
+                               structural_depth + 1);
     }
 
     unsigned l = x;
     for (; IS_PAIR(l); l = cdr(l)) {
-        if (!qq_syntax_valid(car(l), env, depth))
+        if (!qq_syntax_valid(car(l), env, depth, structural_depth + 1))
             return false;
     }
-    if (l && !qq_syntax_valid(l, env, depth))
+    if (l && !qq_syntax_valid(l, env, depth, structural_depth + 1))
         return false;
 
     return true;
@@ -223,12 +237,12 @@ static unsigned qq_expand_depth(unsigned x, unsigned env, int depth)
                     return spliced;
                 }
                 gc_protect(&spliced);
+                if (!list_length_checked(spliced, NULL,
+                                         "unquote-splicing")) {
+                    return TOK_ERROR;
+                }
                 for (; IS_PAIR(spliced); spliced = cdr(spliced)) {
                     list_append(&result, &tail, car(spliced));
-                }
-                if (spliced) {
-                    show_error("unquote-splicing: expected proper list");
-                    return TOK_ERROR;
                 }
                 gc_unprotect(1); // spliced - per-iteration cleanup
             } else {
@@ -266,7 +280,7 @@ static unsigned qq_expand_depth(unsigned x, unsigned env, int depth)
 
 unsigned qq_expand_cps(unsigned x, unsigned env)
 {
-    if (!qq_syntax_valid(x, env, 1))
+    if (!qq_syntax_valid(x, env, 1, 0))
         return TOK_ERROR;
     return qq_expand_depth(x, env, 1);
 }
@@ -455,6 +469,14 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
             }
             // args is now the last element, car(args) is the final list
             proc_args = car(args);
+            // Every apply target, including a continuation, must receive a
+            // proper argument list.  Builtins and closures validate this
+            // later, but continuations otherwise turn a cyclic list into an
+            // invalid multiple-values object.
+            if (!list_length_checked(proc_args, NULL, "apply")) {
+                tramp_error();
+                return;
+            }
 
             // Prepend the reversed prefix to proc_args
             while (prefix) {

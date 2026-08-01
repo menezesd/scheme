@@ -200,6 +200,7 @@ unsigned *vector_data_ptr(unsigned vec);
 // Validate malloc-backed vector and bytevector payloads before walking them.
 bool vector_data_well_formed(const vector_data *vd);
 bool bytevec_data_well_formed(const bytevec_data *bv);
+bool atom_is_valid(unsigned atom);
 
 // ============================================================================
 // Continuation Helpers
@@ -292,6 +293,9 @@ bool list_length_checked(unsigned lst, unsigned *len_out, const char *name);
 
 // Check whether a value is a proper list without reporting an error.
 bool proper_list_silent(unsigned x);
+
+// Check whether following a pair's CDR chain would loop.
+bool pair_chain_is_circular(unsigned x);
 
 // Validate proper-list arity for special forms.
 bool syntax_arity_checked(unsigned form, unsigned min_args, unsigned max_args,

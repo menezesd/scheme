@@ -184,7 +184,16 @@ static bool vm_instruction_starts_at(const code_object *code, unsigned target)
 
 static bool vm_code_is_well_formed(const code_object *code)
 {
-    if (!code || !code->code || code->code_len == 0)
+    // Code objects are GC-managed and their backing arrays are only valid
+    // while the object remains registered.  Check the metadata before
+    // inspecting any array so malformed C API inputs cannot cause an
+    // out-of-bounds access below.
+    if (!code || !code_object_is_registered(code) || !code->code ||
+        code->code_len == 0 || code->code_len > code->code_cap ||
+        code->const_len > code->const_cap ||
+        code->children_len > code->children_cap ||
+        (code->const_len != 0 && !code->constants) ||
+        (code->children_len != 0 && !code->children))
         return false;
     for (unsigned i = 0; i < code->code_len;) {
         unsigned op = code->code[i];
@@ -315,7 +324,7 @@ static unsigned vm_store_bignum_neg(vm_state *vm, const bignum *bn,
 
 #define VM_CHECK_TYPE(vm, val, expected_type, msg)                             \
     do {                                                                       \
-        if (IS_FIXNUM(val) || CELL_TYPE(val) != (expected_type))               \
+        if (!IS_CELL(val) || CELL_TYPE(val) != (expected_type))                \
             VM_ERROR_BREAK(vm, msg);                                           \
     } while (0)
 
@@ -818,50 +827,80 @@ static void restore_continuation(vm_state *vm, unsigned cont_cell,
         VM_ERROR(vm, "restore_continuation: missing stack");
         return;
     }
+    if (cont->bp > cont->sp) {
+        VM_ERROR(vm, "restore_continuation: invalid base pointer");
+        return;
+    }
     if (cont->fp > 0 && !cont->frames) {
         VM_ERROR(vm, "restore_continuation: missing frames");
         return;
     }
-
-    // Restore letrec values if this continuation has them saved
-    // This must happen before restoring the environment
-    if (cont->letrec_saved && cont->letrec_saved_len > 0 && cont->letrec_frame) {
-        if (!IS_PAIR(cont->letrec_frame) || !IS_PAIR(car(cont->letrec_frame))) {
-            VM_ERROR(vm, "restore_continuation: invalid letrec frame");
+    for (unsigned i = 0; i < cont->fp; i++) {
+        vm_frame *frame = &cont->frames[i];
+        if (!vm_code_is_well_formed(frame->code) ||
+            !vm_instruction_starts_at(frame->code, frame->ip) ||
+            frame->bp > frame->sp || frame->sp > cont->sp) {
+            VM_ERROR(vm, "restore_continuation: invalid frame state");
             return;
-        }
-        unsigned frame = car(cont->letrec_frame);
-        unsigned vals = cdr(frame);
-
-        // Restore the saved values to the frame
-        for (unsigned i = 0; i < cont->letrec_saved_len && vals;
-             i++, vals = cdr(vals)) {
-            if (!IS_PAIR(vals)) {
-                VM_ERROR(vm, "restore_continuation: invalid letrec values");
-                return;
-            }
-            cell_set_car(vals, cont->letrec_saved[i]);
         }
     }
 
-    // Restore stack (with return value on top)
+    // Complete any fallible storage growth before restoring mutable letrec
+    // bindings, so a failed restore has no partial semantic side effects.
     if (vm->stack_cap < cont->sp + 1) {
         unsigned new_cap = cont->sp + 1;
         if (!vm_resize_stack(vm, new_cap,
                              "restore_continuation: stack realloc failed"))
             return;
     }
-    memcpy(vm->stack, cont->stack, cont->sp * sizeof(unsigned));
-    vm->sp = cont->sp;
-    vm->stack[vm->sp++] = value; // Push return value
-
-    // Restore frames
     if (vm->frames_cap < cont->fp) {
         unsigned new_cap = cont->fp;
         if (!vm_resize_frames(vm, new_cap,
                               "restore_continuation: frames realloc failed"))
             return;
     }
+
+    if (cont->letrec_saved_len > VM_MAX_STACK_SIZE ||
+        (cont->letrec_saved_len > 0 && !cont->letrec_saved)) {
+        VM_ERROR(vm, "restore_continuation: invalid letrec values");
+        return;
+    }
+
+    // Validate the whole binding list before modifying it.  A malformed
+    // continuation must not restore only a prefix of its saved letrec values.
+    if (cont->letrec_saved_len > 0) {
+        if (!cont->letrec_frame) {
+            VM_ERROR(vm, "restore_continuation: invalid letrec frame");
+            return;
+        }
+        if (!IS_PAIR(cont->letrec_frame) || !IS_PAIR(car(cont->letrec_frame))) {
+            VM_ERROR(vm, "restore_continuation: invalid letrec frame");
+            return;
+        }
+        unsigned frame = car(cont->letrec_frame);
+        unsigned vals = cdr(frame);
+        for (unsigned i = 0; i < cont->letrec_saved_len; i++) {
+            if (!IS_PAIR(vals)) {
+                VM_ERROR(vm, "restore_continuation: invalid letrec values");
+                return;
+            }
+            vals = cdr(vals);
+        }
+
+        // This must happen before restoring the environment.
+        vals = cdr(frame);
+        for (unsigned i = 0; i < cont->letrec_saved_len;
+             i++, vals = cdr(vals)) {
+            cell_set_car(vals, cont->letrec_saved[i]);
+        }
+    }
+
+    // Restore stack (with return value on top)
+    memcpy(vm->stack, cont->stack, cont->sp * sizeof(unsigned));
+    vm->sp = cont->sp;
+    vm->stack[vm->sp++] = value; // Push return value
+
+    // Restore frames
     memcpy(vm->frames, cont->frames, cont->fp * sizeof(vm_frame));
     vm->fp = cont->fp;
 
@@ -901,6 +940,23 @@ static bool vm_push_arg(vm_state *vm, unsigned val, unsigned *argc)
     if (vm->error)
         return false;
     (*argc)++;
+    return true;
+}
+
+// Multiple values are represented as a proper list.  Validate that invariant
+// before walking it so malformed external payloads cannot trap the VM in a
+// circular traversal while dispatching call-with-values.
+static bool vm_push_multiple_values(vm_state *vm, unsigned values,
+                                    unsigned *argc)
+{
+    if (!list_length_checked(values, NULL, "call-with-values")) {
+        VM_ERROR(vm, "call-with-values: invalid multiple values");
+        return false;
+    }
+    for (; values; values = cdr(values)) {
+        if (!vm_push_arg(vm, car(values), argc))
+            return false;
+    }
     return true;
 }
 
@@ -1249,10 +1305,6 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
 unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
 {
     LISP_ASSERT_MSG(vm != NULL, "vm_run: null vm");
-    LISP_ASSERT_MSG(code != NULL, "vm_run: null code object");
-    LISP_ASSERT_MSG(code->code != NULL, "vm_run: null bytecode array");
-    LISP_ASSERT_FMT(code->code_len > 0, "vm_run: empty bytecode (len=%u)",
-                    code->code_len);
     if (!vm_code_is_well_formed(code)) {
         vm->error = true;
         vm->error_msg = "invalid bytecode";
@@ -1377,6 +1429,8 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
         case OP_DEFINE: {
             int64_t sym_id = vm->code->code[vm->ip++];
             unsigned val = vm_pop(vm);
+            if (vm->error)
+                break;
             val = ensure_boxed(val);
             // Protect val before alloc() which can trigger GC
             gc_protect(&val);
@@ -1385,7 +1439,10 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             CELL_TYPE(atom) = BT_ATOM;
             CELL_ID(atom) = sym_id;
             gc_protect(&atom);
-            defvar(atom, val, vm->env);
+            if (defvar(atom, val, vm->env) == TOK_ERROR) {
+                gc_unprotect(2);
+                VM_ERROR_BREAK(vm, "define: invalid environment");
+            }
             gc_unprotect(2);
             break;
         }
@@ -1408,13 +1465,16 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             gc_protect(&target);
             CELL_TYPE(target) = BT_ATOM;
             CELL_ID(target) = target_id;
-            defvar_alias(alias, target, target_cell, vm->env);
+            if (defvar_alias(alias, target, target_cell, vm->env) == TOK_ERROR)
+                VM_ERROR(vm, "define-alias: invalid environment");
             break;
         }
 
         case OP_SET: {
             int64_t sym_id = vm->code->code[vm->ip++];
             unsigned val = vm_pop(vm);
+            if (vm->error)
+                break;
             val = ensure_boxed(val);
             unsigned result = setvar(sym_id, val, vm->env);
             if (result == TOK_ERROR) {
@@ -1429,6 +1489,8 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             // SET + POP fused: set variable, discard old value (no push)
             int64_t sym_id = vm->code->code[vm->ip++];
             unsigned val = vm_pop(vm);
+            if (vm->error)
+                break;
             val = ensure_boxed(val);
             unsigned result = setvar(sym_id, val, vm->env);
             if (result == TOK_ERROR) {
@@ -1691,12 +1753,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 if (IS_MULTIVAL(result)) {
                     unsigned vals = car(result);
                     unsigned consumer_argc = 0;
-                    FORLIST(v, vals)
-                    {
-                        if (!vm_push_arg(vm, car(v), &consumer_argc))
-                            break;
-                    }
-                    if (vm->error)
+                    if (!vm_push_multiple_values(vm, vals, &consumer_argc))
                         break;
                     vm_apply(vm, consumer, consumer_argc, false);
                 } else {
@@ -1862,12 +1919,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             if (IS_MULTIVAL(result)) {
                 unsigned vals = car(result);
                 unsigned argc = 0;
-                FORLIST(v, vals)
-                {
-                    if (!vm_push_arg(vm, car(v), &argc))
-                        break;
-                }
-                if (vm->error)
+                if (!vm_push_multiple_values(vm, vals, &argc))
                     break;
                 vm_apply(vm, consumer, argc, false);
             } else {
@@ -1904,7 +1956,10 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             CELL_TYPE(atom) = BT_ATOM;
             CELL_ID(atom) = sym_id;
             gc_protect(&atom);
-            defvar(atom, transformer, vm->env);
+            if (defvar(atom, transformer, vm->env) == TOK_ERROR) {
+                gc_unprotect(3);
+                VM_ERROR_BREAK(vm, "define-syntax: invalid environment");
+            }
             gc_unprotect(3);
             break;
         }
@@ -3089,7 +3144,12 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                     vm_push(vm, result);
                 }
             } else {
-                vm_push(vm, vm_apply_with_one(n, prim_plus));
+                unsigned result = vm_apply_with_one(n, prim_plus);
+                if (result == TOK_ERROR) {
+                    VM_ERROR_BREAK(vm, ctx.last_error[0] ? ctx.last_error
+                                                         : "add1 failed");
+                }
+                vm_push(vm, result);
             }
             break;
         }
@@ -3123,7 +3183,12 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                     vm_push(vm, result);
                 }
             } else {
-                vm_push(vm, vm_apply_with_one(n, prim_minus));
+                unsigned result = vm_apply_with_one(n, prim_minus);
+                if (result == TOK_ERROR) {
+                    VM_ERROR_BREAK(vm, ctx.last_error[0] ? ctx.last_error
+                                                         : "sub1 failed");
+                }
+                vm_push(vm, result);
             }
             break;
         }

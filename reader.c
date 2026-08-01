@@ -10,7 +10,7 @@
  * - Strings: with escape sequences (\n, \t, \\, \")
  * - Characters: #\a, #\space, #\newline, #\tab
  * - Symbols: case-insensitive, interned for fast comparison
- * - Booleans: #t, #f
+ * - Booleans: #t, #f, #true, #false
  * - Vectors: #(1 2 3)
  *
  * ## Special Syntax
@@ -45,6 +45,7 @@ static const char *reader_filename = "<stdin>";
 static bool reader_fold_case = true;
 
 #define READER_PUSHBACK_CAP 16
+#define READER_MAX_OBJECT_DEPTH 1024
 
 typedef struct {
     int c;
@@ -75,6 +76,16 @@ static void reader_record_history(reader_char_state state)
         reader_history_len--;
     }
     reader_history[reader_history_len++] = state;
+}
+
+static void saved_reader_record_history(reader_char_state state)
+{
+    if (saved_history_len == READER_PUSHBACK_CAP) {
+        memmove(saved_history, saved_history + 1,
+                (READER_PUSHBACK_CAP - 1) * sizeof(saved_history[0]));
+        saved_history_len--;
+    }
+    saved_history[saved_history_len++] = state;
 }
 
 static void advance_position_for_char(int c, int *line, int *col)
@@ -226,11 +237,12 @@ static void reader_ungetc(int c)
         return;
     }
 
-    reader_char_state state = reader_history[--reader_history_len];
+    reader_char_state state = reader_history[reader_history_len - 1];
     if (state.c != c) {
         show_error("reader: pushback order mismatch");
         return;
     }
+    reader_history_len--;
     reader_pushback[reader_pushback_len++] = state;
     reader_line = state.line_before;
     reader_col = state.col_before;
@@ -300,7 +312,11 @@ static void sb_init(string_buffer *sb)
 
 static void sb_append(string_buffer *sb, int ch)
 {
-    if (sb->len + 1 >= sb->cap) {
+    size_t needed;
+    if (!checked_add_size(sb->len, 2, &needed)) {
+        lisp_panic("string buffer too large");
+    }
+    if (needed > sb->cap) {
         size_t new_cap;
         if (!checked_grow_capacity_size(sb->cap, 1, &new_cap)) {
             lisp_panic("string buffer too large");
@@ -529,6 +545,11 @@ static bool read_reader_directive(void)
     sb_init(&sb);
     int c = reader_getchar();
     while (!is_delimiter(c)) {
+        if (c == 0) {
+            show_error("reader directive: invalid null character");
+            sb_free(&sb);
+            return false;
+        }
         sb_append(&sb, c);
         c = reader_getchar();
     }
@@ -804,9 +825,16 @@ static unsigned read_exact_decimal_number(const char *s, bool *handled)
         return TOK_ERROR;
     }
 
-    int64_t scale = frac_digits - exponent;
+    int64_t scale;
+    if (__builtin_sub_overflow(frac_digits, exponent, &scale)) {
+        bn_free(num);
+        show_error("exact decimal literal: exponent too large");
+        return TOK_ERROR;
+    }
     if (scale <= 0) {
-        uint64_t mul_exp = (uint64_t)(-scale);
+        // Avoid undefined signed negation when scale is INT64_MIN.  The
+        // two-step form represents its magnitude exactly in uint64_t.
+        uint64_t mul_exp = (uint64_t)(-(scale + 1)) + 1;
         bignum *factor = reader_pow10(mul_exp);
         if (!factor) {
             bn_free(num);
@@ -853,7 +881,6 @@ static unsigned read_prefixed_number(int prefix)
     if (c == '#') {
         int second = reader_getchar();
         if (!have_radix && prefix_radix(second, &base)) {
-            have_radix = true;
             c = reader_getchar();
         } else if (have_radix && exactness == READER_EXACTNESS_UNSPECIFIED &&
                    prefix_exactness(second, &exactness)) {
@@ -878,6 +905,11 @@ static unsigned read_prefixed_number(int prefix)
         if (neg)
             sb_append(&sb, '-');
         while (!is_delimiter(c)) {
+            if (c == 0) {
+                show_error("null character in numeric literal");
+                sb_free(&sb);
+                return TOK_ERROR;
+            }
             sb_append(&sb, c);
             c = reader_getchar();
         }
@@ -957,6 +989,39 @@ static inline bool is_delimiter(int c)
 static inline bool is_ascii_alpha(int c)
 {
     return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+}
+
+/* Read the part following the initial t or f in a boolean literal.  The
+ * short spellings (#t and #f) and their long aliases must both end at a
+ * delimiter so that, for example, #truex is not accepted as #true followed
+ * by a symbol. */
+static unsigned read_boolean_literal(bool truth)
+{
+    const char *suffix = truth ? "rue" : "alse";
+    int c = reader_getchar();
+
+    if (is_delimiter(c)) {
+        reader_ungetc(c);
+        return truth ? ctx.atom_true : ctx.atom_false;
+    }
+
+    for (size_t i = 0; suffix[i] != '\0'; i++) {
+        if (c == EOF || tolower((unsigned char)c) != suffix[i])
+            goto invalid;
+        c = reader_getchar();
+    }
+
+    if (is_delimiter(c)) {
+        reader_ungetc(c);
+        return truth ? ctx.atom_true : ctx.atom_false;
+    }
+
+invalid:
+    while (!is_delimiter(c))
+        c = reader_getchar();
+    reader_ungetc(c);
+    show_error("invalid boolean literal");
+    return TOK_ERROR;
 }
 
 static bool reject_invalid_prefixed_tail(int c, const char *name)
@@ -1199,6 +1264,11 @@ static unsigned read_string_literal(void)
                 }
             }
         }
+        if (c == 0) {
+            show_error("invalid string character scalar value");
+            sb_free(&sb);
+            return TOK_ERROR;
+        }
         sb_append(&sb, c);
     }
 
@@ -1290,6 +1360,11 @@ static unsigned read_escaped_identifier(void)
                 return TOK_ERROR;
             }
         }
+        if (c == 0) {
+            show_error("escaped identifier: invalid null character");
+            sb_free(&sb);
+            return TOK_ERROR;
+        }
         sb_append(&sb, c);
     }
 
@@ -1314,6 +1389,11 @@ static unsigned read_decimal_number(void)
     while (isdigit(c = reader_getchar()) || c == 'e' || c == 'E' || c == '+' ||
            c == '-') {
         sb_append(&sb, c);
+    }
+    if (c == 0) {
+        show_error("null character in numeric literal");
+        sb_free(&sb);
+        return TOK_ERROR;
     }
     reader_ungetc(c);
 
@@ -1400,9 +1480,9 @@ unsigned read_token(void)
             } else if (c == '\\') {
                 return read_character_literal();
             } else if (c == 't' || c == 'T') {
-                return ctx.atom_true;
+                return read_boolean_literal(true);
             } else if (c == 'f' || c == 'F') {
-                return ctx.atom_false;
+                return read_boolean_literal(false);
             } else if (c == 'x' || c == 'X' || c == 'o' || c == 'O' ||
                        c == 'b' || c == 'B' || c == 'd' || c == 'D' ||
                        c == 'e' || c == 'E' || c == 'i' || c == 'I') {
@@ -1459,7 +1539,12 @@ unsigned read_token(void)
                         unsigned i = 0;
                         for (unsigned p = list; p && IS_PAIR(p); p = cdr(p)) {
                             uint8_t byte_value;
-                            read_byte_value(car(p), &byte_value);
+                            if (!read_byte_value(car(p), &byte_value)) {
+                                bytevec_unregister(bv);
+                                free(bv);
+                                show_error("bytevector literal: byte out of range");
+                                return TOK_ERROR;
+                            }
                             bv->data[i++] = byte_value;
                         }
                         unsigned cell = alloc();
@@ -1514,6 +1599,16 @@ unsigned read_token(void)
                         show_error("datum label must be followed by an object");
                         return TOK_ERROR;
                     }
+                    // A bare self-reference has no datum whose structure can
+                    // be filled into the placeholder.  Treating it as the
+                    // placeholder itself used to overwrite that placeholder
+                    // with its initial empty-list contents, silently reading
+                    // #n=#n# as ().  Cycles must be rooted in an actual
+                    // compound datum, such as #n=(x . #n#).
+                    if (datum == placeholder) {
+                        show_error("datum label cannot directly reference itself");
+                        return TOK_ERROR;
+                    }
                     if (!IS_CELL(datum)) {
                         datum_labels[idx].value = datum;
                         return datum;
@@ -1542,6 +1637,10 @@ unsigned read_token(void)
             return read_escaped_identifier();
         default: {
             // Symbol or number
+            if (c == 0) {
+                show_error("null character in token");
+                return TOK_ERROR;
+            }
             string_buffer sb;
             sb_init(&sb);
             bool is_number = isdigit(c) || c == '-' || c == '+';
@@ -1550,6 +1649,11 @@ unsigned read_token(void)
 
             for (;;) {
                 c = reader_getchar();
+                if (c == 0) {
+                    show_error("null character in token");
+                    sb_free(&sb);
+                    return TOK_ERROR;
+                }
                 // Allow . in numbers (for decimals like 1.5)
                 if (c == '.' && is_number) {
                     int c2 = reader_getchar();
@@ -1718,6 +1822,10 @@ static unsigned read_obj_inner(void)
 
 unsigned read_obj(void)
 {
+    if (reader_obj_depth >= READER_MAX_OBJECT_DEPTH) {
+        show_error("reader nesting too deep");
+        return TOK_ERROR;
+    }
     bool outermost = reader_obj_depth == 0;
     reader_obj_depth++;
     unsigned result = read_obj_inner();
@@ -1730,45 +1838,53 @@ unsigned read_obj(void)
 unsigned read_list(void)
 {
     GC_GUARD;
-    unsigned sh = read_obj();
-    unsigned st;
-    gc_protect(&sh);
-    switch (sh) {
-    case TOK_ERROR:
-        return TOK_ERROR;
-    case TOK_CLOSE:
-        return 0;
-    case TOK_DOT:
-        sh = read_obj();
-        switch (sh) {
-        case TOK_ERROR:
+    unsigned head = 0, tail = 0;
+    gc_protect(&head);
+    gc_protect(&tail);
+
+    for (;;) {
+        unsigned item = read_obj();
+        gc_protect(&item);
+        if (item == TOK_ERROR)
             return TOK_ERROR;
-        case TOK_DOT:
-        case TOK_CLOSE:
-            show_error("a dot must be followed by an object");
-            return TOK_ERROR;
-        case TOK_EOF:
-            show_error("unexpected end of file after dot");
-            return TOK_ERROR;
-        }
-        st = read_list();
-        if (st == TOK_ERROR)
-            return TOK_ERROR;
-        if (st != 0) {
-            show_error("only one object may follow a dot");
-            return TOK_ERROR;
-        }
-        return sh;
-    default:
-        if (sh == TOK_EOF) {
+        if (item == TOK_CLOSE)
+            return head;
+        if (item == TOK_EOF) {
             show_error("unexpected end of file in list");
             return TOK_ERROR;
         }
-        st = read_list();
-        if (st == TOK_ERROR)
+        if (item != TOK_DOT) {
+            list_append(&head, &tail, item);
+            gc_unprotect(1);
+            continue;
+        }
+
+        gc_unprotect(1);
+        if (!tail) {
+            show_error("a dot must follow an object");
             return TOK_ERROR;
-        gc_protect(&st);
-        return alloc_cons(sh, st);
+        }
+
+        unsigned rest = read_obj();
+        gc_protect(&rest);
+        if (rest == TOK_ERROR)
+            return TOK_ERROR;
+        if (rest == TOK_DOT || rest == TOK_CLOSE) {
+            show_error("a dot must be followed by an object");
+            return TOK_ERROR;
+        }
+        if (rest == TOK_EOF) {
+            show_error("unexpected end of file after dot");
+            return TOK_ERROR;
+        }
+
+        unsigned end = read_obj();
+        if (end != TOK_CLOSE) {
+            show_error("only one object may follow a dot");
+            return TOK_ERROR;
+        }
+        cell_set_cdr(tail, rest);
+        return head;
     }
 }
 
@@ -1849,16 +1965,45 @@ size_t reader_port_pending_bytes(FILE *port)
 int reader_port_getc(FILE *port)
 {
     if (reader_port == port && reader_pushback_len > 0) {
-        int c = reader_pushback[--reader_pushback_len].c;
+        reader_char_state state = reader_pushback[--reader_pushback_len];
+        int c = state.c;
         advance_position_for_char(c, &reader_line, &reader_col);
+        reader_record_history(state);
         return c;
     }
     if (saved_pushback_port == port && saved_pushback_len > 0) {
-        int c = saved_pushback[--saved_pushback_len].c;
+        reader_char_state state = saved_pushback[--saved_pushback_len];
+        int c = state.c;
         advance_position_for_char(c, &saved_reader_line, &saved_reader_col);
+        saved_reader_record_history(state);
         return c;
     }
-    return fgetc(port);
+
+    int c = fgetc(port);
+    if (c == EOF)
+        return EOF;
+
+    if (reader_port == port) {
+        reader_char_state state = {c, reader_line, reader_col};
+        advance_position_for_char(c, &reader_line, &reader_col);
+        reader_record_history(state);
+        return c;
+    }
+
+    if (saved_pushback_port != port) {
+        saved_pushback_port = port;
+        saved_pushback_pos = -1;
+        saved_reader_line = 1;
+        saved_reader_col = 0;
+        saved_pushback_len = 0;
+        saved_history_len = 0;
+        saved_reader_fold_case = true;
+    }
+    reader_char_state state = {c, saved_reader_line, saved_reader_col};
+    advance_position_for_char(c, &saved_reader_line, &saved_reader_col);
+    saved_reader_record_history(state);
+    saved_pushback_pos = ftell(port);
+    return c;
 }
 
 int reader_port_peekc(FILE *port)
@@ -1872,6 +2017,40 @@ int reader_port_peekc(FILE *port)
     if (c != EOF && ungetc(c, port) == EOF)
         return EOF;
     return c;
+}
+
+bool reader_port_ungetc(FILE *port, int c)
+{
+    if (c == EOF)
+        return true;
+
+    if (reader_port == port) {
+        if (reader_pushback_len >= READER_PUSHBACK_CAP ||
+            reader_history_len == 0)
+            return false;
+        reader_char_state state = reader_history[reader_history_len - 1];
+        if (state.c != c)
+            return false;
+        reader_history_len--;
+        reader_pushback[reader_pushback_len++] = state;
+        reader_line = state.line_before;
+        reader_col = state.col_before;
+        return true;
+    }
+
+    if (saved_pushback_port != port ||
+        saved_pushback_len >= READER_PUSHBACK_CAP ||
+        saved_history_len == 0)
+        return false;
+    reader_char_state state = saved_history[saved_history_len - 1];
+    if (state.c != c)
+        return false;
+    saved_history_len--;
+    saved_pushback[saved_pushback_len++] = state;
+    saved_reader_line = state.line_before;
+    saved_reader_col = state.col_before;
+    saved_pushback_pos = ftell(port);
+    return true;
 }
 
 void reader_forget_port(FILE *port)

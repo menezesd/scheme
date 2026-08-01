@@ -28,6 +28,8 @@ code_object *code_object_registry = NULL;
 // Register a code object with the GC registry
 void code_register(code_object *code)
 {
+    if (!code || code_object_is_registered(code))
+        return;
     code->gc_next = code_object_registry;
     code_object_registry = code;
 }
@@ -43,6 +45,33 @@ static void code_unregister(code_object *code)
         }
         prev = &(*prev)->gc_next;
     }
+}
+
+static bool code_arrays_well_formed(const code_object *code)
+{
+    return code && code->code_len <= code->code_cap &&
+           code->const_len <= code->const_cap &&
+           code->children_len <= code->children_cap &&
+           (code->code_len == 0 || code->code != NULL) &&
+           (code->const_len == 0 || code->constants != NULL) &&
+           (code->children_len == 0 || code->children != NULL);
+}
+
+// A child can be shared by more than one code object (the public code-object
+// API permits DAGs, not just trees).  Only release it once no registered
+// parent still owns a reference to it.
+static bool code_has_registered_parent(const code_object *child)
+{
+    for (code_object *parent = code_object_registry; parent;
+         parent = parent->gc_next) {
+        if (!code_arrays_well_formed(parent))
+            continue;
+        for (unsigned i = 0; i < parent->children_len; i++) {
+            if (parent->children[i] == child)
+                return true;
+        }
+    }
+    return false;
 }
 
 // ============================================================================
@@ -93,11 +122,15 @@ code_object *code_new(void)
 
 void code_free(code_object *code)
 {
-    if (!code)
+    if (!code || !code_object_is_registered(code))
         return;
     code_unregister(code);
-    for (unsigned i = 0; i < code->children_len; i++) {
-        code_free(code->children[i]);
+    if (code->children_len <= code->children_cap && code->children) {
+        for (unsigned i = 0; i < code->children_len; i++) {
+            code_object *child = code->children[i];
+            if (!code_has_registered_parent(child))
+                code_free(child);
+        }
     }
     code_destroy_shallow(code);
 }
@@ -180,10 +213,13 @@ void code_patch(code_object *code, unsigned pos, unsigned val)
 // GC Integration
 // ============================================================================
 
-unsigned gc_collect_code(code_object *code)
+static void gc_collect_code_inner(code_object *code)
 {
-    if (!code)
-        return 0;
+    if (!code || !code_object_is_registered(code) ||
+        !code_arrays_well_formed(code) || code->gc_updating)
+        return;
+
+    code->gc_updating = true;
 
     // Collect constants
     for (unsigned i = 0; i < code->const_len; i++) {
@@ -192,9 +228,18 @@ unsigned gc_collect_code(code_object *code)
 
     // Recursively collect children
     for (unsigned i = 0; i < code->children_len; i++) {
-        gc_collect_code(code->children[i]);
+        gc_collect_code_inner(code->children[i]);
     }
+}
 
+unsigned gc_collect_code(code_object *code)
+{
+    gc_collect_code_inner(code);
+
+    // Clear the temporary traversal marks, including in the unlikely case
+    // that an invalid child graph prevented a normal recursive unwind.
+    for (code_object *it = code_object_registry; it; it = it->gc_next)
+        it->gc_updating = false;
     return 0;
 }
 
@@ -203,6 +248,8 @@ unsigned gc_collect_code(code_object *code)
 void gc_update_all_code_objects(void)
 {
     for (code_object *code = code_object_registry; code; code = code->gc_next) {
+        if (!code_arrays_well_formed(code))
+            continue;
         // Collect constants - the scan phase will then process their CAR/CDR
         for (unsigned i = 0; i < code->const_len; i++) {
             code->constants[i] = collect(code->constants[i]);
@@ -210,10 +257,22 @@ void gc_update_all_code_objects(void)
     }
 }
 
+void minor_gc_update_all_code_objects(void)
+{
+    for (code_object *code = code_object_registry; code; code = code->gc_next) {
+        if (!code_arrays_well_formed(code))
+            continue;
+        for (unsigned i = 0; i < code->const_len; i++) {
+            code->constants[i] = collect_to_old(code->constants[i]);
+        }
+    }
+}
+
 // Mark a code object and all its children as reachable
 static void mark_code_object(code_object *code)
 {
-    if (!code || code->gc_marked)
+    if (!code || !code_object_is_registered(code) ||
+        !code_arrays_well_formed(code) || code->gc_marked)
         return;
     code->gc_marked = true;
     // Mark children recursively

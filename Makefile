@@ -134,10 +134,18 @@ run: $(TARGET)
 
 # Run Scheme tests
 test: $(TARGET)
-	@./$(TARGET) < test.scm 2>&1 | grep -E '(^===|PASS|FAIL|^Tests:|passed|FAILED)'
+	@tmp=$$(mktemp "$${TMPDIR:-/tmp}/vesper-test.XXXXXX") || exit 1; \
+	./$(TARGET) < test.scm >"$$tmp" 2>&1; rc=$$?; \
+	if [ $$rc -ne 0 ]; then cat "$$tmp"; rm -f "$$tmp"; exit $$rc; fi; \
+	grep -E '(^===|PASS|FAIL|^Tests:|passed|FAILED)' "$$tmp"; rc=$$?; \
+	rm -f "$$tmp"; exit $$rc
 
 test-interpreter: $(TARGET)
-	@./$(TARGET) --interpreter < test.scm 2>&1 | grep -E '(^===|PASS|FAIL|^Tests:|passed|FAILED)'
+	@tmp=$$(mktemp "$${TMPDIR:-/tmp}/vesper-test.XXXXXX") || exit 1; \
+	./$(TARGET) --interpreter < test.scm >"$$tmp" 2>&1; rc=$$?; \
+	if [ $$rc -ne 0 ]; then cat "$$tmp"; rm -f "$$tmp"; exit $$rc; fi; \
+	grep -E '(^===|PASS|FAIL|^Tests:|passed|FAILED)' "$$tmp"; rc=$$?; \
+	rm -f "$$tmp"; exit $$rc
 
 # C unit tests
 TEST_SRCS = test_bignum.c test_reader.c test_context.c test_macros.c test_eval.c test_pattern.c test_unicode_norm.c test_unicode_case.c

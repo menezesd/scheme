@@ -84,7 +84,10 @@ void handle_cont_define(unsigned val, unsigned data, unsigned env,
     gc_protect(&data);
     gc_protect(&env);
     gc_protect(&next);
-    defvar(data, val, env);
+    if (defvar(data, val, env) == TOK_ERROR) {
+        tramp_error();
+        return;
+    }
     tramp_apply(data, next);
 }
 
@@ -586,6 +589,10 @@ void handle_cont_callwithvalues(unsigned val, unsigned data, unsigned env,
     // If producer returned multiple values, unpack them
     if (IS_MULTIVAL(val)) {
         consumer_args = CELL_CAR(val);
+        if (!list_length_checked(consumer_args, NULL, "call-with-values")) {
+            tramp_error();
+            return;
+        }
     } else {
         GC_GUARD;
         // Single value - wrap in a list; protect call inputs across alloc

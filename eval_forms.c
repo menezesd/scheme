@@ -208,7 +208,10 @@ bool handle_define(unsigned id, unsigned env, unsigned cont)
         unsigned body_env = alloc_cons(body, env);
         unsigned p = make_typed_cell(BT_FUNCTION, params, body_env);
         gc_protect(&p);
-        defvar(name, p, env);
+        if (defvar(name, p, env) == TOK_ERROR) {
+            tramp_error();
+            return true;
+        }
         tramp_apply(name, cont);
         return true;
     }
@@ -705,7 +708,10 @@ bool handle_define_macro(unsigned id, unsigned env, unsigned cont)
     unsigned mbody_env = alloc_cons(mbody, env);
     unsigned p = make_typed_cell(BT_MACRO, params, mbody_env);
     gc_protect(&p);
-    defvar(name, p, env);
+    if (defvar(name, p, env) == TOK_ERROR) {
+        tramp_error();
+        return true;
+    }
     tramp_apply(name, cont);
     return true;
 }
@@ -739,7 +745,10 @@ bool handle_define_syntax(unsigned id, unsigned env, unsigned cont)
         return true;
     }
     gc_protect(&p);
-    defvar(name, p, env);
+    if (defvar(name, p, env) == TOK_ERROR) {
+        tramp_error();
+        return true;
+    }
     tramp_apply(name, cont);
     return true;
 }

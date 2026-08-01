@@ -208,6 +208,7 @@ TEST(malformed_bignum_payload_is_safe)
     ASSERT(apply_primitive_argv(PMOD, 2, cmp_args) == TOK_ERROR);
     ASSERT(apply_primitive_argv(PQUOTIENT, 2, cmp_args) == TOK_ERROR);
     ASSERT(apply_primitive_argv(PREMAINDER, 2, cmp_args) == TOK_ERROR);
+    ASSERT(apply_primitive_argv(PABS, 1, args) == TOK_ERROR);
 
     CELL_PTR(bad) = (void *)(uintptr_t)1;
     ASSERT(!is_negative_number(bad));
@@ -222,12 +223,66 @@ TEST(malformed_bignum_payload_is_safe)
     ASSERT(apply_primitive_argv(PMOD, 2, cmp_args) == TOK_ERROR);
     ASSERT(apply_primitive_argv(PQUOTIENT, 2, cmp_args) == TOK_ERROR);
     ASSERT(apply_primitive_argv(PREMAINDER, 2, cmp_args) == TOK_ERROR);
+    ASSERT(apply_primitive_argv(PABS, 1, args) == TOK_ERROR);
 
     FILE *mem = tmpfile();
     ASSERT(mem != NULL);
     display_obj_port(bad, mem);
     fclose(mem);
 
+    PASS();
+}
+
+TEST(malformed_symbol_payload_is_safe)
+{
+    unsigned bad = alloc();
+    CELL_TYPE(bad) = BT_ATOM;
+    CELL_ID(bad) = INT64_MAX;
+    ASSERT(!atom_is_valid(bad));
+
+    unsigned args[1] = {bad};
+    ASSERT_EQ(apply_primitive_argv(PSYM2STR, 1, args), TOK_ERROR);
+    ASSERT_EQ(apply_primitive_argv(PEOF, 1, args), ctx.atom_false);
+    ASSERT(!is_eof_object(bad));
+
+    char *buf = NULL;
+    size_t len = 0;
+    FILE *mem = open_memstream(&buf, &len);
+    ASSERT(mem != NULL);
+    write_obj_port(bad, mem);
+    fclose(mem);
+    ASSERT_STR_EQ(buf, "[invalid-symbol]");
+    free(buf);
+    PASS();
+}
+
+TEST(out_of_range_value_is_not_a_cell)
+{
+    unsigned bad = 2u * SEMISPACE_SIZE;
+    ASSERT(!IS_CELL(bad));
+    ASSERT(!IS_PAIR(bad));
+    ASSERT(!IS_ATOM(bad));
+    ASSERT(!is_numeric(bad));
+
+    unsigned args[1] = {bad};
+    ASSERT_EQ(apply_primitive_argv(PNUMP, 1, args), ctx.atom_false);
+    ASSERT_EQ(apply_primitive_argv(PPROCP, 1, args), ctx.atom_false);
+    ASSERT_EQ(collect(bad), bad);
+    ASSERT_EQ(collect_to_old(bad), bad);
+    PASS();
+}
+
+TEST(equal_hash_table_handles_cyclic_numeric_payload)
+{
+    unsigned cyclic = alloc();
+    CELL_TYPE(cyclic) = BT_RATIONAL;
+    CELL_CAR(cyclic) = cyclic;
+    CELL_CDR(cyclic) = store(1);
+
+    unsigned table = apply_primitive_argv(PMAKEEQUALHASHTABLE, 0, NULL);
+    ASSERT(IS_HASHTABLE(table));
+    unsigned args[3] = {table, cyclic, store(1)};
+    ASSERT_EQ(apply_primitive_argv(PHASHTABLESET, 3, args), 0);
     PASS();
 }
 
@@ -412,6 +467,22 @@ TEST(writer_handles_direct_fixnum)
     PASS();
 }
 
+TEST(writer_handles_out_of_range_value)
+{
+    unsigned bad = 2u * SEMISPACE_SIZE;
+    char *buf = NULL;
+    size_t len = 0;
+    FILE *mem = open_memstream(&buf, &len);
+    ASSERT(mem != NULL);
+
+    write_obj_port(bad, mem);
+    fclose(mem);
+    ASSERT_STR_EQ(buf, "[invalid-value]");
+    ASSERT_STR_EQ(type_name(bad), "invalid-value");
+    free(buf);
+    PASS();
+}
+
 TEST(writer_handles_vector_containing_direct_fixnum)
 {
     unsigned v = make_vector(2, MAKE_FIXNUM(7));
@@ -441,6 +512,45 @@ TEST(writer_handles_vm_continuation)
     write_obj_port(cont, mem);
     fclose(mem);
     ASSERT_STR_EQ(buf, "[continuation]");
+    free(buf);
+    PASS();
+}
+
+TEST(writer_handles_malformed_multiple_values)
+{
+    unsigned values = alloc_cons(store(1), 0);
+    cell_set_cdr(values, values);
+    unsigned multi = alloc();
+    CELL_TYPE(multi) = BT_MULTIVAL;
+    CELL_CAR(multi) = values;
+
+    char *buf = NULL;
+    size_t len = 0;
+    FILE *mem = open_memstream(&buf, &len);
+    ASSERT(mem != NULL);
+
+    write_obj_port(multi, mem);
+    fclose(mem);
+    ASSERT_STR_EQ(buf, "[invalid-values]");
+    free(buf);
+    PASS();
+}
+
+TEST(writer_handles_cyclic_numeric_payload)
+{
+    unsigned bad = alloc();
+    CELL_TYPE(bad) = BT_RATIONAL;
+    CELL_CAR(bad) = bad;
+    CELL_CDR(bad) = store(1);
+
+    char *buf = NULL;
+    size_t len = 0;
+    FILE *mem = open_memstream(&buf, &len);
+    ASSERT(mem != NULL);
+
+    write_obj_port(bad, mem);
+    fclose(mem);
+    ASSERT_STR_EQ(buf, "[invalid-number]");
     free(buf);
     PASS();
 }
@@ -570,6 +680,36 @@ TEST(write_simple_rejects_cycles)
     PASS();
 }
 
+TEST(write_simple_rejects_cycle_after_tracking_table_exhaustion)
+{
+    unsigned head = 0;
+    unsigned tail = 0;
+    for (unsigned i = 0; i < 8300; i++)
+        list_append(&head, &tail, MAKE_FIXNUM((int)i));
+    cell_set_cdr(tail, tail);
+
+    FILE *mem = tmpfile();
+    ASSERT(mem != NULL);
+    ASSERT(!write_simple_obj_port_checked(head, mem));
+    fclose(mem);
+    PASS();
+}
+
+TEST(write_shared_handles_cycle_after_tracking_table_exhaustion)
+{
+    unsigned head = 0;
+    unsigned tail = 0;
+    for (unsigned i = 0; i < 8300; i++)
+        list_append(&head, &tail, MAKE_FIXNUM((int)i));
+    cell_set_cdr(tail, tail);
+
+    FILE *mem = tmpfile();
+    ASSERT(mem != NULL);
+    write_shared_obj_port(head, mem);
+    fclose(mem);
+    PASS();
+}
+
 TEST(string_port_write_failures_return_false)
 {
     string_port *sp = strport_new();
@@ -608,6 +748,23 @@ TEST(list_length_empty)
 TEST(list_length_non_pair_is_zero)
 {
     ASSERT_EQ(list_length(MAKE_FIXNUM(42)), 0);
+    PASS();
+}
+
+TEST(proper_list_silent_rejects_circular_list)
+{
+    unsigned cycle = alloc_cons(MAKE_FIXNUM(1), 0);
+    cell_set_cdr(cycle, cycle);
+    ASSERT(!proper_list_silent(cycle));
+    PASS();
+}
+
+TEST(last_pair_rejects_circular_list)
+{
+    unsigned cycle = alloc_cons(MAKE_FIXNUM(1), 0);
+    cell_set_cdr(cycle, cycle);
+    unsigned args[1] = {cycle};
+    ASSERT_EQ(apply_primitive_argv(PLASTPAIR, 1, args), TOK_ERROR);
     PASS();
 }
 
@@ -950,6 +1107,10 @@ TEST(random_seed_rejects_malformed_bignum)
     ASSERT_EQ(apply_primitive_argv(PRANDOMSEED, 1, args), TOK_ERROR);
     CELL_PTR(bad) = (void *)(uintptr_t)1;
     ASSERT_EQ(apply_primitive_argv(PRANDOMSEED, 1, args), TOK_ERROR);
+    args[0] = ctx.atom_true;
+    ASSERT_EQ(apply_primitive_argv(PRANDOMSEED, 1, args), TOK_ERROR);
+    args[0] = store_inexact(1.5);
+    ASSERT_EQ(apply_primitive_argv(PRANDOMSEED, 1, args), TOK_ERROR);
     PASS();
 }
 
@@ -1058,6 +1219,21 @@ TEST(deep_equal_lists)
     PASS();
 }
 
+TEST(deep_equal_handles_large_lists_without_recursion)
+{
+    const unsigned count = 100000;
+    GC_GUARD;
+    unsigned left = 0, right = 0;
+    gc_protect(&left);
+    gc_protect(&right);
+    for (unsigned i = 0; i < count; i++) {
+        left = alloc_cons(MAKE_FIXNUM(i), left);
+        right = alloc_cons(MAKE_FIXNUM(i), right);
+    }
+    ASSERT(deep_equal(left, right));
+    PASS();
+}
+
 TEST(deep_equal_nested)
 {
     unsigned inner1 = alloc_cons(store(1), alloc_cons(store(2), 0));
@@ -1101,6 +1277,79 @@ TEST(code_free_unregisters_tree)
         ASSERT(code != parent);
         ASSERT(code != child);
     }
+    PASS();
+}
+
+TEST(code_register_is_idempotent)
+{
+    code_object *code = code_new();
+    ASSERT(code != NULL);
+    code_register(code);
+    code_free(code);
+    ASSERT(!code_object_is_registered(code));
+    PASS();
+}
+
+TEST(gc_collect_code_handles_cyclic_children)
+{
+    code_object *code = code_new();
+    ASSERT(code != NULL);
+    code_add_child(code, code);
+
+    ASSERT_EQ(gc_collect_code(code), 0);
+    code_free(code);
+    ASSERT(!code_object_is_registered(code));
+    PASS();
+}
+
+TEST(minor_gc_code_update_ignores_inconsistent_storage_metadata)
+{
+    code_object *code = code_new();
+    ASSERT(code != NULL);
+
+    unsigned saved_const_len = code->const_len;
+    code->const_len = code->const_cap + 1;
+    minor_gc_update_all_code_objects();
+    code->const_len = saved_const_len;
+
+    code_free(code);
+    PASS();
+}
+
+TEST(code_free_handles_cyclic_and_duplicate_children)
+{
+    code_object *parent = code_new();
+    code_object *child = code_new();
+    ASSERT(parent != NULL);
+    ASSERT(child != NULL);
+
+    code_add_child(parent, parent);
+    code_add_child(parent, child);
+    code_add_child(parent, child);
+    code_free(parent);
+
+    ASSERT(!code_object_is_registered(parent));
+    ASSERT(!code_object_is_registered(child));
+    PASS();
+}
+
+TEST(code_free_preserves_shared_child)
+{
+    code_object *left = code_new();
+    code_object *right = code_new();
+    code_object *child = code_new();
+    ASSERT(left != NULL && right != NULL && child != NULL);
+
+    code_add_child(left, child);
+    code_add_child(right, child);
+    code_free(left);
+
+    ASSERT(!code_object_is_registered(left));
+    ASSERT(code_object_is_registered(right));
+    ASSERT(code_object_is_registered(child));
+
+    code_free(right);
+    ASSERT(!code_object_is_registered(child));
     PASS();
 }
 
@@ -1190,6 +1439,21 @@ TEST(code_sweep_ignores_unregistered_vm_continuation_pointer)
     ASSERT(!code_registry_contains(unreferenced));
     CELL_TYPE(cont_cell) = BT_FREE;
     CELL_PTR(cont_cell) = NULL;
+    PASS();
+}
+
+TEST(gc_ignores_unregistered_vm_continuation_payload)
+{
+    unsigned cont_cell = alloc();
+    CELL_TYPE(cont_cell) = BT_VMCONT;
+    CELL_PTR(cont_cell) = (void *)(uintptr_t)1;
+
+    unsigned preserved = gc(cont_cell);
+    ASSERT(CELL_TYPE(preserved) == BT_VMCONT);
+    ASSERT(CELL_PTR(preserved) == (void *)(uintptr_t)1);
+
+    CELL_TYPE(preserved) = BT_FREE;
+    CELL_PTR(preserved) = NULL;
     PASS();
 }
 
@@ -1285,6 +1549,39 @@ TEST(peephole_optimize_ignores_truncated_child_instruction)
     PASS();
 }
 
+TEST(peephole_optimize_handles_cyclic_children)
+{
+    code_object *code = code_new();
+    ASSERT(code != NULL);
+    code_emit(code, OP_CONST);
+    code_emit(code, 0);
+    code_emit(code, OP_HALT);
+    code_add_child(code, code);
+
+    peephole_optimize(code);
+
+    ASSERT(!code->optimizing);
+    ASSERT_EQ(code->code_len, 3);
+    ASSERT_EQ(code->code[0], OP_CONST);
+    ASSERT_EQ(code->code[2], OP_HALT);
+    code_free(code);
+    PASS();
+}
+
+TEST(disassemble_handles_cyclic_children)
+{
+    code_object *code = code_new();
+    ASSERT(code != NULL);
+    code_emit(code, OP_HALT);
+    code_add_child(code, code);
+
+    disassemble(code, "cyclic-code");
+
+    ASSERT(!code->disassembling);
+    code_free(code);
+    PASS();
+}
+
 TEST(peephole_optimize_does_not_thread_into_operand)
 {
     code_object *code = code_new();
@@ -1319,6 +1616,35 @@ TEST(vm_run_rejects_truncated_bytecode)
 
     ASSERT_EQ(result, TOK_ERROR);
     code_free(code);
+    PASS();
+}
+
+TEST(vm_run_rejects_inconsistent_code_storage_metadata)
+{
+    code_object *code = code_new();
+    ASSERT(code != NULL);
+    code_emit(code, OP_HALT);
+
+    unsigned saved_children_len = code->children_len;
+    code->children_len = code->children_cap + 1;
+
+    vm_state vm;
+    vm_init(&vm);
+    unsigned result = vm_run(&vm, code, empty_environment());
+    vm_free(&vm);
+
+    code->children_len = saved_children_len;
+    ASSERT_EQ(result, TOK_ERROR);
+
+    unsigned *saved_code = code->code;
+    code->code = NULL;
+    vm_init(&vm);
+    result = vm_run(&vm, code, empty_environment());
+    vm_free(&vm);
+    code->code = saved_code;
+
+    code_free(code);
+    ASSERT_EQ(result, TOK_ERROR);
     PASS();
 }
 
@@ -1412,6 +1738,40 @@ TEST(vm_run_rejects_primitive_stack_underflow)
 
     ASSERT_EQ(result, TOK_ERROR);
     code_free(code);
+    PASS();
+}
+
+TEST(vm_stack_underflow_does_not_mutate_environment)
+{
+    unsigned env = empty_environment();
+    unsigned existing = atom_from_string("underflow-existing");
+    unsigned new_name = atom_from_string("underflow-new");
+    defvar(existing, store(17), env);
+
+    code_object *set_code = code_new();
+    ASSERT(set_code != NULL);
+    code_emit(set_code, OP_SET);
+    code_emit(set_code, (unsigned)CELL_ID(existing));
+    code_emit(set_code, OP_HALT);
+
+    vm_state vm;
+    vm_init(&vm);
+    ASSERT_EQ(vm_run(&vm, set_code, env), TOK_ERROR);
+    vm_free(&vm);
+    ASSERT_EQ(CELL_ID(lookup(CELL_ID(existing), env)), 17);
+    code_free(set_code);
+
+    code_object *define_code = code_new();
+    ASSERT(define_code != NULL);
+    code_emit(define_code, OP_DEFINE);
+    code_emit(define_code, (unsigned)CELL_ID(new_name));
+    code_emit(define_code, OP_HALT);
+
+    vm_init(&vm);
+    ASSERT_EQ(vm_run(&vm, define_code, env), TOK_ERROR);
+    vm_free(&vm);
+    ASSERT_EQ(lookup(CELL_ID(new_name), env), TOK_ERROR);
+    code_free(define_code);
     PASS();
 }
 
@@ -1774,6 +2134,84 @@ TEST(vm_continuation_rejects_oversized_stack)
     PASS();
 }
 
+TEST(vm_continuation_rejects_invalid_base_pointer)
+{
+    code_object *restore_code = code_new();
+    ASSERT(restore_code != NULL);
+    code_emit(restore_code, OP_RETURN_LOCALS);
+    code_emit(restore_code, 0);
+
+    unsigned cont_cell = alloc();
+    vm_continuation *cont = checked_calloc_array(1, sizeof(vm_continuation));
+    ASSERT(cont != NULL);
+    cont->bp = UINT_MAX;
+    cont->code = restore_code;
+    cont->ip = 0;
+    vm_continuation_register(cont);
+    CELL_TYPE(cont_cell) = BT_VMCONT;
+    CELL_PTR(cont_cell) = cont;
+
+    code_object *call_code = make_test_continuation_call_code(cont_cell);
+    ASSERT(call_code != NULL);
+
+    vm_state vm;
+    vm_init(&vm);
+    unsigned result = vm_run(&vm, call_code, empty_environment());
+    vm_free(&vm);
+
+    ASSERT_EQ(result, TOK_ERROR);
+    CELL_TYPE(cont_cell) = BT_FREE;
+    CELL_PTR(cont_cell) = NULL;
+    vm_continuation_unregister(cont);
+    free(cont);
+    code_free(call_code);
+    code_free(restore_code);
+    PASS();
+}
+
+TEST(vm_continuation_rejects_invalid_frame_state)
+{
+    code_object *restore_code = code_new();
+    code_object *frame_code = code_new();
+    ASSERT(restore_code != NULL);
+    ASSERT(frame_code != NULL);
+    code_emit(restore_code, OP_RETURN);
+    code_emit(frame_code, OP_HALT);
+
+    unsigned cont_cell = alloc();
+    size_t block_size = sizeof(vm_continuation) + sizeof(vm_frame);
+    vm_continuation *cont = checked_calloc_array(1, block_size);
+    ASSERT(cont != NULL);
+    cont->code = restore_code;
+    cont->ip = 0;
+    cont->fp = 1;
+    cont->frames = (vm_frame *)((char *)cont + sizeof(vm_continuation));
+    cont->frames[0].code = frame_code;
+    cont->frames[0].ip = 0;
+    cont->frames[0].sp = UINT_MAX;
+    vm_continuation_register(cont);
+    CELL_TYPE(cont_cell) = BT_VMCONT;
+    CELL_PTR(cont_cell) = cont;
+
+    code_object *call_code = make_test_continuation_call_code(cont_cell);
+    ASSERT(call_code != NULL);
+
+    vm_state vm;
+    vm_init(&vm);
+    unsigned result = vm_run(&vm, call_code, empty_environment());
+    vm_free(&vm);
+
+    ASSERT_EQ(result, TOK_ERROR);
+    CELL_TYPE(cont_cell) = BT_FREE;
+    CELL_PTR(cont_cell) = NULL;
+    vm_continuation_unregister(cont);
+    free(cont);
+    code_free(call_code);
+    code_free(restore_code);
+    code_free(frame_code);
+    PASS();
+}
+
 TEST(vm_continuation_rejects_oversized_frame_stack)
 {
     code_object *restore_code = code_new();
@@ -1805,6 +2243,82 @@ TEST(vm_continuation_rejects_oversized_frame_stack)
     free(cont);
     code_free(call_code);
     code_free(restore_code);
+    PASS();
+}
+
+TEST(vm_continuation_rejects_truncated_letrec_values)
+{
+    code_object *restore_code = code_new();
+    ASSERT(restore_code != NULL);
+    code_emit(restore_code, OP_HALT);
+
+    unsigned frame = alloc_cons(0, 0);
+    unsigned letrec_frame = alloc_cons(frame, 0);
+    unsigned cont_cell = alloc();
+    size_t block_size = sizeof(vm_continuation) + sizeof(unsigned);
+    vm_continuation *cont = checked_calloc_array(1, block_size);
+    ASSERT(cont != NULL);
+    cont->code = restore_code;
+    cont->ip = 0;
+    cont->letrec_frame = letrec_frame;
+    cont->letrec_saved_len = 1;
+    cont->letrec_saved = (unsigned *)((char *)cont + sizeof(vm_continuation));
+    cont->letrec_saved[0] = store(42);
+    vm_continuation_register(cont);
+    CELL_TYPE(cont_cell) = BT_VMCONT;
+    CELL_PTR(cont_cell) = cont;
+
+    code_object *call_code = make_test_continuation_call_code(cont_cell);
+    ASSERT(call_code != NULL);
+
+    vm_state vm;
+    vm_init(&vm);
+    unsigned result = vm_run(&vm, call_code, empty_environment());
+    vm_free(&vm);
+
+    ASSERT_EQ(result, TOK_ERROR);
+    CELL_TYPE(cont_cell) = BT_FREE;
+    CELL_PTR(cont_cell) = NULL;
+    vm_continuation_unregister(cont);
+    free(cont);
+    code_free(call_code);
+    code_free(restore_code);
+    PASS();
+}
+
+TEST(vm_call_with_values_rejects_cyclic_multiple_values)
+{
+    unsigned value_list = alloc_cons(store(1), 0);
+    cell_set_cdr(value_list, value_list);
+    unsigned multiple_values = alloc();
+    CELL_TYPE(multiple_values) = BT_MULTIVAL;
+    CELL_CAR(multiple_values) = value_list;
+
+    code_object *producer = code_new();
+    code_object *caller = code_new();
+    ASSERT(producer != NULL && caller != NULL);
+    unsigned producer_const = code_add_const(producer, multiple_values);
+    code_emit(producer, OP_CONST);
+    code_emit(producer, producer_const);
+    code_emit(producer, OP_RETURN);
+
+    unsigned consumer = alloc();
+    CELL_TYPE(consumer) = BT_BUILTIN;
+    CELL_ID(consumer) = PPLUS;
+    unsigned consumer_const = code_add_const(caller, consumer);
+    code_add_child(caller, producer);
+    code_emit(caller, OP_CLOSURE);
+    code_emit(caller, 0);
+    code_emit(caller, OP_CONST);
+    code_emit(caller, consumer_const);
+    code_emit(caller, OP_CALLWITHVALUES);
+    code_emit(caller, OP_HALT);
+
+    vm_state vm;
+    vm_init(&vm);
+    ASSERT_EQ(vm_run(&vm, caller, empty_environment()), TOK_ERROR);
+    vm_free(&vm);
+    code_free(caller);
     PASS();
 }
 
@@ -1845,6 +2359,48 @@ TEST(execute_pattern_rejects_invalid_binding_slot)
     unsigned result = execute_pattern(pat, store(1));
 
     ASSERT_EQ(result, TOK_ERROR);
+    compiled_pattern_free(pat);
+    PASS();
+}
+
+TEST(execute_pattern_rejects_input_stack_underflow)
+{
+    compiled_pattern *pat = compiled_pattern_new();
+    ASSERT(pat != NULL);
+    pattern_emit(pat, PAT_INPUT_POP, 0);
+    pattern_emit(pat, PAT_SUCCESS, 0);
+
+    ASSERT_EQ(execute_pattern(pat, store(1)), TOK_ERROR);
+    compiled_pattern_free(pat);
+    PASS();
+}
+
+TEST(execute_pattern_rejects_inconsistent_storage_metadata)
+{
+    compiled_pattern *pat = compiled_pattern_new();
+    ASSERT(pat != NULL);
+    pattern_emit(pat, PAT_SUCCESS, 0);
+
+    unsigned saved_var_count = pat->var_count;
+    pat->var_count = pat->var_cap + 1;
+    unsigned result = execute_pattern(pat, 0);
+    pat->var_count = saved_var_count;
+
+    ASSERT_EQ(result, TOK_ERROR);
+    compiled_pattern_free(pat);
+    PASS();
+}
+
+TEST(gc_pattern_update_ignores_inconsistent_storage_metadata)
+{
+    compiled_pattern *pat = compiled_pattern_new();
+    ASSERT(pat != NULL);
+
+    unsigned saved_var_count = pat->var_count;
+    pat->var_count = pat->var_cap + 1;
+    gc_update_all_patterns();
+    pat->var_count = saved_var_count;
+
     compiled_pattern_free(pat);
     PASS();
 }
@@ -2328,6 +2884,15 @@ TEST(cond_expand_rejects_malformed_or_requirement)
     PASS();
 }
 
+TEST(cond_expand_rejects_recursive_requirement)
+{
+    unsigned req = alloc_cons(atom_from_string("and"), 0);
+    unsigned args = alloc_cons(req, 0);
+    cell_set_cdr(req, args);
+    ASSERT(!cond_expand_requirement_satisfied(req));
+    PASS();
+}
+
 // ============================================================================
 // Context Tests - GC
 // ============================================================================
@@ -2540,6 +3105,9 @@ int main(void)
     RUN_TEST(numeric_sign_helpers_accept_direct_fixnum);
     RUN_TEST(bignum_helpers_accept_direct_fixnum);
     RUN_TEST(malformed_bignum_payload_is_safe);
+    RUN_TEST(malformed_symbol_payload_is_safe);
+    RUN_TEST(out_of_range_value_is_not_a_cell);
+    RUN_TEST(equal_hash_table_handles_cyclic_numeric_payload);
     RUN_TEST(malformed_rational_payload_is_not_numeric);
     RUN_TEST(malformed_complex_payload_is_not_numeric);
     RUN_TEST(store_bignum_test);
@@ -2559,8 +3127,11 @@ int main(void)
     RUN_TEST(make_vector_with_fill);
     RUN_TEST(vector_data_access);
     RUN_TEST(writer_handles_direct_fixnum);
+    RUN_TEST(writer_handles_out_of_range_value);
     RUN_TEST(writer_handles_vector_containing_direct_fixnum);
     RUN_TEST(writer_handles_vm_continuation);
+    RUN_TEST(writer_handles_malformed_multiple_values);
+    RUN_TEST(writer_handles_cyclic_numeric_payload);
     RUN_TEST(writer_handles_bytecode_closure_marker);
     RUN_TEST(writer_escapes_control_strings_with_scalar_escape);
     RUN_TEST(writer_writes_unicode_character_literal);
@@ -2568,12 +3139,16 @@ int main(void)
     RUN_TEST(writer_escapes_non_roundtripping_symbols);
     RUN_TEST(writer_escapes_symbol_bar_and_backslash);
     RUN_TEST(write_simple_rejects_cycles);
+    RUN_TEST(write_simple_rejects_cycle_after_tracking_table_exhaustion);
+    RUN_TEST(write_shared_handles_cycle_after_tracking_table_exhaustion);
     RUN_TEST(string_port_write_failures_return_false);
     RUN_TEST(make_string_owned_rejects_null);
 
     // List utilities
     RUN_TEST(list_length_empty);
     RUN_TEST(list_length_non_pair_is_zero);
+    RUN_TEST(proper_list_silent_rejects_circular_list);
+    RUN_TEST(last_pair_rejects_circular_list);
     RUN_TEST(list_length_three);
     RUN_TEST(list_append_builds_list);
 
@@ -2599,27 +3174,38 @@ int main(void)
     RUN_TEST(procedure_predicate_rejects_malformed_vm_continuation);
     RUN_TEST(deep_equal_atoms);
     RUN_TEST(deep_equal_lists);
+    RUN_TEST(deep_equal_handles_large_lists_without_recursion);
     RUN_TEST(deep_equal_nested);
 
     // Continuations
     RUN_TEST(make_cont_test);
     RUN_TEST(make_halt_cont_test);
     RUN_TEST(code_free_unregisters_tree);
+    RUN_TEST(code_register_is_idempotent);
+    RUN_TEST(gc_collect_code_handles_cyclic_children);
+    RUN_TEST(minor_gc_code_update_ignores_inconsistent_storage_metadata);
+    RUN_TEST(code_free_handles_cyclic_and_duplicate_children);
+    RUN_TEST(code_free_preserves_shared_child);
     RUN_TEST(code_sweep_marks_vm_continuation_code);
     RUN_TEST(code_sweep_ignores_unregistered_closure_pointer);
     RUN_TEST(code_sweep_ignores_unregistered_vm_continuation_pointer);
+    RUN_TEST(gc_ignores_unregistered_vm_continuation_payload);
     RUN_TEST(pattern_sweep_ignores_unregistered_pattern_pointer);
     RUN_TEST(gc_mark_pattern_ignores_unregistered_pointer);
     RUN_TEST(code_sweep_ignores_malformed_vm_continuation_frames);
     RUN_TEST(peephole_optimize_ignores_truncated_instruction);
     RUN_TEST(peephole_optimize_ignores_truncated_child_instruction);
+    RUN_TEST(peephole_optimize_handles_cyclic_children);
+    RUN_TEST(disassemble_handles_cyclic_children);
     RUN_TEST(peephole_optimize_does_not_thread_into_operand);
     RUN_TEST(vm_run_rejects_truncated_bytecode);
+    RUN_TEST(vm_run_rejects_inconsistent_code_storage_metadata);
     RUN_TEST(vm_run_rejects_invalid_constant_index);
     RUN_TEST(vm_run_rejects_unknown_opcode);
     RUN_TEST(vm_run_rejects_jump_into_operand);
     RUN_TEST(vm_run_rejects_invalid_closure_child_index);
     RUN_TEST(vm_run_rejects_primitive_stack_underflow);
+    RUN_TEST(vm_stack_underflow_does_not_mutate_environment);
     RUN_TEST(vm_run_rejects_values_stack_underflow);
     RUN_TEST(vm_run_rejects_local_get_out_of_bounds);
     RUN_TEST(vm_run_rejects_local_get_fast_out_of_bounds);
@@ -2634,10 +3220,17 @@ int main(void)
     RUN_TEST(vm_call_closure_rejects_invalid_bytecode);
     RUN_TEST(vm_call_closure_rejects_invalid_parameter_metadata);
     RUN_TEST(vm_continuation_rejects_oversized_stack);
+    RUN_TEST(vm_continuation_rejects_invalid_base_pointer);
+    RUN_TEST(vm_continuation_rejects_invalid_frame_state);
     RUN_TEST(vm_continuation_rejects_oversized_frame_stack);
+    RUN_TEST(vm_continuation_rejects_truncated_letrec_values);
+    RUN_TEST(vm_call_with_values_rejects_cyclic_multiple_values);
     RUN_TEST(execute_pattern_rejects_unknown_opcode);
     RUN_TEST(execute_pattern_rejects_invalid_literal_index);
     RUN_TEST(execute_pattern_rejects_invalid_binding_slot);
+    RUN_TEST(execute_pattern_rejects_input_stack_underflow);
+    RUN_TEST(execute_pattern_rejects_inconsistent_storage_metadata);
+    RUN_TEST(gc_pattern_update_ignores_inconsistent_storage_metadata);
     RUN_TEST(execute_pattern_rejects_invalid_jump_target);
     RUN_TEST(execute_pattern_rejects_input_car_on_non_pair);
     RUN_TEST(execute_pattern_rejects_vector_iteration_on_non_vector);
@@ -2670,6 +3263,7 @@ int main(void)
     RUN_TEST(feature_table_is_well_formed);
     RUN_TEST(cond_expand_rejects_malformed_and_requirement);
     RUN_TEST(cond_expand_rejects_malformed_or_requirement);
+    RUN_TEST(cond_expand_rejects_recursive_requirement);
 
     // GC
     RUN_TEST(gc_preserves_root);

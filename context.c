@@ -43,6 +43,7 @@
 
 #define FNV_OFFSET_BASIS 14695981039346656037ull
 #define FNV_PRIME 1099511628211ull
+#define MAX_COND_EXPAND_REQUIREMENT_DEPTH 1024
 
 // ============================================================================
 // Global State
@@ -730,9 +731,10 @@ static void free_external_cell_data(unsigned x)
         }
         CELL_PTR(x) = NULL;
     } else if (CELL_TYPE(x) == BT_VMCONT) {
-        if (CELL_PTR(x)) {
-            vm_continuation_unregister((vm_continuation *)CELL_PTR(x));
-            free(CELL_PTR(x));
+        vm_continuation *cont = (vm_continuation *)CELL_PTR(x);
+        if (vm_continuation_is_registered(cont)) {
+            vm_continuation_unregister(cont);
+            free(cont);
         }
         CELL_PTR(x) = NULL;
     }
@@ -1046,6 +1048,82 @@ static bool numeric_cell_well_formed(unsigned x, bool allow_complex,
     }
 }
 
+/*
+ * Return the leading one or two limbs of an exact integer and the number of
+ * omitted low limbs.  Keeping the scale separate lets rational conversion
+ * divide two huge integers without first turning both into infinity.
+ */
+static bool exact_integer_top_double(unsigned value, double *top,
+                                     size_t *omitted_limbs, bool *negative)
+{
+    int64_t small;
+    if (IS_FIXNUM(value)) {
+        small = FIXNUM_VALUE(value);
+    } else if (IS_NUM(value)) {
+        small = CELL_ID(value);
+    } else if (IS_BIGNUM(value)) {
+        bignum *bn = get_bignum(value);
+        if (!bn)
+            return false;
+        if (bn->len == 0) {
+            *top = 0.0;
+            *omitted_limbs = 0;
+            *negative = false;
+            return true;
+        }
+        size_t taken = bn->len < 2 ? bn->len : 2;
+        size_t start = bn->len - taken;
+        double leading = 0.0;
+        for (size_t i = bn->len; i > start; i--)
+            leading = leading * (double)((uint64_t)1 << LIMB_BITS) +
+                      bn->limbs[i - 1];
+        *top = leading;
+        *omitted_limbs = start;
+        *negative = bn->sign != 0;
+        return true;
+    } else {
+        return false;
+    }
+
+    uint64_t magnitude =
+        small < 0 ? -(uint64_t)small : (uint64_t)small;
+    *top = (double)magnitude;
+    *omitted_limbs = 0;
+    *negative = small < 0;
+    return true;
+}
+
+static double exact_rational_to_double(unsigned numerator,
+                                       unsigned denominator)
+{
+    double num_top, denom_top;
+    size_t num_omitted, denom_omitted;
+    bool num_negative, denom_negative;
+    if (!exact_integer_top_double(numerator, &num_top, &num_omitted,
+                                  &num_negative) ||
+        !exact_integer_top_double(denominator, &denom_top, &denom_omitted,
+                                  &denom_negative) ||
+        denom_top == 0.0)
+        return to_double(numerator) / to_double(denominator);
+    if (num_top == 0.0)
+        return 0.0;
+
+    bool negative = num_negative != denom_negative;
+    double ratio = num_top / denom_top;
+    if (num_omitted >= denom_omitted) {
+        size_t limb_delta = num_omitted - denom_omitted;
+        if (limb_delta > (size_t)INT_MAX / LIMB_BITS)
+            return negative ? -HUGE_VAL : HUGE_VAL;
+        ratio = scalbn(ratio, (int)(limb_delta * LIMB_BITS));
+    } else {
+        size_t limb_delta = denom_omitted - num_omitted;
+        if (limb_delta > (size_t)INT_MAX / LIMB_BITS)
+            return negative ? -0.0 : 0.0;
+        ratio = scalbn(ratio, -(int)(limb_delta * LIMB_BITS));
+    }
+    return negative ? -ratio : ratio;
+}
+
 double to_double(unsigned x)
 {
     if (x == 0)
@@ -1062,14 +1140,14 @@ double to_double(unsigned x)
         bignum *bn = get_bignum(x);
         if (!bn)
             return 0.0;
-        // Build double from limbs
+        // Build double from most significant limb down.  Accumulating a
+        // low-to-high multiplier can overflow it to infinity while later
+        // zero limbs remain; 0.0 * infinity then produces NaN instead of
+        // the expected signed infinity.
         double result = 0.0;
         double base = (double)((uint64_t)1 << LIMB_BITS);
-        double multiplier = 1.0;
-        for (size_t i = 0; i < bn->len; i++) {
-            result += bn->limbs[i] * multiplier;
-            multiplier *= base;
-        }
+        for (size_t i = bn->len; i > 0; i--)
+            result = result * base + bn->limbs[i - 1];
         return bn->sign ? -result : result;
     }
     case BT_INEXACT: {
@@ -1083,9 +1161,7 @@ double to_double(unsigned x)
     case BT_RATIONAL: {
         if (!numeric_cell_well_formed(x, false, 4))
             return 0.0;
-        double num = to_double(CELL_CAR(x));
-        double denom = to_double(CELL_CDR(x));
-        return num / denom;
+        return exact_rational_to_double(CELL_CAR(x), CELL_CDR(x));
     }
     case BT_COMPLEX:
         if (!numeric_cell_well_formed(x, true, 4))
@@ -1193,6 +1269,15 @@ unsigned *vector_data_ptr(unsigned vec)
     return vector_data_well_formed(vd) ? vd->data : NULL;
 }
 
+bool atom_is_valid(unsigned atom)
+{
+    if (!IS_ATOM(atom))
+        return false;
+    int64_t id = CELL_ID(atom);
+    return id >= 0 && (uint64_t)id < ctx.atom_table_cap &&
+           ctx.atom_table[id] != NULL;
+}
+
 bool vector_data_well_formed(const vector_data *vd)
 {
     const sized_ptr_registry_node *node =
@@ -1281,7 +1366,7 @@ static int hash_with_cap(const char *s, unsigned cap)
 {
     uint64_t h = FNV_OFFSET_BASIS;
     for (const char *p = s; *p; ++p) {
-        h ^= (uint64_t)(*p);
+        h ^= (uint64_t)(unsigned char)*p;
         h *= FNV_PRIME;
     }
     return (int)(h % cap);
@@ -1296,9 +1381,6 @@ static bool str_equals(const char *a, const char *b)
 {
     return strcmp(a, b) == 0;
 }
-
-// Load factor threshold for rehashing (70%)
-#define ATOM_TABLE_LOAD_THRESHOLD 70
 
 // Symbol interning cache with move-to-front (LRU approximation)
 #define INTERN_CACHE_SIZE 16
@@ -1330,72 +1412,6 @@ static inline void intern_cache_insert_front(const char *str, int atom_id)
     intern_cache[0].atom_id = atom_id;
 }
 
-// Check if n is prime (simple trial division)
-static bool is_prime(unsigned n)
-{
-    if (n < 2)
-        return false;
-    if (n == 2)
-        return true;
-    if (n % 2 == 0)
-        return false;
-    for (unsigned i = 3; i <= n / i; i += 2) {
-        if (n % i == 0)
-            return false;
-    }
-    return true;
-}
-
-// Find next prime >= n
-static unsigned next_prime(unsigned n)
-{
-    while (!is_prime(n))
-        n++;
-    return n;
-}
-
-// Rehash atom table to new capacity
-static void rehash_atom_table(void)
-{
-    unsigned old_cap = ctx.atom_table_cap;
-    if (old_cap > UINT_MAX / 2) {
-        fprintf(stderr, "Warning: atom table too large to resize\n");
-        return;
-    }
-    unsigned new_cap = next_prime(old_cap * 2);
-
-    const char **new_table = checked_calloc_array(new_cap, sizeof(const char *));
-    if (!new_table) {
-        // Can't resize - continue with current table
-        fprintf(stderr, "Warning: failed to resize atom table\n");
-        return;
-    }
-
-    // Rehash all existing entries
-    for (unsigned i = 0; i < old_cap; i++) {
-        if (ctx.atom_table[i]) {
-            int h = hash_with_cap(ctx.atom_table[i], new_cap);
-            int probe = h;
-            int j = 1;
-            while (new_table[probe]) {
-                probe = (h + j) % new_cap;
-                j++;
-            }
-            new_table[probe] = ctx.atom_table[i];
-        }
-    }
-
-    // Invalidate interning cache (slot IDs changed)
-    for (int i = 0; i < INTERN_CACHE_SIZE; i++) {
-        intern_cache[i].str = NULL;
-        intern_cache[i].atom_id = 0;
-    }
-
-    free(ctx.atom_table);
-    ctx.atom_table = new_table;
-    ctx.atom_table_cap = new_cap;
-}
-
 int intern(const char *s)
 {
     // Check cache first - move to front on hit
@@ -1406,10 +1422,11 @@ int intern(const char *s)
         }
     }
 
-    // Check if we need to resize (load factor > 70%)
-    if (ctx.atom_count * 100 >= ctx.atom_table_cap * ATOM_TABLE_LOAD_THRESHOLD) {
-        rehash_atom_table();
-    }
+    // Atom IDs are table slots and are stored throughout the heap and
+    // environments.  Rehashing would move entries and silently change the
+    // identity of existing symbols, so this table must retain stable slots.
+    // The probe loop below reports a controlled failure only if this fixed
+    // table is actually full.
 
     int hash_value = hash_function(s);
     int original_hash = hash_value;
@@ -1418,7 +1435,7 @@ int intern(const char *s)
                     !str_equals(ctx.atom_table[hash_value], s);
          i++) {
         hash_value = (original_hash + i) % (int)ctx.atom_table_cap;
-        // Prevent infinite loop on full table (shouldn't happen with rehashing)
+        // Prevent an infinite probe loop if the fixed table is full.
         if ((unsigned)i >= ctx.atom_table_cap) {
             lisp_panic("atom table full");
         }
@@ -1441,11 +1458,12 @@ int intern(const char *s)
 // Helper: check if string could be start of a number
 static bool is_number_start(const char *s)
 {
-    if (isdigit(s[0]))
+    if (isdigit((unsigned char)s[0]))
         return true;
-    if ((s[0] == '-' || s[0] == '+') && (isdigit(s[1]) || s[1] == '.'))
+    if ((s[0] == '-' || s[0] == '+') &&
+        (isdigit((unsigned char)s[1]) || s[1] == '.'))
         return true;
-    if (s[0] == '.' && isdigit(s[1]))
+    if (s[0] == '.' && isdigit((unsigned char)s[1]))
         return true;
     return false;
 }
@@ -1481,9 +1499,11 @@ unsigned atom_from_string(const char *s)
             const char *sep = NULL;
             for (size_t i = 1; i < n - 1; i++) {
                 if ((s[i] == '+' || s[i] == '-') &&
-                    (isdigit(s[i - 1]) || s[i - 1] == '.' || s[i - 1] == 'e' ||
+                    (isdigit((unsigned char)s[i - 1]) || s[i - 1] == '.' ||
+                     s[i - 1] == 'e' ||
                      s[i - 1] == 'E') &&
-                    (isdigit(s[i + 1]) || s[i + 1] == '.' || s[i + 1] == 'i' ||
+                    (isdigit((unsigned char)s[i + 1]) || s[i + 1] == '.' ||
+                     s[i + 1] == 'i' ||
                      s[i + 1] == 'I')) {
                     // Check this isn't part of exponent
                     if (i >= 2 && (s[i - 1] == 'e' || s[i - 1] == 'E'))
@@ -1537,7 +1557,7 @@ unsigned atom_from_string(const char *s)
                     p++;
                 bool all_digits = true;
                 while (*p) {
-                    if (!isdigit(*p)) {
+                    if (!isdigit((unsigned char)*p)) {
                         all_digits = false;
                         break;
                     }
@@ -1560,7 +1580,7 @@ unsigned atom_from_string(const char *s)
                 p++;
             bool all_digits = (p < s + n);
             while (*p && p < s + n) {
-                if (!isdigit(*p)) {
+                if (!isdigit((unsigned char)*p)) {
                     all_digits = false;
                     break;
                 }
@@ -1703,8 +1723,26 @@ bool list_length_checked(unsigned lst, unsigned *len_out, const char *name)
     return true;
 }
 
+bool pair_chain_is_circular(unsigned x)
+{
+    unsigned slow = x;
+    unsigned fast = x;
+    while (IS_PAIR(fast)) {
+        fast = cdr(fast);
+        if (!IS_PAIR(fast))
+            break;
+        fast = cdr(fast);
+        slow = cdr(slow);
+        if (slow == fast)
+            return true;
+    }
+    return false;
+}
+
 bool proper_list_silent(unsigned x)
 {
+    if (pair_chain_is_circular(x))
+        return false;
     while (IS_PAIR(x))
         x = cdr(x);
     return x == 0;
@@ -1761,7 +1799,7 @@ bool syntax_is_underscore(unsigned x)
 
 bool is_eof_object(unsigned expr)
 {
-    return IS_ATOM(expr) &&
+    return atom_is_valid(expr) &&
            strcmp(ctx.atom_table[CELL_ID(expr)], "eof-object") == 0;
 }
 
@@ -1795,10 +1833,13 @@ bool feature_id_available(int64_t id)
     return false;
 }
 
-bool cond_expand_requirement_satisfied(unsigned requirement)
+static bool cond_expand_requirement_satisfied_at_depth(unsigned requirement,
+                                                       unsigned depth)
 {
     if (!requirement)
         return true;
+    if (depth >= MAX_COND_EXPAND_REQUIREMENT_DEPTH)
+        return false;
     if (IS_ATOM(requirement))
         return feature_id_available(CELL_ID(requirement));
     if (!IS_PAIR(requirement) || !IS_ATOM(car(requirement)))
@@ -1807,28 +1848,36 @@ bool cond_expand_requirement_satisfied(unsigned requirement)
     int64_t op = CELL_ID(car(requirement));
     unsigned args = cdr(requirement);
     if (op == ctx.kw_and_feature) {
+        if (!proper_list_silent(args))
+            return false;
         for (; args; args = cdr(args)) {
-            if (!IS_PAIR(args))
-                return false;
-            if (!cond_expand_requirement_satisfied(car(args)))
+            if (!cond_expand_requirement_satisfied_at_depth(car(args),
+                                                            depth + 1))
                 return false;
         }
         return true;
     }
     if (op == ctx.kw_or_feature) {
+        if (!proper_list_silent(args))
+            return false;
         for (; args; args = cdr(args)) {
-            if (!IS_PAIR(args))
-                return false;
-            if (cond_expand_requirement_satisfied(car(args)))
+            if (cond_expand_requirement_satisfied_at_depth(car(args),
+                                                            depth + 1))
                 return true;
         }
         return false;
     }
     if (op == ctx.kw_not_feature) {
         return IS_PAIR(args) && !cdr(args) &&
-               !cond_expand_requirement_satisfied(car(args));
+               !cond_expand_requirement_satisfied_at_depth(car(args),
+                                                            depth + 1);
     }
     return false;
+}
+
+bool cond_expand_requirement_satisfied(unsigned requirement)
+{
+    return cond_expand_requirement_satisfied_at_depth(requirement, 0);
 }
 
 bool syntax_arity_checked(unsigned form, unsigned min_args, unsigned max_args,
@@ -2168,131 +2217,208 @@ typedef struct {
     equal_seen_pair *items;
     size_t len;
     size_t cap;
+} equal_worklist;
+
+typedef struct {
+    equal_seen_pair *slots;
+    size_t len;
+    size_t cap;
 } equal_seen_set;
 
-static bool deep_equal_seen(unsigned a, unsigned b, equal_seen_set *seen);
+static size_t equal_seen_hash(unsigned a, unsigned b)
+{
+    uint64_t h = (uint64_t)a * UINT64_C(0x9e3779b185ebca87);
+    h ^= (uint64_t)b * UINT64_C(0xc2b2ae3d27d4eb4f);
+    h ^= h >> 33;
+    return (size_t)h;
+}
+
+static bool equal_seen_resize(equal_seen_set *seen, size_t new_cap)
+{
+    if (new_cap > UINT_MAX)
+        return false;
+    equal_seen_pair *new_slots =
+        checked_calloc_array((unsigned)new_cap, sizeof(*new_slots));
+    if (!new_slots)
+        return false;
+
+    for (size_t i = 0; i < seen->cap; i++) {
+        equal_seen_pair pair = seen->slots[i];
+        if (pair.a == 0)
+            continue;
+        size_t slot = equal_seen_hash(pair.a, pair.b) & (new_cap - 1);
+        while (new_slots[slot].a != 0)
+            slot = (slot + 1) & (new_cap - 1);
+        new_slots[slot] = pair;
+    }
+    free(seen->slots);
+    seen->slots = new_slots;
+    seen->cap = new_cap;
+    return true;
+}
 
 static bool equal_seen_contains(equal_seen_set *seen, unsigned a, unsigned b)
 {
-    for (size_t i = 0; i < seen->len; i++) {
-        if (seen->items[i].a == a && seen->items[i].b == b)
+    if (seen->cap == 0)
+        return false;
+    size_t slot = equal_seen_hash(a, b) & (seen->cap - 1);
+    while (seen->slots[slot].a != 0) {
+        if (seen->slots[slot].a == a && seen->slots[slot].b == b)
             return true;
+        slot = (slot + 1) & (seen->cap - 1);
     }
     return false;
 }
 
 static bool equal_seen_add(equal_seen_set *seen, unsigned a, unsigned b)
 {
-    if (seen->len == seen->cap) {
+    if (a == 0)
+        return false;
+    if (seen->cap == 0 || (seen->len + 1) * 4 > seen->cap * 3) {
+        size_t new_cap = seen->cap == 0 ? 32 : seen->cap * 2;
+        if (new_cap <= seen->cap || !equal_seen_resize(seen, new_cap))
+            return false;
+    }
+    size_t slot = equal_seen_hash(a, b) & (seen->cap - 1);
+    while (seen->slots[slot].a != 0) {
+        if (seen->slots[slot].a == a && seen->slots[slot].b == b)
+            return true;
+        slot = (slot + 1) & (seen->cap - 1);
+    }
+    seen->slots[slot] = (equal_seen_pair){a, b};
+    seen->len++;
+    return true;
+}
+
+static bool equal_worklist_push(equal_worklist *work, unsigned a, unsigned b)
+{
+    if (work->len == work->cap) {
         size_t new_cap;
-        if (seen->cap == 0) {
+        if (work->cap == 0) {
             new_cap = 16;
-        } else if (!checked_grow_capacity_size(seen->cap,
-                                               sizeof(*seen->items),
-                                               &new_cap)) {
+        } else if (!checked_grow_capacity_size(work->cap,
+                                                sizeof(*work->items),
+                                                &new_cap)) {
             return false;
         }
         size_t alloc_size;
-        if (!checked_flex_size(0, new_cap, sizeof(*seen->items),
+        if (!checked_flex_size(0, new_cap, sizeof(*work->items),
                                &alloc_size))
             return false;
         equal_seen_pair *new_items =
-            checked_realloc_size(seen->items, alloc_size);
+            checked_realloc_size(work->items, alloc_size);
         if (!new_items)
             return false;
-        seen->items = new_items;
-        seen->cap = new_cap;
+        work->items = new_items;
+        work->cap = new_cap;
     }
-    seen->items[seen->len++] = (equal_seen_pair){a, b};
+    work->items[work->len++] = (equal_seen_pair){a, b};
     return true;
 }
 
 static bool deep_equal_seen(unsigned a, unsigned b, equal_seen_set *seen)
 {
-    if (a == b)
-        return true;
-    if (a == 0 || b == 0)
-        return a == b;
-    if (IS_FIXNUM(a)) {
-        return IS_NUM(b) && CELL_ID(b) == (int64_t)FIXNUM_VALUE(a);
-    }
-    if (IS_FIXNUM(b)) {
-        return IS_NUM(a) && CELL_ID(a) == (int64_t)FIXNUM_VALUE(b);
-    }
-    if (!IS_CELL(a) || !IS_CELL(b))
-        return false;
-    if (CELL_TYPE(a) != CELL_TYPE(b))
-        return false;
+    equal_worklist pending = {0};
+    bool result = equal_worklist_push(&pending, a, b);
 
-    switch (CELL_TYPE(a)) {
-    case BT_NUM:
-    case BT_CHAR:
-    case BT_ATOM:
-    case BT_INEXACT:
-        return CELL_ID(a) == CELL_ID(b);
-    case BT_BIGNUM: {
-        bignum *ba = get_bignum(a);
-        bignum *bb = get_bignum(b);
-        return ba && bb && bn_cmp(ba, bb) == 0;
-    }
-    case BT_RATIONAL:
-    case BT_COMPLEX:
-        if (equal_seen_contains(seen, a, b))
-            return true;
-        if (!equal_seen_add(seen, a, b))
-            return false;
-        return deep_equal_seen(car(a), car(b), seen) &&
-               deep_equal_seen(cdr(a), cdr(b), seen);
-    case BT_STRING: {
-        char *sa = GET_STRING_PTR(a);
-        char *sb = GET_STRING_PTR(b);
-        return string_is_registered(sa) && string_is_registered(sb) &&
-               strcmp(sa, sb) == 0;
-    }
-    case BT_BYTEVEC: {
-        bytevec_data *ba = (bytevec_data *)CELL_PTR(a);
-        bytevec_data *bb = (bytevec_data *)CELL_PTR(b);
-        if (!bytevec_data_well_formed(ba) || !bytevec_data_well_formed(bb))
-            return false;
-        return ba->len == bb->len &&
-               memcmp(ba->data, bb->data, ba->len) == 0;
-    }
-    case BT_CONS:
-        if (equal_seen_contains(seen, a, b))
-            return true;
-        if (!equal_seen_add(seen, a, b))
-            return false;
-        return deep_equal_seen(car(a), car(b), seen) &&
-               deep_equal_seen(cdr(a), cdr(b), seen);
-    case BT_VECTOR: {
-        unsigned len_a = vector_len(a);
-        unsigned len_b = vector_len(b);
-        if (len_a != len_b)
-            return false;
-        if (equal_seen_contains(seen, a, b))
-            return true;
-        if (!equal_seen_add(seen, a, b))
-            return false;
-        unsigned *da = vector_data_ptr(a);
-        unsigned *db = vector_data_ptr(b);
-        if ((len_a != 0 && !da) || (len_b != 0 && !db))
-            return false;
-        for (unsigned i = 0; i < len_a; i++) {
-            if (!deep_equal_seen(da[i], db[i], seen))
-                return false;
+    while (result && pending.len > 0) {
+        equal_seen_pair pair = pending.items[--pending.len];
+        a = pair.a;
+        b = pair.b;
+        if (a == b)
+            continue;
+        if (a == 0 || b == 0) {
+            result = false;
+            break;
         }
-        return true;
+        if (IS_FIXNUM(a)) {
+            if (!IS_NUM(b) || CELL_ID(b) != (int64_t)FIXNUM_VALUE(a))
+                result = false;
+            continue;
+        }
+        if (IS_FIXNUM(b)) {
+            if (!IS_NUM(a) || CELL_ID(a) != (int64_t)FIXNUM_VALUE(b))
+                result = false;
+            continue;
+        }
+        if (!IS_CELL(a) || !IS_CELL(b) || CELL_TYPE(a) != CELL_TYPE(b)) {
+            result = false;
+            break;
+        }
+
+        switch (CELL_TYPE(a)) {
+        case BT_NUM:
+        case BT_CHAR:
+        case BT_ATOM:
+        case BT_INEXACT:
+            result = CELL_ID(a) == CELL_ID(b);
+            break;
+        case BT_BIGNUM: {
+            bignum *ba = get_bignum(a);
+            bignum *bb = get_bignum(b);
+            result = ba && bb && bn_cmp(ba, bb) == 0;
+            break;
+        }
+        case BT_RATIONAL:
+        case BT_COMPLEX:
+        case BT_CONS:
+            if (equal_seen_contains(seen, a, b))
+                break;
+            if (!equal_seen_add(seen, a, b) ||
+                !equal_worklist_push(&pending, cdr(a), cdr(b)) ||
+                !equal_worklist_push(&pending, car(a), car(b)))
+                result = false;
+            break;
+        case BT_STRING: {
+            char *sa = GET_STRING_PTR(a);
+            char *sb = GET_STRING_PTR(b);
+            result = string_is_registered(sa) && string_is_registered(sb) &&
+                     strcmp(sa, sb) == 0;
+            break;
+        }
+        case BT_BYTEVEC: {
+            bytevec_data *ba = (bytevec_data *)CELL_PTR(a);
+            bytevec_data *bb = (bytevec_data *)CELL_PTR(b);
+            result = bytevec_data_well_formed(ba) &&
+                     bytevec_data_well_formed(bb) && ba->len == bb->len &&
+                     memcmp(ba->data, bb->data, ba->len) == 0;
+            break;
+        }
+        case BT_VECTOR: {
+            unsigned len_a = vector_len(a);
+            unsigned len_b = vector_len(b);
+            if (len_a != len_b) {
+                result = false;
+                break;
+            }
+            if (equal_seen_contains(seen, a, b))
+                break;
+            unsigned *da = vector_data_ptr(a);
+            unsigned *db = vector_data_ptr(b);
+            if ((len_a != 0 && !da) || (len_b != 0 && !db) ||
+                !equal_seen_add(seen, a, b)) {
+                result = false;
+                break;
+            }
+            for (unsigned i = 0; result && i < len_a; i++)
+                result = equal_worklist_push(&pending, da[i], db[i]);
+            break;
+        }
+        default:
+            result = false;
+            break;
+        }
     }
-    default:
-        return false;
-    }
+
+    free(pending.items);
+    return result;
 }
 
 bool deep_equal(unsigned a, unsigned b)
 {
     equal_seen_set seen = {0};
     bool result = deep_equal_seen(a, b, &seen);
-    free(seen.items);
+    free(seen.slots);
     return result;
 }
 
@@ -2307,6 +2433,11 @@ unsigned collect(unsigned x)
         return x;
     // Fixnums are immediate values, not heap pointers
     if (IS_FIXNUM(x))
+        return x;
+    // Preserve malformed non-cell values rather than dereferencing an index
+    // outside the managed heap.  This also keeps collection robust when a
+    // foreign caller supplies an invalid root.
+    if (!IS_CELL(x))
         return x;
 
     // Check if cell is already in the to-space (doesn't need collection)
@@ -2598,6 +2729,8 @@ unsigned collect_to_old(unsigned x)
     // Fixnums are immediate values, not heap pointers
     if (IS_FIXNUM(x))
         return x;
+    if (!IS_CELL(x))
+        return x;
     // Not in nursery (in old gen)
     if (x < ctx.nursery_start)
         return x;
@@ -2755,12 +2888,8 @@ unsigned minor_gc(unsigned root)
     // Update VM roots if VM is active
     gc_update_vm_roots_minor(get_active_vm(), collect_to_old);
 
-    // Update code object constants - they may point to nursery cells
-    for (code_object *code = code_object_registry; code; code = code->gc_next) {
-        for (unsigned i = 0; i < code->const_len; i++) {
-            code->constants[i] = collect_to_old(code->constants[i]);
-        }
-    }
+    // Update code object constants - they may point to nursery cells.
+    minor_gc_update_all_code_objects();
     minor_gc_update_all_patterns();
 
     // Scan dirty cards in old generation for nursery pointers

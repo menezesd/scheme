@@ -73,8 +73,8 @@ static unsigned prim_inexact_to_exact(unsigned x)
         int64_t denom_exp = -exp;
 
         // Remove trailing zeros from numerator (common factors of 2)
-        while ((num & 1) == 0 && denom_exp > 0) {
-            num >>= 1;
+        while (num % 2 == 0 && denom_exp > 0) {
+            num /= 2;
             denom_exp--;
         }
 
@@ -120,7 +120,7 @@ static unsigned rational_component(unsigned x, bool numerator, const char *name)
         return numerator ? CELL_CAR(x) : CELL_CDR(x);
     case BT_INEXACT: {
         double d = to_double(x);
-        if (floor(d) == d)
+        if (isfinite(d) && floor(d) == d)
             return numerator ? store_inexact(d) : store_inexact(1.0);
         show_error("%s: inexact non-integer", name);
         return TOK_ERROR;
@@ -222,7 +222,7 @@ static unsigned magnitude_value(unsigned x, const char *name)
     if (IS_COMPLEX(x)) {
         double real = to_double(CELL_CAR(x));
         double imag = to_double(CELL_CDR(x));
-        return store_inexact(sqrt(real * real + imag * imag));
+        return store_inexact(hypot(real, imag));
     }
     if (IS_NUM(x))
         return CELL_ID(x) < 0 ? negate_number(x) : x;
@@ -390,8 +390,11 @@ unsigned apply_numtower_primitive(unsigned prim_id, unsigned argc,
         int64_t mid_n, mid_d;
 
         for (int iter = 0; iter < 100; iter++) {
-            mid_n = lo_n + hi_n;
-            mid_d = lo_d + hi_d;
+            if (__builtin_add_overflow(lo_n, hi_n, &mid_n) ||
+                __builtin_add_overflow(lo_d, hi_d, &mid_d) || mid_d <= 0) {
+                show_error("rationalize: result too large");
+                return TOK_ERROR;
+            }
             double mid = (double)mid_n / mid_d;
 
             if (fabs(mid - x) <= epsilon) {

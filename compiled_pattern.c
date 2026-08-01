@@ -29,6 +29,8 @@ static pat_match_state *active_match_state = NULL;
 
 void pattern_register(compiled_pattern *pat)
 {
+    if (!pat || compiled_pattern_is_registered(pat))
+        return;
     pat->gc_next = compiled_pattern_registry;
     compiled_pattern_registry = pat;
 }
@@ -51,6 +53,15 @@ static void pattern_unregister(compiled_pattern *pat)
 // ============================================================================
 
 static void compiled_pattern_destroy_unregistered(compiled_pattern *pat);
+
+static bool pattern_arrays_well_formed(const compiled_pattern *pat)
+{
+    return pat && pat->code_len <= pat->code_cap &&
+           pat->const_len <= pat->const_cap && pat->var_count <= pat->var_cap &&
+           (pat->code_len == 0 || pat->code != NULL) &&
+           (pat->const_len == 0 || pat->constants != NULL) &&
+           (pat->var_count == 0 || pat->var_slots != NULL);
+}
 
 static vector_data *pattern_vector_data(unsigned value)
 {
@@ -95,7 +106,7 @@ compiled_pattern *compiled_pattern_new(void)
 
 void compiled_pattern_free(compiled_pattern *pat)
 {
-    if (!pat)
+    if (!pat || !compiled_pattern_is_registered(pat))
         return;
     pattern_unregister(pat);
     free(pat->code);
@@ -227,6 +238,8 @@ static void update_all_patterns(unsigned (*update)(unsigned))
 {
     for (compiled_pattern *pat = compiled_pattern_registry; pat;
          pat = pat->gc_next) {
+        if (!pattern_arrays_well_formed(pat))
+            continue;
         // Update constants
         for (unsigned i = 0; i < pat->const_len; i++) {
             pat->constants[i] = update(pat->constants[i]);
@@ -419,7 +432,10 @@ static bool pattern_jump_target_is_valid(compiled_pattern *pat,
 
 static bool pattern_bytecode_is_well_formed(compiled_pattern *pat)
 {
-    if (!pat || !pat->code || pat->code_len == 0)
+    // Patterns are registry-managed.  Validate their backing-array metadata
+    // before following instruction operands or allocating match-state arrays.
+    if (!pat || !compiled_pattern_is_registered(pat) ||
+        !pattern_arrays_well_formed(pat) || pat->code_len == 0)
         return false;
 
     for (unsigned i = 0; i < pat->code_len; i++) {
@@ -458,6 +474,10 @@ void pattern_disassemble(compiled_pattern *pat)
 {
     if (!pat) {
         printf("=== Compiled Pattern: <null> ===\n");
+        return;
+    }
+    if (!pattern_arrays_well_formed(pat)) {
+        printf("=== Compiled Pattern: <invalid> ===\n");
         return;
     }
 
@@ -693,23 +713,34 @@ static void compile_pattern_node(unsigned pattern, pattern_compile_ctx *pctx)
         return;
     }
 
-    // Pair: check for ellipsis
+    // Pair: compile an ordinary list spine iteratively.  A fixed-arity macro
+    // pattern may have many arguments while remaining structurally shallow;
+    // recursive cdr compilation would otherwise overflow the C stack.
     if (IS_PAIR(pattern)) {
-        // Check for ellipsis: (elem ... rest)
-        if (IS_PAIR(cdr(pattern)) &&
-            syntax_is_ellipsis(cadr(pattern), pctx->ellipsis_id)) {
-            compile_ellipsis(pattern, pctx);
-            return;
-        }
+        unsigned cdr_depth = 0;
+        for (;;) {
+            if (!IS_PAIR(pattern)) {
+                compile_pattern_node(pattern, pctx);
+                break;
+            }
+            if (IS_PAIR(cdr(pattern)) &&
+                syntax_is_ellipsis(cadr(pattern), pctx->ellipsis_id)) {
+                compile_ellipsis(pattern, pctx);
+                break;
+            }
 
-        // Regular pair: match car and cdr
-        pattern_emit(pctx->pattern, PAT_CHECK_PAIR, 0);
-        pattern_emit(pctx->pattern, PAT_INPUT_CAR, 0);
-        compile_pattern_node(car(pattern), pctx);
-        pattern_emit(pctx->pattern, PAT_INPUT_POP, 0);
-        pattern_emit(pctx->pattern, PAT_INPUT_CDR, 0);
-        compile_pattern_node(cdr(pattern), pctx);
-        pattern_emit(pctx->pattern, PAT_INPUT_POP, 0);
+            pattern_emit(pctx->pattern, PAT_CHECK_PAIR, 0);
+            pattern_emit(pctx->pattern, PAT_INPUT_CAR, 0);
+            compile_pattern_node(car(pattern), pctx);
+            pattern_emit(pctx->pattern, PAT_INPUT_POP, 0);
+            pattern_emit(pctx->pattern, PAT_INPUT_CDR, 0);
+            cdr_depth++;
+            pattern = cdr(pattern);
+        }
+        while (cdr_depth > 0) {
+            pattern_emit(pctx->pattern, PAT_INPUT_POP, 0);
+            cdr_depth--;
+        }
         return;
     }
 
@@ -850,12 +881,12 @@ static void push_input(pat_match_state *state, unsigned input)
 }
 
 // Pop input from stack
-static unsigned pop_input(pat_match_state *state)
+static bool pop_input(pat_match_state *state, unsigned *input_out)
 {
-    if (state->input_sp == 0) {
-        return 0;  // Should not happen
-    }
-    return state->input_stack[--state->input_sp];
+    if (state->input_sp == 0)
+        return false;
+    *input_out = state->input_stack[--state->input_sp];
+    return true;
 }
 
 static unsigned *copy_choice_array(unsigned *src, unsigned len)
@@ -1015,7 +1046,10 @@ unsigned execute_pattern(compiled_pattern *pat, unsigned input)
             break;
 
         case PAT_INPUT_POP:
-            state.input = pop_input(&state);
+            if (!pop_input(&state, &state.input)) {
+                show_error("pattern match: invalid input stack state");
+                failed = true;
+            }
             break;
 
         case PAT_INPUT_ADVANCE:

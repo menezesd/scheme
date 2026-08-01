@@ -197,6 +197,13 @@ TEST(read_malformed_denominator_as_symbol)
     PASS();
 }
 
+TEST(read_exact_decimal_rejects_scale_overflow)
+{
+    ASSERT(read_from_string("#e1.0e-9223372036854775807") == TOK_ERROR);
+    ASSERT(read_from_string("#e1e9223372036854775807") == TOK_ERROR);
+    PASS();
+}
+
 // ============================================================================
 // Reader Tests - Strings
 // ============================================================================
@@ -235,6 +242,7 @@ TEST(read_string_hex_scalar_escape)
 TEST(read_string_rejects_invalid_scalar_escapes)
 {
     ASSERT(read_from_string("\"\\x0;\"") == TOK_ERROR);
+    ASSERT(read_from_string("\"\\000\"") == TOK_ERROR);
     ASSERT(read_from_string("\"\\xD800;\"") == TOK_ERROR);
     ASSERT(read_from_string("\"\\x110000;\"") == TOK_ERROR);
     PASS();
@@ -244,6 +252,39 @@ TEST(read_string_rejects_invalid_utf8)
 {
     const char invalid[] = {'"', (char)0xC0, (char)0x80, '"', '\0'};
     ASSERT(read_from_string(invalid) == TOK_ERROR);
+    PASS();
+}
+
+TEST(read_token_rejects_null_character)
+{
+    const char invalid[] = {'a', '\0', 'b', '\0'};
+    FILE *f = fmemopen((void *)invalid, 3, "r");
+    ASSERT(f != NULL);
+    ASSERT(read_obj_port(f) == TOK_ERROR);
+    reader_forget_port(f);
+    fclose(f);
+    PASS();
+}
+
+TEST(read_numeric_token_rejects_null_character)
+{
+    const char invalid[] = {'#', 'd', '1', '\0', '2', '\0'};
+    FILE *f = fmemopen((void *)invalid, 5, "r");
+    ASSERT(f != NULL);
+    ASSERT(read_obj_port(f) == TOK_ERROR);
+    reader_forget_port(f);
+    fclose(f);
+    PASS();
+}
+
+TEST(read_string_rejects_null_character)
+{
+    const char invalid[] = {'"', 'a', '\0', 'b', '"', '\0'};
+    FILE *f = fmemopen((void *)invalid, 5, "r");
+    ASSERT(f != NULL);
+    ASSERT(read_obj_port(f) == TOK_ERROR);
+    reader_forget_port(f);
+    fclose(f);
     PASS();
 }
 
@@ -565,6 +606,26 @@ TEST(read_false)
     PASS();
 }
 
+TEST(read_boolean_aliases)
+{
+    ASSERT(read_from_string("#T") == ctx.atom_true);
+    ASSERT(read_from_string("#TRUE") == ctx.atom_true);
+    ASSERT(read_from_string("#true") == ctx.atom_true);
+    ASSERT(read_from_string("#F") == ctx.atom_false);
+    ASSERT(read_from_string("#FALSE") == ctx.atom_false);
+    ASSERT(read_from_string("#false") == ctx.atom_false);
+    PASS();
+}
+
+TEST(read_boolean_rejects_invalid_suffix)
+{
+    ASSERT(read_from_string("#tfoo") == TOK_ERROR);
+    ASSERT(read_from_string("#f0") == TOK_ERROR);
+    ASSERT(read_from_string("#truex") == TOK_ERROR);
+    ASSERT(read_from_string("#falsey") == TOK_ERROR);
+    PASS();
+}
+
 // ============================================================================
 // Reader Tests - Lists
 // ============================================================================
@@ -598,6 +659,49 @@ TEST(read_dotted_pair)
     ASSERT_EQ(CELL_ID(car(x)), 1);
     ASSERT(CELL_TYPE(cdr(x)) == BT_NUM);
     ASSERT_EQ(CELL_ID(cdr(x)), 2);
+    PASS();
+}
+
+TEST(read_rejects_dot_without_preceding_object)
+{
+    ASSERT(read_from_string("(. a)") == TOK_ERROR);
+    PASS();
+}
+
+TEST(read_large_flat_list_without_recursion)
+{
+    const size_t count = 100000;
+    char *src = malloc(2 * count + 3);
+    ASSERT(src != NULL);
+    src[0] = '(';
+    for (size_t i = 0; i < count; i++) {
+        src[1 + 2 * i] = 'x';
+        src[2 + 2 * i] = ' ';
+    }
+    src[1 + 2 * count] = ')';
+    src[2 + 2 * count] = '\0';
+
+    unsigned x = read_from_string(src);
+    free(src);
+    ASSERT(x != TOK_ERROR);
+    unsigned length = 0;
+    ASSERT(list_length_checked(x, &length, "test"));
+    ASSERT_EQ(length, count);
+    PASS();
+}
+
+TEST(read_rejects_excessive_nesting)
+{
+    const size_t depth = 1100;
+    char *src = malloc(2 * depth + 2);
+    ASSERT(src != NULL);
+    memset(src, '(', depth);
+    src[depth] = 'x';
+    memset(src + depth + 1, ')', depth);
+    src[2 * depth + 1] = '\0';
+
+    ASSERT(read_from_string(src) == TOK_ERROR);
+    free(src);
     PASS();
 }
 
@@ -721,10 +825,35 @@ TEST(read_datum_label_empty_list)
     PASS();
 }
 
+TEST(read_datum_label_cyclic_pair)
+{
+    unsigned x = read_from_string("#0=(a . #0#)");
+    ASSERT(IS_PAIR(x));
+    ASSERT(CELL_TYPE(car(x)) == BT_ATOM);
+    ASSERT_STR_EQ(ctx.atom_table[CELL_ID(car(x))], "a");
+    ASSERT_EQ(cdr(x), x);
+    PASS();
+}
+
+TEST(read_datum_label_cyclic_vector)
+{
+    unsigned x = read_from_string("#0=#(#0#)");
+    ASSERT(CELL_TYPE(x) == BT_VECTOR);
+    ASSERT_EQ(vector_len(x), 1);
+    ASSERT_EQ(vector_data_ptr(x)[0], x);
+    PASS();
+}
+
 TEST(read_datum_label_rejects_missing_datum)
 {
     unsigned x = read_from_string("#0=");
     ASSERT(x == TOK_ERROR);
+    PASS();
+}
+
+TEST(read_datum_label_rejects_bare_self_reference)
+{
+    ASSERT(read_from_string("#0=#0#") == TOK_ERROR);
     PASS();
 }
 
@@ -884,6 +1013,7 @@ int main(void)
     RUN_TEST(read_exactness_and_radix_prefixes);
     RUN_TEST(read_malformed_rational_as_symbol);
     RUN_TEST(read_malformed_denominator_as_symbol);
+    RUN_TEST(read_exact_decimal_rejects_scale_overflow);
 
     // Strings
     RUN_TEST(read_simple_string);
@@ -891,6 +1021,9 @@ int main(void)
     RUN_TEST(read_string_hex_scalar_escape);
     RUN_TEST(read_string_rejects_invalid_scalar_escapes);
     RUN_TEST(read_string_rejects_invalid_utf8);
+    RUN_TEST(read_token_rejects_null_character);
+    RUN_TEST(read_numeric_token_rejects_null_character);
+    RUN_TEST(read_string_rejects_null_character);
     RUN_TEST(read_empty_string);
 
     // Characters
@@ -931,11 +1064,16 @@ int main(void)
     // Booleans
     RUN_TEST(read_true);
     RUN_TEST(read_false);
+    RUN_TEST(read_boolean_aliases);
+    RUN_TEST(read_boolean_rejects_invalid_suffix);
 
     // Lists
     RUN_TEST(read_empty_list);
     RUN_TEST(read_simple_list);
     RUN_TEST(read_dotted_pair);
+    RUN_TEST(read_rejects_dot_without_preceding_object);
+    RUN_TEST(read_large_flat_list_without_recursion);
+    RUN_TEST(read_rejects_excessive_nesting);
     RUN_TEST(read_nested_list);
     RUN_TEST(read_allows_eof_object_symbol_in_list);
     RUN_TEST(read_rejects_unterminated_list);
@@ -952,7 +1090,10 @@ int main(void)
     RUN_TEST(read_bytevector_rejects_incomplete_prefix);
     RUN_TEST(read_datum_label_number);
     RUN_TEST(read_datum_label_empty_list);
+    RUN_TEST(read_datum_label_cyclic_pair);
+    RUN_TEST(read_datum_label_cyclic_vector);
     RUN_TEST(read_datum_label_rejects_missing_datum);
+    RUN_TEST(read_datum_label_rejects_bare_self_reference);
     RUN_TEST(read_datum_label_rejects_special_tokens);
 
     // Quotes

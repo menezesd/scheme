@@ -43,6 +43,8 @@ const char *type_name(unsigned cell)
         return "integer";
     if (cell == 0)
         return "()";
+    if (!IS_CELL(cell))
+        return "invalid-value";
     switch (CELL_TYPE(cell)) {
     case BT_FREE:
         return "free-cell";
@@ -107,8 +109,7 @@ const char *type_name(unsigned cell)
 // Cycle Detection Hash Table
 // ============================================================================
 
-#define VISITED_TABLE_SIZE                                                     \
-    8192                // Power of 2, supports ~6000 entries at 75% load
+#define VISITED_INITIAL_CAP 8192
 #define VISITED_EMPTY 0 // 0 is never a valid cell (represents nil)
 
 typedef struct {
@@ -118,9 +119,10 @@ typedef struct {
     bool active;   // true while simple writer is printing this object
 } visited_entry;
 
-static visited_entry visited_table[VISITED_TABLE_SIZE];
+static visited_entry *visited_table;
+static size_t visited_cap;
 static int next_label = 0;
-static int visited_count = 0;
+static size_t visited_count;
 static bool writer_emit_shared_labels = true;
 static bool writer_error = false;
 
@@ -133,25 +135,64 @@ static inline unsigned hash_cell(unsigned cell)
     h ^= h >> 13;
     h *= 0xc2b2ae35;
     h ^= h >> 16;
-    return h & (VISITED_TABLE_SIZE - 1);
+    return h;
 }
 
-static void reset_visited(void)
+static bool resize_visited_table(size_t new_cap)
 {
-    // Only clear slots that were used (optimization for sparse tables)
-    for (int i = 0; i < VISITED_TABLE_SIZE; i++) {
-        visited_table[i].cell = VISITED_EMPTY;
+    size_t size;
+    if (!checked_flex_size(0, new_cap, sizeof(*visited_table), &size))
+        return false;
+    visited_entry *new_table = calloc(1, size);
+    if (!new_table)
+        return false;
+
+    for (size_t i = 0; i < visited_cap; i++) {
+        if (visited_table[i].cell == VISITED_EMPTY)
+            continue;
+        size_t idx = (size_t)hash_cell(visited_table[i].cell) & (new_cap - 1);
+        while (new_table[idx].cell != VISITED_EMPTY)
+            idx = (idx + 1) & (new_cap - 1);
+        new_table[idx] = visited_table[i];
     }
+
+    free(visited_table);
+    visited_table = new_table;
+    visited_cap = new_cap;
+    return true;
+}
+
+static bool ensure_visited_capacity(void)
+{
+    if (visited_cap != 0 && visited_count < visited_cap - visited_cap / 4)
+        return true;
+
+    size_t new_cap = VISITED_INITIAL_CAP;
+    if (visited_cap != 0 &&
+        !checked_grow_capacity_size(visited_cap, sizeof(*visited_table),
+                                    &new_cap))
+        return false;
+    return resize_visited_table(new_cap);
+}
+
+static bool reset_visited(void)
+{
+    if (!ensure_visited_capacity())
+        return false;
+    memset(visited_table, 0, visited_cap * sizeof(*visited_table));
     next_label = 0;
     visited_count = 0;
+    return true;
 }
 
 // Find entry in hash table, returns pointer or NULL if not found
 static visited_entry *find_visited(unsigned cell)
 {
-    unsigned idx = hash_cell(cell);
-    for (int i = 0; i < VISITED_TABLE_SIZE; i++) {
-        unsigned probe = (idx + i) & (VISITED_TABLE_SIZE - 1);
+    if (!visited_table)
+        return NULL;
+    size_t idx = (size_t)hash_cell(cell) & (visited_cap - 1);
+    for (size_t i = 0; i < visited_cap; i++) {
+        size_t probe = (idx + i) & (visited_cap - 1);
         if (visited_table[probe].cell == VISITED_EMPTY)
             return NULL; // Empty slot = not found
         if (visited_table[probe].cell == cell)
@@ -163,18 +204,15 @@ static visited_entry *find_visited(unsigned cell)
 // Insert new entry into hash table, returns pointer to entry
 static visited_entry *insert_visited(unsigned cell)
 {
-    // Warn if approaching capacity
-    if (visited_count >= VISITED_TABLE_SIZE * 3 / 4) {
-        static bool warned = false;
-        if (!warned) {
-            fprintf(stderr, "warning: cycle detection table near capacity\n");
-            warned = true;
-        }
+    if (!ensure_visited_capacity()) {
+        show_error("writer: structure too large");
+        writer_error = true;
+        return NULL;
     }
 
-    unsigned idx = hash_cell(cell);
-    for (int i = 0; i < VISITED_TABLE_SIZE; i++) {
-        unsigned probe = (idx + i) & (VISITED_TABLE_SIZE - 1);
+    size_t idx = (size_t)hash_cell(cell) & (visited_cap - 1);
+    for (size_t i = 0; i < visited_cap; i++) {
+        size_t probe = (idx + i) & (visited_cap - 1);
         if (visited_table[probe].cell == VISITED_EMPTY) {
             visited_table[probe].cell = cell;
             visited_table[probe].label = -1;
@@ -184,48 +222,79 @@ static visited_entry *insert_visited(unsigned cell)
             return &visited_table[probe];
         }
     }
-    return NULL; // Table full
+    show_error("writer: structure too large");
+    writer_error = true;
+    return NULL;
+}
+
+static bool active_cell_push(unsigned **cells, size_t *len, size_t *cap,
+                             unsigned cell)
+{
+    if (*len == *cap) {
+        size_t new_cap;
+        if (*cap == 0) {
+            new_cap = 64;
+        } else if (!checked_grow_capacity_size(*cap, sizeof(**cells),
+                                                &new_cap)) {
+            return false;
+        }
+        size_t size;
+        if (!checked_flex_size(0, new_cap, sizeof(**cells), &size))
+            return false;
+        unsigned *new_cells = checked_realloc_size(*cells, size);
+        if (!new_cells)
+            return false;
+        *cells = new_cells;
+        *cap = new_cap;
+    }
+    (*cells)[(*len)++] = cell;
+    return true;
 }
 
 // First pass: mark all cells that are visited more than once
 static void mark_shared(unsigned s)
 {
-    if (s == 0 || s == TOK_ERROR)
-        return;
-    if (IS_FIXNUM(s))
-        return;
-    if (is_bytecode_closure_object(s))
-        return;
+    // Follow the cdr spine iteratively.  This keeps large flat lists from
+    // consuming C stack space while nested cars and vectors retain the normal
+    // recursive traversal (the reader bounds their nesting depth).
+    for (;;) {
+        if (writer_error || s == 0 || s == TOK_ERROR || IS_FIXNUM(s) ||
+            !IS_CELL(s) || is_bytecode_closure_object(s))
+            return;
 
-    // Only track cons cells and vectors (things that can have sharing)
-    enum lisp_type type = CELL_TYPE(s);
-    if (type != BT_CONS && type != BT_VECTOR)
-        return;
+        // Only track cons cells and vectors (things that can have sharing).
+        enum lisp_type type = CELL_TYPE(s);
+        if (type != BT_CONS && type != BT_VECTOR)
+            return;
 
-    visited_entry *entry = find_visited(s);
-    if (entry) {
-        // Seen before - assign a label if not already assigned
-        if (entry->label < 0) {
-            entry->label = next_label++;
+        visited_entry *entry = find_visited(s);
+        if (entry) {
+            // Seen before - assign a label if not already assigned.
+            if (entry->label < 0)
+                entry->label = next_label++;
+            return;
         }
-        return; // Don't recurse into already-visited cells
-    }
 
-    // First visit - add to hash table
-    insert_visited(s);
+        // First visit - add to hash table.
+        if (!insert_visited(s))
+            return;
 
-    // Recurse into children
-    if (type == BT_CONS) {
-        mark_shared(car(s));
-        mark_shared(cdr(s));
-    } else if (type == BT_VECTOR) {
+        if (type == BT_CONS) {
+            mark_shared(car(s));
+            s = cdr(s);
+            continue;
+        }
+
         unsigned len = vector_len(s);
         unsigned *data = vector_data_ptr(s);
         if (len != 0 && !data)
             return;
         for (unsigned i = 0; i < len; i++) {
             mark_shared(data[i]);
+            if (writer_error)
+                return;
         }
+        return;
     }
 }
 
@@ -401,63 +470,107 @@ static void write_character_literal(FILE *fp, int c)
 
 static void write_list_tail_fp(unsigned st, bool with_quotes, FILE *fp)
 {
+    if (writer_error)
+        return;
     if (st == 0)
         return;
 
-    // Check if the tail has a label (shared/circular)
-    visited_entry *entry = find_visited(st);
-    if (entry && entry->label >= 0) {
-        if (entry->printed) {
-            // Already printed - use reference
-            fprintf(fp, " . #%d#", entry->label);
-            return;
-        }
-        // First print of this shared cell - print with label
-        fprintf(fp, " . #%d=", entry->label);
-        entry->printed = true;
-        if (IS_PAIR(st)) {
-            fprintf(fp, "(");
+    if (writer_emit_shared_labels) {
+        unsigned opened_labeled_lists = 0;
+        for (;;) {
+            if (st == 0)
+                break;
+
+            visited_entry *entry = find_visited(st);
+            if (entry && entry->label >= 0) {
+                if (entry->printed) {
+                    fprintf(fp, " . #%d#", entry->label);
+                    break;
+                }
+                fprintf(fp, " . #%d=", entry->label);
+                entry->printed = true;
+                if (!IS_PAIR(st)) {
+                    write_obj_fp(st, with_quotes, fp);
+                    break;
+                }
+                fprintf(fp, "(");
+                write_obj_fp(car(st), with_quotes, fp);
+                if (writer_error)
+                    break;
+                opened_labeled_lists++;
+                st = cdr(st);
+                continue;
+            }
+
+            if (!IS_PAIR(st)) {
+                fprintf(fp, " . ");
+                write_obj_fp(st, with_quotes, fp);
+                break;
+            }
+
+            fprintf(fp, " ");
             write_obj_fp(car(st), with_quotes, fp);
-            write_list_tail_fp(cdr(st), with_quotes, fp);
+            if (writer_error)
+                break;
+            st = cdr(st);
+        }
+        while (opened_labeled_lists > 0) {
             fprintf(fp, ")");
-        } else {
-            write_obj_fp(st, with_quotes, fp);
+            opened_labeled_lists--;
         }
         return;
     }
 
-    bool simple_tracking = false;
-    visited_entry *simple_entry = NULL;
-    if (!writer_emit_shared_labels && IS_PAIR(st)) {
-        simple_entry = find_visited(st);
-        if (simple_entry && simple_entry->active) {
+    unsigned *active_cells = NULL;
+    size_t active_len = 0, active_cap = 0;
+    for (;;) {
+        if (st == 0)
+            break;
+        if (!IS_PAIR(st)) {
+            fprintf(fp, " . ");
+            write_obj_fp(st, with_quotes, fp);
+            break;
+        }
+
+        visited_entry *entry = find_visited(st);
+        if (entry && entry->active) {
             show_error("write-simple: circular structure");
             writer_error = true;
-            return;
+            break;
         }
-        if (!simple_entry)
-            simple_entry = insert_visited(st);
-        if (simple_entry) {
-            simple_entry->active = true;
-            simple_tracking = true;
+        if (!entry)
+            entry = insert_visited(st);
+        if (!entry) {
+            if (!writer_error) {
+                show_error("write-simple: structure too large");
+                writer_error = true;
+            }
+            break;
         }
-    }
-
-    if (IS_PAIR(st)) {
+        if (!active_cell_push(&active_cells, &active_len, &active_cap, st)) {
+            show_error("write-simple: out of memory");
+            writer_error = true;
+            break;
+        }
+        entry->active = true;
         fprintf(fp, " ");
         write_obj_fp(car(st), with_quotes, fp);
-        write_list_tail_fp(cdr(st), with_quotes, fp);
-    } else {
-        fprintf(fp, " . ");
-        write_obj_fp(st, with_quotes, fp);
+        if (writer_error)
+            break;
+        st = cdr(st);
     }
-
-    if (simple_tracking)
-        simple_entry->active = false;
+    for (size_t i = 0; i < active_len; i++) {
+        visited_entry *entry = find_visited(active_cells[i]);
+        if (entry)
+            entry->active = false;
+    }
+    free(active_cells);
 }
 
 static void write_obj_fp(unsigned s, bool with_quotes, FILE *fp)
 {
+    if (writer_error)
+        return;
     if (s == 0) {
         fprintf(fp, "()");
         return;
@@ -468,6 +581,10 @@ static void write_obj_fp(unsigned s, bool with_quotes, FILE *fp)
     }
     if (IS_FIXNUM(s)) {
         fprintf(fp, "%" PRId64, (int64_t)FIXNUM_VALUE(s));
+        return;
+    }
+    if (!IS_CELL(s)) {
+        fprintf(fp, "[invalid-value]");
         return;
     }
     if (is_bytecode_closure_object(s)) {
@@ -488,10 +605,13 @@ static void write_obj_fp(unsigned s, bool with_quotes, FILE *fp)
         }
         if (!simple_entry)
             simple_entry = insert_visited(s);
-        if (simple_entry) {
-            simple_entry->active = true;
-            simple_tracking = true;
+        if (!simple_entry) {
+            show_error("write-simple: structure too large");
+            writer_error = true;
+            return;
         }
+        simple_entry->active = true;
+        simple_tracking = true;
     }
 
     // Check for shared/circular structure
@@ -514,6 +634,8 @@ static void write_obj_fp(unsigned s, bool with_quotes, FILE *fp)
             fprintf(fp, "#t");
         } else if (s == ctx.atom_false) {
             fprintf(fp, "#f");
+        } else if (!atom_is_valid(s)) {
+            fprintf(fp, "[invalid-symbol]");
         } else {
             const char *name = ctx.atom_table[CELL_ID(s)];
             if (symbol_needs_escape(name))
@@ -558,11 +680,19 @@ static void write_obj_fp(unsigned s, bool with_quotes, FILE *fp)
         break;
     }
     case BT_RATIONAL:
+        if (!is_numeric(s)) {
+            fprintf(fp, "[invalid-number]");
+            break;
+        }
         write_obj_fp(CELL_CAR(s), with_quotes, fp);
         fprintf(fp, "/");
         write_obj_fp(CELL_CDR(s), with_quotes, fp);
         break;
     case BT_COMPLEX: {
+        if (!is_numeric(s)) {
+            fprintf(fp, "[invalid-number]");
+            break;
+        }
         write_obj_fp(CELL_CAR(s), with_quotes, fp);
         unsigned imag = CELL_CDR(s);
         double imag_val = to_double(imag);
@@ -674,6 +804,10 @@ static void write_obj_fp(unsigned s, bool with_quotes, FILE *fp)
     case BT_MULTIVAL: {
         // Print multiple values
         unsigned vals = CELL_CAR(s);
+        if (!proper_list_silent(vals)) {
+            fprintf(fp, "[invalid-values]");
+            break;
+        }
         bool first = true;
         for (; vals; vals = cdr(vals)) {
             if (!first)
@@ -691,34 +825,45 @@ static void write_obj_fp(unsigned s, bool with_quotes, FILE *fp)
         simple_entry->active = false;
 }
 
+static bool begin_writer(bool emit_shared_labels)
+{
+    writer_error = false;
+    writer_emit_shared_labels = emit_shared_labels;
+    if (reset_visited())
+        return true;
+    show_error("writer: out of memory");
+    writer_error = true;
+    return false;
+}
+
 void write_obj(unsigned s)
 {
-    reset_visited();
-    writer_emit_shared_labels = true;
+    if (!begin_writer(true))
+        return;
     mark_shared(s);
     write_obj_fp(s, true, stdout);
 }
 
 void display_obj(unsigned s)
 {
-    reset_visited();
-    writer_emit_shared_labels = true;
+    if (!begin_writer(true))
+        return;
     mark_shared(s);
     write_obj_fp(s, false, stdout);
 }
 
 void write_obj_port(unsigned s, FILE *port)
 {
-    reset_visited();
-    writer_emit_shared_labels = true;
+    if (!begin_writer(true))
+        return;
     mark_shared(s);
     write_obj_fp(s, true, port);
 }
 
 void write_shared_obj_port(unsigned s, FILE *port)
 {
-    reset_visited();
-    writer_emit_shared_labels = true;
+    if (!begin_writer(true))
+        return;
     mark_shared(s);
     write_obj_fp(s, true, port);
 }
@@ -730,9 +875,10 @@ void write_simple_obj_port(unsigned s, FILE *port)
 
 bool write_simple_obj_port_checked(unsigned s, FILE *port)
 {
-    reset_visited();
-    writer_error = false;
-    writer_emit_shared_labels = false;
+    if (!begin_writer(false)) {
+        writer_emit_shared_labels = true;
+        return false;
+    }
     write_obj_fp(s, true, port);
     writer_emit_shared_labels = true;
     return !writer_error;
@@ -740,8 +886,8 @@ bool write_simple_obj_port_checked(unsigned s, FILE *port)
 
 void display_obj_port(unsigned s, FILE *port)
 {
-    reset_visited();
-    writer_emit_shared_labels = true;
+    if (!begin_writer(true))
+        return;
     mark_shared(s);
     write_obj_fp(s, false, port);
 }

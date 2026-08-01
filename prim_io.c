@@ -26,6 +26,7 @@
  */
 
 #include "prim_internal.h"
+#include "utf8.h"
 #include <errno.h>
 #include <poll.h>
 
@@ -68,6 +69,16 @@ static unsigned write_arg_to_string_port(unsigned arg, string_port *sport,
     return arg;
 }
 
+static bool flush_output_and_transcript(FILE *fport, const char *name)
+{
+    if (!flush_file_port(fport, name))
+        return false;
+    if (ctx.transcript && fport == ctx.current_output &&
+        !flush_file_port(ctx.transcript, name))
+        return false;
+    return true;
+}
+
 static bool write_arg_to_file_port(unsigned arg, FILE *fport, const char *name,
                                    bool display)
 {
@@ -88,7 +99,7 @@ static bool write_arg_to_file_port(unsigned arg, FILE *fport, const char *name,
             write_obj_port(arg, ctx.transcript);
     }
 
-    return flush_file_port(fport, name);
+    return flush_output_and_transcript(fport, name);
 }
 
 static unsigned write_arg_to_string_port_mode(unsigned arg, string_port *sport,
@@ -158,7 +169,7 @@ static bool write_arg_to_file_port_mode(unsigned arg, FILE *fport,
     writer(arg, fport);
     if (ctx.transcript && fport == ctx.current_output)
         writer(arg, ctx.transcript);
-    return flush_file_port(fport, name);
+    return flush_output_and_transcript(fport, name);
 }
 
 static bool write_arg_to_file_port_checked(unsigned arg, FILE *fport,
@@ -171,7 +182,7 @@ static bool write_arg_to_file_port_checked(unsigned arg, FILE *fport,
         if (!writer(arg, ctx.transcript))
             return false;
     }
-    return flush_file_port(fport, name);
+    return flush_output_and_transcript(fport, name);
 }
 
 static bool write_newline_to_file_port(FILE *fport)
@@ -179,14 +190,52 @@ static bool write_newline_to_file_port(FILE *fport)
     fprintf(fport, "\n");
     if (ctx.transcript && fport == ctx.current_output)
         fprintf(ctx.transcript, "\n");
-    return flush_file_port(fport, "newline");
+    return flush_output_and_transcript(fport, "newline");
+}
+
+static bool encode_char_utf8(int c, char encoded[4], size_t *encoded_len,
+                             const char *name)
+{
+    if (!scheme_utf8_encode_scalar((uint32_t)c, encoded, encoded_len)) {
+        show_error("%s: invalid character", name);
+        return false;
+    }
+    return true;
 }
 
 static bool write_char_to_string_port(string_port *sport, int c,
                                       const char *name)
 {
-    if (!strport_putc(sport, c)) {
+    if (c == 0) {
+        show_error("%s: null character cannot be stored in a string", name);
+        return false;
+    }
+    char encoded[4];
+    size_t encoded_len;
+    if (!encode_char_utf8(c, encoded, &encoded_len, name))
+        return false;
+    if (encoded_len > SIZE_MAX - sport->len - 1 ||
+        !strport_ensure_capacity(sport, sport->len + encoded_len + 1)) {
         show_error("%s: string port write failed", name);
+        return false;
+    }
+    memcpy(sport->data + sport->len, encoded, encoded_len);
+    sport->len += encoded_len;
+    sport->data[sport->len] = '\0';
+    return true;
+}
+
+static bool write_char_to_file_port(FILE *fport, int c, const char *name)
+{
+    char encoded[4];
+    size_t encoded_len;
+    if (!encode_char_utf8(c, encoded, &encoded_len, name))
+        return false;
+    if (fwrite(encoded, 1, encoded_len, fport) != encoded_len ||
+        (ctx.transcript && fport == ctx.current_output &&
+         fwrite(encoded, 1, encoded_len, ctx.transcript) != encoded_len) ||
+        !flush_output_and_transcript(fport, name)) {
+        show_error("%s: write failed", name);
         return false;
     }
     return true;
@@ -269,23 +318,102 @@ static bool reject_reader_token(unsigned result, const char *name)
     return true;
 }
 
+static size_t utf8_char_byte_len(unsigned char first)
+{
+    if (first < 0x80)
+        return 1;
+    if (first >= 0xC2 && first <= 0xDF)
+        return 2;
+    if (first >= 0xE0 && first <= 0xEF)
+        return 3;
+    if (first >= 0xF0 && first <= 0xF4)
+        return 4;
+    return 0;
+}
+
+/* Returns 1 for a character, 0 for EOF, and -1 for an invalid sequence. */
+static int read_or_peek_utf8_char(FILE *fport, string_port *sport, int ptype,
+                                  bool peek, uint32_t *codepoint,
+                                  char bytes[4], size_t *byte_len,
+                                  const char **error_msg)
+{
+    if (peek && ptype == 1) {
+        if (sport->pos >= sport->len)
+            return 0;
+        size_t remaining = sport->len - sport->pos;
+        size_t offset = 0;
+        if (!scheme_utf8_decode_next(sport->data + sport->pos, remaining,
+                                     &offset, codepoint, error_msg))
+            return -1;
+        *byte_len = offset;
+        memcpy(bytes, sport->data + sport->pos, offset);
+        return 1;
+    }
+
+    int c = ptype == 1 ? strport_getc(sport) : reader_port_getc(fport);
+    if (c == EOF)
+        return 0;
+    bytes[0] = (char)c;
+    *byte_len = utf8_char_byte_len((unsigned char)c);
+    if (*byte_len == 0) {
+        *error_msg = "invalid UTF-8 leading byte";
+        *byte_len = 1;
+        goto restore_peeked_bytes;
+    }
+    for (size_t i = 1; i < *byte_len; i++) {
+        c = ptype == 1 ? strport_getc(sport) : reader_port_getc(fport);
+        if (c == EOF) {
+            *error_msg = "truncated UTF-8 sequence";
+            *byte_len = i;
+            goto restore_peeked_bytes;
+        }
+        bytes[i] = (char)c;
+    }
+    size_t offset = 0;
+    if (!scheme_utf8_decode_next(bytes, *byte_len, &offset, codepoint,
+                                 error_msg))
+        goto restore_peeked_bytes;
+
+    if (!peek)
+        return 1;
+
+restore_peeked_bytes:
+    if (peek) {
+        for (size_t i = *byte_len; i > 0; i--) {
+            bool restored = ptype == 1
+                ? (--sport->pos, true)
+                : reader_port_ungetc(fport, (unsigned char)bytes[i - 1]);
+            if (!restored) {
+                *error_msg = "could not restore input while peeking";
+                return -1;
+            }
+        }
+    }
+    return *error_msg ? -1 : 1;
+}
+
 static unsigned read_or_peek_char(FILE *fport, string_port *sport, int ptype,
                                   bool peek, const char *name)
 {
-    int c;
-    if (ptype == 1) {
-        c = peek ? strport_peekc(sport) : strport_getc(sport);
-    } else {
-        c = peek ? reader_port_peekc(fport) : reader_port_getc(fport);
-    }
-    if (c == EOF) {
+    uint32_t codepoint;
+    char bytes[4];
+    size_t byte_len = 0;
+    const char *utf8_error = NULL;
+    int status = read_or_peek_utf8_char(fport, sport, ptype, peek, &codepoint,
+                                        bytes, &byte_len, &utf8_error);
+    if (status == 0) {
         if (ptype == 0 && ferror(fport)) {
             show_error("%s: read failed", name);
             return TOK_ERROR;
         }
         return atom_from_string("eof-object");
     }
-    return make_char(c);
+    if (status < 0) {
+        show_error("%s: %s", name,
+                   utf8_error ? utf8_error : "invalid UTF-8 sequence");
+        return TOK_ERROR;
+    }
+    return make_char((int)codepoint);
 }
 
 static unsigned read_or_peek_u8(FILE *fport, string_port *sport, int ptype,
@@ -307,16 +435,17 @@ static unsigned read_or_peek_u8(FILE *fport, string_port *sport, int ptype,
     return store(c & 0xff);
 }
 
-static bool grow_read_line_buffer(char **buf, size_t *cap)
+static bool grow_read_buffer(char **buf, size_t *cap, const char *name,
+                             const char *too_long)
 {
     size_t new_cap;
     if (!checked_grow_capacity_size(*cap, 1, &new_cap)) {
-        show_error("read-line: line too long");
+        show_error("%s: %s", name, too_long);
         return false;
     }
     char *newbuf = checked_realloc_size(*buf, new_cap);
     if (!newbuf) {
-        show_error("read-line: out of memory");
+        show_error("%s: out of memory", name);
         return false;
     }
     *buf = newbuf;
@@ -338,21 +467,43 @@ static unsigned read_string_value(unsigned count_arg, unsigned argc,
         return TOK_ERROR;
     if (count == 0)
         return make_string_copy("");
-    if ((uint64_t)count > SIZE_MAX - 1) {
-        show_error("%s: count too large", name);
-        return TOK_ERROR;
-    }
-    char *buf = checked_malloc_size((size_t)count + 1);
+    size_t cap = 16;
+    char *buf = checked_malloc_size(cap);
     if (!buf) {
         show_error("%s: out of memory", name);
         return TOK_ERROR;
     }
     size_t n = 0;
-    while (n < (size_t)count) {
-        int c = ptype == 1 ? strport_getc(sport) : reader_port_getc(fport);
-        if (c == EOF)
+    for (int64_t chars = 0; chars < count; chars++) {
+        uint32_t codepoint;
+        char bytes[4];
+        size_t byte_len = 0;
+        const char *utf8_error = NULL;
+        int status = read_or_peek_utf8_char(fport, sport, ptype, false,
+                                            &codepoint, bytes, &byte_len,
+                                            &utf8_error);
+        if (status == 0)
             break;
-        buf[n++] = (char)c;
+        if (status < 0) {
+            free(buf);
+            show_error("%s: %s", name,
+                       utf8_error ? utf8_error : "invalid UTF-8 sequence");
+            return TOK_ERROR;
+        }
+        if (codepoint == 0) {
+            free(buf);
+            show_error("%s: null character cannot be stored in a string",
+                       name);
+            return TOK_ERROR;
+        }
+        while (n > SIZE_MAX - byte_len - 1 || n + byte_len >= cap) {
+            if (!grow_read_buffer(&buf, &cap, name, "string too long")) {
+                free(buf);
+                return TOK_ERROR;
+            }
+        }
+        memcpy(buf + n, bytes, byte_len);
+        n += byte_len;
     }
     if (ptype == 0 && ferror(fport)) {
         free(buf);
@@ -373,21 +524,40 @@ static unsigned write_string_value(unsigned argc, unsigned *argv,
     char *str = require_string_ptr(argv[0], name);
     if (!str)
         return TOK_ERROR;
-    size_t len = strlen(str);
+    size_t char_len;
+    const char *utf8_error = NULL;
+    if (!scheme_utf8_count_chars(str, &char_len, &utf8_error)) {
+        show_error("%s: %s", name,
+                   utf8_error ? utf8_error : "invalid UTF-8 string");
+        return TOK_ERROR;
+    }
+    if (char_len >= UINT_MAX || char_len > INT64_MAX) {
+        show_error("%s: string too long", name);
+        return TOK_ERROR;
+    }
     int64_t start = 0;
-    int64_t end = (int64_t)len;
+    int64_t end = (int64_t)char_len;
     unsigned port_index = 1;
     if (argc >= 3) {
         port_index = 1;
-        if (!expect_index(argv[2], (unsigned)len + 1, &start, name))
+        if (!expect_index(argv[2], (unsigned)char_len + 1, &start, name))
             return TOK_ERROR;
         if (argc >= 4) {
-            if (!expect_index(argv[3], (unsigned)len + 1, &end, name))
+            if (!expect_index(argv[3], (unsigned)char_len + 1, &end, name))
                 return TOK_ERROR;
         }
     }
     if (start > end) {
         show_error("%s: invalid range", name);
+        return TOK_ERROR;
+    }
+    size_t start_byte, end_byte;
+    if (!scheme_utf8_byte_offset_for_index(str, (size_t)start, true,
+                                           &start_byte, &utf8_error) ||
+        !scheme_utf8_byte_offset_for_index(str, (size_t)end, true, &end_byte,
+                                           &utf8_error)) {
+        show_error("%s: %s", name,
+                   utf8_error ? utf8_error : "invalid UTF-8 string");
         return TOK_ERROR;
     }
     FILE *fport;
@@ -399,8 +569,8 @@ static unsigned write_string_value(unsigned argc, unsigned *argv,
     if (ptype == -1)
         return TOK_ERROR;
     if (ptype == 1) {
-        size_t slice_len = (size_t)(end - start);
-        char *slice = checked_string_copy_len(str + start, slice_len);
+        size_t slice_len = end_byte - start_byte;
+        char *slice = checked_string_copy_len(str + start_byte, slice_len);
         if (!slice) {
             show_error("%s: out of memory", name);
             return TOK_ERROR;
@@ -412,10 +582,14 @@ static unsigned write_string_value(unsigned argc, unsigned *argv,
             return TOK_ERROR;
         }
     } else {
-        size_t slice_len = (size_t)(end - start);
+        size_t slice_len = end_byte - start_byte;
         if ((slice_len > 0 &&
-             fwrite(str + start, 1, slice_len, fport) != slice_len) ||
-            !flush_file_port(fport, name)) {
+             fwrite(str + start_byte, 1, slice_len, fport) != slice_len) ||
+            (ctx.transcript && fport == ctx.current_output &&
+             slice_len > 0 &&
+             fwrite(str + start_byte, 1, slice_len, ctx.transcript) !=
+                 slice_len) ||
+            !flush_output_and_transcript(fport, name)) {
             show_error("%s: write failed", name);
             return TOK_ERROR;
         }
@@ -529,7 +703,7 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
     case PWRITECHAR: {
         REQUIRE_ARGC(argc, 1, 2, "write-char");
         CHECK_CHAR(argv[0], "write-char");
-        int c = (unsigned char)CELL_ID(argv[0]);
+        int c = GET_CHAR_CODE(argv[0]);
         FILE *fport;
         string_port *sport;
         int ptype = extract_optional_port(argc, argv, 2, PORT_OUTPUT, &fport,
@@ -539,8 +713,7 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
             if (!write_char_to_string_port(sport, c, "write-char"))
                 return TOK_ERROR;
         } else {
-            fputc(c, fport);
-            if (!flush_file_port(fport, "write-char"))
+            if (!write_char_to_file_port(fport, c, "write-char"))
                 return TOK_ERROR;
         }
         return 0;
@@ -548,7 +721,7 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
     case PEOF: {
         REQUIRE_ARGC(argc, 1, 1, "eof-object?");
         unsigned arg = argv[0];
-        return scheme_bool(IS_ATOM(arg) &&
+        return scheme_bool(atom_is_valid(arg) &&
                            strcmp(ctx.atom_table[CELL_ID(arg)],
                                   "eof-object") == 0);
     }
@@ -662,6 +835,11 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
             }
             if (c == EOF || c == '\n')
                 break;
+            if (c == 0) {
+                free(buf);
+                show_error("read-line: null character in string");
+                return TOK_ERROR;
+            }
             if (c == '\r') {
                 int next = ptype == 1 ? strport_peekc(sport)
                                       : reader_port_peekc(fport);
@@ -674,7 +852,7 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
                 break;
             }
             if (len + 1 >= cap) {
-                if (!grow_read_line_buffer(&buf, &cap)) {
+                if (!grow_read_buffer(&buf, &cap, "read-line", "line too long")) {
                     free(buf);
                     return TOK_ERROR;
                 }
@@ -695,6 +873,14 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         }
 
         buf[len] = '\0';
+        size_t char_count;
+        const char *utf8_error = NULL;
+        if (!scheme_utf8_count_chars(buf, &char_count, &utf8_error)) {
+            free(buf);
+            show_error("read-line: %s",
+                       utf8_error ? utf8_error : "invalid UTF-8 sequence");
+            return TOK_ERROR;
+        }
         return make_string_owned(buf);
     }
     case PEXIT: {

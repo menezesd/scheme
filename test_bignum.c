@@ -188,17 +188,54 @@ TEST(bn_mul_karatsuba_threshold)
     PASS();
 }
 
-TEST(bn_mul_toom3_threshold)
+TEST(bn_mul_large_karatsuba)
 {
-    bignum *a = bn_make_all_ones(TOOM3_THRESHOLD);
+    const size_t limbs = KARATSUBA_THRESHOLD * 4;
+    bignum *a = bn_make_all_ones(limbs);
     ASSERT(a != NULL);
-    ASSERT(a->len == TOOM3_THRESHOLD);
+    ASSERT(a->len == limbs);
 
     bignum *prod = bn_mul(a, a);
-    assert_all_ones_square_shape(prod, TOOM3_THRESHOLD);
+    assert_all_ones_square_shape(prod, limbs);
 
     bn_free(prod);
     bn_free(a);
+    PASS();
+}
+
+TEST(bn_mul_large_power_matches_square)
+{
+    bignum *ten = bn_from_int(10);
+    ASSERT(ten != NULL);
+    bignum *a = bn_pow(ten, 2000);
+    ASSERT(a != NULL);
+    bignum *square = bn_mul(a, a);
+    ASSERT(square != NULL);
+    bignum *expected = bn_pow(ten, 4000);
+    ASSERT(expected != NULL);
+    ASSERT_EQ(bn_cmp(square, expected), 0);
+
+    bignum *quotient = expected;
+    expected = NULL;
+    for (unsigned i = 0; i < 4000; i++) {
+        bignum *remainder = NULL;
+        bignum *next = bn_div(quotient, ten, &remainder);
+        ASSERT(next != NULL);
+        ASSERT(remainder != NULL);
+        ASSERT(bn_is_zero(remainder));
+        bn_free(remainder);
+        bn_free(quotient);
+        quotient = next;
+    }
+    bignum *one = bn_from_int(1);
+    ASSERT(one != NULL);
+    ASSERT_EQ(bn_cmp(quotient, one), 0);
+
+    bn_free(ten);
+    bn_free(a);
+    bn_free(square);
+    bn_free(quotient);
+    bn_free(one);
     PASS();
 }
 
@@ -376,6 +413,12 @@ TEST(bn_from_string_rejects_trailing_junk)
     PASS();
 }
 
+TEST(bn_from_string_rejects_non_ascii_char)
+{
+    ASSERT(bn_from_string("\xFF", 10) == NULL);
+    PASS();
+}
+
 TEST(bn_from_string_rejects_empty_digits)
 {
     bignum *a = bn_from_string("-", 10);
@@ -550,6 +593,26 @@ TEST(bn_checked_add_limb_negative)
     PASS();
 }
 
+TEST(bn_gcd_large)
+{
+    bignum *a = bn_from_string("123456789012345678901234567890", 10);
+    bignum *b = bn_from_string("98765432109876543210", 10);
+    ASSERT(a != NULL);
+    ASSERT(b != NULL);
+
+    bignum *gcd = bn_gcd(a, b);
+    bignum *expected = bn_from_int(90);
+    ASSERT(gcd != NULL);
+    ASSERT(expected != NULL);
+    ASSERT_EQ(bn_cmp(gcd, expected), 0);
+
+    bn_free(a);
+    bn_free(b);
+    bn_free(gcd);
+    bn_free(expected);
+    PASS();
+}
+
 // ============================================================================
 // Main
 // ============================================================================
@@ -569,7 +632,8 @@ int main(void)
     RUN_TEST(bn_mul_simple);
     RUN_TEST(bn_mul_negative);
     RUN_TEST(bn_mul_karatsuba_threshold);
-    RUN_TEST(bn_mul_toom3_threshold);
+    RUN_TEST(bn_mul_large_karatsuba);
+    RUN_TEST(bn_mul_large_power_matches_square);
     RUN_TEST(bn_div_simple);
     RUN_TEST(bn_div_with_remainder);
     RUN_TEST(bn_mod_simple);
@@ -583,6 +647,7 @@ int main(void)
     RUN_TEST(bn_from_string_positive);
     RUN_TEST(bn_from_string_negative);
     RUN_TEST(bn_from_string_rejects_trailing_junk);
+    RUN_TEST(bn_from_string_rejects_non_ascii_char);
     RUN_TEST(bn_from_string_rejects_empty_digits);
     RUN_TEST(bn_to_string_test);
     RUN_TEST(bn_to_string_negative);
@@ -597,6 +662,7 @@ int main(void)
     RUN_TEST(bn_add_ip_large);
     RUN_TEST(bn_checked_in_place_ops);
     RUN_TEST(bn_checked_add_limb_negative);
+    RUN_TEST(bn_gcd_large);
 
     TEST_SUMMARY("bignum");
 }

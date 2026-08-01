@@ -183,6 +183,7 @@ static unsigned make_bytevector_from_u8_argv(unsigned argc, unsigned *argv,
     for (unsigned i = 0; i < argc; i++) {
         int64_t val;
         if (!expect_u8(argv[i], &val, name)) {
+            bytevec_unregister(bv);
             free(bv);
             return TOK_ERROR;
         }
@@ -344,7 +345,9 @@ static bool char_list_length(unsigned lst, unsigned *len_out,
 static bool utf8_encode_char(int code, char out[4], size_t *len,
                              const char *name)
 {
-    if (!scheme_utf8_encode_scalar((uint32_t)code, out, len)) {
+    // Scheme strings are represented by NUL-terminated C buffers, so an
+    // embedded U+0000 would make subsequent string operations truncate them.
+    if (code == 0 || !scheme_utf8_encode_scalar((uint32_t)code, out, len)) {
         show_error("%s: character cannot be stored in a string", name);
         return false;
     }
@@ -487,7 +490,11 @@ static unsigned make_string_from_char_list(unsigned lst, const char *name)
     for (; lst; lst = cdr(lst)) {
         char encoded[4];
         size_t encoded_len;
-        utf8_encode_char((int)CELL_ID(car(lst)), encoded, &encoded_len, name);
+        if (!utf8_encode_char((int)CELL_ID(car(lst)), encoded, &encoded_len,
+                              name)) {
+            free(s);
+            return TOK_ERROR;
+        }
         memcpy(s + i, encoded, encoded_len);
         i += encoded_len;
     }
@@ -522,7 +529,11 @@ static unsigned make_string_from_chars(unsigned argc, unsigned *argv,
     for (unsigned i = 0; i < argc; i++) {
         char encoded[4];
         size_t encoded_len;
-        utf8_encode_char((int)CELL_ID(argv[i]), encoded, &encoded_len, name);
+        if (!utf8_encode_char((int)CELL_ID(argv[i]), encoded, &encoded_len,
+                              name)) {
+            free(s);
+            return TOK_ERROR;
+        }
         memcpy(s + pos, encoded, encoded_len);
         pos += encoded_len;
     }
@@ -633,7 +644,10 @@ static unsigned make_symbol_from_string(unsigned str, const char *name)
 
 static unsigned make_string_from_symbol(unsigned sym, const char *name)
 {
-    CHECK_SYMBOL(sym, name);
+    if (!atom_is_valid(sym)) {
+        show_error("%s: invalid symbol", name);
+        return TOK_ERROR;
+    }
     return make_string_copy(ctx.atom_table[CELL_ID(sym)]);
 }
 
@@ -731,16 +745,11 @@ static unsigned last_pair(unsigned lst, const char *name)
         show_error("%s: not a pair", name);
         return TOK_ERROR;
     }
-    for (;;) {
-        unsigned next = cdr(lst);
-        if (!next)
-            return lst;
-        if (!IS_PAIR(next)) {
-            show_error("%s: improper list", name);
-            return TOK_ERROR;
-        }
-        lst = next;
-    }
+    if (!list_length_checked(lst, NULL, name))
+        return TOK_ERROR;
+    while (cdr(lst))
+        lst = cdr(lst);
+    return lst;
 }
 
 static unsigned string_length_value(unsigned str, const char *name)
@@ -1040,6 +1049,11 @@ static unsigned utf8_to_string_value(unsigned argc, unsigned *argv,
     while (offset < len) {
         if (!utf8_decode_next(bytes, len, &offset, &code, name))
             return TOK_ERROR;
+        if (code == 0) {
+            show_error("%s: null character cannot be stored in a string",
+                       name);
+            return TOK_ERROR;
+        }
     }
     char *copy = checked_string_copy_len(bytes, len);
     if (!copy) {
@@ -1469,6 +1483,10 @@ static unsigned apply_bitwise_primitive(unsigned prim_id, unsigned argc,
 static unsigned current_second_value(void)
 {
     time_t now = time(NULL);
+    if (now == (time_t)-1) {
+        show_error("current-second: time failed");
+        return TOK_ERROR;
+    }
     return store_inexact((double)now);
 }
 
@@ -1477,6 +1495,14 @@ static unsigned current_jiffy_value(void)
     struct timespec ts;
     if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
         show_error("current-jiffy: clock_gettime failed");
+        return TOK_ERROR;
+    }
+    if (ts.tv_nsec < 0 || ts.tv_nsec >= JIFFIES_PER_SECOND ||
+        ts.tv_sec > INT64_MAX / JIFFIES_PER_SECOND ||
+        (ts.tv_sec == INT64_MAX / JIFFIES_PER_SECOND &&
+         ts.tv_nsec > INT64_MAX % JIFFIES_PER_SECOND) ||
+        ts.tv_sec < INT64_MIN / JIFFIES_PER_SECOND) {
+        show_error("current-jiffy: time out of range");
         return TOK_ERROR;
     }
     return store((int64_t)ts.tv_sec * JIFFIES_PER_SECOND + ts.tv_nsec);
@@ -1650,8 +1676,12 @@ static unsigned temporary_file_path_value(void)
         show_error("temporary-file-path: cannot create temporary path");
         return TOK_ERROR;
     }
-    close(fd);
-    unlink(tmpl);
+    int close_result = close(fd);
+    int unlink_result = unlink(tmpl);
+    if (close_result != 0 || unlink_result != 0) {
+        show_error("temporary-file-path: cannot prepare temporary path");
+        return TOK_ERROR;
+    }
     return make_string_copy(tmpl);
 }
 
@@ -1659,12 +1689,28 @@ static unsigned current_directory_value(unsigned argc, unsigned *argv,
                                         const char *name)
 {
     if (argc == 0) {
-        char *cwd = getcwd(NULL, 0);
-        if (!cwd) {
-            show_error("%s: cannot read current directory", name);
-            return TOK_ERROR;
+        size_t cap = 256;
+        for (;;) {
+            char *cwd = checked_malloc_size(cap);
+            if (!cwd) {
+                show_error("%s: out of memory", name);
+                return TOK_ERROR;
+            }
+            if (getcwd(cwd, cap))
+                return make_string_owned(cwd);
+            int err = errno;
+            free(cwd);
+            if (err != ERANGE) {
+                show_error("%s: cannot read current directory", name);
+                return TOK_ERROR;
+            }
+            size_t new_cap;
+            if (!checked_grow_capacity_size(cap, 1, &new_cap)) {
+                show_error("%s: path too long", name);
+                return TOK_ERROR;
+            }
+            cap = new_cap;
         }
-        return make_string_owned(cwd);
     }
 
     char *path = require_string_ptr(argv[0], name);
@@ -1824,7 +1870,15 @@ static unsigned read_bytevector_into(unsigned argc, unsigned *argv,
     size_t len = (size_t)(end - start);
     if (len == 0)
         return store(0);
-    size_t n = fread(bv->data + start, 1, len, f);
+    size_t n = 0;
+    while (n < len && reader_port_pending_bytes(f) > 0) {
+        int c = reader_port_getc(f);
+        if (c == EOF)
+            break;
+        bv->data[start + n++] = (uint8_t)c;
+    }
+    if (n < len)
+        n += fread(bv->data + start + n, 1, len - n, f);
     if (ferror(f)) {
         show_error("%s: read failed", name);
         return TOK_ERROR;
@@ -1868,7 +1922,9 @@ static uint64_t scheme_hash(unsigned key)
         return key;
     switch (CELL_TYPE(key)) {
     case BT_ATOM:
-        return hash_string_bytes(ctx.atom_table[CELL_ID(key)]);
+        return atom_is_valid(key)
+                   ? hash_string_bytes(ctx.atom_table[CELL_ID(key)])
+                   : PRIM_FNV_OFFSET_BASIS;
     case BT_NUM:
     case BT_CHAR:
         return (uint64_t)CELL_ID(key) * PRIM_FNV_PRIME;
@@ -1906,7 +1962,9 @@ static uint64_t hash_key_for_table_seen(hash_table_data *ht, unsigned key,
     if (IS_FIXNUM(key) || !IS_CELL(key))
         return scheme_hash(key);
 
-    bool track_path = CELL_TYPE(key) == BT_CONS || CELL_TYPE(key) == BT_VECTOR;
+    enum lisp_type key_type = CELL_TYPE(key);
+    bool track_path = key_type == BT_CONS || key_type == BT_VECTOR ||
+                      key_type == BT_RATIONAL || key_type == BT_COMPLEX;
     if (track_path) {
         if (hash_seen_contains(seen, seen_len, key))
             return HASH_RECURSION_MARKER;
@@ -1915,7 +1973,7 @@ static uint64_t hash_key_for_table_seen(hash_table_data *ht, unsigned key,
         seen[seen_len++] = key;
     }
 
-    switch (CELL_TYPE(key)) {
+    switch (key_type) {
     case BT_RATIONAL:
     case BT_COMPLEX:
     case BT_CONS:

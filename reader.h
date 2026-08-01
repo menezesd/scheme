@@ -19,6 +19,10 @@ size_t reader_port_pending_bytes(FILE *port);
 int reader_port_getc(FILE *port);
 int reader_port_peekc(FILE *port);
 
+// Put back the most recently read byte, preserving reader pushback state.
+// Returns false if the byte cannot be restored.
+bool reader_port_ungetc(FILE *port, int c);
+
 // Discard saved reader state for a port before closing it
 void reader_forget_port(FILE *port);
 

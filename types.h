@@ -714,7 +714,11 @@ static inline int32_t FIXNUM_VALUE(unsigned v)
 #define CELL_ID(c) (ctx.cons_cells[c].id)
 
 // Type checking macros
-#define IS_CELL(c) ((c) != 0 && !IS_FIXNUM(c))
+// Values are either tagged fixnums or indexes into the two semispaces.  Keep
+// this range check in the common type predicate so malformed external values
+// cannot turn into out-of-bounds heap dereferences through IS_PAIR/IS_ATOM.
+#define IS_CELL(c)                                                            \
+    ((c) != 0 && (c) < 2u * SEMISPACE_SIZE && !IS_FIXNUM(c))
 #define IS_PAIR(c) (IS_CELL(c) && CELL_TYPE(c) == BT_CONS)
 #define IS_ATOM(c) (IS_CELL(c) && CELL_TYPE(c) == BT_ATOM)
 #define IS_NUM(c) (IS_CELL(c) && CELL_TYPE(c) == BT_NUM)

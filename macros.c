@@ -93,7 +93,7 @@ static unsigned do_gensym(void)
 
 static bool generated_gensym_atom(unsigned atom)
 {
-    if (!IS_ATOM(atom))
+    if (!atom_is_valid(atom))
         return false;
     const char *name = ctx.atom_table[CELL_ID(atom)];
     const char prefix[] = "##gensym##";
@@ -245,11 +245,26 @@ static bool pattern_literals_match(unsigned pattern, unsigned input,
                                           ellipsis_id, closure_env, use_env);
         }
 
-        return IS_PAIR(input) &&
-               pattern_literals_match(car(pattern), car(input), literals,
-                                      ellipsis_id, closure_env, use_env) &&
-               pattern_literals_match(cdr(pattern), cdr(input), literals,
-                                      ellipsis_id, closure_env, use_env);
+        // Fixed-arity patterns can be wide even when they are not nested.
+        // Compare their list spine iteratively rather than recursing through
+        // every cdr.
+        for (;;) {
+            if (!IS_PAIR(input) ||
+                !pattern_literals_match(car(pattern), car(input), literals,
+                                        ellipsis_id, closure_env, use_env))
+                return false;
+            pattern = cdr(pattern);
+            input = cdr(input);
+            if (!IS_PAIR(pattern))
+                return pattern_literals_match(pattern, input, literals,
+                                              ellipsis_id, closure_env,
+                                              use_env);
+            if (IS_PAIR(cdr(pattern)) &&
+                syntax_is_ellipsis(cadr(pattern), ellipsis_id))
+                return pattern_literals_match(pattern, input, literals,
+                                              ellipsis_id, closure_env,
+                                              use_env);
+        }
     }
 
     if (!IS_CELL(pattern) || !IS_CELL(input))
@@ -360,8 +375,11 @@ static unsigned collect_ellipsis_vars(unsigned tmpl, unsigned bindings,
     }
 
     if (IS_PAIR(tmpl)) {
-        collected = collect_ellipsis_vars(car(tmpl), bindings, collected);
-        return collect_ellipsis_vars(cdr(tmpl), bindings, collected);
+        while (IS_PAIR(tmpl)) {
+            collected = collect_ellipsis_vars(car(tmpl), bindings, collected);
+            tmpl = cdr(tmpl);
+        }
+        return collect_ellipsis_vars(tmpl, bindings, collected);
     }
 
     if (IS_VECTOR(tmpl)) {
@@ -752,11 +770,28 @@ static unsigned collect_free_ids_quasiquote(unsigned tmpl, unsigned bindings,
             }
         }
 
-        collected = collect_free_ids_quasiquote(
-            car(tmpl), bindings, collected, ellipsis_id, depth, closure_env);
-        gc_protect(&collected);
-        return collect_free_ids_quasiquote(cdr(tmpl), bindings, collected,
-                                           ellipsis_id, depth, closure_env);
+        // A quasiquoted datum may be a wide, flat list.  Preserve the
+        // special unquote handling while avoiding one recursive call per cdr.
+        for (;;) {
+            collected = collect_free_ids_quasiquote(
+                car(tmpl), bindings, collected, ellipsis_id, depth,
+                closure_env);
+            unsigned next = cdr(tmpl);
+            if (!IS_PAIR(next))
+                return collect_free_ids_quasiquote(
+                    next, bindings, collected, ellipsis_id, depth,
+                    closure_env);
+            if (IS_ATOM(car(next))) {
+                int64_t next_id = CELL_ID(car(next));
+                if (next_id == ctx.kw_unquote ||
+                    next_id == ctx.kw_unquote_splicing ||
+                    next_id == ctx.kw_quasiquote)
+                    return collect_free_ids_quasiquote(
+                        next, bindings, collected, ellipsis_id, depth,
+                        closure_env);
+            }
+            tmpl = next;
+        }
     }
 
     if (IS_VECTOR(tmpl)) {
@@ -879,13 +914,26 @@ static unsigned collect_free_ids(unsigned tmpl, unsigned bindings,
                 return collected;
             }
         }
-        // Recursively collect from car and cdr
-        collected =
-            collect_free_ids(car(tmpl), bindings, collected, ellipsis_id,
-                             closure_env);
-        gc_protect(&collected);
-        return collect_free_ids(cdr(tmpl), bindings, collected, ellipsis_id,
-                                closure_env);
+        // Traverse ordinary list spines iteratively.  Macro templates may
+        // contain very large flat executable forms (for example a begin with
+        // many expressions), for which recursive cdr traversal overflows the
+        // C stack.
+        for (;;) {
+            collected = collect_free_ids(car(tmpl), bindings, collected,
+                                         ellipsis_id, closure_env);
+            unsigned next = cdr(tmpl);
+            if (!IS_PAIR(next))
+                return collect_free_ids(next, bindings, collected,
+                                        ellipsis_id, closure_env);
+
+            // Keep specialized handling for a tail that begins a syntactic
+            // form; otherwise it is ordinary list data and can stay in this
+            // loop.
+            if (IS_ATOM(car(next)) && is_special_form(CELL_ID(car(next))))
+                return collect_free_ids(next, bindings, collected,
+                                        ellipsis_id, closure_env);
+            tmpl = next;
+        }
     }
 
     if (IS_VECTOR(tmpl)) {
@@ -960,19 +1008,57 @@ static unsigned rename_free_ids_quasiquote(unsigned tmpl, unsigned rename_map,
             }
         }
 
-        unsigned new_car =
-            rename_free_ids_quasiquote(car(tmpl), rename_map, depth);
-        if (new_car == TOK_ERROR)
-            return TOK_ERROR;
-        gc_protect(&new_car);
-        unsigned new_cdr =
-            rename_free_ids_quasiquote(cdr(tmpl), rename_map, depth);
-        if (new_cdr == TOK_ERROR)
-            return TOK_ERROR;
-        gc_protect(&new_cdr);
-        if (new_car == car(tmpl) && new_cdr == cdr(tmpl))
-            return tmpl;
-        return alloc_cons(new_car, new_cdr);
+        unsigned original = tmpl;
+        unsigned result = 0, result_tail = 0;
+        bool changed = false;
+        gc_protect(&original);
+        gc_protect(&result);
+        gc_protect(&result_tail);
+        for (;;) {
+            unsigned old_car = car(tmpl);
+            unsigned new_car =
+                rename_free_ids_quasiquote(old_car, rename_map, depth);
+            if (new_car == TOK_ERROR)
+                return TOK_ERROR;
+            if (new_car != old_car)
+                changed = true;
+            gc_protect(&new_car);
+            list_append(&result, &result_tail, new_car);
+            gc_unprotect(1);
+
+            unsigned next = cdr(tmpl);
+            if (!IS_PAIR(next)) {
+                unsigned new_tail =
+                    rename_free_ids_quasiquote(next, rename_map, depth);
+                if (new_tail == TOK_ERROR)
+                    return TOK_ERROR;
+                if (new_tail != next)
+                    changed = true;
+                if (!changed)
+                    return original;
+                if (new_tail)
+                    cell_set_cdr(result_tail, new_tail);
+                return result;
+            }
+            if (IS_ATOM(car(next))) {
+                int64_t next_id = CELL_ID(car(next));
+                if (next_id == ctx.kw_unquote ||
+                    next_id == ctx.kw_unquote_splicing ||
+                    next_id == ctx.kw_quasiquote) {
+                    unsigned new_tail = rename_free_ids_quasiquote(
+                        next, rename_map, depth);
+                    if (new_tail == TOK_ERROR)
+                        return TOK_ERROR;
+                    if (new_tail != next)
+                        changed = true;
+                    if (!changed)
+                        return original;
+                    cell_set_cdr(result_tail, new_tail);
+                    return result;
+                }
+            }
+            tmpl = next;
+        }
     }
 
     if (IS_VECTOR(tmpl)) {
@@ -1177,21 +1263,58 @@ static unsigned rename_free_ids_inner(unsigned tmpl, unsigned rename_map,
                 return tmpl;
             }
         }
-        unsigned new_car =
-            rename_free_ids_inner(car(tmpl), rename_map, quote_shadowed,
-                                  quasiquote_shadowed);
-        if (new_car == TOK_ERROR)
-            return TOK_ERROR;
-        gc_protect(&new_car);
-        unsigned new_cdr =
-            rename_free_ids_inner(cdr(tmpl), rename_map, quote_shadowed,
-                                  quasiquote_shadowed);
-        if (new_cdr == TOK_ERROR)
-            return TOK_ERROR;
-        gc_protect(&new_cdr);
-        if (new_car == car(tmpl) && new_cdr == cdr(tmpl))
-            return tmpl;
-        return alloc_cons(new_car, new_cdr);
+        // Ordinary template lists can be very wide.  Walking their cdrs
+        // recursively makes an otherwise shallow macro expansion consume one
+        // C stack frame per element (notably for a large introduced begin).
+        // Build the renamed spine iteratively, while delegating a tail that
+        // starts a syntactic form to the existing specialized handling.
+        unsigned original = tmpl;
+        unsigned result = 0, result_tail = 0;
+        bool changed = false;
+        gc_protect(&original);
+        gc_protect(&result);
+        gc_protect(&result_tail);
+        for (;;) {
+            unsigned old_car = car(tmpl);
+            unsigned new_car = rename_free_ids_inner(
+                old_car, rename_map, quote_shadowed, quasiquote_shadowed);
+            if (new_car == TOK_ERROR)
+                return TOK_ERROR;
+            if (new_car != old_car)
+                changed = true;
+            gc_protect(&new_car);
+            list_append(&result, &result_tail, new_car);
+            gc_unprotect(1);
+
+            unsigned next = cdr(tmpl);
+            if (!IS_PAIR(next)) {
+                unsigned new_tail = rename_free_ids_inner(
+                    next, rename_map, quote_shadowed, quasiquote_shadowed);
+                if (new_tail == TOK_ERROR)
+                    return TOK_ERROR;
+                if (new_tail != next)
+                    changed = true;
+                if (!changed)
+                    return original;
+                if (new_tail)
+                    cell_set_cdr(result_tail, new_tail);
+                return result;
+            }
+
+            if (IS_ATOM(car(next)) && is_special_form(CELL_ID(car(next)))) {
+                unsigned new_tail = rename_free_ids_inner(
+                    next, rename_map, quote_shadowed, quasiquote_shadowed);
+                if (new_tail == TOK_ERROR)
+                    return TOK_ERROR;
+                if (new_tail != next)
+                    changed = true;
+                if (!changed)
+                    return original;
+                cell_set_cdr(result_tail, new_tail);
+                return result;
+            }
+            tmpl = next;
+        }
     }
 
     if (IS_VECTOR(tmpl)) {
@@ -1257,8 +1380,12 @@ static bool pattern_binds_id(unsigned pattern, int64_t old_id,
     }
 
     if (IS_PAIR(pattern)) {
-        return pattern_binds_id(car(pattern), old_id, literals, ellipsis_id) ||
-               pattern_binds_id(cdr(pattern), old_id, literals, ellipsis_id);
+        while (IS_PAIR(pattern)) {
+            if (pattern_binds_id(car(pattern), old_id, literals, ellipsis_id))
+                return true;
+            pattern = cdr(pattern);
+        }
+        return pattern_binds_id(pattern, old_id, literals, ellipsis_id);
     }
 
     if (IS_VECTOR(pattern)) {
@@ -1327,19 +1454,57 @@ static unsigned rename_in_quasiquote(unsigned tmpl, int64_t old_id,
             }
         }
 
-        unsigned new_car =
-            rename_in_quasiquote(car(tmpl), old_id, new_sym, depth);
-        if (new_car == TOK_ERROR)
-            return TOK_ERROR;
-        gc_protect(&new_car);
-        unsigned new_cdr =
-            rename_in_quasiquote(cdr(tmpl), old_id, new_sym, depth);
-        if (new_cdr == TOK_ERROR)
-            return TOK_ERROR;
-        gc_protect(&new_cdr);
-        if (new_car == car(tmpl) && new_cdr == cdr(tmpl))
-            return tmpl;
-        return alloc_cons(new_car, new_cdr);
+        unsigned original = tmpl;
+        unsigned result = 0, result_tail = 0;
+        bool changed = false;
+        gc_protect(&original);
+        gc_protect(&result);
+        gc_protect(&result_tail);
+        for (;;) {
+            unsigned old_car = car(tmpl);
+            unsigned new_car =
+                rename_in_quasiquote(old_car, old_id, new_sym, depth);
+            if (new_car == TOK_ERROR)
+                return TOK_ERROR;
+            if (new_car != old_car)
+                changed = true;
+            gc_protect(&new_car);
+            list_append(&result, &result_tail, new_car);
+            gc_unprotect(1);
+
+            unsigned next = cdr(tmpl);
+            if (!IS_PAIR(next)) {
+                unsigned new_tail =
+                    rename_in_quasiquote(next, old_id, new_sym, depth);
+                if (new_tail == TOK_ERROR)
+                    return TOK_ERROR;
+                if (new_tail != next)
+                    changed = true;
+                if (!changed)
+                    return original;
+                if (new_tail)
+                    cell_set_cdr(result_tail, new_tail);
+                return result;
+            }
+            if (IS_ATOM(car(next))) {
+                int64_t next_id = CELL_ID(car(next));
+                if (next_id == ctx.kw_unquote ||
+                    next_id == ctx.kw_unquote_splicing ||
+                    next_id == ctx.kw_quasiquote) {
+                    unsigned new_tail = rename_in_quasiquote(
+                        next, old_id, new_sym, depth);
+                    if (new_tail == TOK_ERROR)
+                        return TOK_ERROR;
+                    if (new_tail != next)
+                        changed = true;
+                    if (!changed)
+                        return original;
+                    cell_set_cdr(result_tail, new_tail);
+                    return result;
+                }
+            }
+            tmpl = next;
+        }
     }
 
     if (IS_VECTOR(tmpl)) {
@@ -1420,17 +1585,55 @@ static unsigned rename_in_template(unsigned tmpl, int64_t old_id,
                 return alloc_cons(head, result_tail);
             }
         }
-        unsigned new_car = rename_in_template(car(tmpl), old_id, new_sym);
-        if (new_car == TOK_ERROR)
-            return TOK_ERROR;
-        gc_protect(&new_car);
-        unsigned new_cdr = rename_in_template(cdr(tmpl), old_id, new_sym);
-        if (new_cdr == TOK_ERROR)
-            return TOK_ERROR;
-        gc_protect(&new_cdr);
-        if (new_car == car(tmpl) && new_cdr == cdr(tmpl))
-            return tmpl;
-        return alloc_cons(new_car, new_cdr);
+        unsigned original = tmpl;
+        unsigned result = 0, result_tail = 0;
+        bool changed = false;
+        gc_protect(&original);
+        gc_protect(&result);
+        gc_protect(&result_tail);
+        for (;;) {
+            unsigned old_car = car(tmpl);
+            unsigned new_car = rename_in_template(old_car, old_id, new_sym);
+            if (new_car == TOK_ERROR)
+                return TOK_ERROR;
+            if (new_car != old_car)
+                changed = true;
+            gc_protect(&new_car);
+            list_append(&result, &result_tail, new_car);
+            gc_unprotect(1);
+
+            unsigned next = cdr(tmpl);
+            if (!IS_PAIR(next)) {
+                unsigned new_tail = rename_in_template(next, old_id, new_sym);
+                if (new_tail == TOK_ERROR)
+                    return TOK_ERROR;
+                if (new_tail != next)
+                    changed = true;
+                if (!changed)
+                    return original;
+                if (new_tail)
+                    cell_set_cdr(result_tail, new_tail);
+                return result;
+            }
+            if (IS_ATOM(car(next))) {
+                int64_t next_id = CELL_ID(car(next));
+                if (next_id == ctx.kw_protected || next_id == ctx.kw_quote ||
+                    next_id == ctx.kw_quasiquote ||
+                    syntax_rules_form_like(next)) {
+                    unsigned new_tail =
+                        rename_in_template(next, old_id, new_sym);
+                    if (new_tail == TOK_ERROR)
+                        return TOK_ERROR;
+                    if (new_tail != next)
+                        changed = true;
+                    if (!changed)
+                        return original;
+                    cell_set_cdr(result_tail, new_tail);
+                    return result;
+                }
+            }
+            tmpl = next;
+        }
     }
 
     if (IS_VECTOR(tmpl)) {
@@ -1595,17 +1798,57 @@ static unsigned hygienize_quasiquote(unsigned tmpl, unsigned bindings,
             }
         }
 
-        unsigned new_car = hygienize_quasiquote(car(tmpl), bindings, depth);
-        if (new_car == TOK_ERROR)
-            return TOK_ERROR;
-        gc_protect(&new_car);
-        unsigned new_cdr = hygienize_quasiquote(cdr(tmpl), bindings, depth);
-        if (new_cdr == TOK_ERROR)
-            return TOK_ERROR;
-        gc_protect(&new_cdr);
-        if (new_car == car(tmpl) && new_cdr == cdr(tmpl))
-            return tmpl;
-        return alloc_cons(new_car, new_cdr);
+        unsigned original = tmpl;
+        unsigned result = 0, result_tail = 0;
+        bool changed = false;
+        gc_protect(&original);
+        gc_protect(&result);
+        gc_protect(&result_tail);
+        for (;;) {
+            unsigned old_car = car(tmpl);
+            unsigned new_car =
+                hygienize_quasiquote(old_car, bindings, depth);
+            if (new_car == TOK_ERROR)
+                return TOK_ERROR;
+            if (new_car != old_car)
+                changed = true;
+            gc_protect(&new_car);
+            list_append(&result, &result_tail, new_car);
+            gc_unprotect(1);
+
+            unsigned next = cdr(tmpl);
+            if (!IS_PAIR(next)) {
+                unsigned new_tail =
+                    hygienize_quasiquote(next, bindings, depth);
+                if (new_tail == TOK_ERROR)
+                    return TOK_ERROR;
+                if (new_tail != next)
+                    changed = true;
+                if (!changed)
+                    return original;
+                if (new_tail)
+                    cell_set_cdr(result_tail, new_tail);
+                return result;
+            }
+            if (IS_ATOM(car(next))) {
+                int64_t next_id = CELL_ID(car(next));
+                if (next_id == ctx.kw_unquote ||
+                    next_id == ctx.kw_unquote_splicing ||
+                    next_id == ctx.kw_quasiquote) {
+                    unsigned new_tail =
+                        hygienize_quasiquote(next, bindings, depth);
+                    if (new_tail == TOK_ERROR)
+                        return TOK_ERROR;
+                    if (new_tail != next)
+                        changed = true;
+                    if (!changed)
+                        return original;
+                    cell_set_cdr(result_tail, new_tail);
+                    return result;
+                }
+            }
+            tmpl = next;
+        }
     }
 
     if (IS_VECTOR(tmpl)) {
@@ -2370,27 +2613,50 @@ static unsigned hygienize_template(unsigned tmpl, unsigned bindings)
             }
         }
 
-        // Regular list - hygienize each element
-        unsigned new_car = hygienize_template(car(tmpl), bindings);
-        if (new_car == TOK_ERROR) {
-            gc_unprotect(2);
-            return TOK_ERROR;
+        // Walk ordinary list spines iteratively.  A macro template may hold
+        // a very large flat datum, for which recursing through each cdr would
+        // overflow the C stack despite shallow structural nesting.
+        unsigned result = 0, result_tail = 0;
+        gc_protect(&result);
+        gc_protect(&result_tail);
+        for (;;) {
+            unsigned new_car = hygienize_template(car(tmpl), bindings);
+            if (new_car == TOK_ERROR) {
+                gc_unprotect(4);
+                return TOK_ERROR;
+            }
+            gc_protect(&new_car);
+            list_append(&result, &result_tail, new_car);
+            gc_unprotect(1);
+
+            unsigned next = cdr(tmpl);
+            if (!IS_PAIR(next)) {
+                if (next) {
+                    unsigned new_tail = hygienize_template(next, bindings);
+                    if (new_tail == TOK_ERROR) {
+                        gc_unprotect(4);
+                        return TOK_ERROR;
+                    }
+                    cell_set_cdr(result_tail, new_tail);
+                }
+                gc_unprotect(4);
+                return result;
+            }
+
+            // Preserve the existing special-form handling if a cdr happens
+            // to begin a new syntactic form rather than being list data.
+            if (IS_ATOM(car(next)) && is_special_form(CELL_ID(car(next)))) {
+                unsigned new_tail = hygienize_template(next, bindings);
+                if (new_tail == TOK_ERROR) {
+                    gc_unprotect(4);
+                    return TOK_ERROR;
+                }
+                cell_set_cdr(result_tail, new_tail);
+                gc_unprotect(4);
+                return result;
+            }
+            tmpl = next;
         }
-        gc_protect(&new_car);
-        unsigned new_cdr = hygienize_template(cdr(tmpl), bindings);
-        if (new_cdr == TOK_ERROR) {
-            gc_unprotect(3);
-            return TOK_ERROR;
-        }
-        gc_protect(&new_cdr);
-        // Now 4 protected: tmpl, bindings, new_car, new_cdr
-        unsigned result;
-        if (new_car == car(tmpl) && new_cdr == cdr(tmpl))
-            result = tmpl;
-        else
-            result = alloc_cons(new_car, new_cdr);
-        gc_unprotect(4);
-        return result;
     }
 
     if (IS_VECTOR(tmpl)) {
@@ -2679,24 +2945,39 @@ unsigned syntax_match(unsigned pattern, unsigned input, unsigned literals,
             return TOK_ERROR;
         }
 
-        // Regular cons pattern
-        if (!IS_PAIR(input)) {
-            gc_unprotect(4);
-            return TOK_ERROR;
-        }
+        // Match ordinary list spines iteratively.  A macro may legitimately
+        // have a very wide fixed-arity pattern, which must not require one C
+        // frame per argument.
+        for (;;) {
+            if (!IS_PAIR(input)) {
+                gc_unprotect(4);
+                return TOK_ERROR;
+            }
 
-        // Match car
-        bindings = syntax_match(car(pattern), car(input), literals, bindings,
-                                ellipsis_id);
-        if (bindings == TOK_ERROR) {
-            gc_unprotect(4);
-            return TOK_ERROR;
-        }
+            bindings = syntax_match(car(pattern), car(input), literals,
+                                    bindings, ellipsis_id);
+            if (bindings == TOK_ERROR) {
+                gc_unprotect(4);
+                return TOK_ERROR;
+            }
 
-        // Match cdr - tail call, unprotect first
-        gc_unprotect(4);
-        return syntax_match(cdr(pattern), cdr(input), literals, bindings,
-                            ellipsis_id);
+            pattern = cdr(pattern);
+            input = cdr(input);
+            if (!IS_PAIR(pattern)) {
+                gc_unprotect(4);
+                return syntax_match(pattern, input, literals, bindings,
+                                    ellipsis_id);
+            }
+
+            // Let the existing ellipsis logic handle a tail that begins an
+            // ellipsis group, just as the former recursive cdr call did.
+            if (IS_PAIR(cdr(pattern)) &&
+                syntax_is_ellipsis(cadr(pattern), ellipsis_id)) {
+                gc_unprotect(4);
+                return syntax_match(pattern, input, literals, bindings,
+                                    ellipsis_id);
+            }
+        }
     }
 
     // Other patterns (numbers, strings, etc.) must match exactly
@@ -2840,24 +3121,60 @@ unsigned syntax_expand(unsigned tmpl, unsigned bindings, unsigned mark,
             return rest_expanded;
         }
 
-        // Regular cons - expand both parts
-        unsigned new_car = 0;
-        gc_protect(&new_car);
-        new_car = syntax_expand(car(tmpl), bindings, mark, ellipsis_id);
-        if (new_car == TOK_ERROR) {
-            gc_unprotect(3);
-            return TOK_ERROR;
+        // Expand ordinary list spines iteratively.  Flat templates can be
+        // arbitrarily long even though their structural nesting is shallow;
+        // recursively expanding every cdr used to overflow the C stack.
+        unsigned result = 0, result_tail = 0;
+        gc_protect(&result);
+        gc_protect(&result_tail);
+        for (;;) {
+            if (!IS_PAIR(tmpl)) {
+                if (tmpl) {
+                    unsigned rest =
+                        syntax_expand(tmpl, bindings, mark, ellipsis_id);
+                    if (rest == TOK_ERROR) {
+                        gc_unprotect(4);
+                        return TOK_ERROR;
+                    }
+                    if (result)
+                        cell_set_cdr(result_tail, rest);
+                    else
+                        result = rest;
+                }
+                gc_unprotect(4);
+                return result;
+            }
+
+            // Delegate an ellipsis group to its dedicated expansion path.
+            // That path appends its expanded tail, while this loop handles
+            // every ordinary cons before it without growing the C stack.
+            if (IS_PAIR(cdr(tmpl)) &&
+                syntax_is_ellipsis(cadr(tmpl), ellipsis_id)) {
+                unsigned rest = syntax_expand(tmpl, bindings, mark,
+                                              ellipsis_id);
+                if (rest == TOK_ERROR) {
+                    gc_unprotect(4);
+                    return TOK_ERROR;
+                }
+                if (result)
+                    cell_set_cdr(result_tail, rest);
+                else
+                    result = rest;
+                gc_unprotect(4);
+                return result;
+            }
+
+            unsigned new_car =
+                syntax_expand(car(tmpl), bindings, mark, ellipsis_id);
+            if (new_car == TOK_ERROR) {
+                gc_unprotect(4);
+                return TOK_ERROR;
+            }
+            gc_protect(&new_car);
+            list_append(&result, &result_tail, new_car);
+            gc_unprotect(1);
+            tmpl = cdr(tmpl);
         }
-        unsigned new_cdr =
-            syntax_expand(cdr(tmpl), bindings, mark, ellipsis_id);
-        if (new_cdr == TOK_ERROR) {
-            gc_unprotect(3);
-            return TOK_ERROR;
-        }
-        gc_protect(&new_cdr);
-        unsigned result = alloc_cons(new_car, new_cdr);
-        gc_unprotect(4);
-        return result;
     }
 
     // Vector template - expand each element
@@ -3023,7 +3340,8 @@ static bool syntax_transformer_well_formed(unsigned transformer, unsigned input,
                                            unsigned *literals_out,
                                            unsigned *rules_out)
 {
-    if (!IS_SYNTAX(transformer) || !IS_PAIR(input))
+    if (!IS_SYNTAX(transformer) || !IS_PAIR(input) ||
+        pair_chain_is_circular(input))
         return false;
 
     unsigned syn_data = car(transformer);
