@@ -247,6 +247,22 @@ static void close_reader_stream(FILE *port)
     fclose(port);
 }
 
+// True if bytes already sit in the FILE*'s stdio read buffer. poll() only
+// sees the underlying fd, so without this a port can report "not ready"
+// while read-char would return instantly from the buffer.
+static bool file_has_buffered_input(FILE *fp)
+{
+#if defined(__GLIBC__)
+    return fp->_IO_read_ptr < fp->_IO_read_end;
+#elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) ||     \
+    defined(__OpenBSD__)
+    return fp->_r > 0;
+#else
+    (void)fp;
+    return false; // Conservative: fall through to poll()
+#endif
+}
+
 static int extract_optional_port(unsigned argc, unsigned *argv,
                                  unsigned argc_with_port, port_dir dir,
                                  FILE **fport, string_port **sport,
@@ -743,6 +759,8 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         // so R7RS requires char-ready? to return #t
         if (feof(fport) || ferror(fport))
             return ctx.atom_true;
+        if (file_has_buffered_input(fport))
+            return ctx.atom_true;
 
         // File port: use poll() to check if data is available
         int fd = fileno(fport);
@@ -777,6 +795,8 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         if (reader_port_pending_bytes(fport) > 0)
             return ctx.atom_true;
         if (feof(fport) || ferror(fport))
+            return ctx.atom_true;
+        if (file_has_buffered_input(fport))
             return ctx.atom_true;
         int fd = fileno(fport);
         if (fd < 0)

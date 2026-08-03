@@ -270,6 +270,8 @@ static void update_match_state_roots(pat_match_state *state,
 
     state->input = update(state->input);
     state->vec_iter_vec = update(state->vec_iter_vec);
+    for (unsigned i = 0; i < state->vec_sp; i++)
+        state->vec_stack[i].vec = update(state->vec_stack[i].vec);
 
     for (unsigned i = 0; i < state->input_sp; i++) {
         state->input_stack[i] = update(state->input_stack[i]);
@@ -277,6 +279,9 @@ static void update_match_state_roots(pat_match_state *state,
     for (unsigned i = 0; i < state->choice_sp; i++) {
         state->choices[i].input = update(state->choices[i].input);
         state->choices[i].vec_iter_vec = update(state->choices[i].vec_iter_vec);
+        for (unsigned j = 0; j < state->choices[i].vec_sp; j++)
+            state->choices[i].vec_stack[j].vec =
+                update(state->choices[i].vec_stack[j].vec);
         unsigned n = state->pattern ? state->pattern->var_count : 0;
         for (unsigned j = 0; j < n; j++) {
             if (state->choices[i].bindings)
@@ -405,6 +410,7 @@ static const char *opcode_names[] = {
     [PAT_CHECK_VECLEN_MIN] = "CHECK_VECLEN_MIN",
     [PAT_VEC_ELLIPSIS_INIT] = "VEC_ELLIPSIS_INIT",
     [PAT_VEC_ELLIPSIS_NEXT] = "VEC_ELLIPSIS_NEXT",
+    [PAT_VEC_ELLIPSIS_DONE] = "VEC_ELLIPSIS_DONE",
     [PAT_INPUT_VEC_ITER] = "INPUT_VEC_ITER",
     [PAT_INPUT_VECREF_END] = "INPUT_VECREF_END",
     [PAT_MATCH_ATOM_ID] = "MATCH_ATOM_ID",
@@ -680,6 +686,9 @@ static void compile_pattern_node(unsigned pattern, pattern_compile_ctx *pctx)
             unsigned done_label = pattern_current_pos(pctx->pattern);
             pattern_patch(pctx->pattern, done_patch, done_label);
 
+            // Restore the enclosing vector iterator saved by INIT
+            pattern_emit(pctx->pattern, PAT_VEC_ELLIPSIS_DONE, 0);
+
             // Emit depth-based ELLIPSIS_LIST for all vars at this depth
             pattern_emit(pctx->pattern, PAT_ELLIPSIS_LIST, pctx->ellipsis_depth);
 
@@ -769,11 +778,45 @@ static void free_match_arrays(pat_match_state *state)
     free(state->bound);
     free(state->level_lists);
     free(state->level_tails);
+    free(state->vec_stack);
     state->input_stack = NULL;
     state->bindings = NULL;
     state->bound = NULL;
     state->level_lists = NULL;
     state->level_tails = NULL;
+    state->vec_stack = NULL;
+    state->vec_sp = 0;
+    state->vec_cap = 0;
+}
+
+// Save the current vector iterator before a nested INIT replaces it
+static void push_vec_iter(pat_match_state *state)
+{
+    if (state->vec_sp == state->vec_cap) {
+        unsigned new_cap = state->vec_cap ? state->vec_cap * 2 : 8;
+        pat_vec_iter *grown = checked_realloc_array(
+            state->vec_stack, new_cap, sizeof(pat_vec_iter));
+        if (!grown)
+            lisp_panic("pattern vector iterator stack: realloc failed");
+        state->vec_stack = grown;
+        state->vec_cap = new_cap;
+    }
+    pat_vec_iter *slot = &state->vec_stack[state->vec_sp++];
+    slot->vec = state->vec_iter_vec;
+    slot->idx = state->vec_iter_idx;
+    slot->count = state->vec_iter_count;
+    slot->pre = state->vec_iter_pre;
+}
+
+static void pop_vec_iter(pat_match_state *state)
+{
+    if (state->vec_sp == 0)
+        return; // Unbalanced DONE: leave the iterator unchanged
+    pat_vec_iter *slot = &state->vec_stack[--state->vec_sp];
+    state->vec_iter_vec = slot->vec;
+    state->vec_iter_idx = slot->idx;
+    state->vec_iter_count = slot->count;
+    state->vec_iter_pre = slot->pre;
 }
 
 static void free_choice_snapshot(pat_choice_point *cp)
@@ -782,10 +825,13 @@ static void free_choice_snapshot(pat_choice_point *cp)
     free(cp->bound);
     free(cp->level_lists);
     free(cp->level_tails);
+    free(cp->vec_stack);
     cp->bindings = NULL;
     cp->bound = NULL;
     cp->level_lists = NULL;
     cp->level_tails = NULL;
+    cp->vec_stack = NULL;
+    cp->vec_sp = 0;
 }
 
 // Initialize match state - returns false on allocation failure
@@ -920,6 +966,16 @@ static void push_choice(pat_match_state *state, unsigned retry_ip)
         copy_choice_array(state->level_lists, n * state->max_depth);
     cp->level_tails =
         copy_choice_array(state->level_tails, n * state->max_depth);
+    cp->vec_sp = state->vec_sp;
+    cp->vec_stack = NULL;
+    if (state->vec_sp) {
+        cp->vec_stack = checked_malloc_array(state->vec_sp,
+                                             sizeof(pat_vec_iter));
+        if (!cp->vec_stack)
+            lisp_panic("pattern choice stack: snapshot alloc failed");
+        memcpy(cp->vec_stack, state->vec_stack,
+               state->vec_sp * sizeof(pat_vec_iter));
+    }
 }
 
 // Backtrack to previous choice point
@@ -937,6 +993,10 @@ static bool backtrack(pat_match_state *state)
     state->vec_iter_idx = cp->vec_iter_idx;
     state->vec_iter_count = cp->vec_iter_count;
     state->vec_iter_pre = cp->vec_iter_pre;
+    state->vec_sp = cp->vec_sp;
+    if (cp->vec_sp)
+        memcpy(state->vec_stack, cp->vec_stack,
+               cp->vec_sp * sizeof(pat_vec_iter));
 
     unsigned n = state->pattern ? state->pattern->var_count : 0;
     if (n) {
@@ -1259,6 +1319,10 @@ unsigned execute_pattern(compiled_pattern *pat, unsigned input)
                     failed = true;
                 break;
             }
+            // Save the enclosing iterator: an inner vector ellipsis would
+            // otherwise clobber the outer iteration and silently drop
+            // elements
+            push_vec_iter(&state);
             state.vec_iter_vec = state.input;
             state.vec_iter_pre = pre_count;
             state.vec_iter_count = len - pre_count - post_count;
@@ -1273,6 +1337,10 @@ unsigned execute_pattern(compiled_pattern *pat, unsigned input)
             } else {
                 state.vec_iter_idx++;
             }
+            break;
+
+        case PAT_VEC_ELLIPSIS_DONE:
+            pop_vec_iter(&state);
             break;
 
         case PAT_INPUT_VEC_ITER: {

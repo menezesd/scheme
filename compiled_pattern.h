@@ -47,8 +47,10 @@ enum pat_opcode {
     PAT_CHECK_VECLEN_MIN,// Fail if vector_len(input) < operand
 
     // Vector ellipsis iteration
-    PAT_VEC_ELLIPSIS_INIT,  // Setup iteration: pre | (post << 16)
+    PAT_VEC_ELLIPSIS_INIT,  // Setup iteration: pre | (post << 16); saves the
+                            // enclosing iterator so vector ellipses can nest
     PAT_VEC_ELLIPSIS_NEXT,  // If done, jump to operand; else advance
+    PAT_VEC_ELLIPSIS_DONE,  // Restore the enclosing iterator saved by INIT
     PAT_INPUT_VEC_ITER,     // Push input, set input = vec[pre_count + iter_idx]
     PAT_INPUT_VECREF_END,   // Push input, set input = vec[len - 1 - operand]
 
@@ -143,6 +145,9 @@ typedef struct {
     // Flat copies of the per-depth accumulators (max_depth * var_count)
     unsigned *level_lists;
     unsigned *level_tails;
+    // Snapshot of the saved enclosing vector iterators
+    struct pat_vec_iter *vec_stack;
+    unsigned vec_sp;
 } pat_choice_point;
 
 /**
@@ -177,12 +182,25 @@ typedef struct {
     unsigned choice_sp;
     unsigned choice_cap;
 
-    // Vector ellipsis iteration state
+    // Vector ellipsis iteration state (current innermost iterator)
     unsigned vec_iter_vec;   // Vector being iterated
     unsigned vec_iter_idx;   // Current iteration index
     unsigned vec_iter_count; // Total iterations
     unsigned vec_iter_pre;   // Pre-ellipsis element count
+
+    // Enclosing iterators saved by nested PAT_VEC_ELLIPSIS_INIT
+    struct pat_vec_iter *vec_stack;
+    unsigned vec_sp;
+    unsigned vec_cap;
 } pat_match_state;
+
+// Saved vector iterator (for nested vector ellipses)
+typedef struct pat_vec_iter {
+    unsigned vec;
+    unsigned idx;
+    unsigned count;
+    unsigned pre;
+} pat_vec_iter;
 
 // ============================================================================
 // Compiled Pattern API
