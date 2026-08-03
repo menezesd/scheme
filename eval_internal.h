@@ -787,6 +787,10 @@ extern const cont_handler_t cont_handlers[CONT_COUNT];
 
 unsigned qq_expand_cps(unsigned x, unsigned env);
 
+// Transform a quasiquote template into an equivalent expression to be
+// evaluated by the normal trampoline (keeps call/cc working in unquotes)
+unsigned qq_transform_cps(unsigned x, unsigned env);
+
 // ============================================================================
 // Function Application
 // ============================================================================

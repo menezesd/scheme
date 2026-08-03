@@ -668,13 +668,15 @@ bool handle_quasiquote(unsigned id, unsigned env, unsigned cont)
     gc_protect(&tmpl);
     gc_protect(&env);
     gc_protect(&cont);
-    unsigned result = qq_expand_cps(tmpl, env);
-    gc_protect(&result);
-    if (result == TOK_ERROR) {
+    // Transform the template into ordinary code and evaluate it through the
+    // regular trampoline so continuations work across unquotes
+    unsigned expr = qq_transform_cps(tmpl, env);
+    gc_protect(&expr);
+    if (expr == TOK_ERROR) {
         tramp_error();
         return true;
     }
-    tramp_apply(result, cont);
+    tramp_eval(expr, env, cont);
     return true;
 }
 

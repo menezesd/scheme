@@ -140,10 +140,9 @@ typedef struct {
     unsigned *bindings;
     unsigned *bound; // Per-var flags: bindings[i] is a real match this
                      // iteration (distinguishes a () binding from unbound)
-    unsigned *ellipsis_lists;
-    unsigned *ellipsis_tails;
-    unsigned *inner_lists;
-    unsigned *inner_tails;
+    // Flat copies of the per-depth accumulators (max_depth * var_count)
+    unsigned *level_lists;
+    unsigned *level_tails;
 } pat_choice_point;
 
 /**
@@ -165,13 +164,13 @@ typedef struct {
     unsigned *bound;         // Nonzero if bindings[i] holds a real match
                              // (distinguishes a () binding from unbound)
 
-    // Ellipsis accumulation (per-variable list of matched values)
-    // Depth 1 (outermost ellipsis) — also the final result read by build_bindings
-    unsigned *ellipsis_lists;    // Head of list for each ellipsis var
-    unsigned *ellipsis_tails;    // Tail pointer for efficient append
-    // Depth 2 (inner ellipsis) — temporary, finalized into bindings[]
-    unsigned *inner_lists;
-    unsigned *inner_tails;
+    // Ellipsis accumulation: one lists/tails pair per nesting depth, stored
+    // flat as max_depth rows of var_count entries. Row 0 (depth 1, the
+    // outermost ellipsis) holds the final result read by build_bindings;
+    // deeper rows are temporaries finalized into bindings[] per group.
+    unsigned *level_lists;
+    unsigned *level_tails;
+    unsigned max_depth; // Number of accumulator rows (>= 1)
 
     // Backtracking
     pat_choice_point *choices;

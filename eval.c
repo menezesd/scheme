@@ -72,6 +72,8 @@ void eval_reset_macro_expansion_depth(void)
 // Quasiquote Expansion
 // ============================================================================
 
+static bool qq_spine_tail_unquote(unsigned l, unsigned env);
+
 static bool qq_syntax_valid(unsigned x, unsigned env, int depth,
                             unsigned structural_depth)
 {
@@ -124,6 +126,10 @@ static bool qq_syntax_valid(unsigned x, unsigned env, int depth,
 
     unsigned l = x;
     for (; IS_PAIR(l); l = cdr(l)) {
+        // (... . ,tail) reads as (... unquote tail): the rest of the spine
+        // is an unquote form, not further elements
+        if (l != x && qq_spine_tail_unquote(l, env))
+            return qq_syntax_valid(l, env, depth, structural_depth + 1);
         if (!qq_syntax_valid(car(l), env, depth, structural_depth + 1))
             return false;
     }
@@ -225,6 +231,10 @@ static unsigned qq_expand_depth(unsigned x, unsigned env, int depth)
     unsigned l = x;
     gc_protect(&l);
     for (; IS_PAIR(l); l = cdr(l)) {
+        // (... . ,tail) reads as (... unquote tail): the rest of the spine
+        // is a tail form, handled by the improper-tail expansion below
+        if (l != x && qq_spine_tail_unquote(l, env))
+            break;
         unsigned elem = car(l);
 
         // Check if element is (unquote-splicing expr) - only if not shadowed
@@ -246,7 +256,9 @@ static unsigned qq_expand_depth(unsigned x, unsigned env, int depth)
                 }
                 gc_unprotect(1); // spliced - per-iteration cleanup
             } else {
-                // Keep but expand inside
+                // Keep but expand inside. Rebuild with the original head
+                // atom cell (consing the raw keyword id would put an
+                // invalid cell reference into the result)
                 unsigned inner = qq_expand_depth(cadr(elem), env, depth - 1);
                 if (inner == TOK_ERROR) {
                     return inner;
@@ -254,7 +266,7 @@ static unsigned qq_expand_depth(unsigned x, unsigned env, int depth)
                 gc_protect(&inner);
                 unsigned kept_tail = alloc_cons(inner, 0);
                 gc_protect(&kept_tail);
-                unsigned kept = alloc_cons(ctx.kw_unquote_splicing, kept_tail);
+                unsigned kept = alloc_cons(car(elem), kept_tail);
                 gc_unprotect(2); // kept_tail, inner - per-iteration cleanup
                 list_append(&result, &tail, kept);
             }
@@ -283,6 +295,184 @@ unsigned qq_expand_cps(unsigned x, unsigned env)
     if (!qq_syntax_valid(x, env, 1, 0))
         return TOK_ERROR;
     return qq_expand_depth(x, env, 1);
+}
+
+// ============================================================================
+// Quasiquote Transformation
+// ============================================================================
+// Transform a quasiquote template into an ordinary expression built from
+// primitive applications (cons/append/vector) and quote forms. Evaluating
+// that expression through the normal trampoline keeps first-class
+// continuations working across unquotes: the old approach of running a
+// nested evaluator inside the expander could neither escape from nor
+// re-enter the quasiquote when a continuation fired.
+
+static unsigned qq_quote_expr(unsigned x)
+{
+    GC_GUARD;
+    gc_protect(&x);
+    unsigned tail = alloc_cons(x, 0);
+    gc_protect(&tail);
+    return alloc_cons(ctx.atom_quote, tail);
+}
+
+// Build (op a b) with op a builtin primitive value, immune to shadowing
+static unsigned qq_call2(int64_t prim, unsigned a, unsigned b)
+{
+    GC_GUARD;
+    gc_protect(&a);
+    gc_protect(&b);
+    unsigned args = alloc_cons(b, 0);
+    gc_protect(&args);
+    args = alloc_cons(a, args);
+    gc_protect(&args);
+    unsigned op = mk_primop(prim);
+    gc_protect(&op);
+    return alloc_cons(op, args);
+}
+
+// Build code producing (sym . (inner-value . ())) for reconstructing
+// nested unquote/quasiquote forms at depth > 1
+static unsigned qq_keyword_pair_expr(unsigned sym_atom, unsigned inner_expr)
+{
+    GC_GUARD;
+    gc_protect(&sym_atom);
+    gc_protect(&inner_expr);
+    unsigned nil_expr = qq_quote_expr(0);
+    gc_protect(&nil_expr);
+    unsigned tail_expr = qq_call2(PCONS, inner_expr, nil_expr);
+    gc_protect(&tail_expr);
+    unsigned sym_expr = qq_quote_expr(sym_atom);
+    gc_protect(&sym_expr);
+    return qq_call2(PCONS, sym_expr, tail_expr);
+}
+
+// True when the rest of a template spine is an unquote/unquote-splicing/
+// quasiquote tail form, e.g. `(a . ,b) which reads as (a unquote b)
+static bool qq_spine_tail_unquote(unsigned l, unsigned env)
+{
+    unsigned h = car(l);
+    return (IS_KEYWORD(h, ctx.kw_unquote) &&
+            !is_keyword_shadowed(ctx.kw_unquote, env)) ||
+           (IS_KEYWORD(h, ctx.kw_unquote_splicing) &&
+            !is_keyword_shadowed(ctx.kw_unquote_splicing, env)) ||
+           (IS_KEYWORD(h, ctx.kw_quasiquote) &&
+            !is_keyword_shadowed(ctx.kw_quasiquote, env));
+}
+
+static unsigned qq_transform(unsigned x, unsigned env, int depth)
+{
+    if (IS_VECTOR(x)) {
+        GC_GUARD;
+        gc_protect(&x);
+        gc_protect(&env);
+        unsigned len = vector_len(x);
+        unsigned args = 0, args_tail = 0;
+        gc_protect(&args);
+        gc_protect(&args_tail);
+        for (unsigned i = 0; i < len; i++) {
+            unsigned elem = vector_data_ptr(x)[i];
+            gc_protect(&elem);
+            if (depth == 1 && IS_PAIR(elem) &&
+                IS_KEYWORD(car(elem), ctx.kw_unquote_splicing) &&
+                !is_keyword_shadowed(ctx.kw_unquote_splicing, env)) {
+                show_error("unquote-splicing not inside list");
+                return TOK_ERROR;
+            }
+            unsigned e = qq_transform(elem, env, depth);
+            if (e == TOK_ERROR)
+                return TOK_ERROR;
+            gc_protect(&e);
+            list_append(&args, &args_tail, e);
+            gc_unprotect(2);
+        }
+        unsigned op = mk_primop(PVECTOR);
+        gc_protect(&op);
+        return alloc_cons(op, args);
+    }
+
+    if (!IS_PAIR(x))
+        return qq_quote_expr(x);
+
+    GC_GUARD;
+    gc_protect(&x);
+    gc_protect(&env);
+    unsigned head = car(x);
+    gc_protect(&head);
+
+    if (IS_KEYWORD(head, ctx.kw_unquote) &&
+        !is_keyword_shadowed(ctx.kw_unquote, env)) {
+        if (depth == 1)
+            return cadr(x);
+        unsigned inner = qq_transform(cadr(x), env, depth - 1);
+        if (inner == TOK_ERROR)
+            return TOK_ERROR;
+        return qq_keyword_pair_expr(head, inner);
+    }
+    if (IS_KEYWORD(head, ctx.kw_unquote_splicing) &&
+        !is_keyword_shadowed(ctx.kw_unquote_splicing, env)) {
+        if (depth == 1) {
+            show_error("unquote-splicing not inside list");
+            return TOK_ERROR;
+        }
+        unsigned inner = qq_transform(cadr(x), env, depth - 1);
+        if (inner == TOK_ERROR)
+            return TOK_ERROR;
+        return qq_keyword_pair_expr(head, inner);
+    }
+    if (IS_KEYWORD(head, ctx.kw_quasiquote) &&
+        !is_keyword_shadowed(ctx.kw_quasiquote, env)) {
+        unsigned inner = qq_transform(cadr(x), env, depth + 1);
+        if (inner == TOK_ERROR)
+            return TOK_ERROR;
+        return qq_keyword_pair_expr(head, inner);
+    }
+
+    // General list: collect the spine iteratively (flat templates can be
+    // long), transform the tail, then fold back with cons/append
+    unsigned rev_elems = 0;
+    gc_protect(&rev_elems);
+    unsigned l = x;
+    gc_protect(&l);
+    while (IS_PAIR(l)) {
+        if (l != x && qq_spine_tail_unquote(l, env))
+            break; // (... . ,tail) - the rest is an unquote form
+        rev_elems = alloc_cons(car(l), rev_elems);
+        l = cdr(l);
+    }
+
+    unsigned result = IS_PAIR(l) ? qq_transform(l, env, depth)
+                                 : qq_quote_expr(l);
+    if (result == TOK_ERROR)
+        return TOK_ERROR;
+    gc_protect(&result);
+
+    for (unsigned r = rev_elems; r; r = cdr(r)) {
+        unsigned elem = car(r);
+        gc_protect(&elem);
+        if (depth == 1 && IS_PAIR(elem) &&
+            IS_KEYWORD(car(elem), ctx.kw_unquote_splicing) &&
+            !is_keyword_shadowed(ctx.kw_unquote_splicing, env)) {
+            // ,@e: splice - append validates e is a proper list
+            result = qq_call2(PAPPEND, cadr(elem), result);
+        } else {
+            unsigned elem_expr = qq_transform(elem, env, depth);
+            if (elem_expr == TOK_ERROR)
+                return TOK_ERROR;
+            gc_protect(&elem_expr);
+            result = qq_call2(PCONS, elem_expr, result);
+            gc_unprotect(1);
+        }
+        gc_unprotect(1);
+    }
+    return result;
+}
+
+unsigned qq_transform_cps(unsigned x, unsigned env)
+{
+    if (!qq_syntax_valid(x, env, 1, 0))
+        return TOK_ERROR;
+    return qq_transform(x, env, 1);
 }
 
 // ============================================================================

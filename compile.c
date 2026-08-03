@@ -4169,6 +4169,19 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
     return dynamic_result();
 }
 
+// True when the rest of a template spine is an unquote/unquote-splicing/
+// quasiquote tail form, e.g. `(a . ,b) which reads as (a unquote b)
+static bool qq_compile_spine_tail_unquote(unsigned l, compile_ctx *cctx)
+{
+    unsigned h = car(l);
+    return (IS_KEYWORD(h, ctx.kw_unquote) &&
+            !is_keyword_shadowed(ctx.kw_unquote, cctx->env)) ||
+           (IS_KEYWORD(h, ctx.kw_unquote_splicing) &&
+            !is_keyword_shadowed(ctx.kw_unquote_splicing, cctx->env)) ||
+           (IS_KEYWORD(h, ctx.kw_quasiquote) &&
+            !is_keyword_shadowed(ctx.kw_quasiquote, cctx->env));
+}
+
 // Check if quasiquote contains unquote or unquote-splicing
 static bool qq_has_unquote(unsigned x, compile_ctx *cctx, int depth)
 {
@@ -4210,6 +4223,9 @@ static bool qq_has_unquote(unsigned x, compile_ctx *cctx, int depth)
     // Check all elements of list
     unsigned l = x;
     for (; IS_PAIR(l); l = cdr(l)) {
+        // (... . ,tail): the rest of the spine is an unquote form
+        if (l != x && qq_compile_spine_tail_unquote(l, cctx))
+            return qq_has_unquote(l, cctx, depth);
         if (qq_has_unquote(car(l), cctx, depth))
             return true;
     }
@@ -4266,6 +4282,10 @@ static bool qq_syntax_valid(unsigned x, compile_ctx *cctx, int depth,
 
     unsigned l = x;
     for (; IS_PAIR(l); l = cdr(l)) {
+        // (... . ,tail) reads as (... unquote tail): the rest of the spine
+        // is an unquote form, not further elements
+        if (l != x && qq_compile_spine_tail_unquote(l, cctx))
+            return qq_syntax_valid(l, cctx, depth, structural_depth + 1);
         if (!qq_syntax_valid(car(l), cctx, depth, structural_depth + 1))
             return false;
     }
@@ -4362,6 +4382,8 @@ static void compile_qq_rec(unsigned x, compile_ctx *cctx, int depth)
     // Need to handle unquote-splicing specially
     bool has_splice = false;
     for (unsigned l = x; IS_PAIR(l); l = cdr(l)) {
+        if (l != x && qq_compile_spine_tail_unquote(l, cctx))
+            break; // (... . ,tail): rest of spine is a tail form
         unsigned elem = car(l);
         if (IS_PAIR(elem) && IS_KEYWORD(car(elem), ctx.kw_unquote_splicing) &&
             !is_keyword_shadowed(ctx.kw_unquote_splicing, cctx->env) &&
@@ -4378,7 +4400,15 @@ static void compile_qq_rec(unsigned x, compile_ctx *cctx, int depth)
         // Start with empty list
         emit2(cctx, OP_CONST, code_add_const(cctx->code, 0));
 
+        bool tail_done = false;
         for (cursor = x; IS_PAIR(cursor); cursor = cdr(cursor)) {
+            if (cursor != x && qq_compile_spine_tail_unquote(cursor, cctx)) {
+                // (... . ,tail): compile the tail form and append it
+                compile_qq_rec(cursor, cctx, depth);
+                emit3(cctx, OP_PRIM, PAPPEND, 2);
+                tail_done = true;
+                break;
+            }
             unsigned elem = car(cursor);
             if (IS_PAIR(elem) &&
                 IS_KEYWORD(car(elem), ctx.kw_unquote_splicing) &&
@@ -4401,29 +4431,40 @@ static void compile_qq_rec(unsigned x, compile_ctx *cctx, int depth)
             }
         }
 
-        unsigned tail = x;
-        while (IS_PAIR(tail))
-            tail = cdr(tail);
-        if (tail) {
-            compile_qq_rec(tail, cctx, depth);
-            emit3(cctx, OP_PRIM, PAPPEND, 2);
+        if (!tail_done) {
+            unsigned tail = x;
+            while (IS_PAIR(tail))
+                tail = cdr(tail);
+            if (tail) {
+                compile_qq_rec(tail, cctx, depth);
+                emit3(cctx, OP_PRIM, PAPPEND, 2);
+            }
         }
     } else {
         // No splicing: build with cons from the end
         // First compile all elements, then cons them together
         unsigned len = 0;
+        bool tail_done = false;
         for (cursor = x; IS_PAIR(cursor); cursor = cdr(cursor)) {
+            if (cursor != x && qq_compile_spine_tail_unquote(cursor, cctx)) {
+                // (... . ,tail): the rest of the spine is the tail value
+                compile_qq_rec(cursor, cctx, depth);
+                tail_done = true;
+                break;
+            }
             compile_qq_rec(car(cursor), cctx, depth);
             len++;
         }
-        // Handle improper list tail
-        unsigned tail = x;
-        while (IS_PAIR(tail))
-            tail = cdr(tail);
-        if (tail) {
-            compile_qq_rec(tail, cctx, depth);
-        } else {
-            emit2(cctx, OP_CONST, code_add_const(cctx->code, 0));
+        if (!tail_done) {
+            // Handle improper list tail
+            unsigned tail = x;
+            while (IS_PAIR(tail))
+                tail = cdr(tail);
+            if (tail) {
+                compile_qq_rec(tail, cctx, depth);
+            } else {
+                emit2(cctx, OP_CONST, code_add_const(cctx->code, 0));
+            }
         }
         // Now cons them together from right to left
         for (unsigned i = 0; i < len; i++) {

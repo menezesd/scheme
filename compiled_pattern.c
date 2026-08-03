@@ -282,18 +282,15 @@ static void update_match_state_roots(pat_match_state *state,
             if (state->choices[i].bindings)
                 state->choices[i].bindings[j] =
                     update(state->choices[i].bindings[j]);
-            if (state->choices[i].ellipsis_lists)
-                state->choices[i].ellipsis_lists[j] =
-                    update(state->choices[i].ellipsis_lists[j]);
-            if (state->choices[i].ellipsis_tails)
-                state->choices[i].ellipsis_tails[j] =
-                    update(state->choices[i].ellipsis_tails[j]);
-            if (state->choices[i].inner_lists)
-                state->choices[i].inner_lists[j] =
-                    update(state->choices[i].inner_lists[j]);
-            if (state->choices[i].inner_tails)
-                state->choices[i].inner_tails[j] =
-                    update(state->choices[i].inner_tails[j]);
+        }
+        unsigned total = n * state->max_depth;
+        for (unsigned j = 0; j < total; j++) {
+            if (state->choices[i].level_lists)
+                state->choices[i].level_lists[j] =
+                    update(state->choices[i].level_lists[j]);
+            if (state->choices[i].level_tails)
+                state->choices[i].level_tails[j] =
+                    update(state->choices[i].level_tails[j]);
         }
     }
 
@@ -301,14 +298,13 @@ static void update_match_state_roots(pat_match_state *state,
     for (unsigned i = 0; i < n; i++) {
         if (state->bindings)
             state->bindings[i] = update(state->bindings[i]);
-        if (state->ellipsis_lists)
-            state->ellipsis_lists[i] = update(state->ellipsis_lists[i]);
-        if (state->ellipsis_tails)
-            state->ellipsis_tails[i] = update(state->ellipsis_tails[i]);
-        if (state->inner_lists)
-            state->inner_lists[i] = update(state->inner_lists[i]);
-        if (state->inner_tails)
-            state->inner_tails[i] = update(state->inner_tails[i]);
+    }
+    unsigned total = n * state->max_depth;
+    for (unsigned i = 0; i < total; i++) {
+        if (state->level_lists)
+            state->level_lists[i] = update(state->level_lists[i]);
+        if (state->level_tails)
+            state->level_tails[i] = update(state->level_tails[i]);
     }
 }
 
@@ -771,33 +767,25 @@ static void free_match_arrays(pat_match_state *state)
     free(state->input_stack);
     free(state->bindings);
     free(state->bound);
-    free(state->ellipsis_lists);
-    free(state->ellipsis_tails);
-    free(state->inner_lists);
-    free(state->inner_tails);
+    free(state->level_lists);
+    free(state->level_tails);
     state->input_stack = NULL;
     state->bindings = NULL;
     state->bound = NULL;
-    state->ellipsis_lists = NULL;
-    state->ellipsis_tails = NULL;
-    state->inner_lists = NULL;
-    state->inner_tails = NULL;
+    state->level_lists = NULL;
+    state->level_tails = NULL;
 }
 
 static void free_choice_snapshot(pat_choice_point *cp)
 {
     free(cp->bindings);
     free(cp->bound);
-    free(cp->ellipsis_lists);
-    free(cp->ellipsis_tails);
-    free(cp->inner_lists);
-    free(cp->inner_tails);
+    free(cp->level_lists);
+    free(cp->level_tails);
     cp->bindings = NULL;
     cp->bound = NULL;
-    cp->ellipsis_lists = NULL;
-    cp->ellipsis_tails = NULL;
-    cp->inner_lists = NULL;
-    cp->inner_tails = NULL;
+    cp->level_lists = NULL;
+    cp->level_tails = NULL;
 }
 
 // Initialize match state - returns false on allocation failure
@@ -818,23 +806,24 @@ static bool init_match_state(pat_match_state *state, compiled_pattern *pat,
         return false;
     state->input_sp = 0;
 
-    // Bindings
+    // Bindings and per-depth ellipsis accumulators. One accumulator row
+    // per nesting depth: sharing rows across depths corrupts bindings when
+    // ellipses nest three or more deep.
+    state->max_depth = 1;
+    for (unsigned i = 0; i < pat->var_count; i++) {
+        if (pat->var_slots[i].depth > state->max_depth)
+            state->max_depth = pat->var_slots[i].depth;
+    }
     if (pat->var_count > 0) {
+        unsigned total = pat->var_count * state->max_depth;
         state->bindings =
             checked_calloc_array(pat->var_count, sizeof(unsigned));
         state->bound =
             checked_calloc_array(pat->var_count, sizeof(unsigned));
-        state->ellipsis_lists =
-            checked_calloc_array(pat->var_count, sizeof(unsigned));
-        state->ellipsis_tails =
-            checked_calloc_array(pat->var_count, sizeof(unsigned));
-        state->inner_lists =
-            checked_calloc_array(pat->var_count, sizeof(unsigned));
-        state->inner_tails =
-            checked_calloc_array(pat->var_count, sizeof(unsigned));
-        if (!state->bindings || !state->bound || !state->ellipsis_lists ||
-            !state->ellipsis_tails || !state->inner_lists ||
-            !state->inner_tails) {
+        state->level_lists = checked_calloc_array(total, sizeof(unsigned));
+        state->level_tails = checked_calloc_array(total, sizeof(unsigned));
+        if (!state->bindings || !state->bound || !state->level_lists ||
+            !state->level_tails) {
             free_match_arrays(state);
             return false;
         }
@@ -927,10 +916,10 @@ static void push_choice(pat_match_state *state, unsigned retry_ip)
     unsigned n = state->pattern ? state->pattern->var_count : 0;
     cp->bindings = copy_choice_array(state->bindings, n);
     cp->bound = copy_choice_array(state->bound, n);
-    cp->ellipsis_lists = copy_choice_array(state->ellipsis_lists, n);
-    cp->ellipsis_tails = copy_choice_array(state->ellipsis_tails, n);
-    cp->inner_lists = copy_choice_array(state->inner_lists, n);
-    cp->inner_tails = copy_choice_array(state->inner_tails, n);
+    cp->level_lists =
+        copy_choice_array(state->level_lists, n * state->max_depth);
+    cp->level_tails =
+        copy_choice_array(state->level_tails, n * state->max_depth);
 }
 
 // Backtrack to previous choice point
@@ -951,23 +940,20 @@ static bool backtrack(pat_match_state *state)
 
     unsigned n = state->pattern ? state->pattern->var_count : 0;
     if (n) {
+        unsigned total = n * state->max_depth;
         memcpy(state->bindings, cp->bindings, n * sizeof(unsigned));
         memcpy(state->bound, cp->bound, n * sizeof(unsigned));
-        memcpy(state->ellipsis_lists, cp->ellipsis_lists,
-               n * sizeof(unsigned));
-        memcpy(state->ellipsis_tails, cp->ellipsis_tails,
-               n * sizeof(unsigned));
-        memcpy(state->inner_lists, cp->inner_lists, n * sizeof(unsigned));
-        memcpy(state->inner_tails, cp->inner_tails, n * sizeof(unsigned));
+        memcpy(state->level_lists, cp->level_lists,
+               total * sizeof(unsigned));
+        memcpy(state->level_tails, cp->level_tails,
+               total * sizeof(unsigned));
         // ELLIPSIS_ACCUM appends by mutating the shared tail cells in
         // place, so restoring the head/tail pointers alone would leave
         // elements accumulated after this snapshot spliced into the lists.
         // Sever the restored tails to drop them.
-        for (unsigned i = 0; i < n; i++) {
-            if (IS_PAIR(state->ellipsis_tails[i]))
-                cell_set_cdr(state->ellipsis_tails[i], 0);
-            if (IS_PAIR(state->inner_tails[i]))
-                cell_set_cdr(state->inner_tails[i], 0);
+        for (unsigned i = 0; i < total; i++) {
+            if (IS_PAIR(state->level_tails[i]))
+                cell_set_cdr(state->level_tails[i], 0);
         }
     }
     free_choice_snapshot(cp);
@@ -986,7 +972,7 @@ static unsigned build_bindings_alist(pat_match_state *state)
         unsigned value;
 
         if (state->pattern->var_slots[i].is_ellipsis) {
-            value = state->ellipsis_lists[i];
+            value = state->level_lists[i]; // Row 0 = depth 1 (final result)
         } else {
             value = state->bindings[i];
         }
@@ -1164,11 +1150,15 @@ unsigned execute_pattern(compiled_pattern *pat, unsigned input)
             // variables (e.g., step in ((var init step ...) ...)) are
             // captured by the outer ellipsis too.
             unsigned depth = instr->operand;
-            // Select accumulator arrays by depth
-            unsigned *lists = (depth <= 1) ? state.ellipsis_lists
-                                           : state.inner_lists;
-            unsigned *tails = (depth <= 1) ? state.ellipsis_tails
-                                           : state.inner_tails;
+            // Select the accumulator row for this depth. A depth beyond
+            // max_depth means no variable can be bound at it (an ellipsis
+            // whose element pattern has no deep vars); nothing to do.
+            if (depth < 1 || depth > state.max_depth)
+                break;
+            unsigned *lists =
+                &state.level_lists[(depth - 1) * pat->var_count];
+            unsigned *tails =
+                &state.level_tails[(depth - 1) * pat->var_count];
             for (unsigned i = 0; i < pat->var_count; i++) {
                 // The bound flag (not a nonzero binding) decides whether this
                 // iteration produced a value: a variable matching the empty
@@ -1199,21 +1189,28 @@ unsigned execute_pattern(compiled_pattern *pat, unsigned input)
             // operand = depth level being finalized.
             unsigned depth = instr->operand;
             if (depth >= 2) {
-                // Inner ellipsis: finalize inner_lists into bindings so the
-                // outer ACCUM can pick them up. An empty group binds () with
-                // the bound flag set, so no sentinel value is needed.
+                // Inner ellipsis: finalize this depth's row into bindings so
+                // the enclosing ACCUM can pick the groups up. An empty group
+                // binds () with the bound flag set, so no sentinel value is
+                // needed.
+                if (depth > state.max_depth)
+                    break; // No variable can be bound this deep
+                unsigned *lists =
+                    &state.level_lists[(depth - 1) * pat->var_count];
+                unsigned *tails =
+                    &state.level_tails[(depth - 1) * pat->var_count];
                 for (unsigned i = 0; i < pat->var_count; i++) {
                     if (pat->var_slots[i].is_ellipsis &&
                         pat->var_slots[i].depth >= depth) {
-                        state.bindings[i] = state.inner_lists[i];
+                        state.bindings[i] = lists[i];
                         state.bound[i] = 1;
-                        state.inner_lists[i] = 0;
-                        state.inner_tails[i] = 0;
+                        lists[i] = 0;
+                        tails[i] = 0;
                     }
                 }
             } else {
                 // Outermost ellipsis: clear bindings for all ellipsis vars
-                // (ellipsis_lists already has the final result for
+                // (row 0 already has the final result for
                 //  build_bindings_alist to read)
                 for (unsigned i = 0; i < pat->var_count; i++) {
                     if (pat->var_slots[i].is_ellipsis &&
