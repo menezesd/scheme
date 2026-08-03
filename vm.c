@@ -735,8 +735,19 @@ static unsigned capture_continuation(vm_state *vm)
     LISP_ASSERT_MSG(checked_array_size(letrec_count, sizeof(unsigned),
                                        &letrec_size),
                     "capture_continuation: letrec size overflow");
+
+    // vm_frame starts with a code_object* and needs pointer alignment, but
+    // stack_size (a multiple of sizeof(unsigned) == 4) isn't necessarily a
+    // multiple of that when vm->sp is odd - pad up so the frames array
+    // that follows the stack array in the single allocation stays aligned.
+    size_t frames_align = _Alignof(vm_frame);
+    size_t stack_padding =
+        (frames_align - (stack_size % frames_align)) % frames_align;
+
     LISP_ASSERT_MSG(checked_add_size(sizeof(vm_continuation), stack_size,
                                      &total_size),
+                    "capture_continuation: size overflow");
+    LISP_ASSERT_MSG(checked_add_size(total_size, stack_padding, &total_size),
                     "capture_continuation: size overflow");
     LISP_ASSERT_MSG(checked_add_size(total_size, frames_size, &total_size),
                     "capture_continuation: size overflow");
@@ -755,7 +766,8 @@ static unsigned capture_continuation(vm_state *vm)
     // Place struct at start, arrays after it
     vm_continuation *cont = (vm_continuation *)block;
     cont->stack = (unsigned *)(block + sizeof(vm_continuation));
-    cont->frames = (vm_frame *)(block + sizeof(vm_continuation) + stack_size);
+    cont->frames = (vm_frame *)(block + sizeof(vm_continuation) + stack_size +
+                                stack_padding);
 
     // Copy stack
     cont->sp = vm->sp;
@@ -775,7 +787,7 @@ static unsigned capture_continuation(vm_state *vm)
     if (letrec_count > 0) {
         cont->letrec_saved =
             (unsigned *)(block + sizeof(vm_continuation) + stack_size +
-                         frames_size);
+                         stack_padding + frames_size);
         cont->letrec_saved_len = letrec_count;
         cont->letrec_frame = vm->letrec_frame;
 

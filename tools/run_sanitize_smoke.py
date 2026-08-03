@@ -68,6 +68,19 @@ def main():
         ("interpreter expression", [exe, "--interpreter"], "(+ 1 2 3)\n"),
         ("unicode string", [exe], '(string-foldcase "Straße")\n'),
         ("continuation", [exe], "(call/cc (lambda (k) (k 42)))\n"),
+        # capture_continuation packs a vm_continuation's stack and frames
+        # arrays into one malloc'd block; frames requires pointer alignment
+        # but the preceding stack array's size is only a multiple of 4
+        # bytes, misaligning frames whenever the live operand-stack depth
+        # at capture time (vm->sp) is odd. These vary the number of
+        # pending operands ahead of the call/cc so at least one hits an
+        # odd depth and would trip UBSan's misaligned-address check.
+        ("continuation odd stack depth 1",
+         [exe], "(display (+ 1 (call/cc (lambda (k) (k 1)))))\n"),
+        ("continuation odd stack depth 3",
+         [exe], "(display (+ 1 2 3 (call/cc (lambda (k) (k 1)))))\n"),
+        ("continuation odd stack depth 5",
+         [exe], "(display (+ 1 2 3 4 5 (call/cc (lambda (k) (k 1)))))\n"),
     ]
 
     ok = True
