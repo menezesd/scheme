@@ -1160,6 +1160,14 @@
 (test "radix rational literal" 1/2 #x1/2)
 (test "numerator of inexact" 3.0 (numerator 1.5))
 (test "rationalize contagion" #t (inexact? (rationalize .3 1/10)))
+;; rational? used to only recognize the exact numeric representations,
+;; missing that any finite inexact real is also rational (R7RS 6.2.5) -
+;; only +inf.0/-inf.0/+nan.0 are real but not rational.
+(test "rational? on finite inexact" #t (rational? 3.5))
+(test "rational? on inexact integer" #t (rational? 2.0))
+(test "rational? on infinity" #f (rational? +inf.0))
+(test "rational? on negative infinity" #f (rational? -inf.0))
+(test "rational? on nan" #f (rational? +nan.0))
 
 (test-section "Reader and writer round-trips")
 (test "eof-object is not a symbol" #f (symbol? (eof-object)))

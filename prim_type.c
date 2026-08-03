@@ -71,7 +71,11 @@ static bool rational_predicate(unsigned arg)
 {
     if (!is_numeric(arg))
         return false;
-    return IS_FIXNUM(arg) || IS_NUM(arg) || IS_BIGNUM(arg) || IS_RATIONAL(arg);
+    if (IS_FIXNUM(arg) || IS_NUM(arg) || IS_BIGNUM(arg) || IS_RATIONAL(arg))
+        return true;
+    if (IS_INEXACT(arg))
+        return isfinite(to_double(arg));
+    return false;
 }
 static bool pair_predicate(unsigned arg) { return IS_PAIR(arg); }
 static bool null_predicate(unsigned arg) { return IS_NIL(arg); }
