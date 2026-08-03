@@ -920,19 +920,30 @@
 (test "macro sees use-site shadow of a primitive" 3
     (let ((length car)) (hygiene-test-mylen hygiene-test-lst)))
 
-;; Known limitation (not exercised here since VM and interpreter modes
-;; genuinely disagree on the result): when the referenced binding is an
-;; INTERNAL (non-global) define compiled in the same top-level form as the
-;; macro, the compiler's placeholder frame for forward references is a
-;; different object from the frame OP_PUSHENV creates at runtime, so the
-;; safe cell-embedding above doesn't apply and the compiler falls back to a
-;; name-based lookup that can still be captured. The interpreter doesn't
-;; have this gap (macro expansion happens lazily during evaluation, after
-;; the internal define has already run). See vesper-known-issues memory.
-;;   (let () (define (f) 100)
-;;           (define-syntax callf (syntax-rules () ((_) (f))))
-;;           (let ((f (lambda () 200))) (callf)))
-;; => 100 in --interpreter mode, 200 (captured) in compiled VM mode.
+;; define-syntax now resolves free identifiers eagerly at its own
+;; definition point (mirroring let-syntax), instead of lazily at each use
+;; site via apply_syntax. This closes the internal-define gap that used to
+;; make this diverge between VM and interpreter modes.
+(test "macro references an internal (non-global) define" 100
+    (let ()
+      (define (f) 100)
+      (define-syntax callf (syntax-rules () ((_) (f))))
+      (let ((f (lambda () 200))) (callf))))
+(test "internal define hygiene holds across repeated invocations" '(100 100)
+    (letrec ((make-thing
+               (lambda ()
+                 (define (f) 100)
+                 (define-syntax callf (syntax-rules () ((_) (f))))
+                 (let ((f (lambda () 200))) (callf)))))
+      (list (make-thing) (make-thing))))
+(test "internal define-syntax referencing mutable local state" '(3 3)
+    (letrec ((counter-maker
+               (lambda ()
+                 (define n 0)
+                 (define-syntax bump! (syntax-rules () ((_) (set! n (+ n 1)))))
+                 (bump!) (bump!) (bump!)
+                 n)))
+      (list (counter-maker) (counter-maker))))
 
 (test-section "call-with-values continuations")
 (test "continuation escapes and resumes call-with-values" 5

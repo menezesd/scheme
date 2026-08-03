@@ -3478,8 +3478,18 @@ unsigned apply_syntax(unsigned transformer, unsigned input, unsigned use_env)
                 // Look up in closure environment (macro definition site)
                 unsigned closure_val = lookup_silent(free_id, closure_env);
 
-                if (closure_val != TOK_ERROR) {
-                    // Found in closure env - create gensym and bind in use_env
+                if (closure_val != TOK_ERROR && !generated_gensym_atom(free_atom)) {
+                    // Found in closure env - create gensym and bind in use_env.
+                    // An identifier that is ALREADY a generated gensym (e.g.
+                    // from the compiler's own definition-time hygiene
+                    // renaming for define-syntax/let-syntax) is left alone:
+                    // it's already hygienic by construction (its name can't
+                    // collide with anything a user could write), and
+                    // aliasing it again would create a second layer of
+                    // BT_BINDING_REF indirection that the single-level
+                    // dereference in try_deref_binding_value doesn't unwind,
+                    // leaving the reference resolving to a binding-ref cell
+                    // instead of the real value.
                     unsigned gensym = do_gensym();
                     gc_protect(&gensym);
                     gc_protect(&closure_val);
