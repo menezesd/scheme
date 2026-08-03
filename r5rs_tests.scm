@@ -1089,6 +1089,17 @@
     (let ((p (open-input-string "abc")))
       (list (peek-u8 p) (u8-ready? p))))
 
+(test-section "string-upper-case?/string-lower-case? with no cased letters")
+;; "is every alphabetic character uppercase/lowercase" is vacuously true
+;; when there are no alphabetic characters at all, matching MIT Scheme.
+(test "string-upper-case? on digits" #t (string-upper-case? "123"))
+(test "string-upper-case? on empty string" #t (string-upper-case? ""))
+(test "string-upper-case? on punctuation" #t (string-upper-case? "!!!"))
+(test "string-upper-case? still false on mixed case" #f (string-upper-case? "ABc"))
+(test "string-lower-case? on digits" #t (string-lower-case? "123"))
+(test "string-lower-case? on empty string" #t (string-lower-case? ""))
+(test "string-lower-case? still false on mixed case" #f (string-lower-case? "abC"))
+
 (test-section "SRFI-1/R7RS-large stdlib procedures")
 (test "hash-table-update! calls the default as a thunk" 11
     (let ((h (make-strong-eqv-hash-table)))

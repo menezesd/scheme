@@ -2328,23 +2328,26 @@
                   if-lt
                   if-gt))
 
+;; Vacuously true for a string with no cased letters at all (e.g. "123" or
+;; ""), matching MIT Scheme: this asks "is every alphabetic character
+;; uppercase/lowercase", not "does the string contain such a character".
 (define (string-upper-case? str)
-  (let loop ((chars (string->list str)) (saw-letter? #f))
-    (cond ((null? chars) saw-letter?)
+  (let loop ((chars (string->list str)))
+    (cond ((null? chars) #t)
           ((char-alphabetic? (car chars))
            (and (char-upper-case? (car chars))
-                (loop (cdr chars) #t)))
+                (loop (cdr chars))))
           (else
-           (loop (cdr chars) saw-letter?)))))
+           (loop (cdr chars))))))
 
 (define (string-lower-case? str)
-  (let loop ((chars (string->list str)) (saw-letter? #f))
-    (cond ((null? chars) saw-letter?)
+  (let loop ((chars (string->list str)))
+    (cond ((null? chars) #t)
           ((char-alphabetic? (car chars))
            (and (char-lower-case? (car chars))
-                (loop (cdr chars) #t)))
+                (loop (cdr chars))))
           (else
-           (loop (cdr chars) saw-letter?)))))
+           (loop (cdr chars))))))
 
 (define (string-count proc str . strs)
   (let ((count 0))
