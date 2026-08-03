@@ -45,6 +45,13 @@ enum opcode {
     OP_DEFINE, // Define variable: DEFINE sym_id -> pop val, defvar(sym_id, val)
     OP_SET,    // Set variable: SET sym_id -> pop val, setvar(sym_id, val)
     OP_DEFINE_ALIAS, // Define alias: DEFINE_ALIAS alias_id target_id
+                     // (target resolved in the runtime env at execution)
+    OP_DEFINE_ALIAS_REF, // Define alias to a binding resolved at compile
+                         // time: DEFINE_ALIAS_REF alias_id const_idx where
+                         // constants[const_idx] is a BT_BINDING_REF. Used
+                         // for hygiene gensyms so a macro's reference to a
+                         // definition-site global cannot be captured by a
+                         // use-site local of the same name.
 
     // Closures and functions
     OP_CLOSURE,  // Create closure: CLOSURE code_idx -> push closure(code[idx],
@@ -74,6 +81,12 @@ enum opcode {
     // Multiple values
     OP_VALUES,         // Wrap N values: VALUES n -> pop n vals, push multival
     OP_CALLWITHVALUES, // Reserved (unused): call-with-values uses OP_PRIM
+    OP_CWV_FINISH, // call-with-values finisher: stack is [consumer, result];
+                   // unpack result (multival or single) and apply consumer.
+                   // Lives in a pinned singleton code object that producer
+                   // frames return into, so the producer runs in the same
+                   // VM and continuations captured inside it can restore
+                   // the whole computation.
 
     // Macros (compile-time only, but needed for dynamic define-syntax)
     OP_DEFSYNTAX, // Define syntax: DEFSYNTAX sym_id -> pop transformer
@@ -236,6 +249,8 @@ typedef struct code_object {
     // GC integration: linked list of all code objects
     struct code_object *gc_next;
     bool gc_marked; // True if reachable during current GC
+    bool gc_pinned; // Never swept (internal singletons like the
+                    // call-with-values finisher)
     bool gc_updating; // True while recursively updating GC references
     bool optimizing;  // True while recursively optimizing this code graph
     bool disassembling; // True while recursively printing this code graph

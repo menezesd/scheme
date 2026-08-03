@@ -799,6 +799,99 @@
             (begin (set! first #f) (k 99))
             result))))
 
+(test-section "Hygiene: definition-site references")
+;; These reference genuine TOP-LEVEL globals (each define below is its own
+;; already-executed top-level form by the time the macro is compiled) -
+;; the scenario the audit reported and this fix targets.
+(define (hygiene-test-f) 100)
+(define-syntax hygiene-test-callf (syntax-rules () ((_) (hygiene-test-f))))
+(test "macro references runtime-defined global" 100
+    (let ((hygiene-test-f (lambda () 200))) (hygiene-test-callf)))
+
+(define hygiene-test-x 1)
+(define-syntax hygiene-test-getx (syntax-rules () ((_) hygiene-test-x)))
+(set! hygiene-test-x 2)
+(test "macro sees mutation, not use-site shadow" 2
+    (let ((hygiene-test-x 99)) (hygiene-test-getx)))
+
+(define (hygiene-test-g) 'old)
+(define-syntax hygiene-test-callg (syntax-rules () ((_) (hygiene-test-g))))
+(define (hygiene-test-g) 'new)
+(test "macro sees redefinition, not use-site shadow" 'new
+    (let ((hygiene-test-g (lambda () 'local))) (hygiene-test-callg)))
+
+(define-syntax swap!
+  (syntax-rules ()
+    ((_ a b) (let ((tmp a)) (set! a b) (set! b tmp)))))
+(test "swap! hygiene unaffected by fix" '(2 1 77)
+    (let ()
+      (define p 1) (define q 2)
+      (let ((tmp 77)) (swap! p q) (list p q tmp))))
+
+(define hygiene-test-lst '(1 2 3))
+(define-syntax hygiene-test-mylen (syntax-rules () ((_ v) (length v))))
+(test "macro sees use-site shadow of a primitive" 3
+    (let ((length car)) (hygiene-test-mylen hygiene-test-lst)))
+
+;; Known limitation (not exercised here since VM and interpreter modes
+;; genuinely disagree on the result): when the referenced binding is an
+;; INTERNAL (non-global) define compiled in the same top-level form as the
+;; macro, the compiler's placeholder frame for forward references is a
+;; different object from the frame OP_PUSHENV creates at runtime, so the
+;; safe cell-embedding above doesn't apply and the compiler falls back to a
+;; name-based lookup that can still be captured. The interpreter doesn't
+;; have this gap (macro expansion happens lazily during evaluation, after
+;; the internal define has already run). See vesper-known-issues memory.
+;;   (let () (define (f) 100)
+;;           (define-syntax callf (syntax-rules () ((_) (f))))
+;;           (let ((f (lambda () 200))) (callf)))
+;; => 100 in --interpreter mode, 200 (captured) in compiled VM mode.
+
+(test-section "call-with-values continuations")
+(test "continuation escapes and resumes call-with-values" 5
+    (let ((k #f))
+      (let ((v (call-with-values
+                 (lambda () (call/cc (lambda (c) (set! k c) 1)))
+                 (lambda (x) x))))
+        (if (< v 5) (k (+ v 1)) v))))
+(test "call-with-values basic" 6
+    (call-with-values (lambda () (values 1 2 3)) +))
+(test "call-with-values zero values" '()
+    (call-with-values (lambda () (values)) list))
+(test "call-with-values single value" '(42)
+    (call-with-values (lambda () 42) list))
+(test "nested call-with-values" '(1 2 3 4)
+    (call-with-values
+      (lambda ()
+        (call-with-values (lambda () (values 1 2)) values))
+      (lambda (a b)
+        (call-with-values
+          (lambda () (call-with-values (lambda () (values 3 4)) values))
+          (lambda (c d) (list a b c d))))))
+(test "call-with-values producer does real work" 1000000
+    (call-with-values
+      (lambda ()
+        (define (loop n acc) (if (= n 0) acc (loop (- n 1) (+ acc 1))))
+        (values (loop 1000000 0)))
+      (lambda (x) x)))
+(test "dynamic-wind around call-with-values" '(in 6 out)
+    (let ((log '()))
+      (define (add x) (set! log (cons x log)))
+      (dynamic-wind
+        (lambda () (add 'in))
+        (lambda () (add (call-with-values (lambda () (values 1 2 3)) +)))
+        (lambda () (add 'out)))
+      (reverse log)))
+(test "call-with-values consumer is a builtin" 3
+    (call-with-values (lambda () (values 1 2)) +))
+(test "call-with-values keep-alive across continuation" '((keep-me . 42) 3)
+    (let ()
+      (define (churn n acc) (if (= n 0) acc (churn (- n 1) (cons n '()))))
+      (list (cons 'keep-me 42)
+            (call-with-values
+              (lambda () (churn 500000 '()) (values 1 2))
+              +))))
+
 (test-section "Numeric semantics")
 (test "eqv? on bignums" #t (eqv? (expt 10 30) (expt 10 30)))
 (test "eqv? on rationals" #t (eqv? 1/2 1/2))

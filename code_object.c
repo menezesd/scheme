@@ -312,9 +312,9 @@ static void mark_vm_continuation_code(vm_continuation *cont)
 // Call this after the heap GC is complete
 void gc_sweep_code_objects(void)
 {
-    // First, clear all marks
+    // First, clear all marks (pinned objects stay marked forever)
     for (code_object *code = code_object_registry; code; code = code->gc_next) {
-        code->gc_marked = false;
+        code->gc_marked = code->gc_pinned;
     }
 
     // Walk the heap and mark code objects referenced by closures

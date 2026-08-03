@@ -91,6 +91,7 @@ unsigned instruction_size(unsigned op)
     case OP_LETREC_MARK:
         return 2; // opcode + 1 operand
     case OP_DEFINE_ALIAS:
+    case OP_DEFINE_ALIAS_REF:
         return 3; // opcode + alias + target
     case OP_PRIM:
         return 3; // opcode + 2 operands
@@ -794,6 +795,7 @@ static const char *opcode_names[] = {
     [OP_LOOKUP] = "LOOKUP",
     [OP_DEFINE] = "DEFINE",
     [OP_DEFINE_ALIAS] = "DEFINE_ALIAS",
+    [OP_DEFINE_ALIAS_REF] = "DEFINE_ALIAS_REF",
     [OP_SET] = "SET",
     [OP_CLOSURE] = "CLOSURE",
     [OP_CALL] = "CALL",
@@ -810,6 +812,7 @@ static const char *opcode_names[] = {
     [OP_POPENV] = "POPENV",
     [OP_VALUES] = "VALUES",
     [OP_CALLWITHVALUES] = "CALLWITHVALUES",
+    [OP_CWV_FINISH] = "CWV_FINISH",
     [OP_DEFSYNTAX] = "DEFSYNTAX",
     [OP_HALT] = "HALT",
     [OP_CAR] = "CAR",
@@ -990,6 +993,11 @@ void disassemble(code_object *code, const char *name)
         case OP_DEFINE_ALIAS:
             printf(" %s %s", disassemble_atom_name(code->code[start + 1]),
                    disassemble_atom_name(code->code[start + 2]));
+            break;
+        case OP_DEFINE_ALIAS_REF:
+            printf(" %s const[%u]",
+                   disassemble_atom_name(code->code[start + 1]),
+                   code->code[start + 2]);
             break;
         case OP_CALL:
         case OP_TAILCALL:

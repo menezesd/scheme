@@ -54,6 +54,12 @@ unsigned defvar(unsigned var, unsigned aval, unsigned env);
 unsigned defvar_alias(unsigned var, unsigned target_var, unsigned target_val_cell,
                       unsigned env);
 
+// Build a standalone BT_BINDING_REF cell (CAR = target_val_cell,
+// CDR = target_var) without installing it in an environment. Used to embed
+// a resolved binding as a code constant, e.g. for hygienic references to a
+// macro's free identifiers that must survive expansion-time-only lookup.
+unsigned make_binding_ref_cell(unsigned target_var, unsigned target_val_cell);
+
 // Find the value cell for a variable in an environment, or 0 if absent
 unsigned env_find_binding_cell(int64_t var, unsigned env);
 

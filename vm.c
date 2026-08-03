@@ -920,6 +920,26 @@ static void restore_continuation(vm_state *vm, unsigned cont_cell,
 // Forward declaration for vm_handle_apply
 static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail);
 
+// Pinned singleton code object that call-with-values producer frames return
+// into: [OP_CWV_FINISH, OP_RETURN]. Running the producer in the current VM
+// (returning here) instead of a nested VM lets continuations captured inside
+// the producer restore the whole computation.
+static code_object *cwv_finish_code = NULL;
+
+static code_object *get_cwv_finish_code(void)
+{
+    if (cwv_finish_code)
+        return cwv_finish_code;
+    code_object *code = code_new();
+    if (!code)
+        return NULL;
+    code_emit(code, OP_CWV_FINISH);
+    code_emit(code, OP_RETURN);
+    code->gc_pinned = true;
+    cwv_finish_code = code;
+    return code;
+}
+
 static bool vm_require_proper_list(vm_state *vm, unsigned list,
                                    const char *msg)
 {
@@ -1472,6 +1492,37 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             break;
         }
 
+        case OP_DEFINE_ALIAS_REF: {
+            // Alias to a binding resolved at macro-expansion time; using the
+            // embedded cell (not a runtime name lookup) keeps a macro's
+            // reference to a definition-site global from being captured by
+            // a use-site local of the same name
+            int64_t alias_id = vm->code->code[vm->ip++];
+            unsigned const_idx = vm->code->code[vm->ip++];
+            if (const_idx >= vm->code->const_len) {
+                VM_ERROR(vm, "alias reference constant out of bounds");
+                break;
+            }
+            unsigned binding_ref = vm->code->constants[const_idx];
+            if (!IS_BINDING_REF(binding_ref)) {
+                VM_ERROR(vm, "invalid alias reference constant");
+                break;
+            }
+            unsigned target_cell = CELL_CAR(binding_ref);
+            unsigned target_var = CELL_CDR(binding_ref);
+            GC_GUARD;
+            gc_protect(&target_cell);
+            gc_protect(&target_var);
+            unsigned alias = alloc();
+            CELL_TYPE(alias) = BT_ATOM;
+            CELL_ID(alias) = alias_id;
+            gc_protect(&alias);
+            if (defvar_alias(alias, target_var, target_cell, vm->env) ==
+                TOK_ERROR)
+                VM_ERROR(vm, "define-alias: invalid environment");
+            break;
+        }
+
         case OP_SET: {
             int64_t sym_id = vm->code->code[vm->ip++];
             unsigned val = vm_pop(vm);
@@ -1629,6 +1680,30 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             break;
         }
 
+        case OP_CWV_FINISH: {
+            // The producer arranged by PCALLWITHVALUES has returned.
+            // Stack: [.., consumer, producer-result]. Unpack the result and
+            // apply the consumer; its return (or the OP_RETURN following
+            // this instruction, for synchronous appliers) pops the frame
+            // saved before the producer ran.
+            unsigned result = vm_pop(vm);
+            unsigned consumer = vm_pop(vm);
+            GC_GUARD;
+            gc_protect(&result);
+            gc_protect(&consumer);
+            unsigned consumer_argc = 0;
+            if (IS_MULTIVAL(result)) {
+                unsigned vals = car(result);
+                if (!vm_push_multiple_values(vm, vals, &consumer_argc))
+                    break;
+            } else {
+                vm_push(vm, result);
+                consumer_argc = 1;
+            }
+            vm_apply(vm, consumer, consumer_argc, false);
+            break;
+        }
+
         case OP_JUMP: {
             unsigned target = vm->code->code[vm->ip++];
             vm->ip = target;
@@ -1711,16 +1786,35 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 unsigned producer = argv[0];
                 unsigned consumer = argv[1];
                 vm->sp -= argc;
-                unsigned result;
 
+                if (is_bytecode_closure_object(producer)) {
+                    // Run the producer in THIS VM rather than a nested one:
+                    // stash the consumer on the stack, arrange the producer's
+                    // return to land in the finisher code, and let the
+                    // dispatch loop continue. A continuation captured inside
+                    // the producer then snapshots the whole computation,
+                    // including the pending consumer and caller frames.
+                    code_object *finish = get_cwv_finish_code();
+                    if (!finish)
+                        VM_ERROR_BREAK(
+                            vm, "call-with-values: out of memory");
+                    vm_push(vm, consumer);
+                    push_frame(vm, vm->code, vm->ip, vm->bp, vm->sp,
+                               vm->env);
+                    if (vm->error)
+                        break;
+                    vm->code = finish;
+                    vm->ip = 0;
+                    vm_apply(vm, producer, 0, false);
+                    break;
+                }
+
+                unsigned result;
                 gc_protect(&consumer);
                 gc_protect(&producer);
 
-                // Call producer with 0 args - handle different closure types
-                if (is_bytecode_closure_object(producer)) {
-                    // Bytecode closure - use vm_call_closure
-                    result = vm_call_closure(producer, 0);
-                } else if (IS_FUNCTION(producer)) {
+                // Non-bytecode producers complete synchronously
+                if (IS_FUNCTION(producer)) {
                     // CPS closure - use CPS evaluator via callback
                     // Build: (producer)
                     unsigned call_expr = alloc_cons(producer, 0);

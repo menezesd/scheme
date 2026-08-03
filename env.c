@@ -102,8 +102,11 @@ static unsigned set_binding_value(unsigned val_cell, unsigned aval)
     return old;
 }
 
-static unsigned make_binding_ref(unsigned target_var, unsigned target_val_cell)
+unsigned make_binding_ref_cell(unsigned target_var, unsigned target_val_cell)
 {
+    GC_GUARD;
+    gc_protect(&target_var);
+    gc_protect(&target_val_cell);
     unsigned ref = alloc();
     CELL_TYPE(ref) = BT_BINDING_REF;
     CELL_CAR(ref) = target_val_cell;
@@ -272,7 +275,7 @@ unsigned defvar_alias(unsigned var, unsigned target_var, unsigned target_val_cel
     gc_protect(&target_var);
     gc_protect(&target_val_cell);
     gc_protect(&env);
-    unsigned ref = make_binding_ref(target_var, target_val_cell);
+    unsigned ref = make_binding_ref_cell(target_var, target_val_cell);
     return defvar(var, ref, env);
 }
 

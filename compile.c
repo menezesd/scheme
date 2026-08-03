@@ -66,6 +66,25 @@ static bool builtin_keyword_unbound(int64_t kw, unsigned env)
     return lookup_silent(kw, env) == TOK_ERROR;
 }
 
+// True if target_cell is reachable through the persistent top-level global
+// environment (the outermost frame of cctx->env). Only bindings satisfying
+// this are safe to embed as a compile-time cell reference (OP_DEFINE_ALIAS_REF):
+// the global frame is a single object that lives for the whole program, so a
+// cell found there now is the same cell OP_DEFINE will mutate later. Any
+// other frame - an internal-define placeholder from scan_internal_defines,
+// or a let/lambda body's frame - is a compile-time-only bookkeeping object;
+// OP_PUSHENV allocates an unrelated fresh frame at runtime (once per
+// invocation), so a cell resolved against the compile-time frame is never
+// the one that execution actually updates.
+static bool binding_cell_is_stable_global(compile_ctx *cctx, int64_t var_id,
+                                          unsigned target_cell)
+{
+    unsigned global_env = cctx->env;
+    while (IS_PAIR(global_env) && cdr(global_env))
+        global_env = cdr(global_env);
+    return env_find_binding_cell(var_id, global_env) == target_cell;
+}
+
 static bool install_compile_time_define_syntax(unsigned expr, compile_ctx *cctx)
 {
     if (!IS_PAIR(expr) || !IS_KEYWORD(car(expr), ctx.kw_define_syntax) ||
@@ -1524,10 +1543,25 @@ static void emit_gensym_definitions(compile_ctx *cctx, unsigned old_gensym,
                 emit2(cctx, OP_DEFINE, gensym_id);
                 continue;
             }
+            // A VM stack local has no heap binding cell to reference (its
+            // value lives in a VM register, not an environment frame), so
+            // it must be captured by value at expansion time.
             int local_slot = find_stack_local_slot(cctx, CELL_ID(target_var));
             if (local_slot >= 0) {
                 emit_local_get_slot(cctx, local_slot);
                 emit2(cctx, OP_DEFINE, gensym_id);
+                continue;
+            }
+            // If the free reference resolved to the persistent global
+            // environment, embed that binding cell directly rather than
+            // re-resolving target_var by name at runtime (OP_DEFINE_ALIAS):
+            // a name-based lookup would find whatever binding shadows that
+            // name at the use site instead of the one the macro's free
+            // reference actually meant, breaking hygiene.
+            if (binding_cell_is_stable_global(cctx, CELL_ID(target_var),
+                                              target_cell)) {
+                emit3(cctx, OP_DEFINE_ALIAS_REF, gensym_id,
+                      code_add_const(cctx->code, binding_ref));
                 continue;
             }
             emit3(cctx, OP_DEFINE_ALIAS, gensym_id, CELL_ID(target_var));
@@ -1889,13 +1923,36 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
                                                    gensym_const_bindings);
                                     gc_unprotect(1);
                                 } else {
+                                    // Resolve the binding cell now, against
+                                    // this definition-time environment, so
+                                    // the emission below can embed it
+                                    // directly instead of re-resolving
+                                    // var_atom by name at runtime (which
+                                    // would find whatever shadows it at the
+                                    // use site instead). Only safe when the
+                                    // binding lives in the persistent global
+                                    // frame - see binding_cell_is_stable_global.
+                                    unsigned target_cell =
+                                        env_find_binding_cell(var_id,
+                                                              cctx->env);
+                                    unsigned binding_ref =
+                                        (target_cell &&
+                                        binding_cell_is_stable_global(
+                                            cctx, var_id, target_cell))
+                                            ? make_binding_ref_cell(
+                                                  var_atom, target_cell)
+                                            : 0;
+                                    gc_protect(&binding_ref);
+                                    unsigned var_and_ref =
+                                        alloc_cons(var_atom, binding_ref);
+                                    gc_protect(&var_and_ref);
                                     unsigned bind_entry =
-                                        alloc_cons(gensym_atom, var_atom);
+                                        alloc_cons(gensym_atom, var_and_ref);
                                     gc_protect(&bind_entry);
                                     gensym_bindings =
                                         alloc_cons(bind_entry,
                                                    gensym_bindings);
-                                    gc_unprotect(1);
+                                    gc_unprotect(3);
                                 }
 
                                 gc_unprotect(2);
@@ -2062,14 +2119,25 @@ next_free_var:
                 for (unsigned gb = gensym_bindings; gb; gb = cdr(gb)) {
                     unsigned entry = car(gb);
                     unsigned gensym_atom = car(entry);
-                    unsigned var_atom = cdr(entry);
+                    unsigned var_and_ref = cdr(entry);
+                    unsigned var_atom = car(var_and_ref);
+                    unsigned binding_ref = cdr(var_and_ref);
                     int64_t gensym_id = CELL_ID(gensym_atom);
                     int64_t var_id = CELL_ID(var_atom);
 
+                    // A VM stack local has no heap binding cell (its value
+                    // lives in a register), so it must be captured by value.
                     int local_slot = find_stack_local_slot(cctx, var_id);
                     if (local_slot >= 0) {
                         emit_local_get_slot(cctx, local_slot);
                         emit2(cctx, OP_DEFINE, gensym_id);
+                    } else if (binding_ref) {
+                        // Embed the binding cell resolved at let-syntax
+                        // definition time instead of re-resolving var_atom
+                        // by name at runtime, which would find whatever
+                        // shadows it at the use site and break hygiene.
+                        emit3(cctx, OP_DEFINE_ALIAS_REF, gensym_id,
+                              code_add_const(cctx->code, binding_ref));
                     } else {
                         emit3(cctx, OP_DEFINE_ALIAS, gensym_id, var_id);
                     }
