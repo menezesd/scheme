@@ -305,8 +305,11 @@ unsigned apply_numtower_primitive(unsigned prim_id, unsigned argc,
         if (!require_real(real, "make-rectangular") ||
             !require_real(imag, "make-rectangular"))
             return TOK_ERROR;
-        // If imaginary part is zero, return just the real
-        if (is_zero_number(imag))
+        // Only an EXACT zero imaginary part collapses to just the real
+        // part (R7RS/MIT: (make-rectangular 3 0.0) is a genuine inexact
+        // complex 3+0.i, not the real number 3 - the imaginary part's
+        // inexactness is observable, e.g. via (exact? ...)).
+        if (is_exact(imag) && is_zero_number(imag))
             return real;
         return store_complex(real, imag);
     }

@@ -267,10 +267,14 @@ static bool pattern_literals_match(unsigned pattern, unsigned input,
         }
     }
 
+    // Self-evaluating literal data in a pattern (strings, bignums,
+    // bytevectors, inexact numbers, ...) must match by content, not by cell
+    // identity: two distinct-but-equal? literal cells (e.g. two separately
+    // read "hello" strings) have unrelated CELL_IDs, so comparing those
+    // directly rejected every such literal pattern.
     if (!IS_CELL(pattern) || !IS_CELL(input))
         return pattern == input;
-    return CELL_TYPE(pattern) == CELL_TYPE(input) &&
-           CELL_ID(pattern) == CELL_ID(input);
+    return deep_equal(pattern, input);
 }
 
 // Check if a pattern contains a variable (for ellipsis expansion)

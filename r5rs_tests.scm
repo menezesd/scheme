@@ -848,6 +848,26 @@
     (let-syntax ((f (syntax-rules ()
                       ((_ #(a x ... b)) '(a (x ...) b)))))
       (f #(1 2 3 4))))
+;; A self-evaluating literal in a pattern (string, bignum, ...) used to be
+;; matched by comparing raw cell identity instead of content, so a literal
+;; that happened to be a separately-allocated (but equal?) cell - the
+;; normal case, since the pattern's literal and the use site's argument
+;; are read from different source text - could never match.
+(test "string literal pattern matches by content" 'matched
+    (let-syntax ((f (syntax-rules ()
+                      ((_ "hello") 'matched)
+                      ((_ s) (list 'nomatch s)))))
+      (f "hello")))
+(test "string literal pattern still falls through on mismatch" '(nomatch "world")
+    (let-syntax ((f (syntax-rules ()
+                      ((_ "hello") 'matched)
+                      ((_ s) (list 'nomatch s)))))
+      (f "world")))
+(test "bignum literal pattern matches by content" 'matched-big
+    (let-syntax ((f (syntax-rules ()
+                      ((_ 100000000000000000000) 'matched-big)
+                      ((_ s) (list 'nomatch s)))))
+      (f 100000000000000000000)))
 
 (test-section "Quasiquote semantics")
 (test "dotted tail unquote" '(1 . 3) `(1 . ,(+ 1 2)))
@@ -1168,6 +1188,16 @@
 (test "rational? on infinity" #f (rational? +inf.0))
 (test "rational? on negative infinity" #f (rational? -inf.0))
 (test "rational? on nan" #f (rational? +nan.0))
+;; make-rectangular used to collapse to just the real part whenever the
+;; imaginary part was numerically zero, even if it was an *inexact* zero -
+;; per R7RS/MIT, only an exact zero imaginary part collapses; an inexact
+;; 0.0 produces a genuine (inexact) complex number.
+(test "make-rectangular with inexact zero imaginary stays complex" #f
+    (exact? (make-rectangular 3 0.0)))
+(test "make-rectangular with exact zero imaginary collapses to real" #t
+    (and (= 3 (make-rectangular 3 0)) (exact? (make-rectangular 3 0))))
+(test "make-rectangular with inexact real, exact zero imaginary" 3.0
+    (make-rectangular 3.0 0))
 
 (test-section "Reader and writer round-trips")
 (test "eof-object is not a symbol" #f (symbol? (eof-object)))
