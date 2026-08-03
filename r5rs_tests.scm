@@ -725,6 +725,66 @@
             (c 'talk2)
             (reverse path)))))
 
+(test "dynamic-wind ancestor jump leaves shared outer wind untouched"
+    '(start before-a before-b body after-b before-b body after-b after-a done)
+    (let ((log '()) (k1 #f) (invoked #f))
+      (define (add x) (set! log (cons x log)))
+      (add 'start)
+      (dynamic-wind
+        (lambda () (add 'before-a))
+        (lambda ()
+          (call/cc (lambda (k) (set! k1 k)))
+          (dynamic-wind
+            (lambda () (add 'before-b))
+            (lambda ()
+              (add 'body)
+              (if (not invoked) (begin (set! invoked #t) (k1 #f))))
+            (lambda () (add 'after-b))))
+        (lambda () (add 'after-a)))
+      (add 'done)
+      (reverse log)))
+
+(test "dynamic-wind descendant jump re-enters only the inner wind"
+    '(start before-a before-b body-b after-b mid before-b after-b mid after-a done)
+    (let ((log '()) (k1 #f) (invoked #f))
+      (define (add x) (set! log (cons x log)))
+      (add 'start)
+      (dynamic-wind
+        (lambda () (add 'before-a))
+        (lambda ()
+          (dynamic-wind
+            (lambda () (add 'before-b))
+            (lambda ()
+              (add 'body-b)
+              (call/cc (lambda (k) (set! k1 k))))
+            (lambda () (add 'after-b)))
+          (add 'mid)
+          (if (not invoked) (begin (set! invoked #t) (k1 #f))))
+        (lambda () (add 'after-a)))
+      (add 'done)
+      (reverse log)))
+
+(test "dynamic-wind unwinds across an unequal-depth sibling jump"
+    '(before-a before-b before-c body-c after-c before-c body-c after-c after-b after-a)
+    (let ((log '()) (kc #f) (invoked #f))
+      (define (add x) (set! log (cons x log)))
+      (dynamic-wind
+        (lambda () (add 'before-a))
+        (lambda ()
+          (dynamic-wind
+            (lambda () (add 'before-b))
+            (lambda ()
+              (call/cc (lambda (k) (set! kc k)))
+              (dynamic-wind
+                (lambda () (add 'before-c))
+                (lambda ()
+                  (add 'body-c)
+                  (if (not invoked) (begin (set! invoked #t) (kc #f))))
+                (lambda () (add 'after-c))))
+            (lambda () (add 'after-b))))
+        (lambda () (add 'after-a)))
+      (reverse log)))
+
 (test-section "Syntax-rules ellipsis renaming")
 (test "custom ellipsis" 2 (let-syntax
             ((foo (syntax-rules ::: ()
@@ -798,6 +858,33 @@
         (if first
             (begin (set! first #f) (k 99))
             result))))
+
+(test-section "Exception handling")
+(test "guard re-raises to enclosing handler without looping" '(caught-at-top boom)
+    (call/cc (lambda (top)
+      (with-exception-handler
+        (lambda (e) (top (list 'caught-at-top e)))
+        (lambda ()
+          (guard (e (#f 'never-matches))
+            (raise 'boom)))))))
+(test "nested guard propagates unmatched condition to outer guard" '(outer boom)
+    (guard (e1 (#t (list 'outer e1)))
+      (guard (e2 (#f 'never))
+        (raise 'boom))))
+(test "guard with matching clause catches normally" '(caught x)
+    (guard (e (#t (list 'caught e))) (raise 'x)))
+(test "raise-continuable returns handler value to raise point" 16
+    (with-exception-handler
+      (lambda (e) (+ e 1))
+      (lambda () (+ 10 (raise-continuable 5)))))
+(test "error object carries message through guard" "boom"
+    (guard (e (#t (error-object-message e))) (error "boom" 1 2)))
+(test "deep re-raise chain terminates at the matching guard" '(caught-deep deep)
+    (letrec ((nest (lambda (n)
+                     (if (= n 0)
+                         (raise 'deep)
+                         (guard (e (#f 'never)) (nest (- n 1)))))))
+      (guard (e (#t (list 'caught-deep e))) (nest 10))))
 
 (test-section "Hygiene: definition-site references")
 ;; These reference genuine TOP-LEVEL globals (each define below is its own
@@ -891,6 +978,49 @@
             (call-with-values
               (lambda () (churn 500000 '()) (values 1 2))
               +))))
+
+(test-section "SRFI-1/R7RS-large stdlib procedures")
+(test "hash-table-update! calls the default as a thunk" 11
+    (let ((h (make-strong-eqv-hash-table)))
+      (hash-table-update! h 'y (lambda (v) (+ v 1)) (lambda () 10))
+      (hash-table-ref h 'y #f)))
+(test "hash-table-update! on an existing key" 6
+    (let ((h (make-strong-eqv-hash-table)))
+      (hash-table-set! h 'x 5)
+      (hash-table-update! h 'x (lambda (v) (+ v 1)))
+      (hash-table-ref h 'x #f)))
+(test "member accepts an optional compare procedure" '(5.0 6)
+    (member 5 (list 1 2 5.0 6) =))
+(test "assoc accepts an optional compare procedure" '(2 . b)
+    (assoc 2.0 (list (cons 1 'a) (cons 2 'b)) =))
+(test "reduce returns ridentity on an empty list" 0 (reduce + 0 '()))
+(test "reduce folds over a nonempty list" 10 (reduce + 0 (list 1 2 3 4)))
+(test "any returns the predicate's true value, not a bare #t" 4
+    (any (lambda (x) (and (even? x) x)) '(1 3 4 5)))
+(test "every returns the last predicate value, not a bare #t" 9
+    (every (lambda (x) (* x x)) '(1 2 3)))
+(test "any over multiple lists stops at the shortest" #f (any < '(1 2) '()))
+(test "any/every on an empty list" '(#f . #t)
+    (cons (any (lambda (x) x) '()) (every (lambda (x) x) '())))
+(test "take/drop use (list k) order" '((1 2 3) (4 5))
+    (list (take '(1 2 3 4 5) 3) (drop '(1 2 3 4 5) 3)))
+(test "take-right/drop-right on a proper list" '((3) (1 2))
+    (list (take-right '(1 2 3) 1) (drop-right '(1 2 3) 1)))
+(test "take-right/drop-right accept an improper list" '((b c . d) (a))
+    (list (take-right '(a b c . d) 2) (drop-right '(a b c . d) 2)))
+(test "list-copy preserves an improper tail" '(1 2 . 3)
+    (list-copy '(1 2 . 3)))
+(test "last-pair accepts an improper list" '(b . c) (last-pair '(a b . c)))
+(test "append! accepts a non-list final argument" '(1 2 . 3)
+    (append! (list 1 2) 3))
+(test "iota with start and step" '(10 12 14 16 18) (iota 5 10 2))
+(test "iota default start and step" '(0 1 2 3 4) (iota 5))
+(test "string-join with separator and prefix but no suffix" "[a,b"
+    (string-join (list "a" "b") "," "["))
+(test "string-join with separator, prefix, and suffix" "<a-b>"
+    (string-join (list "a" "b") "-" "<" ">"))
+(test "format ~r honors a radix parameter" "hex: ff decimal: 42 bin: 101"
+    (format #f "hex: ~16r decimal: ~r bin: ~b" 255 42 5))
 
 (test-section "Numeric semantics")
 (test "eqv? on bignums" #t (eqv? (expt 10 30) (expt 10 30)))

@@ -157,7 +157,8 @@
 ;; Wrap read-bytevector to support bytevector input ports
 (let ((prim-read-bytevector read-bytevector))
   (set! read-bytevector
-    (lambda (k port)
+    (lambda (k . args)
+     (let ((port (if (pair? args) (car args) (current-input-port))))
       (cond
         ((bytevector-input-port-open? port)
          (let* ((bv (vector-ref port 1))
@@ -172,7 +173,7 @@
         ((bytevector-input-port? port)
          (error "read-bytevector: port is closed"))
         (else
-         (prim-read-bytevector k port))))))
+         (prim-read-bytevector k port)))))))
 
 (let ((primitive-input-port? input-port?)
       (primitive-output-port? output-port?)
@@ -274,12 +275,25 @@
     (newline)
     (exit 1)))
 
+;; Per R7RS 6.11, a handler invoked by raise/raise-continuable must run
+;; with the PREVIOUS handler in effect (not itself), so that a handler
+;; which re-raises (e.g. a guard clause that falls through) propagates to
+;; the enclosing handler instead of calling itself forever. We install a
+;; wrapper that swaps back to the previous handler for the duration of the
+;; user handler's call, restoring itself afterward if the handler returns
+;; (the raise-continuable case).
 (define (with-exception-handler handler thunk)
   (let ((old-handler *current-exception-handler*))
-    (dynamic-wind
-      (lambda () (set! *current-exception-handler* handler))
-      thunk
-      (lambda () (set! *current-exception-handler* old-handler)))))
+    (letrec ((wrapped-handler
+               (lambda (obj)
+                 (dynamic-wind
+                   (lambda () (set! *current-exception-handler* old-handler))
+                   (lambda () (handler obj))
+                   (lambda () (set! *current-exception-handler* wrapped-handler))))))
+      (dynamic-wind
+        (lambda () (set! *current-exception-handler* wrapped-handler))
+        thunk
+        (lambda () (set! *current-exception-handler* old-handler))))))
 
 (define (raise obj)
   (*current-exception-handler* obj)
@@ -409,6 +423,33 @@
       k
       (error (string-append who ": expected nonnegative integer"))))
 
+; Like %require-proper-list, but allows a non-nil final cdr (an improper/
+; dotted list), as several R7RS/SRFI-1 procedures explicitly permit.
+; Still rejects circular lists (Floyd's cycle detection) so callers can't
+; hang walking one.
+(define (%require-finite-list who lst)
+  (let loop ((slow lst) (fast lst))
+    (cond ((not (pair? fast)) lst)
+          ((not (pair? (cdr fast))) lst)
+          (else
+           (let ((fast2 (cddr fast)) (slow2 (cdr slow)))
+             (if (eq? fast2 slow2)
+                 (error (string-append who ": circular list"))
+                 (loop slow2 fast2)))))))
+
+; Like %require-proper-lists, but the LAST element of `lists` may be any
+; object (R7RS `append`'s convention: every argument but the last must be
+; a list, and the last is used as-is, becoming the final tail).
+(define (%require-proper-lists-but-last who lists)
+  (if (pair? lists)
+      (let loop ((lists lists))
+        (if (pair? (cdr lists))
+            (begin
+              (%require-proper-list who (car lists))
+              (loop (cdr lists)))
+            lists))
+      lists))
+
 (define (%require-proper-lists who lists)
   (%require-proper-list who lists)
   (let loop ((lists lists))
@@ -447,12 +488,13 @@
           ((eqv? obj (car lst)) lst)
           (else (loop (cdr lst))))))
 
-(define (member obj lst)
+(define (member obj lst . maybe-compare)
   (%require-proper-list "member" lst)
-  (let loop ((lst lst))
-    (cond ((null? lst) #f)
-          ((equal? obj (car lst)) lst)
-          (else (loop (cdr lst))))))
+  (let ((compare (if (null? maybe-compare) equal? (car maybe-compare))))
+    (let loop ((lst lst))
+      (cond ((null? lst) #f)
+            ((compare obj (car lst)) lst)
+            (else (loop (cdr lst)))))))
 
 ; Association list functions
 (define (assq obj alist)
@@ -469,12 +511,13 @@
           ((eqv? obj (caar alist)) (car alist))
           (else (loop (cdr alist))))))
 
-(define (assoc obj alist)
+(define (assoc obj alist . maybe-compare)
   (%require-proper-list "assoc" alist)
-  (let loop ((alist alist))
-    (cond ((null? alist) #f)
-          ((equal? obj (caar alist)) (car alist))
-          (else (loop (cdr alist))))))
+  (let ((compare (if (null? maybe-compare) equal? (car maybe-compare))))
+    (let loop ((alist alist))
+      (cond ((null? alist) #f)
+            ((compare obj (caar alist)) (car alist))
+            (else (loop (cdr alist)))))))
 
 ;;; ============================================================================
 ;;; Numeric predicates
@@ -724,20 +767,42 @@
           (else (loop (cdr lst))))))
 
 ; any - return #t if any element satisfies predicate
-(define (any pred lst)
-  (%require-proper-list "any" lst)
-  (let loop ((lst lst))
-    (cond ((null? lst) #f)
-          ((pred (car lst)) #t)
-          (else (loop (cdr lst))))))
+; any - return the predicate's true value for the first element(s) that
+; satisfy it (not a bare #t), stopping at the shortest of any number of
+; lists; #f if none satisfy (SRFI-1)
+(define (any pred lst . more-lists)
+  (if (null? more-lists)
+      (begin
+        (%require-proper-list "any" lst)
+        (let loop ((lst lst))
+          (cond ((null? lst) #f)
+                ((pred (car lst)))
+                (else (loop (cdr lst))))))
+      (let loop ((lsts (cons lst more-lists)))
+        (if (any-null? lsts)
+            #f
+            (or (apply pred (map car lsts))
+                (loop (map cdr lsts)))))))
 
-; every - return #t if all elements satisfy predicate
-(define (every pred lst)
-  (%require-proper-list "every" lst)
-  (let loop ((lst lst))
-    (cond ((null? lst) #t)
-          ((not (pred (car lst))) #f)
-          (else (loop (cdr lst))))))
+; every - return the predicate's value for the last element(s) (not a bare
+; #t), stopping at the shortest of any number of lists; #t if all satisfy
+; (or any list is empty from the start) (SRFI-1)
+(define (every pred lst . more-lists)
+  (if (null? more-lists)
+      (begin
+        (%require-proper-list "every" lst)
+        (let loop ((lst lst) (last-result #t))
+          (cond ((null? lst) last-result)
+                ((pred (car lst)) => (lambda (r) (loop (cdr lst) r)))
+                (else #f))))
+      (let loop ((lsts (cons lst more-lists)) (last-result #t))
+        (if (any-null? lsts)
+            last-result
+            (let ((r (apply pred (map car lsts))))
+              (if r (loop (map cdr lsts) r) #f))))))
+
+(define (any-null? lsts)
+  (if (null? lsts) #f (or (null? (car lsts)) (any-null? (cdr lsts)))))
 
 ; count - count elements satisfying predicate
 (define (count pred lst)
@@ -762,22 +827,25 @@
       init
       (proc (car lst) (fold-right proc init (cdr lst)))))
 
-; reduce - like fold but uses first element as initial value
-(define (reduce proc lst)
+; reduce - like fold but uses first element as initial value; returns
+; ridentity for an empty list (SRFI-1 signature: (reduce f ridentity list))
+(define (reduce proc ridentity lst)
   (if (null? lst)
-      (error "reduce: empty list")
+      ridentity
       (fold proc (car lst) (cdr lst))))
 
-; take - return first n elements of list
-(define (take n lst)
+; take - return first n elements of list (SRFI-1/R7RS-large signature:
+; (take list k), matching MIT and every sibling function in this file)
+(define (take lst n)
   (%require-nonnegative-integer "take" n)
   (let loop ((n n) (lst lst))
     (if (or (= n 0) (null? lst))
         '()
         (cons (car lst) (loop (- n 1) (cdr lst))))))
 
-; drop - return list without first n elements
-(define (drop n lst)
+; drop - return list without first n elements (SRFI-1/R7RS-large
+; signature: (drop list k))
+(define (drop lst n)
   (%require-nonnegative-integer "drop" n)
   (let loop ((n n) (lst lst))
     (if (or (= n 0) (null? lst))
@@ -813,12 +881,15 @@
 (define (last lst)
   (car (last-pair lst)))
 
-; iota - generate list of integers [0, n)
-(define (iota n)
-  (let loop ((i (- n 1)) (acc '()))
-    (if (< i 0)
-        acc
-        (loop (- i 1) (cons i acc)))))
+; iota - generate a list of count numbers: start, start+step, ...
+; (SRFI-1/R7RS-large signature: (iota count [start [step]]))
+(define (iota count . args)
+  (let ((start (if (pair? args) (car args) 0))
+        (step (if (and (pair? args) (pair? (cdr args))) (cadr args) 1)))
+    (let loop ((i (- count 1)) (acc '()))
+      (if (< i 0)
+          acc
+          (loop (- i 1) (cons (+ start (* i step)) acc))))))
 
 ; range - generate list of integers [start, end)
 (define (range start end)
@@ -857,12 +928,13 @@
         acc
         (loop (- i 1) (cons (init-proc i) acc)))))
 
-; list-copy - shallow copy of list
+; list-copy - shallow copy of list; R7RS explicitly documents this on
+; improper (dotted) lists too, preserving the non-null final cdr
 (define (list-copy lst)
-  (%require-proper-list "list-copy" lst)
-  (if (null? lst)
-      '()
-      (cons (car lst) (list-copy (cdr lst)))))
+  (%require-finite-list "list-copy" lst)
+  (if (pair? lst)
+      (cons (car lst) (list-copy (cdr lst)))
+      lst))
 
 ;;; ============================================================================
 ;;; Additional SRFI-1 Predicates
@@ -936,38 +1008,36 @@
 (define (car+cdr pair)
   (values (car pair) (cdr pair)))
 
-; take-right - return last n elements
+; Count the pairs in a (possibly improper) list, ignoring any final
+; non-nil cdr - unlike `length`, which requires proper termination.
+(define (%pair-count lst)
+  (let loop ((lst lst) (n 0))
+    (if (pair? lst) (loop (cdr lst) (+ n 1)) n)))
+
+; take-right - return last n elements. SRFI-1/MIT permit a possibly
+; improper (dotted) list, returning the final non-nil cdr along with the
+; last n elements if n reaches all the way to it.
 (define (take-right lst n)
-  (%require-proper-list "take-right" lst)
+  (%require-finite-list "take-right" lst)
   (%require-nonnegative-integer "take-right" n)
-  (let ((len (length lst)))
+  (let ((len (%pair-count lst)))
     (if (>= n len)
         lst
-        (drop (- len n) lst))))
+        (drop lst (- len n)))))
 
 ; drop-right - return all but last n elements
 (define (drop-right lst n)
-  (%require-proper-list "drop-right" lst)
+  (%require-finite-list "drop-right" lst)
   (%require-nonnegative-integer "drop-right" n)
-  (let ((len (length lst)))
+  (let ((len (%pair-count lst)))
     (if (>= n len)
         '()
-        (take (- len n) lst))))
+        (take lst (- len n)))))
 
 ; split-at - split list at index, return two lists
 (define (split-at lst n)
   (%require-nonnegative-integer "split-at" n)
-  (values (take n lst) (drop n lst)))
-
-; last-pair - return last pair of list
-(define (last-pair lst)
-  (%require-proper-list "last-pair" lst)
-  (if (not (pair? lst))
-      (error "last-pair: expected pair")
-      (let loop ((lst lst))
-        (if (null? (cdr lst))
-            lst
-            (loop (cdr lst))))))
+  (values (take lst n) (drop lst n)))
 
 ;;; ============================================================================
 ;;; Additional SRFI-1 Miscellaneous
@@ -1165,7 +1235,7 @@
   (cond ((<= n 0) '())
         ((null? lst) '())
         (else
-         (let ((tail (drop (- n 1) lst)))
+         (let ((tail (drop lst (- n 1))))
            (if (null? tail)
                lst
                (begin
@@ -1187,16 +1257,18 @@
   (%require-nonnegative-integer "split-at!" n)
   (if (<= n 0)
       (values '() lst)
-      (let ((tail (drop (- n 1) lst)))
+      (let ((tail (drop lst (- n 1))))
         (if (null? tail)
             (values lst '())
             (let ((rest (cdr tail)))
               (set-cdr! tail '())
               (values lst rest))))))
 
-; append! - destructive append
+; append! - destructive append. Every argument but the last must be a
+; proper list; the last may be any object (including improper), matching
+; R7RS `append` and this file's own C-primitive `append`.
 (define (append! . lists)
-  (%require-proper-lists "append!" lists)
+  (%require-proper-lists-but-last "append!" lists)
   (if (null? lists)
       '()
       (let loop ((result '()) (lists lists))
@@ -1337,24 +1409,68 @@
 ; Wind stack: list of (before . after) pairs
 (define *wind-stack* '())
 
-; Helper: execute wind thunks when jumping between continuation points
-; Must update *wind-stack* as we go so thunks see correct state
+; Helper: execute wind thunks when jumping between continuation points.
+; `from`/`to` are wind-stacks (innermost frame at the head, see
+; *wind-stack* above), and any real common ancestor context corresponds to
+; a common TAIL of the two lists - so this is the classic "find the
+; convergence point of two lists that may differ in length" problem.
+; Popping one frame off *each* side per step (as a naive implementation
+; might) only finds that point when the lists happen to have equal
+; length; when they don't, the shorter side hits '() first and the
+; unequal-length remainder of the longer side gets misidentified as
+; divergent, spuriously unwinding/rewinding dynamic-wind frames that were
+; never actually left. Fix: first equalize lengths by consuming the
+; longer list's extra head frames (running their thunks - after-thunks
+; for `from`, before-thunks for `to`), then walk the equal-length
+; remainders together to find the true common tail.
 (define (do-wind from to)
-  (set! *wind-stack* from)
-  (cond ((eq? from to))  ; Same point - nothing to do
-        ((null? from)
-         ; Rewinding into 'to': recurse first, then run before thunks
-         (do-wind from (cdr to))
-         ((caar to)))
-        ((null? to)
-         ; Unwinding out of 'from': run after thunks, then recurse
-         ((cdar from))
-         (do-wind (cdr from) to))
-        (else
-         ; Both non-empty and different: unwind one, recurse, rewind one
-         ((cdar from))
-         (do-wind (cdr from) (cdr to))
-         ((caar to))))
+  (define (length-of lst)
+    (let loop ((l lst) (n 0)) (if (null? l) n (loop (cdr l) (+ n 1)))))
+  ; Run after-thunks for the n innermost (head) frames of `from` that have
+  ; no counterpart in `to` because `to` is shorter. Innermost-first order
+  ; (head to tail) is correct for unwinding.
+  (define (unwind-extra from n)
+    (if (= n 0)
+        from
+        (begin
+          (set! *wind-stack* from)
+          ((cdar from))
+          (unwind-extra (cdr from) (- n 1)))))
+  ; Run before-thunks for the n innermost (head) frames of `to` that have
+  ; no counterpart in `from` because `from` is shorter. Must run
+  ; outermost-first (reverse of `to`'s head-to-tail order), so recurse
+  ; down to the equal-length point first and run each thunk as the
+  ; recursion returns.
+  (define (rewind-extra to n)
+    (if (= n 0)
+        to
+        (let ((rest (rewind-extra (cdr to) (- n 1))))
+          (set! *wind-stack* to)
+          ((caar to))
+          rest)))
+  ; `from`/`to` now have equal length. Find the common tail: unwind from's
+  ; divergent prefix innermost-first (before recursing), then rewind to's
+  ; divergent prefix outermost-first (after recursing).
+  (define (converge from to)
+    (if (eq? from to)
+        to
+        (begin
+          (set! *wind-stack* from)
+          ((cdar from))
+          (let ((common (converge (cdr from) (cdr to))))
+            (set! *wind-stack* to)
+            ((caar to))
+            common))))
+  (unless (eq? from to)
+    (let* ((from-len (length-of from))
+           (to-len (length-of to))
+           (from1 (if (> from-len to-len)
+                      (unwind-extra from (- from-len to-len))
+                      from))
+           (to1 (if (> to-len from-len)
+                    (rewind-extra to (- to-len from-len))
+                    to)))
+      (converge from1 to1)))
   (set! *wind-stack* to))
 
 ; dynamic-wind: establish before/after thunks around body
@@ -1773,49 +1889,66 @@
       (format-to-port out)
       (get-output-string out)))
 
+  ; Scan an optional decimal radix parameter between ~ and the directive
+  ; letter (e.g. ~16r), returning (values radix-or-#f index-after-digits).
+  (define (scan-radix-param i)
+    (let loop ((j i) (n #f))
+      (if (and (< j (string-length fmt)) (char-numeric? (string-ref fmt j)))
+          (loop (+ j 1)
+                (+ (* (or n 0) 10) (digit-value (string-ref fmt j))))
+          (values n j))))
+
   (define (format-to-port port)
     (let loop ((i 0) (args args))
       (if (< i (string-length fmt))
           (let ((c (string-ref fmt i)))
             (if (char=? c #\~)
                 (if (< (+ i 1) (string-length fmt))
-                    (let ((directive (string-ref fmt (+ i 1))))
+                    (call-with-values
+                      (lambda () (scan-radix-param (+ i 1)))
+                      (lambda (radix-param j)
+                        (if (>= j (string-length fmt))
+                            (error "format: incomplete escape at end of string")
+                            (let ((directive (string-ref fmt j))
+                                  (next (+ j 1)))
                       (cond
                         ((or (char=? directive #\a) (char=? directive #\A))
                          (display (require-arg args "a") port)
-                         (loop (+ i 2) (cdr args)))
+                         (loop next (cdr args)))
                         ((or (char=? directive #\s) (char=? directive #\S))
                          (write (require-arg args "s") port)
-                         (loop (+ i 2) (cdr args)))
+                         (loop next (cdr args)))
                         ((or (char=? directive #\d) (char=? directive #\D))
-                         (loop (+ i 2) (format-radix args 10 "d" port)))
+                         (loop next (format-radix args 10 "d" port)))
                         ((or (char=? directive #\x) (char=? directive #\X))
-                         (loop (+ i 2) (format-radix args 16 "x" port)))
+                         (loop next (format-radix args 16 "x" port)))
                         ((or (char=? directive #\o) (char=? directive #\O))
-                         (loop (+ i 2) (format-radix args 8 "o" port)))
+                         (loop next (format-radix args 8 "o" port)))
                         ((or (char=? directive #\b) (char=? directive #\B))
-                         (loop (+ i 2) (format-radix args 2 "b" port)))
+                         (loop next (format-radix args 2 "b" port)))
                         ((or (char=? directive #\r) (char=? directive #\R))
-                         (let ((arg (require-arg args "r")))
-                           (display arg port)
-                           (loop (+ i 2) (cdr args))))
+                         ; ~NNr prints in radix NN (e.g. ~16r for hex);
+                         ; bare ~r defaults to radix 10, like ~d
+                         (loop next
+                               (format-radix args (or radix-param 10) "r"
+                                            port)))
                         ((or (char=? directive #\c) (char=? directive #\C))
                          (let ((arg (require-arg args "c")))
                            (if (char? arg)
                                (write-char arg port)
                                (error "format: ~c expects a character"))
-                           (loop (+ i 2) (cdr args))))
+                           (loop next (cdr args))))
                         ((char=? directive #\%)
                          (newline port)
-                         (loop (+ i 2) args))
+                         (loop next args))
                         ((or (char=? directive #\&) (char=? directive #\_))
                          (newline port)
-                         (loop (+ i 2) args))
+                         (loop next args))
                         ((char=? directive #\~)
                          (write-char #\~ port)
-                         (loop (+ i 2) args))
+                         (loop next args))
                         (else
-                         (error "format: unknown directive" directive))))
+                         (error "format: unknown directive" directive)))))))
                     (error "format: incomplete escape at end of string"))
                 (begin
                   (write-char c port)
@@ -1930,19 +2063,6 @@
                               result))
                     (loop (+ i 1) (or start i) result))))))))
 
-;; string-join - join strings with separator (uses string port for O(n))
-(define (string-join strs . args)
-  (let ((sep (if (null? args) " " (car args))))
-    (if (null? strs)
-        ""
-        (let ((out (open-output-string)))
-          (display (car strs) out)
-          (for-each (lambda (s)
-                      (display sep out)
-                      (display s out))
-                    (cdr strs))
-          (get-output-string out)))))
-
 ;;; ============================================================================
 ;;; SRFI-8: receive (binding to multiple values)
 ;;; ============================================================================
@@ -2044,10 +2164,17 @@
 (define (hash-table-ref/default table key default)
   (hash-table-ref table key default))
 
-(define (hash-table-update! table key proc . maybe-default)
-  (let ((default (if (null? maybe-default) #f (car maybe-default))))
-    (hash-table-set! table key
-                     (proc (hash-table-ref table key default)))))
+(define (hash-table-update! table key proc . maybe-get-default)
+  ; The optional 4th argument is a THUNK invoked to produce the default
+  ; when key is absent (SRFI-69/R7RS-large convention, matches MIT), not
+  ; a literal default value.
+  (let ((current
+          (if (hash-table-exists? table key)
+              (hash-table-ref table key)
+              (if (null? maybe-get-default)
+                  (error "hash-table-update!: key not found" key)
+                  ((car maybe-get-default))))))
+    (hash-table-set! table key (proc current))))
 
 (define (hash-table-walk table proc)
   (for-each (lambda (entry)
@@ -2246,12 +2373,16 @@
           ((eq? (car xs) key) (cadr xs))
           (else (loop (cddr xs))))))
 
+; string-join - join strings with an optional separator/prefix/suffix.
+; Each argument is picked up positionally (like the other optional-arg
+; wrappers in this file), so 1 or 2 optional args apply just that many
+; instead of silently discarding a 2-arg (sep, prefix) call.
 (define (string-join strings . args)
-  (let ((infix (cond ((null? args) " ")
-                     ((= (length args) 1) (car args))
-                     (else (car args))))
-        (prefix (if (= (length args) 3) (cadr args) ""))
-        (suffix (if (= (length args) 3) (caddr args) "")))
+  (let* ((infix (if (pair? args) (car args) " "))
+         (rest1 (if (pair? args) (cdr args) '()))
+         (prefix (if (pair? rest1) (car rest1) ""))
+         (rest2 (if (pair? rest1) (cdr rest1) '()))
+         (suffix (if (pair? rest2) (car rest2) "")))
     (let loop ((xs strings) (first? #t) (out prefix))
       (cond ((null? xs) (string-append out suffix))
             (first?
