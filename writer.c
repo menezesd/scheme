@@ -28,10 +28,38 @@
 #include "bignum.h"
 #include "bytecode.h"
 #include "context.h"
+#include "utf8.h"
 #include <inttypes.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+
+// ============================================================================
+// Number Formatting
+// ============================================================================
+
+void format_double_repr(char *buf, size_t size, double d)
+{
+    if (isnan(d)) {
+        snprintf(buf, size, "+nan.0");
+        return;
+    }
+    if (isinf(d)) {
+        snprintf(buf, size, d < 0 ? "-inf.0" : "+inf.0");
+        return;
+    }
+    // Inexact integers show a decimal point (R5RS)
+    if (d == (double)(long long)d && d >= -1e15 && d <= 1e15) {
+        snprintf(buf, size, "%.1f", d);
+        return;
+    }
+    // Shortest precision that round-trips through the reader
+    for (int prec = 1; prec <= 17; prec++) {
+        snprintf(buf, size, "%.*g", prec, d);
+        if (strtod(buf, NULL) == d)
+            return;
+    }
+}
 
 // ============================================================================
 // Type Names for Error Messages
@@ -92,6 +120,8 @@ const char *type_name(unsigned cell)
         return "multiple-values";
     case BT_BUILTIN:
         return "primitive";
+    case BT_EOF:
+        return "eof-object";
     case BT_CLOSURE:
         return "bytecode-closure";
     case BT_VMCONT:
@@ -252,11 +282,32 @@ static bool active_cell_push(unsigned **cells, size_t *len, size_t *cap,
 }
 
 // First pass: mark all cells that are visited more than once
+// Car/vector traversal recurses on the C stack, and data built
+// programmatically (unlike reader input) has no depth bound - fail cleanly
+// instead of overflowing the stack
+#define WRITER_MAX_DEPTH 10000
+static int writer_depth = 0;
+
+static void mark_shared_inner(unsigned s);
+
 static void mark_shared(unsigned s)
+{
+    if (writer_depth >= WRITER_MAX_DEPTH) {
+        if (!writer_error)
+            show_error("write: nesting too deep");
+        writer_error = true;
+        return;
+    }
+    writer_depth++;
+    mark_shared_inner(s);
+    writer_depth--;
+}
+
+static void mark_shared_inner(unsigned s)
 {
     // Follow the cdr spine iteratively.  This keeps large flat lists from
     // consuming C stack space while nested cars and vectors retain the normal
-    // recursive traversal (the reader bounds their nesting depth).
+    // recursive traversal.
     for (;;) {
         if (writer_error || s == 0 || s == TOK_ERROR || IS_FIXNUM(s) ||
             !IS_CELL(s) || is_bytecode_closure_object(s))
@@ -338,10 +389,21 @@ static void write_escaped_string(FILE *fp, const char *s)
     fputc('"', fp);
 }
 
+// Unicode case folding (defined in prim_char.c, declared in prim_internal.h;
+// redeclared here to avoid pulling the whole primitive-internal header)
+uint32_t unicode_simple_foldcase(uint32_t code);
+bool unicode_full_foldcase(uint32_t code, const uint32_t **mapping,
+                           size_t *length);
+
 static bool symbol_looks_numeric(const char *s)
 {
     if (!s[0])
         return false;
+    // Special spellings the reader parses as numbers
+    if (strcmp(s, "+inf.0") == 0 || strcmp(s, "-inf.0") == 0 ||
+        strcmp(s, "+nan.0") == 0 || strcmp(s, "-nan.0") == 0 ||
+        strcmp(s, "+i") == 0 || strcmp(s, "-i") == 0)
+        return true;
     if ((s[0] == '+' || s[0] == '-') && s[1])
         s++;
     if (s[0] == '.' && s[1] == '\0')
@@ -350,11 +412,41 @@ static bool symbol_looks_numeric(const char *s)
            (s[0] == '.' && s[1] >= '0' && s[1] <= '9');
 }
 
+// True if the default fold-case reader would read this name back as a
+// different symbol, so it must be pipe-escaped for a faithful round-trip
+static bool symbol_folds_differently(const char *s)
+{
+    size_t len = strlen(s);
+    size_t offset = 0;
+    while (offset < len) {
+        unsigned char b = (unsigned char)s[offset];
+        if (b < 0x80) {
+            if (b >= 'A' && b <= 'Z')
+                return true;
+            offset++;
+            continue;
+        }
+        uint32_t code;
+        if (!scheme_utf8_decode_next(s, len, &offset, &code, NULL))
+            return true; // invalid UTF-8: escape to be safe
+        const uint32_t *mapping;
+        size_t map_len;
+        if (unicode_full_foldcase(code, &mapping, &map_len)) {
+            if (map_len != 1 || mapping[0] != code)
+                return true;
+        } else if (unicode_simple_foldcase(code) != code) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool symbol_needs_escape(const char *s)
 {
     if (!s[0] || symbol_looks_numeric(s))
         return true;
-    if (strcmp(s, ".") == 0)
+    // Leading '.' lexes as the dotted-pair marker (only "..." reads back)
+    if (s[0] == '.' && strcmp(s, "...") != 0)
         return true;
     unsigned char first = (unsigned char)s[0];
     if (first == '#' || first == '"' || first == '\'' || first == '`' ||
@@ -365,10 +457,8 @@ static bool symbol_needs_escape(const char *s)
             *p == '`' || *p == ',' || *p == '(' || *p == ')' ||
             *p == ';' || *p == '|' || *p == '\\')
             return true;
-        if (*p >= 'A' && *p <= 'Z')
-            return true;
     }
-    return false;
+    return symbol_folds_differently(s);
 }
 
 static void write_escaped_symbol(FILE *fp, const char *s)
@@ -487,12 +577,15 @@ static void write_list_tail_fp(unsigned st, bool with_quotes, FILE *fp)
                     fprintf(fp, " . #%d#", entry->label);
                     break;
                 }
-                fprintf(fp, " . #%d=", entry->label);
-                entry->printed = true;
                 if (!IS_PAIR(st)) {
+                    // Let write_obj_fp emit the "#N=" prefix itself;
+                    // marking printed here would make it emit "#N#" instead
+                    fprintf(fp, " . ");
                     write_obj_fp(st, with_quotes, fp);
                     break;
                 }
+                fprintf(fp, " . #%d=", entry->label);
+                entry->printed = true;
                 fprintf(fp, "(");
                 write_obj_fp(car(st), with_quotes, fp);
                 if (writer_error)
@@ -567,7 +660,22 @@ static void write_list_tail_fp(unsigned st, bool with_quotes, FILE *fp)
     free(active_cells);
 }
 
+static void write_obj_fp_inner(unsigned s, bool with_quotes, FILE *fp);
+
 static void write_obj_fp(unsigned s, bool with_quotes, FILE *fp)
+{
+    if (writer_depth >= WRITER_MAX_DEPTH) {
+        if (!writer_error)
+            show_error("write: nesting too deep");
+        writer_error = true;
+        return;
+    }
+    writer_depth++;
+    write_obj_fp_inner(s, with_quotes, fp);
+    writer_depth--;
+}
+
+static void write_obj_fp_inner(unsigned s, bool with_quotes, FILE *fp)
 {
     if (writer_error)
         return;
@@ -668,15 +776,9 @@ static void write_obj_fp(unsigned s, bool with_quotes, FILE *fp)
             int64_t i;
         } u;
         u.i = CELL_ID(s);
-        // Use %g but ensure inexact integers show decimal point (R5RS)
-        // Check if value is a whole number
-        if (u.d == (double)(long long)u.d && isfinite(u.d) && u.d >= -1e15 &&
-            u.d <= 1e15) {
-            // It's an inexact integer - show with .0
-            fprintf(fp, "%.1f", u.d);
-        } else {
-            fprintf(fp, "%g", u.d);
-        }
+        char numbuf[NUMBER_BUF_SIZE];
+        format_double_repr(numbuf, sizeof(numbuf), u.d);
+        fprintf(fp, "%s", numbuf);
         break;
     }
     case BT_RATIONAL:
@@ -801,6 +903,9 @@ static void write_obj_fp(unsigned s, bool with_quotes, FILE *fp)
     case BT_BUILTIN:
         fprintf(fp, "[builtin]");
         break;
+    case BT_EOF:
+        fprintf(fp, "#[eof]");
+        break;
     case BT_MULTIVAL: {
         // Print multiple values
         unsigned vals = CELL_CAR(s);
@@ -821,13 +926,19 @@ static void write_obj_fp(unsigned s, bool with_quotes, FILE *fp)
         fprintf(fp, "[???]");
     }
 
-    if (simple_tracking)
-        simple_entry->active = false;
+    if (simple_tracking) {
+        // Re-look-up: recursion above may have grown the visited table,
+        // freeing the array simple_entry pointed into
+        visited_entry *cur = find_visited(s);
+        if (cur)
+            cur->active = false;
+    }
 }
 
 static bool begin_writer(bool emit_shared_labels)
 {
     writer_error = false;
+    writer_depth = 0;
     writer_emit_shared_labels = emit_shared_labels;
     if (reset_visited())
         return true;

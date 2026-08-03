@@ -406,7 +406,7 @@ static unsigned read_or_peek_char(FILE *fport, string_port *sport, int ptype,
             show_error("%s: read failed", name);
             return TOK_ERROR;
         }
-        return atom_from_string("eof-object");
+        return CELL_EOF_OBJECT;
     }
     if (status < 0) {
         show_error("%s: %s", name,
@@ -430,7 +430,7 @@ static unsigned read_or_peek_u8(FILE *fport, string_port *sport, int ptype,
             show_error("%s: read failed", name);
             return TOK_ERROR;
         }
-        return atom_from_string("eof-object");
+        return CELL_EOF_OBJECT;
     }
     return store(c & 0xff);
 }
@@ -512,7 +512,7 @@ static unsigned read_string_value(unsigned count_arg, unsigned argc,
     }
     if (n == 0) {
         free(buf);
-        return atom_from_string("eof-object");
+        return CELL_EOF_OBJECT;
     }
     buf[n] = '\0';
     return make_string_owned(buf);
@@ -646,7 +646,7 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
             // String port: use fmemopen on remaining content
             size_t remaining = sport->len - sport->pos;
             if (remaining == 0) {
-                return atom_from_string("eof-object");
+                return CELL_EOF_OBJECT;
             }
             FILE *mem = fmemopen(sport->data + sport->pos, remaining, "r");
             if (!mem) {
@@ -720,14 +720,11 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
     }
     case PEOF: {
         REQUIRE_ARGC(argc, 1, 1, "eof-object?");
-        unsigned arg = argv[0];
-        return scheme_bool(atom_is_valid(arg) &&
-                           strcmp(ctx.atom_table[CELL_ID(arg)],
-                                  "eof-object") == 0);
+        return scheme_bool(is_eof_object(argv[0]));
     }
     case PEOFOBJECT:
         REQUIRE_ARGC(argc, 0, 0, "eof-object");
-        return atom_from_string("eof-object");
+        return CELL_EOF_OBJECT;
     case PCHARREADY: {
         REQUIRE_ARGC(argc, 0, 1, "char-ready?");
         FILE *fport;
@@ -737,10 +734,14 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         if (ptype == -1) return TOK_ERROR;
 
         if (ptype == 1) {
-            // String port: ready if there are characters remaining
-            return scheme_bool(sport->pos < sport->len);
+            // String port: never blocks (a char or the eof object is ready)
+            return ctx.atom_true;
         }
         if (reader_port_pending_bytes(fport) > 0)
+            return ctx.atom_true;
+        // At end of file read-char returns the eof object without blocking,
+        // so R7RS requires char-ready? to return #t
+        if (feof(fport) || ferror(fport))
             return ctx.atom_true;
 
         // File port: use poll() to check if data is available
@@ -762,7 +763,7 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
             show_error("char-ready?: port error");
             return TOK_ERROR;
         }
-        return scheme_bool(ret > 0 && (pfd.revents & POLLIN));
+        return scheme_bool(ret > 0 && (pfd.revents & (POLLIN | POLLHUP)));
     }
     case PU8READY: {
         REQUIRE_ARGC(argc, 0, 1, "u8-ready?");
@@ -772,8 +773,10 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
                                           &sport, "u8-ready?");
         if (ptype == -1) return TOK_ERROR;
         if (ptype == 1)
-            return scheme_bool(sport->pos < sport->len);
+            return ctx.atom_true; // Never blocks: a byte or eof is ready
         if (reader_port_pending_bytes(fport) > 0)
+            return ctx.atom_true;
+        if (feof(fport) || ferror(fport))
             return ctx.atom_true;
         int fd = fileno(fport);
         if (fd < 0)
@@ -790,7 +793,7 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
             show_error("u8-ready?: port error");
             return TOK_ERROR;
         }
-        return scheme_bool(ret > 0 && (pfd.revents & POLLIN));
+        return scheme_bool(ret > 0 && (pfd.revents & (POLLIN | POLLHUP)));
     }
     case PPEEKU8: {
         REQUIRE_ARGC(argc, 0, 1, "peek-u8");
@@ -869,7 +872,7 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         // EOF with no characters read -> return eof-object
         if (c == EOF && len == 0) {
             free(buf);
-            return atom_from_string("eof-object");
+            return CELL_EOF_OBJECT;
         }
 
         buf[len] = '\0';

@@ -74,6 +74,7 @@ enum lisp_type {
     BT_STROUTPORT,      // String output port: id = string_port* pointer
     BT_MULTIVAL,        // Multiple return values: car = list of values
     BT_BUILTIN,         // Built-in primitive: id = primitive_id enum value
+    BT_EOF,             // End-of-file object (distinct singleton type)
     BT_CLOSURE = 100,   // VM closure (bytecode)
     BT_VMCONT = 101,    // VM continuation (distinct from CPS BT_CONT)
     BT_COMPILED_PATTERN = 102, // Compiled pattern: ptr = compiled_pattern*
@@ -265,7 +266,8 @@ typedef struct {
 #define INT_CACHE_MIN 0
 #define INT_CACHE_MAX 255
 #define INT_CACHE_START 16    // First cell for cached integers
-#define HEAP_RESERVED 272     // Reserved cells (0-271)
+#define CELL_EOF_OBJECT 272   // The unique end-of-file object
+#define HEAP_RESERVED 273     // Reserved cells (0-272)
 #define NUMBER_BUF_SIZE 128   // Buffer size for number->string conversion
 #define CHAR_NAME_BUF_SIZE 16 // Buffer size for character name parsing
 
@@ -357,6 +359,7 @@ enum primitive_id {
     PEQUAL,
     PNOT,
     PEQ,
+    PEQV,
     PEQUALP,
     PSETCAR,
     PSETCDR,

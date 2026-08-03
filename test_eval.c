@@ -913,85 +913,111 @@ TEST(compiled_empty_let_forms_do_not_leak_internal_defines)
     PASS();
 }
 
-TEST(eval_empty_syntax_binding_forms_do_not_leak_internal_defines)
+// Empty let-syntax/letrec-syntax are transparent for internal defines:
+// definitions splice into the enclosing scope (MIT Scheme semantics)
+TEST(eval_empty_syntax_binding_forms_splice_internal_defines)
 {
     unsigned env = default_environment();
     unsigned result = eval_string(
         "(let-syntax () "
-        "  (define eval-empty-let-syntax-leak 1) "
-        "  eval-empty-let-syntax-leak)",
+        "  (define eval-empty-let-syntax-def 1) "
+        "  eval-empty-let-syntax-def)",
         env);
     ASSERT(is_int(result, 1));
-    ASSERT(eval_string("eval-empty-let-syntax-leak", env) == TOK_ERROR);
+    ASSERT(is_int(eval_string("eval-empty-let-syntax-def", env), 1));
 
     result = eval_string(
         "(letrec-syntax () "
-        "  (define eval-empty-letrec-syntax-leak 1) "
-        "  eval-empty-letrec-syntax-leak)",
+        "  (define eval-empty-letrec-syntax-def 2) "
+        "  eval-empty-letrec-syntax-def)",
         env);
-    ASSERT(is_int(result, 1));
-    ASSERT(eval_string("eval-empty-letrec-syntax-leak", env) == TOK_ERROR);
+    ASSERT(is_int(result, 2));
+    ASSERT(is_int(eval_string("eval-empty-letrec-syntax-def", env), 2));
 
-    ASSERT(eval_string(
-               "(begin "
-               "  (let-syntax () "
-               "    (define-syntax eval-empty-let-syntax-macro "
-               "      (syntax-rules () "
-               "        ((eval-empty-let-syntax-macro) 1))) "
-               "    0) "
-               "  (eval-empty-let-syntax-macro))",
-               env) == TOK_ERROR);
-    ASSERT(eval_string(
-               "(begin "
-               "  (letrec-syntax () "
-               "    (define-syntax eval-empty-letrec-syntax-macro "
-               "      (syntax-rules () "
-               "        ((eval-empty-letrec-syntax-macro) 1))) "
-               "    0) "
-               "  (eval-empty-letrec-syntax-macro))",
-               env) == TOK_ERROR);
+    ASSERT(is_int(eval_string(
+                      "(begin "
+                      "  (let-syntax () "
+                      "    (define-syntax eval-empty-let-syntax-macro "
+                      "      (syntax-rules () "
+                      "        ((eval-empty-let-syntax-macro) 1))) "
+                      "    0) "
+                      "  (eval-empty-let-syntax-macro))",
+                      env),
+                  1));
+    ASSERT(is_int(eval_string(
+                      "(begin "
+                      "  (letrec-syntax () "
+                      "    (define-syntax eval-empty-letrec-syntax-macro "
+                      "      (syntax-rules () "
+                      "        ((eval-empty-letrec-syntax-macro) 1))) "
+                      "    0) "
+                      "  (eval-empty-letrec-syntax-macro))",
+                      env),
+                  1));
+
+    ASSERT(is_int(eval_string("(let () "
+                              "  (let-syntax () "
+                              "    (define eval-let-syntax-body-def 3)) "
+                              "  eval-let-syntax-body-def)",
+                              env),
+                  3));
+    ASSERT(eval_string("eval-let-syntax-body-def", env) == TOK_ERROR);
     PASS();
 }
 
-TEST(compiled_empty_syntax_binding_forms_do_not_leak_internal_defines)
+// Empty let-syntax/letrec-syntax are transparent for internal defines:
+// definitions splice into the enclosing scope (MIT Scheme semantics)
+TEST(compiled_empty_syntax_binding_forms_splice_internal_defines)
 {
     unsigned env = default_environment();
     unsigned result = compiled_eval_string(
         "(let-syntax () "
-        "  (define compiled-empty-let-syntax-leak 1) "
-        "  compiled-empty-let-syntax-leak)",
+        "  (define compiled-empty-let-syntax-def 1) "
+        "  compiled-empty-let-syntax-def)",
         env);
     ASSERT(is_int(result, 1));
-    ASSERT(compiled_eval_string("compiled-empty-let-syntax-leak", env) ==
-           TOK_ERROR);
+    ASSERT(is_int(compiled_eval_string("compiled-empty-let-syntax-def", env),
+                  1));
 
     result = compiled_eval_string(
         "(letrec-syntax () "
-        "  (define compiled-empty-letrec-syntax-leak 1) "
-        "  compiled-empty-letrec-syntax-leak)",
+        "  (define compiled-empty-letrec-syntax-def 2) "
+        "  compiled-empty-letrec-syntax-def)",
         env);
-    ASSERT(is_int(result, 1));
-    ASSERT(compiled_eval_string("compiled-empty-letrec-syntax-leak", env) ==
-           TOK_ERROR);
+    ASSERT(is_int(result, 2));
+    ASSERT(is_int(compiled_eval_string("compiled-empty-letrec-syntax-def", env),
+                  2));
 
-    ASSERT(compiled_eval_string(
-               "(begin "
-               "  (let-syntax () "
-               "    (define-syntax compiled-empty-let-syntax-macro "
-               "      (syntax-rules () "
-               "        ((compiled-empty-let-syntax-macro) 1))) "
-               "    0) "
-               "  (compiled-empty-let-syntax-macro))",
-               env) == TOK_ERROR);
-    ASSERT(compiled_eval_string(
-               "(begin "
-               "  (letrec-syntax () "
-               "    (define-syntax compiled-empty-letrec-syntax-macro "
-               "      (syntax-rules () "
-               "        ((compiled-empty-letrec-syntax-macro) 1))) "
-               "    0) "
-               "  (compiled-empty-letrec-syntax-macro))",
-               env) == TOK_ERROR);
+    ASSERT(is_int(compiled_eval_string(
+                      "(begin "
+                      "  (let-syntax () "
+                      "    (define-syntax compiled-empty-let-syntax-macro "
+                      "      (syntax-rules () "
+                      "        ((compiled-empty-let-syntax-macro) 1))) "
+                      "    0) "
+                      "  (compiled-empty-let-syntax-macro))",
+                      env),
+                  1));
+    ASSERT(is_int(compiled_eval_string(
+                      "(begin "
+                      "  (letrec-syntax () "
+                      "    (define-syntax compiled-empty-letrec-syntax-macro "
+                      "      (syntax-rules () "
+                      "        ((compiled-empty-letrec-syntax-macro) 1))) "
+                      "    0) "
+                      "  (compiled-empty-letrec-syntax-macro))",
+                      env),
+                  1));
+
+    ASSERT(is_int(compiled_eval_string(
+                      "(let () "
+                      "  (let-syntax () "
+                      "    (define compiled-let-syntax-body-def 3)) "
+                      "  compiled-let-syntax-body-def)",
+                      env),
+                  3));
+    ASSERT(compiled_eval_string("compiled-let-syntax-body-def", env) ==
+           TOK_ERROR);
     PASS();
 }
 
@@ -1226,6 +1252,22 @@ TEST(gc_shadow_stack_lambda)
 
     eval_string("(lambda (x) x)", env);
 
+    int final = get_shadow_stack_top();
+    ASSERT_EQ(initial, final);
+    PASS();
+}
+
+TEST(gc_shadow_stack_macro_expansion)
+{
+    unsigned env = default_environment();
+    eval_string("(define-syntax swap! "
+                "  (syntax-rules () "
+                "    ((_ a b) (let ((tmp a)) (set! a b) (set! b tmp)))))",
+                env);
+    eval_string("(define x 1) (define y 2)", env);
+    int initial = get_shadow_stack_top();
+    for (int i = 0; i < 100; i++)
+        eval_string("(swap! x y)", env);
     int final = get_shadow_stack_top();
     ASSERT_EQ(initial, final);
     PASS();
@@ -5504,8 +5546,8 @@ int main(void)
     RUN_TEST(eval_let_nested);
     RUN_TEST(eval_empty_let_forms_do_not_leak_internal_defines);
     RUN_TEST(compiled_empty_let_forms_do_not_leak_internal_defines);
-    RUN_TEST(eval_empty_syntax_binding_forms_do_not_leak_internal_defines);
-    RUN_TEST(compiled_empty_syntax_binding_forms_do_not_leak_internal_defines);
+    RUN_TEST(eval_empty_syntax_binding_forms_splice_internal_defines);
+    RUN_TEST(compiled_empty_syntax_binding_forms_splice_internal_defines);
     RUN_TEST(eval_letstar);
     RUN_TEST(eval_letrec);
 
@@ -5537,6 +5579,7 @@ int main(void)
     // GC protection
     RUN_TEST(gc_shadow_stack_balanced);
     RUN_TEST(gc_shadow_stack_lambda);
+    RUN_TEST(gc_shadow_stack_macro_expansion);
     RUN_TEST(gc_shadow_stack_letrec);
     RUN_TEST(gc_preserves_closures);
     RUN_TEST(gc_preserves_continuations);

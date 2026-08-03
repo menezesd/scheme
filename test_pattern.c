@@ -405,8 +405,9 @@ TEST(execute_ellipsis_with_tail_binding)
 
     compiled_pattern *cpat = compile_pattern(pat, 0, ctx.kw_ellipsis);
     ASSERT(cpat->var_count == 2);
-    ASSERT(!cpat->var_slots[0].is_ellipsis); // y is post-ellipsis tail
-    ASSERT(cpat->var_slots[1].is_ellipsis);  // x is repeated
+    // Greedy compilation emits the element pattern before the tail
+    ASSERT(cpat->var_slots[0].is_ellipsis);  // x is repeated
+    ASSERT(!cpat->var_slots[1].is_ellipsis); // y is post-ellipsis tail
 
     unsigned input = list3(store(1), store(2), store(3));
     unsigned bindings = execute_pattern(cpat, input);

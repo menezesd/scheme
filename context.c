@@ -28,6 +28,7 @@
 #include "bytecode.h"
 #include "compiled_pattern.h"
 #include "env.h"
+#include "primitives.h"
 #include "feature_table.h"
 #include "reader.h"
 #include <ctype.h>
@@ -462,6 +463,16 @@ int gc_mark(void)
 int get_shadow_stack_top(void)
 {
     return shadow_stack_top;
+}
+
+// After a lisp_panic longjmp the C frames that registered shadow-stack
+// entries are gone, and a panic inside gc() can leave GC mode latched.
+// Drop the dangling roots and reset collector state before resuming.
+void gc_recover_after_panic(void)
+{
+    shadow_stack_top = 0;
+    in_gc_mode = false;
+    alloc_gc_root = NULL;
 }
 
 void gc_release(int mark)
@@ -1488,6 +1499,14 @@ unsigned atom_from_string(const char *s)
         return store_complex(real_part, imag_part);
     }
 
+    // R7RS infinity and nan literals
+    if (strcmp(s, "+inf.0") == 0)
+        return store_inexact(HUGE_VAL);
+    if (strcmp(s, "-inf.0") == 0)
+        return store_inexact(-HUGE_VAL);
+    if (strcmp(s, "+nan.0") == 0 || strcmp(s, "-nan.0") == 0)
+        return store_inexact((double)NAN);
+
     // Check if the string might be a number
     if (is_number_start(s)) {
         char *endptr;
@@ -1799,8 +1818,7 @@ bool syntax_is_underscore(unsigned x)
 
 bool is_eof_object(unsigned expr)
 {
-    return atom_is_valid(expr) &&
-           strcmp(ctx.atom_table[CELL_ID(expr)], "eof-object") == 0;
+    return IS_CELL(expr) && CELL_TYPE(expr) == BT_EOF;
 }
 
 bool syntax_rules_form_like(unsigned expr)
@@ -1910,40 +1928,29 @@ bool lambda_params_valid(unsigned params)
 
     unsigned seen = 0;
     gc_protect(&seen);
+    gc_protect(&params); // alloc_cons below can GC; keep the walk valid
     while (params) {
         if (identifier_valid(params)) {
             FORLIST(p, seen) {
-                if (CELL_ID(car(p)) == CELL_ID(params)) {
-                    gc_unprotect(1);
+                if (CELL_ID(car(p)) == CELL_ID(params))
                     return false;
-                }
             }
-            gc_unprotect(1);
             return true;
         }
-        if (IS_ATOM(params)) {
-            gc_unprotect(1);
+        if (IS_ATOM(params))
             return false;
-        }
-        if (!IS_PAIR(params)) {
-            gc_unprotect(1);
+        if (!IS_PAIR(params))
             return false;
-        }
         unsigned param = car(params);
-        if (!identifier_valid(param)) {
-            gc_unprotect(1);
+        if (!identifier_valid(param))
             return false;
-        }
         FORLIST(p, seen) {
-            if (CELL_ID(car(p)) == CELL_ID(param)) {
-                gc_unprotect(1);
+            if (CELL_ID(car(p)) == CELL_ID(param))
                 return false;
-            }
         }
         seen = alloc_cons(param, seen);
         params = cdr(params);
     }
-    gc_unprotect(1);
     return true;
 }
 
@@ -2481,6 +2488,8 @@ unsigned collect(unsigned x)
                     entry->value = collect(entry->value);
                 }
             }
+            // Moved keys hash to new buckets; rehash after the GC finishes
+            hash_table_gc_register_rehash(ht);
         }
         return xx;
     }
@@ -2608,8 +2617,9 @@ unsigned gc(unsigned root)
     }
     gc_update_active_pattern_state();
 
-    // Update VM roots if VM is active
-    gc_update_vm_roots(get_active_vm());
+    // Update VM roots for the whole chain of active and suspended VMs
+    for (vm_state *vm = get_active_vm(); vm; vm = vm->parent)
+        gc_update_vm_roots(vm);
 
     // Collect code object constants BEFORE scan phase so their
     // CAR/CDR are recursively processed
@@ -2620,7 +2630,7 @@ unsigned gc(unsigned root)
         enum lisp_type t = CELL_TYPE(scan);
         if (t == BT_CONS || t == BT_FUNCTION || t == BT_MACRO ||
             t == BT_SYNTAX || t == BT_CONT || t == BT_RATIONAL ||
-            t == BT_COMPLEX || t == BT_BINDING_REF) {
+            t == BT_COMPLEX || t == BT_BINDING_REF || t == BT_MULTIVAL) {
             CELL_CAR(scan) = collect(CELL_CAR(scan));
             CELL_CDR(scan) = collect(CELL_CDR(scan));
         }
@@ -2668,11 +2678,21 @@ unsigned gc(unsigned root)
     }
     ctx.nursery_ptr = ctx.nursery_start;
 
+    // If live data reaches into the nursery region, allocation would
+    // silently overwrite it - fail loudly instead
+    if (ctx.hptr > ctx.nursery_start) {
+        in_gc_mode = false;
+        lisp_panic("heap exhausted: live data overlaps nursery after GC");
+    }
+
     // Clear card table for the new semispace (if generational GC is enabled)
     if (ctx.card_table) {
         size_t num_cards = (2 * SEMISPACE_SIZE) / CARD_SIZE;
         memset(ctx.card_table, 0, (num_cards + 7) / 8);
     }
+
+    // Heap is consistent again: rebuild buckets of tables whose keys moved
+    hash_table_gc_rehash_pending();
 
     // Exit GC mode
     in_gc_mode = false;
@@ -2769,6 +2789,8 @@ unsigned collect_to_old(unsigned x)
                     entry->value = collect_to_old(entry->value);
                 }
             }
+            // Moved keys hash to new buckets; rehash after the GC finishes
+            hash_table_gc_register_rehash(ht);
         }
         return xx;
     }
@@ -2886,7 +2908,8 @@ unsigned minor_gc(unsigned root)
     minor_gc_update_active_pattern_state();
 
     // Update VM roots if VM is active
-    gc_update_vm_roots_minor(get_active_vm(), collect_to_old);
+    for (vm_state *vm = get_active_vm(); vm; vm = vm->parent)
+        gc_update_vm_roots_minor(vm, collect_to_old);
 
     // Update code object constants - they may point to nursery cells.
     minor_gc_update_all_code_objects();
@@ -2914,7 +2937,8 @@ unsigned minor_gc(unsigned root)
                 enum lisp_type t = CELL_TYPE(cell);
                 if (t == BT_CONS || t == BT_FUNCTION || t == BT_MACRO ||
                     t == BT_SYNTAX || t == BT_CONT || t == BT_RATIONAL ||
-                    t == BT_COMPLEX || t == BT_BINDING_REF) {
+                    t == BT_COMPLEX || t == BT_BINDING_REF ||
+                    t == BT_MULTIVAL) {
                     // CPS continuations (BT_CONT) use CAR/CDR for structure
                     CELL_CAR(cell) = collect_to_old(CELL_CAR(cell));
                     CELL_CDR(cell) = collect_to_old(CELL_CDR(cell));
@@ -2936,6 +2960,8 @@ unsigned minor_gc(unsigned root)
                             entry->value = collect_to_old(entry->value);
                         }
                     }
+                    // Promoted keys hash to new buckets; rehash post-GC
+                    hash_table_gc_register_rehash(ht);
                 } else if (t == BT_VMCONT) {
                     // VM continuation: update cell references inside struct
                     collect_vm_continuation_roots(
@@ -2952,7 +2978,7 @@ unsigned minor_gc(unsigned root)
         enum lisp_type t = CELL_TYPE(scan);
         if (t == BT_CONS || t == BT_FUNCTION || t == BT_MACRO ||
             t == BT_SYNTAX || t == BT_CONT || t == BT_RATIONAL ||
-            t == BT_COMPLEX || t == BT_BINDING_REF) {
+            t == BT_COMPLEX || t == BT_BINDING_REF || t == BT_MULTIVAL) {
             // CPS continuations (BT_CONT) use CAR/CDR for structure
             CELL_CAR(scan) = collect_to_old(CELL_CAR(scan));
             CELL_CDR(scan) = collect_to_old(CELL_CDR(scan));
@@ -2974,6 +3000,9 @@ unsigned minor_gc(unsigned root)
 
     // Reset nursery - all survivors are now in old gen
     ctx.nursery_ptr = ctx.nursery_start;
+
+    // Heap is consistent again: rebuild buckets of tables whose keys moved
+    hash_table_gc_rehash_pending();
 
     // Invalidate environment lookup cache (cell references may have moved)
     env_invalidate_cache();
@@ -3018,6 +3047,10 @@ void init_keywords(void)
         CELL_TYPE(cell) = BT_NUM;
         CELL_ID(cell) = i;
     }
+
+    // The unique eof object lives in reserved space (never GC'd)
+    CELL_TYPE(CELL_EOF_OBJECT) = BT_EOF;
+    CELL_ID(CELL_EOF_OBJECT) = 0;
 
     // Initialize permanent atoms in reserved cells (never GC'd)
     init_permanent_atom(CELL_ATOM_FALSE, "false");

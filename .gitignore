@@ -6,8 +6,10 @@ lisp
 vesper
 vesper-debug
 vesper-asan
+vesper-ubsan
 vesper-debug-nosan
 test_bignum
+test_bignum_ubsan
 test_reader
 test_context
 test_macros
@@ -15,6 +17,9 @@ test_eval
 test_pattern
 test_unicode_norm
 test_unicode_case
+
+# Debug symbol bundles (macOS)
+*.dSYM/
 
 # Downloaded Unicode source files
 .unicode/

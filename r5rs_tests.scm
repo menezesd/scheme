@@ -739,6 +739,64 @@
                  (list ultimate penultimate args ...)))))
       (foo 1 2 3 4 5)))
 
+(test-section "Ellipsis semantics")
+(test "empty list under ellipsis" '(() 1 2)
+    (let-syntax ((foo (syntax-rules () ((_ x ...) '(x ...)))))
+      (foo () 1 2)))
+(test "parallel vars with empty list" '((1 2) (() 3))
+    (let-syntax ((foo (syntax-rules () ((_ (a b) ...) '((a ...) (b ...))))))
+      (foo (1 ()) (2 3))))
+(test "nested ellipsis with empty group" '((1) () (2))
+    (let-syntax ((foo (syntax-rules () ((_ (x ...) ...) '((x ...) ...)))))
+      (foo (1) () (2))))
+(test "greedy ellipsis with dotted tail" '((1 2 3) ())
+    (let-syntax ((foo (syntax-rules () ((_ x ... . r) '((x ...) r)))))
+      (foo 1 2 3)))
+(test "ellipsis escape" '(... ...)
+    (let-syntax ((foo (syntax-rules () ((_) '((... ...) (... ...))))))
+      (foo)))
+(test "macro-writing macro" '(1 2 3)
+    (let ()
+      (define-syntax gen
+        (syntax-rules ()
+          ((_ name)
+           (define-syntax name
+             (syntax-rules () ((_ x (... ...)) '(x (... ...))))))))
+      (gen collect)
+      (collect 1 2 3)))
+
+(test-section "Numeric semantics")
+(test "eqv? on bignums" #t (eqv? (expt 10 30) (expt 10 30)))
+(test "eqv? on rationals" #t (eqv? 1/2 1/2))
+(test "eqv? on inexact" #t (eqv? 1.5 1.5))
+(test "eqv? distinguishes exactness" #f (eqv? 1 1.0))
+(test "round half to even" 2.0 (round 2.5))
+(test "round rational half to even" 2 (round 5/2))
+(test "exact rational floor" 333333333333333333333333333333
+    (floor (/ (expt 10 30) 3)))
+(test "mixed compare rational float" #f (= 1/10 0.1))
+(test "inexact division by zero" #t (= (/ 1.0 0.0) (* 2 (/ 1.0 0.0))))
+(test "quotient inexact contagion" 3.0 (quotient 7.0 2))
+(test "string->number radix prefix" 255 (string->number "#xff"))
+(test "string->number exact decimal" 3/2 (string->number "#e1.5"))
+(test "radix rational literal" 1/2 #x1/2)
+(test "numerator of inexact" 3.0 (numerator 1.5))
+(test "rationalize contagion" #t (inexact? (rationalize .3 1/10)))
+
+(test-section "Reader and writer round-trips")
+(test "eof-object is not a symbol" #f (symbol? (eof-object)))
+(test "eof-object? rejects the symbol" #f (eof-object? 'eof-object))
+(test "float round-trip" #t
+    (= 3.141592653589793
+       (string->number (number->string 3.141592653589793))))
+(test "string line continuation" "ab"
+    "a\
+b")
+(test "numeric-looking symbol round-trip" '+inf.0-sym
+    (string->symbol
+     (string-append (symbol->string (string->symbol "+inf.0")) "-sym")))
+(test "infinity literal" #t (> +inf.0 0))
+
 ;;; ============================================================================
 ;;; Summary
 ;;; ============================================================================

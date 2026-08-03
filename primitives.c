@@ -281,7 +281,7 @@ static unsigned read_bytevector_from_port(unsigned count_arg,
     }
     if (n == 0) {
         free(buf);
-        return atom_from_string("eof-object");
+        return CELL_EOF_OBJECT;
     }
 
     unsigned result = make_bytevector_copy(buf, (unsigned)n, name);
@@ -701,6 +701,35 @@ static unsigned eq_value(unsigned arg1, unsigned arg2)
     }
 }
 
+// eqv? extends eq? by comparing numbers of the same type by value (R7RS 6.1)
+static unsigned eqv_value(unsigned arg1, unsigned arg2)
+{
+    if (eq_value(arg1, arg2) == ctx.atom_true)
+        return ctx.atom_true;
+    if (!IS_CELL(arg1) || !IS_CELL(arg2))
+        return ctx.atom_false;
+    if (CELL_TYPE(arg1) != CELL_TYPE(arg2))
+        return ctx.atom_false;
+    switch (CELL_TYPE(arg1)) {
+    case BT_BIGNUM: {
+        bignum *a = get_bignum(arg1);
+        bignum *b = get_bignum(arg2);
+        return scheme_bool(a && b && bn_cmp(a, b) == 0);
+    }
+    case BT_INEXACT:
+        // Bit equality: distinguishes 0.0 from -0.0, treats nan as eqv to
+        // itself
+        return scheme_bool(CELL_ID(arg1) == CELL_ID(arg2));
+    case BT_RATIONAL:
+    case BT_COMPLEX:
+        return scheme_bool(
+            eqv_value(CELL_CAR(arg1), CELL_CAR(arg2)) == ctx.atom_true &&
+            eqv_value(CELL_CDR(arg1), CELL_CDR(arg2)) == ctx.atom_true);
+    default:
+        return ctx.atom_false;
+    }
+}
+
 static unsigned pair_car(unsigned pair, const char *name)
 {
     CHECK_PAIR(pair, name);
@@ -739,17 +768,29 @@ static unsigned make_list_from_argv(unsigned argc, unsigned *argv)
     return result;
 }
 
+// Returns the last pair of a (possibly improper) list, rejecting cycles
 static unsigned last_pair(unsigned lst, const char *name)
 {
     if (!IS_PAIR(lst)) {
         show_error("%s: not a pair", name);
         return TOK_ERROR;
     }
-    if (!list_length_checked(lst, NULL, name))
-        return TOK_ERROR;
-    while (cdr(lst))
-        lst = cdr(lst);
-    return lst;
+    unsigned slow = lst, fast = lst;
+    for (;;) {
+        unsigned next = cdr(fast);
+        if (!IS_PAIR(next))
+            return fast;
+        fast = next;
+        next = cdr(fast);
+        if (!IS_PAIR(next))
+            return fast;
+        fast = next;
+        slow = cdr(slow);
+        if (fast == slow) {
+            show_error("%s: circular list", name);
+            return TOK_ERROR;
+        }
+    }
 }
 
 static unsigned string_length_value(unsigned str, const char *name)
@@ -1215,7 +1256,7 @@ static unsigned number_to_string_value(unsigned num, int radix,
         }
         double d = to_double(num);
         char buf[NUMBER_BUF_SIZE];
-        snprintf(buf, sizeof(buf), "%g", d);
+        format_double_repr(buf, sizeof(buf), d);
         return make_string_copy(buf);
     } else if (IS_COMPLEX(num)) {
         if (radix != 10) {
@@ -1232,30 +1273,120 @@ static unsigned number_to_string_value(unsigned num, int radix,
     }
 }
 
+// Parse an integer or num/den rational in the given radix. Returns
+// ctx.atom_false if the string is not valid in that radix.
+static unsigned parse_radix_number(const char *s, int radix, const char *name)
+{
+    const char *slash = strchr(s, '/');
+    if (!slash) {
+        bignum *bn = bn_from_string(s, radix);
+        if (!bn)
+            return ctx.atom_false;
+        return store_integer(bn);
+    }
+
+    // R7RS rational syntax: sign only on the numerator, denominator unsigned
+    if (slash[1] == '+' || slash[1] == '-')
+        return ctx.atom_false;
+    char *num_str = checked_string_copy_len(s, (size_t)(slash - s));
+    if (!num_str) {
+        show_error("%s: out of memory", name);
+        return TOK_ERROR;
+    }
+    bignum *num = bn_from_string(num_str, radix);
+    free(num_str);
+    bignum *den = num ? bn_from_string(slash + 1, radix) : NULL;
+    if (!num || !den || bn_is_zero(den)) {
+        bn_free(num);
+        bn_free(den);
+        return ctx.atom_false;
+    }
+    GC_GUARD;
+    unsigned num_cell = store_integer(num);
+    gc_protect(&num_cell);
+    unsigned den_cell = store_integer(den);
+    if (num_cell == TOK_ERROR || den_cell == TOK_ERROR)
+        return TOK_ERROR;
+    gc_protect(&den_cell);
+    return normalize_rational_cells(num_cell, den_cell);
+}
+
 static unsigned string_to_number_value(unsigned str, int radix,
                                        const char *name)
 {
     char *s = require_string_ptr(str, name);
     if (!s)
         return TOK_ERROR;
+
+    // R7RS number prefixes: one radix (#b #o #d #x) and one exactness
+    // (#e #i) marker, in either order, overriding the radix argument
+    int exactness = 0; // 1 = exact, -1 = inexact, 0 = as written
+    bool have_radix = false, have_exact = false;
+    while (s[0] == '#') {
+        char p = s[1];
+        if (!have_radix && (p == 'b' || p == 'B')) {
+            radix = 2;
+            have_radix = true;
+        } else if (!have_radix && (p == 'o' || p == 'O')) {
+            radix = 8;
+            have_radix = true;
+        } else if (!have_radix && (p == 'd' || p == 'D')) {
+            radix = 10;
+            have_radix = true;
+        } else if (!have_radix && (p == 'x' || p == 'X')) {
+            radix = 16;
+            have_radix = true;
+        } else if (!have_exact && (p == 'e' || p == 'E')) {
+            exactness = 1;
+            have_exact = true;
+        } else if (!have_exact && (p == 'i' || p == 'I')) {
+            exactness = -1;
+            have_exact = true;
+        } else {
+            return ctx.atom_false;
+        }
+        s += 2;
+    }
+
+    GC_GUARD;
+    unsigned parsed;
     if (radix == 10) {
         char *copy = checked_string_copy(s);
         if (!copy) {
             show_error("%s: out of memory", name);
             return TOK_ERROR;
         }
-        unsigned parsed = atom_from_string(copy);
+        parsed = TOK_ERROR;
+        if (exactness == 1) {
+            // #e1.5 must yield 3/2 exactly, not a converted double
+            bool handled = false;
+            parsed = read_exact_decimal_number(copy, &handled);
+            if (!handled)
+                parsed = TOK_ERROR;
+        }
+        if (parsed == TOK_ERROR)
+            parsed = atom_from_string(copy);
         free(copy);
         if (parsed == TOK_ERROR)
             return TOK_ERROR;
-        if (is_numeric(parsed))
+        if (!is_numeric(parsed))
+            return ctx.atom_false;
+    } else {
+        parsed = parse_radix_number(s, radix, name);
+        if (parsed == TOK_ERROR || parsed == ctx.atom_false)
             return parsed;
-        return ctx.atom_false;
     }
-    bignum *bn = bn_from_string(s, radix);
-    if (!bn)
-        return ctx.atom_false;
-    return store_integer(bn);
+
+    gc_protect(&parsed);
+    if (exactness == -1 && is_exact(parsed) && !IS_COMPLEX(parsed))
+        return store_inexact(to_double(parsed));
+    if (exactness == 1 && IS_INEXACT(parsed)) {
+        double d = to_double(parsed);
+        if (isnan(d) || isinf(d))
+            return ctx.atom_false; // no exact representation
+        return prim_inexact_to_exact(parsed);
+    }
+    return parsed;
 }
 
 static unsigned apply_arithmetic_primitive(unsigned prim_id, unsigned argc,
@@ -1271,15 +1402,16 @@ static unsigned apply_arithmetic_primitive(unsigned prim_id, unsigned argc,
     case PDIV:
         return prim_div(argc, argv);
     case PMOD:
-        return prim_modulo(argc, argv);
+        return prim_divlike_inexact(prim_modulo, argc, argv, "modulo");
     case PREMAINDER:
-        return prim_remainder(argc, argv);
+        return prim_divlike_inexact(prim_remainder, argc, argv, "remainder");
     case PTRUNCATEDIVREM:
-        return prim_truncate_divrem(argc, argv);
+        return prim_divlike_inexact(prim_truncate_divrem, argc, argv,
+                                    "truncate/");
     case PFLOORDIVREM:
-        return prim_floor_divrem(argc, argv);
+        return prim_divlike_inexact(prim_floor_divrem, argc, argv, "floor/");
     case PQUOTIENT:
-        return prim_quotient(argc, argv);
+        return prim_divlike_inexact(prim_quotient, argc, argv, "quotient");
     case PABS:
         return prim_abs(argc, argv);
     default:
@@ -1320,6 +1452,9 @@ static unsigned apply_logic_primitive(unsigned prim_id, unsigned argc,
     case PEQ:
         REQUIRE_ARGC(argc, 2, 2, "eq?");
         return eq_value(argv[0], argv[1]);
+    case PEQV:
+        REQUIRE_ARGC(argc, 2, 2, "eqv?");
+        return eqv_value(argv[0], argv[1]);
     case PEQUALP:
         REQUIRE_ARGC(argc, 2, 2, "equal?");
         return scheme_bool(deep_equal(argv[0], argv[1]));
@@ -1884,7 +2019,7 @@ static unsigned read_bytevector_into(unsigned argc, unsigned *argv,
         return TOK_ERROR;
     }
     if (n == 0)
-        return atom_from_string("eof-object");
+        return CELL_EOF_OBJECT;
     return store((int64_t)n);
 }
 
@@ -2045,6 +2180,58 @@ static bool hash_key_equal(hash_table_data *ht, unsigned a, unsigned b)
         return deep_equal(a, b);
     }
     return false;
+}
+
+// Hash tables whose keys may have moved during GC. eq/eqv tables hash
+// compound keys by cell index, so bucket positions go stale when the copying
+// collector moves a key. The GC registers affected tables here and calls
+// hash_table_gc_rehash_pending() once the heap is consistent again
+// (content-based hashing is unsafe mid-GC while broken hearts exist).
+static hash_table_data **pending_rehash = NULL;
+static size_t pending_rehash_len = 0, pending_rehash_cap = 0;
+
+void hash_table_gc_register_rehash(hash_table_data *ht)
+{
+    if (!ht)
+        return;
+    for (size_t i = 0; i < pending_rehash_len; i++)
+        if (pending_rehash[i] == ht)
+            return;
+    if (pending_rehash_len == pending_rehash_cap) {
+        size_t cap = pending_rehash_cap ? pending_rehash_cap * 2 : 16;
+        hash_table_data **grown = realloc(pending_rehash, cap * sizeof(*grown));
+        if (!grown)
+            return; // table keeps stale buckets; still memory-safe
+        pending_rehash = grown;
+        pending_rehash_cap = cap;
+    }
+    pending_rehash[pending_rehash_len++] = ht;
+}
+
+void hash_table_gc_rehash_pending(void)
+{
+    for (size_t t = 0; t < pending_rehash_len; t++) {
+        hash_table_data *ht = pending_rehash[t];
+        if (!hash_table_data_well_formed(ht))
+            continue;
+        unsigned cap = ht->capacity;
+        hash_entry **fresh = calloc(cap, sizeof(*fresh));
+        if (!fresh)
+            continue; // keep stale buckets rather than lose entries
+        for (unsigned i = 0; i < cap; i++) {
+            hash_entry *e = ht->buckets[i];
+            while (e) {
+                hash_entry *next = e->next;
+                unsigned b = (unsigned)(hash_key_for_table(ht, e->key) % cap);
+                e->next = fresh[b];
+                fresh[b] = e;
+                e = next;
+            }
+        }
+        free(ht->buckets);
+        ht->buckets = fresh;
+    }
+    pending_rehash_len = 0;
 }
 
 static unsigned hash_table_capacity_for_size(uint64_t initial_size)
@@ -2586,6 +2773,7 @@ unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
     // Logic
     case PNOT:
     case PEQ:
+    case PEQV:
     case PEQUALP:
         return apply_logic_primitive(prim_id, argc, argv);
 

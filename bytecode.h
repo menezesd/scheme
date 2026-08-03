@@ -73,7 +73,7 @@ enum opcode {
 
     // Multiple values
     OP_VALUES,         // Wrap N values: VALUES n -> pop n vals, push multival
-    OP_CALLWITHVALUES, // call-with-values: pop consumer, pop producer, call
+    OP_CALLWITHVALUES, // Reserved (unused): call-with-values uses OP_PRIM
 
     // Macros (compile-time only, but needed for dynamic define-syntax)
     OP_DEFSYNTAX, // Define syntax: DEFSYNTAX sym_id -> pop transformer
@@ -326,7 +326,7 @@ bool is_vm_continuation_object(unsigned value);
 /**
  * Virtual machine execution state.
  */
-typedef struct {
+typedef struct vm_state {
     // Value stack
     unsigned *stack;    // Value stack (cell indices)
     unsigned sp;        // Stack pointer (next free slot)
@@ -351,6 +351,11 @@ typedef struct {
     bool running;          // True while VM is executing
     bool error;            // True if error occurred
     const char *error_msg; // Error message (if error)
+
+    // Enclosing suspended VM when this VM was entered via a nested vm_run
+    // (e.g. a closure called from C). GC must trace the whole chain, not
+    // just the innermost VM.
+    struct vm_state *parent;
 } vm_state;
 
 // ============================================================================
@@ -375,6 +380,8 @@ typedef struct compile_ctx {
     int64_t loop_var_id;        // Symbol ID of loop variable (-1 if none)
     unsigned loop_params;       // Parameter list (cell index) for SET generation
     unsigned loop_arity;        // Number of fixed parameters
+    bool loop_pending;          // Loop info set by letrec, awaiting pickup by
+                                // the binding's own lambda (not nested ones)
     unsigned env_depth;         // Number of PUSHENV frames since lambda entry
     unsigned macro_expansion_depth; // Guard against recursive expansion
 } compile_ctx;

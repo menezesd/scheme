@@ -45,11 +45,25 @@ static unsigned make_filled_vector(unsigned len_arg, unsigned fill,
     return vec == TOK_ERROR ? TOK_ERROR : vec;
 }
 
-static void vector_fill(unsigned vec, unsigned fill)
+// Parse optional start/end arguments (argv[first], argv[first+1]) against
+// the vector's length, defaulting to the full range
+static bool vector_range(unsigned argc, unsigned *argv, unsigned first,
+                         unsigned vec, int64_t *start, int64_t *end,
+                         const char *name)
 {
     unsigned len = vector_len(vec);
-    for (unsigned i = 0; i < len; i++)
-        vector_set_elem(vec, i, fill);
+    *start = 0;
+    *end = len;
+    if (argc > first && !expect_nonneg_int64(argv[first], start, name))
+        return false;
+    if (argc > first + 1 &&
+        !expect_nonneg_int64(argv[first + 1], end, name))
+        return false;
+    if (*start > *end || *end > len) {
+        show_error("%s: invalid range", name);
+        return false;
+    }
+    return true;
 }
 
 static unsigned make_vector_from_list(unsigned lst, const char *name)
@@ -68,17 +82,15 @@ static unsigned make_vector_from_list(unsigned lst, const char *name)
     return vec;
 }
 
-static unsigned make_list_from_vector(unsigned vec, const char *name)
+static unsigned make_list_from_vector(unsigned vec, int64_t start,
+                                      int64_t end)
 {
     GC_GUARD;
     gc_protect(&vec);
-    if (!require_vector(vec, name))
-        return TOK_ERROR;
-    unsigned len = vector_len(vec);
     unsigned result = 0, tail = 0;
     gc_protect(&result);
     gc_protect(&tail);
-    for (unsigned i = 0; i < len; i++) {
+    for (int64_t i = start; i < end; i++) {
         unsigned elem = vector_data_ptr(vec)[i];
         gc_protect(&elem);
         list_append(&result, &tail, elem);
@@ -129,12 +141,16 @@ unsigned apply_vector_primitive(unsigned prim_id, unsigned argc,
         return store(vector_len(vec));
     }
     case PVECFILL: {
-        REQUIRE_ARGC(argc, 2, 2, "vector-fill!");
+        REQUIRE_ARGC(argc, 2, 4, "vector-fill!");
         unsigned vec = argv[0];
         if (!require_vector(vec, "vector-fill!"))
             return TOK_ERROR;
+        int64_t start, end;
+        if (!vector_range(argc, argv, 2, vec, &start, &end, "vector-fill!"))
+            return TOK_ERROR;
         unsigned fill = argv[1];
-        vector_fill(vec, fill);
+        for (int64_t i = start; i < end; i++)
+            vector_set_elem(vec, (unsigned)i, fill);
         return 0;
     }
     case PLIST2VEC: {
@@ -142,8 +158,14 @@ unsigned apply_vector_primitive(unsigned prim_id, unsigned argc,
         return make_vector_from_list(argv[0], "list->vector");
     }
     case PVEC2LIST: {
-        REQUIRE_ARGC(argc, 1, 1, "vector->list");
-        return make_list_from_vector(argv[0], "vector->list");
+        REQUIRE_ARGC(argc, 1, 3, "vector->list");
+        unsigned vec = argv[0];
+        if (!require_vector(vec, "vector->list"))
+            return TOK_ERROR;
+        int64_t start, end;
+        if (!vector_range(argc, argv, 1, vec, &start, &end, "vector->list"))
+            return TOK_ERROR;
+        return make_list_from_vector(vec, start, end);
     }
     default:
         return TOK_ERROR;

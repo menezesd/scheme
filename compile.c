@@ -271,6 +271,7 @@ static bool is_foldable_primitive(int64_t prim_id)
     case PVECTORP:
     case PNOT:
     case PEQ:
+    case PEQV:
     case PEQUAL:
     case PEQUALP:
     // String operations that return immutable/immediate values. Operations
@@ -1763,16 +1764,10 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
                     return emit_syntax_error(
                         cctx, "syntax binding: invalid syntax");
 
+                // If no bindings, compile body in the current env so internal
+                // defines splice into the enclosing body
                 if (!bindings) {
-                    GC_GUARD;
-                    gc_protect(&body);
-                    unsigned saved_env = cctx->env;
-                    gc_protect(&saved_env);
-                    emit_pushenv(cctx);
-                    compile_begin(body, cctx);
-                    cctx->env = saved_env;
-                    emit_popenv(cctx);
-                    return dynamic_result();
+                    return compile_begin(body, cctx);
                 }
 
                 GC_GUARD;
@@ -2233,9 +2228,6 @@ static compile_result compile_lambda(unsigned expr, compile_ctx *cctx)
         return emit_syntax_error(cctx, "lambda: expected formals and body");
     unsigned params = car(rest);
     unsigned body = cdr(rest);
-    if (!body || !list_length_checked(body, NULL, "lambda") ||
-        !lambda_params_valid(params))
-        return emit_syntax_error(cctx, "lambda: invalid syntax");
 
     // Create compile-time environment that shadows lambda parameters
     // This prevents the compiler from inlining builtins that are shadowed
@@ -2246,6 +2238,11 @@ static compile_result compile_lambda(unsigned expr, compile_ctx *cctx)
     gc_protect(&params);
     gc_protect(&body);
     gc_protect(&lambda_env);
+
+    // lambda_params_valid allocates, so locals must be protected first
+    if (!body || !list_length_checked(body, NULL, "lambda") ||
+        !lambda_params_valid(params))
+        return emit_syntax_error(cctx, "lambda: invalid syntax");
 
     // Build a dummy frame with parameters as vars, all bound to 0
     {
@@ -2291,13 +2288,17 @@ static compile_result compile_lambda(unsigned expr, compile_ctx *cctx)
     }
     lambda_cctx->tail_position = true;
 
-    // Inherit loop info from parent (for letrec-bound lambdas)
-    if (cctx->loop_var_id >= 0) {
+    // Pick up loop info staged by an enclosing letrec. Only the letrec
+    // binding's own lambda may take it (loop_pending); lambdas nested inside
+    // the loop body must NOT inherit it, or their tail calls to the loop
+    // variable would compile as self-jumps into the wrong code object.
+    if (cctx->loop_pending && cctx->loop_var_id >= 0) {
         lambda_cctx->loop_var_id = cctx->loop_var_id;
         lambda_cctx->loop_params = cctx->loop_params;
         lambda_cctx->loop_arity = cctx->loop_arity;
         // Clear parent's loop info so it doesn't leak to other children
         cctx->loop_var_id = -1;
+        cctx->loop_pending = false;
     }
 
     // Count parameters
@@ -2837,12 +2838,42 @@ static compile_result compile_letrec(unsigned expr, compile_ctx *cctx)
         unsigned val_expr = cadr(car(bindings));
         if (IS_ATOM(binding) && IS_PAIR(val_expr) && IS_ATOM(car(val_expr)) &&
             CELL_ID(car(val_expr)) == ctx.kw_lambda &&
-            builtin_keyword_unbound(ctx.kw_lambda, cctx->env)) {
-            loop_var = CELL_ID(binding);
-            loop_params = cadr(val_expr);
-            // Count arity
-            for (unsigned p = loop_params; p && IS_PAIR(p); p = cdr(p))
-                loop_arity++;
+            builtin_keyword_unbound(ctx.kw_lambda, cctx->env) &&
+            IS_PAIR(cdr(val_expr))) {
+            unsigned lparams = cadr(val_expr);
+            unsigned lbody = cddr(val_expr);
+            // The SET+JUMP transform reuses one mutable frame across
+            // iterations, so it is only safe when the lambda has no rest
+            // parameter (a matching-arity call would leave it stale) and no
+            // parameter is captured by an inner closure (each iteration must
+            // see a fresh binding).
+            bool safe = true;
+            unsigned count = 0;
+            for (unsigned p = lparams; p; p = IS_PAIR(p) ? cdr(p) : 0) {
+                if (!IS_PAIR(p)) {
+                    safe = false; // rest parameter
+                    break;
+                }
+                if (!IS_ATOM(car(p))) {
+                    safe = false;
+                    break;
+                }
+                count++;
+            }
+            if (safe) {
+                for (unsigned p = lparams; p && IS_PAIR(p); p = cdr(p)) {
+                    if (captured_by_inner_lambda(lbody, CELL_ID(car(p)),
+                                                 cctx->env)) {
+                        safe = false;
+                        break;
+                    }
+                }
+            }
+            if (safe) {
+                loop_var = CELL_ID(binding);
+                loop_params = lparams;
+                loop_arity = count;
+            }
         }
     }
 
@@ -2857,6 +2888,7 @@ static compile_result compile_letrec(unsigned expr, compile_ctx *cctx)
     cctx->loop_params = loop_params;
     gc_protect(&cctx->loop_params);
     cctx->loop_arity = loop_arity;
+    cctx->loop_pending = loop_var >= 0;
     FORLIST(b, bindings) {
         unsigned binding = car(b);
         gc_protect(&binding);
@@ -2868,6 +2900,7 @@ static compile_result compile_letrec(unsigned expr, compile_ctx *cctx)
     cctx->loop_var_id = saved_loop_var;
     cctx->loop_params = saved_loop_params;
     cctx->loop_arity = saved_loop_arity;
+    cctx->loop_pending = false;
 
     // End letrec initialization - continuations after this won't restore values
     emit(cctx, OP_LETREC_DONE);
@@ -3267,16 +3300,17 @@ static compile_result compile_define(unsigned expr, compile_ctx *cctx)
         unsigned name = car(second);
         unsigned params = cdr(second);
         unsigned body = cddr(expr);
+        GC_GUARD;
+        gc_protect(&name);
+        gc_protect(&params);
+        gc_protect(&body);
+        // lambda_params_valid allocates, so locals must be protected first
         if (!identifier_valid(name) || !body ||
             !list_length_checked(body, NULL, "define") ||
             !lambda_params_valid(params))
             return emit_syntax_error(cctx, "define: invalid syntax");
 
         // Build lambda expression
-        GC_GUARD;
-        gc_protect(&name);
-        gc_protect(&params);
-        gc_protect(&body);
         unsigned lambda_atom = atom_from_string("lambda");
         gc_protect(&lambda_atom);
         unsigned lambda_args = alloc_cons(params, body);
@@ -3869,6 +3903,9 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
 
         unsigned lambda_params = cadr(fn_expr);
         unsigned lambda_body = cddr(fn_expr);
+        gc_protect(&lambda_params);
+        gc_protect(&lambda_body);
+        // lambda_params_valid allocates, so locals must be protected first
         if (!lambda_params_valid(lambda_params) ||
             !list_length_checked(lambda_body, NULL, "lambda"))
             return emit_syntax_error(cctx, "lambda: invalid syntax");
@@ -4250,6 +4287,11 @@ static void compile_qq_error(compile_ctx *cctx, const char *message)
 // Compile quasiquote recursively - generates runtime code
 static void compile_qq_rec(unsigned x, compile_ctx *cctx, int depth)
 {
+    // The compile calls below allocate (macro expansion, env frames), so the
+    // template and traversal cursor must stay rooted across them
+    GC_GUARD;
+    gc_protect(&x);
+
     if (IS_VECTOR(x)) {
         unsigned len = vector_len(x);
         for (unsigned i = 0; i < len; i++) {
@@ -4329,13 +4371,15 @@ static void compile_qq_rec(unsigned x, compile_ctx *cctx, int depth)
         }
     }
 
+    unsigned cursor = 0;
+    gc_protect(&cursor);
     if (has_splice) {
         // Use append-based building for splicing
         // Start with empty list
         emit2(cctx, OP_CONST, code_add_const(cctx->code, 0));
 
-        for (unsigned l = x; IS_PAIR(l); l = cdr(l)) {
-            unsigned elem = car(l);
+        for (cursor = x; IS_PAIR(cursor); cursor = cdr(cursor)) {
+            unsigned elem = car(cursor);
             if (IS_PAIR(elem) &&
                 IS_KEYWORD(car(elem), ctx.kw_unquote_splicing) &&
                 !is_keyword_shadowed(ctx.kw_unquote_splicing, cctx->env) &&
@@ -4368,8 +4412,8 @@ static void compile_qq_rec(unsigned x, compile_ctx *cctx, int depth)
         // No splicing: build with cons from the end
         // First compile all elements, then cons them together
         unsigned len = 0;
-        for (unsigned l = x; IS_PAIR(l); l = cdr(l)) {
-            compile_qq_rec(car(l), cctx, depth);
+        for (cursor = x; IS_PAIR(cursor); cursor = cdr(cursor)) {
+            compile_qq_rec(car(cursor), cctx, depth);
             len++;
         }
         // Handle improper list tail

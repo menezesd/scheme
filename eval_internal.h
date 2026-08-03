@@ -373,6 +373,15 @@ static inline bool syntax_template_valid_at(unsigned tmpl, unsigned pattern,
         return true;
     }
     if (IS_PAIR(tmpl)) {
+        // R7RS ellipsis escape: (<ellipsis> <template>) is <template> with
+        // ellipses inside carrying no special meaning. Validate the payload
+        // with an ellipsis id (-1) that cannot match any identifier.
+        if (syntax_ellipsis_atom(car(tmpl), ellipsis_id) &&
+            IS_PAIR(cdr(tmpl)) && !cddr(tmpl)) {
+            return syntax_template_valid_at(cadr(tmpl), pattern, literals, -1,
+                                            context, template_depth,
+                                            structural_depth + 1);
+        }
         unsigned it = tmpl;
         while (IS_PAIR(it)) {
             unsigned elem = car(it);
@@ -613,6 +622,7 @@ static inline unsigned make_syntax_transformer_with_default_ellipsis(
         }
 
         gc_protect(&tmpl);
+        gc_protect(&pattern); // alloc() below can GC; pattern is stored later
 
         // Create a cell to hold the compiled pattern pointer
         unsigned cpat_cell = alloc();
@@ -628,7 +638,7 @@ static inline unsigned make_syntax_transformer_with_default_ellipsis(
         unsigned new_rule = alloc_cons(compiled_pattern_pair, tmpl);
         gc_protect(&new_rule);
         unsigned new_node = alloc_cons(new_rule, 0);
-        gc_unprotect(4);
+        gc_unprotect(5);
 
         if (!compiled_rules) {
             compiled_rules = new_node;

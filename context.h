@@ -100,6 +100,9 @@ void gc_protect(unsigned *ptr);
 void gc_unprotect(int count);
 int get_shadow_stack_top(void);
 
+// Reset GC roots and collector mode after recovering from lisp_panic
+void gc_recover_after_panic(void);
+
 // Allocate a typed cell with given car and cdr
 static inline unsigned make_typed_cell(enum lisp_type type, unsigned car_val,
                                        unsigned cdr_val)

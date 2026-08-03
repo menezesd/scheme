@@ -58,15 +58,55 @@ static int reader_pushback_len = 0;
 static reader_char_state reader_history[READER_PUSHBACK_CAP];
 static int reader_history_len = 0;
 
-static FILE *saved_pushback_port = NULL;
-static long saved_pushback_pos = -1;
-static int saved_reader_line = 1;
-static int saved_reader_col = 0;
-static reader_char_state saved_pushback[READER_PUSHBACK_CAP];
-static int saved_pushback_len = 0;
-static reader_char_state saved_history[READER_PUSHBACK_CAP];
-static int saved_history_len = 0;
-static bool saved_reader_fold_case = true;
+// Per-port reader state. Peeked characters are physically consumed from the
+// FILE* and restored here, so each port needs its own slot: a single shared
+// slot would silently drop one port's pushback when another port is read.
+typedef struct port_reader_state {
+    FILE *port;
+    long pos; // ftell after the reader last touched the stream (-1 unknown)
+    int line, col;
+    reader_char_state pushback[READER_PUSHBACK_CAP];
+    int pushback_len;
+    reader_char_state history[READER_PUSHBACK_CAP];
+    int history_len;
+    bool fold_case;
+    struct port_reader_state *next;
+} port_reader_state;
+
+static port_reader_state *port_states = NULL;
+
+static port_reader_state *port_state_find(FILE *port)
+{
+    for (port_reader_state *ps = port_states; ps; ps = ps->next)
+        if (ps->port == port)
+            return ps;
+    return NULL;
+}
+
+static void port_state_reset(port_reader_state *ps)
+{
+    ps->pos = -1;
+    ps->line = 1;
+    ps->col = 0;
+    ps->pushback_len = 0;
+    ps->history_len = 0;
+    ps->fold_case = true;
+}
+
+static port_reader_state *port_state_get(FILE *port)
+{
+    port_reader_state *ps = port_state_find(port);
+    if (ps)
+        return ps;
+    ps = malloc(sizeof(*ps));
+    if (!ps)
+        lisp_panic("reader: out of memory tracking port state");
+    ps->port = port;
+    port_state_reset(ps);
+    ps->next = port_states;
+    port_states = ps;
+    return ps;
+}
 
 static void reader_record_history(reader_char_state state)
 {
@@ -78,14 +118,15 @@ static void reader_record_history(reader_char_state state)
     reader_history[reader_history_len++] = state;
 }
 
-static void saved_reader_record_history(reader_char_state state)
+static void port_state_record_history(port_reader_state *ps,
+                                      reader_char_state state)
 {
-    if (saved_history_len == READER_PUSHBACK_CAP) {
-        memmove(saved_history, saved_history + 1,
-                (READER_PUSHBACK_CAP - 1) * sizeof(saved_history[0]));
-        saved_history_len--;
+    if (ps->history_len == READER_PUSHBACK_CAP) {
+        memmove(ps->history, ps->history + 1,
+                (READER_PUSHBACK_CAP - 1) * sizeof(ps->history[0]));
+        ps->history_len--;
     }
-    saved_history[saved_history_len++] = state;
+    ps->history[ps->history_len++] = state;
 }
 
 static void advance_position_for_char(int c, int *line, int *col)
@@ -164,6 +205,68 @@ void reader_update_datum_labels(unsigned (*collector)(unsigned))
     for (int i = 0; i < datum_label_count; i++) {
         if (datum_labels[i].defined)
             datum_labels[i].value = collector(datum_labels[i].value);
+    }
+}
+
+// True if some defined datum label already denotes this cell (chained
+// definitions like #1=#2=<datum> make the inner label's object the outer
+// label's datum)
+static bool cell_is_datum_label_value(unsigned datum)
+{
+    for (int i = 0; i < datum_label_count; i++)
+        if (datum_labels[i].defined && datum_labels[i].value == datum)
+            return true;
+    return false;
+}
+
+// Replace every reference to `from` with `to` inside `root` (cycle-safe).
+// Used when a chained label abandons its placeholder for the inner label's
+// object: forward references created while reading still point at the
+// abandoned placeholder.
+static void patch_datum_references(unsigned root, unsigned from, unsigned to,
+                                   unsigned **visited, size_t *visited_len,
+                                   size_t *visited_cap)
+{
+    if (!IS_CELL(root))
+        return;
+    enum lisp_type type = CELL_TYPE(root);
+    if (type != BT_CONS && type != BT_VECTOR)
+        return;
+    for (size_t i = 0; i < *visited_len; i++)
+        if ((*visited)[i] == root)
+            return;
+    if (*visited_len == *visited_cap) {
+        size_t new_cap = *visited_cap ? *visited_cap * 2 : 32;
+        unsigned *grown = realloc(*visited, new_cap * sizeof(**visited));
+        if (!grown)
+            return; // out of memory: leave remaining references unpatched
+        *visited = grown;
+        *visited_cap = new_cap;
+    }
+    (*visited)[(*visited_len)++] = root;
+
+    if (type == BT_CONS) {
+        if (car(root) == from)
+            cell_set_car(root, to);
+        else
+            patch_datum_references(car(root), from, to, visited, visited_len,
+                                   visited_cap);
+        if (cdr(root) == from)
+            cell_set_cdr(root, to);
+        else
+            patch_datum_references(cdr(root), from, to, visited, visited_len,
+                                   visited_cap);
+        return;
+    }
+
+    unsigned len = vector_len(root);
+    for (unsigned i = 0; i < len; i++) {
+        unsigned elem = vector_data_ptr(root)[i];
+        if (elem == from)
+            vector_set_elem(root, i, to);
+        else
+            patch_datum_references(elem, from, to, visited, visited_len,
+                                   visited_cap);
     }
 }
 
@@ -248,21 +351,16 @@ static void reader_ungetc(int c)
     reader_col = state.col_before;
 }
 
-// Reset line tracking (call when switching input sources)
+// Reset line tracking (call when switching input sources). Per-port
+// pushback state is left intact so peeked characters survive; ports drop
+// their state via reader_forget_port when they close.
 void reader_reset_position(void)
 {
     reader_line = 1;
     reader_col = 0;
     reader_pushback_len = 0;
     reader_history_len = 0;
-    saved_pushback_port = NULL;
-    saved_pushback_pos = -1;
-    saved_reader_line = 1;
-    saved_reader_col = 0;
-    saved_pushback_len = 0;
-    saved_history_len = 0;
     reader_fold_case = true;
-    saved_reader_fold_case = true;
 }
 
 // Get current reader position for error messages
@@ -711,10 +809,24 @@ static bool radix_digit_p(int c, int base)
 
 static unsigned maybe_apply_exactness(unsigned value, reader_exactness exactness)
 {
-    if (exactness == READER_EXACTNESS_INEXACT && is_numeric(value) &&
-        !IS_INEXACT(value) && !IS_COMPLEX(value))
-        return store_inexact(to_double(value));
-    return value;
+    if (exactness != READER_EXACTNESS_INEXACT || !is_numeric(value) ||
+        IS_INEXACT(value))
+        return value;
+    if (IS_COMPLEX(value)) {
+        // #i applies to both components (e.g. #i1+2i => 1.0+2.0i)
+        GC_GUARD;
+        gc_protect(&value);
+        unsigned real_part = CELL_CAR(value);
+        unsigned imag_part = CELL_CDR(value);
+        gc_protect(&real_part);
+        gc_protect(&imag_part);
+        if (!IS_INEXACT(real_part))
+            real_part = store_inexact(to_double(real_part));
+        if (!IS_INEXACT(imag_part))
+            imag_part = store_inexact(to_double(imag_part));
+        return store_complex(real_part, imag_part);
+    }
+    return store_inexact(to_double(value));
 }
 
 static bignum *reader_pow10(uint64_t exp)
@@ -727,7 +839,7 @@ static bignum *reader_pow10(uint64_t exp)
     return result;
 }
 
-static unsigned read_exact_decimal_number(const char *s, bool *handled)
+unsigned read_exact_decimal_number(const char *s, bool *handled)
 {
     *handled = false;
     const char *p = s;
@@ -943,6 +1055,39 @@ static unsigned read_prefixed_number(int prefix)
     while (radix_digit_p(c, base)) {
         sb_append(&sb, c);
         c = reader_getchar();
+    }
+    if (sb.len > 0 && c == '/') {
+        // Rational in this radix: <digits>/<digits> (R7RS <num R>)
+        string_buffer den;
+        sb_init(&den);
+        c = reader_getchar();
+        while (radix_digit_p(c, base)) {
+            sb_append(&den, c);
+            c = reader_getchar();
+        }
+        if (den.len == 0 ||
+            reject_invalid_prefixed_tail(c, "prefixed rational")) {
+            if (den.len == 0)
+                show_error("invalid prefixed rational literal");
+            sb_free(&den);
+            sb_free(&sb);
+            return TOK_ERROR;
+        }
+        unsigned num_cell = read_prefixed_integer(sb.data, base, neg);
+        sb_free(&sb);
+        if (num_cell == TOK_ERROR) {
+            sb_free(&den);
+            return TOK_ERROR;
+        }
+        GC_GUARD;
+        gc_protect(&num_cell);
+        unsigned den_cell = read_prefixed_integer(den.data, base, false);
+        sb_free(&den);
+        if (den_cell == TOK_ERROR)
+            return TOK_ERROR;
+        gc_protect(&den_cell);
+        unsigned value = normalize_rational_cells(num_cell, den_cell);
+        return maybe_apply_exactness(value, exactness);
     }
     if (reject_invalid_prefixed_tail(c, "prefixed integer")) {
         sb_free(&sb);
@@ -1183,6 +1328,34 @@ static unsigned read_string_literal(void)
             case 'a': c = '\a'; break;
             case 'b': c = '\b'; break;
             case 'e': c = 27; break; // ESC
+            case ' ':
+            case '\t':
+            case '\n':
+            case '\r': {
+                // R7RS line continuation:
+                // \<intraline ws>*<line ending><intraline ws>* reads as
+                // nothing, letting long string literals span lines
+                int lc = c;
+                while (lc == ' ' || lc == '\t')
+                    lc = reader_getchar();
+                if (lc != '\n' && lc != '\r') {
+                    show_warning("unknown escape sequence: \\ ");
+                    if (lc != EOF)
+                        reader_ungetc(lc);
+                    continue;
+                }
+                if (lc == '\r') {
+                    int nx = reader_getchar();
+                    if (nx != '\n' && nx != EOF)
+                        reader_ungetc(nx);
+                }
+                int nx = reader_getchar();
+                while (nx == ' ' || nx == '\t')
+                    nx = reader_getchar();
+                if (nx != EOF)
+                    reader_ungetc(nx);
+                continue;
+            }
             case 'x': {
                 string_buffer hex;
                 sb_init(&hex);
@@ -1236,11 +1409,14 @@ static unsigned read_string_literal(void)
                     break;
                 }
                 show_warning("invalid hex escape");
-                for (size_t i = hex.len; i > 0; i--)
-                    reader_ungetc(hex.data[i - 1]);
+                // Keep the consumed digits directly: the pushback buffer
+                // holds only 16 characters, so ungetting a long run would
+                // silently drop input
+                sb_append(&sb, 'x');
+                for (size_t i = 0; i < hex.len; i++)
+                    sb_append(&sb, hex.data[i]);
                 sb_free(&hex);
-                c = 'x';
-                break;
+                continue;
             }
             default:
                 if (c >= '0' && c <= '7') {
@@ -1392,6 +1568,13 @@ static unsigned read_decimal_number(void)
     }
     if (c == 0) {
         show_error("null character in numeric literal");
+        sb_free(&sb);
+        return TOK_ERROR;
+    }
+    // R7RS requires a delimiter after a number: .5x is an error, not 0.5
+    // followed by the symbol x
+    if (!is_delimiter(c)) {
+        show_error("invalid character in numeric literal");
         sb_free(&sb);
         return TOK_ERROR;
     }
@@ -1613,6 +1796,21 @@ unsigned read_token(void)
                         datum_labels[idx].value = datum;
                         return datum;
                     }
+                    // Chained labels (#1=#2=<datum>): the datum is the inner
+                    // label's object. Copying its contents would leave two
+                    // cells owning the same external data and strand the
+                    // inner label's references, so share the object instead
+                    // and patch forward references to our placeholder.
+                    if (cell_is_datum_label_value(datum)) {
+                        datum_labels[idx].value = datum;
+                        unsigned *visited = NULL;
+                        size_t visited_len = 0, visited_cap = 0;
+                        patch_datum_references(datum, placeholder, datum,
+                                               &visited, &visited_len,
+                                               &visited_cap);
+                        free(visited);
+                        return datum;
+                    }
                     resolve_datum_label_placeholder(placeholder, datum);
                     return placeholder;
                 } else if (c == '#') {
@@ -1831,7 +2029,7 @@ unsigned read_obj(void)
     unsigned result = read_obj_inner();
     reader_obj_depth--;
     if (outermost && result == TOK_EOF)
-        return atom_from_string("eof-object");
+        return CELL_EOF_OBJECT;
     return result;
 }
 
@@ -1909,38 +2107,33 @@ unsigned read_obj_port(FILE *port)
     memcpy(old_history, reader_history, sizeof(old_history));
 
     reader_port = port;
+    port_reader_state *ps = port_state_get(port);
     long port_pos = ftell(port);
-    if (saved_pushback_port == port &&
-        (port_pos < 0 || port_pos == saved_pushback_pos)) {
-        reader_line = saved_reader_line;
-        reader_col = saved_reader_col;
-        memcpy(reader_pushback, saved_pushback, sizeof(reader_pushback));
-        memcpy(reader_history, saved_history, sizeof(reader_history));
-        reader_pushback_len = saved_pushback_len;
-        reader_history_len = saved_history_len;
-        reader_fold_case = saved_reader_fold_case;
-    } else {
-        reader_line = 1;
-        reader_col = 0;
-        reader_pushback_len = 0;
-        reader_history_len = 0;
-        reader_fold_case = true;
-    }
+    // If the underlying stream moved since the reader last touched it
+    // (external read or seek), the saved pushback no longer applies
+    if (!(port_pos < 0 || ps->pos < 0 || port_pos == ps->pos))
+        port_state_reset(ps);
+    reader_line = ps->line;
+    reader_col = ps->col;
+    memcpy(reader_pushback, ps->pushback, sizeof(reader_pushback));
+    memcpy(reader_history, ps->history, sizeof(reader_history));
+    reader_pushback_len = ps->pushback_len;
+    reader_history_len = ps->history_len;
+    reader_fold_case = ps->fold_case;
     reset_datum_labels();
     unsigned result = read_obj();
     if (ferror(port)) {
         show_error("read: input error");
         result = TOK_ERROR;
     }
-    saved_pushback_port = port;
-    saved_pushback_pos = ftell(port);
-    saved_reader_line = reader_line;
-    saved_reader_col = reader_col;
-    memcpy(saved_pushback, reader_pushback, sizeof(saved_pushback));
-    memcpy(saved_history, reader_history, sizeof(saved_history));
-    saved_pushback_len = reader_pushback_len;
-    saved_history_len = reader_history_len;
-    saved_reader_fold_case = reader_fold_case;
+    ps->pos = ftell(port);
+    ps->line = reader_line;
+    ps->col = reader_col;
+    memcpy(ps->pushback, reader_pushback, sizeof(ps->pushback));
+    memcpy(ps->history, reader_history, sizeof(ps->history));
+    ps->pushback_len = reader_pushback_len;
+    ps->history_len = reader_history_len;
+    ps->fold_case = reader_fold_case;
 
     reader_port = old_port;
     reader_line = old_line;
@@ -1957,9 +2150,8 @@ size_t reader_port_pending_bytes(FILE *port)
 {
     if (reader_port == port)
         return (size_t)reader_pushback_len;
-    if (saved_pushback_port == port)
-        return (size_t)saved_pushback_len;
-    return 0;
+    port_reader_state *ps = port_state_find(port);
+    return ps ? (size_t)ps->pushback_len : 0;
 }
 
 int reader_port_getc(FILE *port)
@@ -1971,11 +2163,12 @@ int reader_port_getc(FILE *port)
         reader_record_history(state);
         return c;
     }
-    if (saved_pushback_port == port && saved_pushback_len > 0) {
-        reader_char_state state = saved_pushback[--saved_pushback_len];
+    port_reader_state *ps = port_state_find(port);
+    if (ps && reader_port != port && ps->pushback_len > 0) {
+        reader_char_state state = ps->pushback[--ps->pushback_len];
         int c = state.c;
-        advance_position_for_char(c, &saved_reader_line, &saved_reader_col);
-        saved_reader_record_history(state);
+        advance_position_for_char(c, &ps->line, &ps->col);
+        port_state_record_history(ps, state);
         return c;
     }
 
@@ -1990,19 +2183,12 @@ int reader_port_getc(FILE *port)
         return c;
     }
 
-    if (saved_pushback_port != port) {
-        saved_pushback_port = port;
-        saved_pushback_pos = -1;
-        saved_reader_line = 1;
-        saved_reader_col = 0;
-        saved_pushback_len = 0;
-        saved_history_len = 0;
-        saved_reader_fold_case = true;
-    }
-    reader_char_state state = {c, saved_reader_line, saved_reader_col};
-    advance_position_for_char(c, &saved_reader_line, &saved_reader_col);
-    saved_reader_record_history(state);
-    saved_pushback_pos = ftell(port);
+    if (!ps)
+        ps = port_state_get(port);
+    reader_char_state state = {c, ps->line, ps->col};
+    advance_position_for_char(c, &ps->line, &ps->col);
+    port_state_record_history(ps, state);
+    ps->pos = ftell(port);
     return c;
 }
 
@@ -2010,8 +2196,9 @@ int reader_port_peekc(FILE *port)
 {
     if (reader_port == port && reader_pushback_len > 0)
         return reader_pushback[reader_pushback_len - 1].c;
-    if (saved_pushback_port == port && saved_pushback_len > 0)
-        return saved_pushback[saved_pushback_len - 1].c;
+    port_reader_state *ps = port_state_find(port);
+    if (ps && reader_port != port && ps->pushback_len > 0)
+        return ps->pushback[ps->pushback_len - 1].c;
 
     int c = fgetc(port);
     if (c != EOF && ungetc(c, port) == EOF)
@@ -2038,31 +2225,32 @@ bool reader_port_ungetc(FILE *port, int c)
         return true;
     }
 
-    if (saved_pushback_port != port ||
-        saved_pushback_len >= READER_PUSHBACK_CAP ||
-        saved_history_len == 0)
+    port_reader_state *ps = port_state_find(port);
+    if (!ps || ps->pushback_len >= READER_PUSHBACK_CAP ||
+        ps->history_len == 0)
         return false;
-    reader_char_state state = saved_history[saved_history_len - 1];
+    reader_char_state state = ps->history[ps->history_len - 1];
     if (state.c != c)
         return false;
-    saved_history_len--;
-    saved_pushback[saved_pushback_len++] = state;
-    saved_reader_line = state.line_before;
-    saved_reader_col = state.col_before;
-    saved_pushback_pos = ftell(port);
+    ps->history_len--;
+    ps->pushback[ps->pushback_len++] = state;
+    ps->line = state.line_before;
+    ps->col = state.col_before;
+    ps->pos = ftell(port);
     return true;
 }
 
 void reader_forget_port(FILE *port)
 {
-    if (saved_pushback_port == port) {
-        saved_pushback_port = NULL;
-        saved_pushback_pos = -1;
-        saved_reader_line = 1;
-        saved_reader_col = 0;
-        saved_pushback_len = 0;
-        saved_history_len = 0;
-        saved_reader_fold_case = true;
+    port_reader_state **link = &port_states;
+    while (*link) {
+        if ((*link)->port == port) {
+            port_reader_state *dead = *link;
+            *link = dead->next;
+            free(dead);
+            break;
+        }
+        link = &(*link)->next;
     }
     if (reader_port == port) {
         reader_pushback_len = 0;

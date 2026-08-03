@@ -27,4 +27,7 @@ void display_obj_port(unsigned s, FILE *port);
 // Get type name for error messages
 const char *type_name(unsigned cell);
 
+// Format a double using the shortest representation that reads back exactly
+void format_double_repr(char *buf, size_t size, double d);
+
 #endif // WRITER_H

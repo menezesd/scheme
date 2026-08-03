@@ -249,8 +249,12 @@ static unsigned inexact_complex_div_value(unsigned argc, unsigned *argv)
     for (unsigned i = start; i < argc; i++) {
         double r, im;
         get_complex_parts(argv[i], &r, &im);
-        if (r == 0.0 && im == 0.0)
-            ERROR_RETURN("/: division by zero");
+        if (r == 0.0 && im == 0.0) {
+            // IEEE semantics for inexact division by zero (R7RS 6.2.4)
+            real = real / 0.0;
+            imag = imag / 0.0;
+            continue;
+        }
 
         /*
          * Normalize both operands before combining their components.  This
@@ -845,16 +849,13 @@ slow_path:;
         return inexact_complex_div_value(argc, argv);
     }
     case NUM_INEXACT: {
+        // Inexact division by zero follows IEEE 754 per R7RS 6.2.4:
+        // (/ 1.0 0.0) => +inf.0, (/ -1.0 0.0) => -inf.0, (/ 0.0 0.0) => +nan.0
         double res = to_double(argv[0]);
-        if (argc == 1) {
-            CHECK_DIV_ZERO_DBL(res, "/");
+        if (argc == 1)
             return store_inexact(1.0 / res);
-        }
-        for (unsigned i = 1; i < argc; i++) {
-            double divisor = to_double(argv[i]);
-            CHECK_DIV_ZERO_DBL(divisor, "/");
-            res /= divisor;
-        }
+        for (unsigned i = 1; i < argc; i++)
+            res /= to_double(argv[i]);
         return store_inexact(res);
     }
     case NUM_RATIONAL:
@@ -888,6 +889,49 @@ slow_path:;
     }
     }
     return store(0);
+}
+
+// R7RS 6.2.6: the division operators accept integer-valued inexact
+// arguments, and any inexact operand makes the result(s) inexact
+// (e.g. (quotient 7.0 2) => 3.0)
+unsigned prim_divlike_inexact(unsigned (*fn)(unsigned, unsigned *),
+                              unsigned argc, unsigned *argv, const char *name)
+{
+    if (argc != 2 || (!IS_INEXACT(argv[0]) && !IS_INEXACT(argv[1])))
+        return fn(argc, argv);
+
+    GC_GUARD;
+    unsigned conv[2];
+    for (int i = 0; i < 2; i++) {
+        unsigned v = argv[i];
+        if (IS_INEXACT(v)) {
+            double d = to_double(v);
+            if (!isfinite(d) || floor(d) != d) {
+                show_error("%s: expected integer", name);
+                return TOK_ERROR;
+            }
+            v = prim_inexact_to_exact(v);
+            if (v == TOK_ERROR)
+                return TOK_ERROR;
+        }
+        conv[i] = v;
+        gc_protect(&conv[i]);
+    }
+    unsigned result = fn(2, conv);
+    if (result == TOK_ERROR)
+        return TOK_ERROR;
+    gc_protect(&result);
+    if (IS_MULTIVAL(result)) {
+        unsigned vals = CELL_CAR(result);
+        gc_protect(&vals);
+        unsigned q = store_inexact(to_double(car(vals)));
+        gc_protect(&q);
+        unsigned r = store_inexact(to_double(cadr(vals)));
+        gc_protect(&r);
+        unsigned out[2] = {q, r};
+        return values_from_argv(2, out);
+    }
+    return store_inexact(to_double(result));
 }
 
 unsigned prim_modulo(unsigned argc, unsigned *argv)

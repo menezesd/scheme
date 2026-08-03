@@ -138,6 +138,8 @@ typedef struct {
     unsigned vec_iter_count;
     unsigned vec_iter_pre;
     unsigned *bindings;
+    unsigned *bound; // Per-var flags: bindings[i] is a real match this
+                     // iteration (distinguishes a () binding from unbound)
     unsigned *ellipsis_lists;
     unsigned *ellipsis_tails;
     unsigned *inner_lists;
@@ -160,6 +162,8 @@ typedef struct {
 
     // Variable bindings (indexed by var slot)
     unsigned *bindings;      // Current binding for each variable
+    unsigned *bound;         // Nonzero if bindings[i] holds a real match
+                             // (distinguishes a () binding from unbound)
 
     // Ellipsis accumulation (per-variable list of matched values)
     // Depth 1 (outermost ellipsis) — also the final result read by build_bindings

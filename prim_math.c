@@ -126,12 +126,25 @@ typedef struct {
 static const math_func_entry math_funcs[] = {
     {PASIN, asin, "asin"}, {PACOS, acos, "acos"}, {0, NULL, NULL}};
 
-static const math_func_entry rounding_funcs[] = {
-    {PFLOOR, floor, "floor"},
-    {PCEILING, ceil, "ceiling"},
-    {PTRUNCATE, trunc, "truncate"},
-    {PROUND, round, "round"},
-    {0, NULL, NULL}};
+typedef enum {
+    ROUND_FLOOR,
+    ROUND_CEILING,
+    ROUND_TRUNCATE,
+    ROUND_NEAREST // Ties to even (R7RS round)
+} round_mode;
+
+typedef struct {
+    unsigned id;
+    round_mode mode;
+    const char *name;
+} rounding_func_entry;
+
+static const rounding_func_entry rounding_funcs[] = {
+    {PFLOOR, ROUND_FLOOR, "floor"},
+    {PCEILING, ROUND_CEILING, "ceiling"},
+    {PTRUNCATE, ROUND_TRUNCATE, "truncate"},
+    {PROUND, ROUND_NEAREST, "round"},
+    {0, 0, NULL}};
 
 static const math_func_entry *find_math_func(const math_func_entry *entries,
                                              unsigned prim_id)
@@ -143,15 +156,122 @@ static const math_func_entry *find_math_func(const math_func_entry *entries,
     return NULL;
 }
 
-static unsigned apply_rounding(unsigned x, double (*func)(double),
-                               const char *name)
+static const rounding_func_entry *find_rounding_func(unsigned prim_id)
+{
+    for (const rounding_func_entry *entry = rounding_funcs; entry->name;
+         entry++) {
+        if (entry->id == prim_id)
+            return entry;
+    }
+    return NULL;
+}
+
+static bool bn_is_even(const bignum *a)
+{
+    return a->len == 0 || (a->limbs[0] & 1) == 0;
+}
+
+// Round an exact rational to an exact integer without any double conversion
+// (doubles have only 53 mantissa bits, which silently corrupts wide values)
+static unsigned exact_rational_round(unsigned x, round_mode mode,
+                                     const char *name)
+{
+    bignum *num = to_bignum(CELL_CAR(x));
+    bignum *den = to_bignum(CELL_CDR(x));
+    bignum *rem = NULL;
+    bignum *q = NULL;
+    if (!num || !den || bn_is_zero(den) || bn_sign(den) < 0 ||
+        !(q = bn_div(num, den, &rem)) || !rem) {
+        bn_free(num);
+        bn_free(den);
+        bn_free(q);
+        bn_free(rem);
+        show_error("%s: invalid rational", name);
+        return TOK_ERROR;
+    }
+
+    // q is the truncated quotient; rem has the sign of num, |rem| < den
+    bool ok = true;
+    if (!bn_is_zero(rem)) {
+        switch (mode) {
+        case ROUND_TRUNCATE:
+            break;
+        case ROUND_FLOOR:
+            if (bn_sign(num) < 0) {
+                bignum one = {.limbs = (limb_t[]){1}, .len = 1, .cap = 1,
+                              .sign = 0};
+                ok = bn_sub_ip_checked(q, &one);
+            }
+            break;
+        case ROUND_CEILING:
+            if (bn_sign(num) > 0) {
+                bignum one = {.limbs = (limb_t[]){1}, .len = 1, .cap = 1,
+                              .sign = 0};
+                ok = bn_add_ip_checked(q, &one);
+            }
+            break;
+        case ROUND_NEAREST: {
+            // Work with the floor quotient qf and remainder rf in [0, den)
+            bignum one = {.limbs = (limb_t[]){1}, .len = 1, .cap = 1,
+                          .sign = 0};
+            if (bn_sign(num) < 0) {
+                ok = bn_sub_ip_checked(q, &one); // q = floor(num/den)
+                if (ok)
+                    ok = bn_add_ip_checked(rem, den); // rem in [0, den)
+            }
+            if (ok) {
+                // Compare 2*rem against den
+                bignum *twice = bn_add(rem, rem);
+                if (!twice) {
+                    ok = false;
+                } else {
+                    int cmp = bn_cmp(twice, den);
+                    bn_free(twice);
+                    if (cmp > 0 || (cmp == 0 && !bn_is_even(q)))
+                        ok = bn_add_ip_checked(q, &one);
+                }
+            }
+            break;
+        }
+        }
+    }
+
+    bn_free(num);
+    bn_free(den);
+    bn_free(rem);
+    if (!ok) {
+        bn_free(q);
+        show_error("%s: out of memory", name);
+        return TOK_ERROR;
+    }
+    return store_integer(q);
+}
+
+static unsigned apply_rounding(unsigned x, round_mode mode, const char *name)
 {
     if (!require_real(x, name))
         return TOK_ERROR;
     if (IS_FIXNUM(x) || IS_NUM(x) || IS_BIGNUM(x))
         return x;
+    if (IS_RATIONAL(x) && is_exact(x))
+        return exact_rational_round(x, mode, name);
     double d = to_double(x);
-    return make_real_result(func(d), is_exact(x));
+    double r;
+    switch (mode) {
+    case ROUND_FLOOR:
+        r = floor(d);
+        break;
+    case ROUND_CEILING:
+        r = ceil(d);
+        break;
+    case ROUND_TRUNCATE:
+        r = trunc(d);
+        break;
+    default:
+        r = nearbyint(d); // Ties to even in the default rounding mode
+        break;
+    }
+    return make_real_result(r, is_exact(x));
 }
 
 typedef void (*complex_unary_func)(double real, double imag, double *out_real,
@@ -374,7 +494,9 @@ static const unary_number_math_entry *find_unary_number_math(unsigned prim_id)
  * Returns the root if base is a perfect nth power, NULL otherwise.
  * Caller must free the returned bignum.
  */
-static bignum *bn_exact_nth_root(const bignum *base, int64_t n)
+// Newton's method for the integer nth root (approximately floor(base^1/n);
+// may be off by one, so callers needing exactness must verify)
+static bignum *bn_approx_nth_root(const bignum *base, int64_t n)
 {
     if (n <= 0 || bn_is_zero(base))
         return NULL;
@@ -501,6 +623,14 @@ static bignum *bn_exact_nth_root(const bignum *base, int64_t n)
 
     bn_free(n_bn);
     bn_free(n_minus_1);
+    return guess;
+}
+
+static bignum *bn_exact_nth_root(const bignum *base, int64_t n)
+{
+    bignum *guess = bn_approx_nth_root(base, n);
+    if (!guess)
+        return NULL;
 
     // Verify: guess^n == base
     bignum *check = bn_from_int(1);
@@ -593,6 +723,20 @@ static unsigned sqrt_value(unsigned arg, const char *name)
             bignum *root = bn_exact_nth_root(bn, 2);
             if (root)
                 return store_integer(root);
+            // Operands beyond double range would convert to infinity below;
+            // approximate through the integer square root instead, which
+            // halves the exponent back into double range
+            if (isinf(to_double(arg))) {
+                bignum *approx = bn_approx_nth_root(bn, 2);
+                if (approx) {
+                    GC_GUARD;
+                    unsigned root_cell = store_integer(approx);
+                    if (root_cell == TOK_ERROR)
+                        return TOK_ERROR;
+                    gc_protect(&root_cell);
+                    return store_inexact(to_double(root_cell));
+                }
+            }
         }
     }
 
@@ -731,11 +875,10 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned argc,
         return store_inexact(math_func->func(to_double(argv[0])));
     }
 
-    const math_func_entry *rounding_func =
-        find_math_func(rounding_funcs, prim_id);
+    const rounding_func_entry *rounding_func = find_rounding_func(prim_id);
     if (rounding_func) {
         REQUIRE_ARGC(argc, 1, 1, rounding_func->name);
-        return apply_rounding(argv[0], rounding_func->func,
+        return apply_rounding(argv[0], rounding_func->mode,
                               rounding_func->name);
     }
 

@@ -31,7 +31,7 @@ UBSAN_OBJS = $(SRCS:.c=.ubsan.o)
 UBSAN_CFLAGS = $(DEBUG_CFLAGS) -fsanitize=undefined
 UBSAN_LDFLAGS = $(LDFLAGS) -fsanitize=undefined
 
-.PHONY: all clean distclean debug sanitize ubsan test test-interpreter test-c test-prop test-sanitize test-ubsan test-all unicode-tables
+.PHONY: all clean distclean debug sanitize ubsan test test-interpreter test-c test-prop test-r5rs test-stress test-sanitize test-ubsan test-all unicode-tables
 
 all: $(TARGET)
 
@@ -191,6 +191,25 @@ test_unicode_case: test_unicode_case.c $(INTERP_OBJS) unicode_case_test_data.h
 test-prop: $(TARGET)
 	@./$(TARGET) property_tests.scm
 
+# Run R5RS conformance tests (in both VM and interpreter modes)
+test-r5rs: $(TARGET)
+	@for mode in "" "--interpreter"; do \
+		tmp=$$(mktemp "$${TMPDIR:-/tmp}/vesper-test.XXXXXX") || exit 1; \
+		./$(TARGET) $$mode r5rs_tests.scm >"$$tmp" 2>&1; \
+		grep -E '(^===|FAIL|error|^R5RS Tests:|passed)' "$$tmp"; \
+		grep -q '^All R5RS tests passed!' "$$tmp"; rc=$$?; \
+		rm -f "$$tmp"; \
+		[ $$rc -eq 0 ] || exit 1; \
+	done
+
+# Run stress tests
+test-stress: $(TARGET)
+	@tmp=$$(mktemp "$${TMPDIR:-/tmp}/vesper-test.XXXXXX") || exit 1; \
+	./$(TARGET) stress_tests.scm >"$$tmp" 2>&1; \
+	grep -E '(^===|FAIL|error|^Stress Tests:|passed)' "$$tmp"; \
+	grep -q '^All stress tests passed!' "$$tmp"; rc=$$?; \
+	rm -f "$$tmp"; exit $$rc
+
 # Run bounded sanitizer smoke tests
 test-sanitize: sanitize
 	@python3 tools/run_sanitize_smoke.py ./$(SAN_TARGET)
@@ -203,7 +222,7 @@ test-ubsan: ubsan test_bignum_ubsan
 
 # Run all tests, including the UBSan-only smoke path that works on macOS
 # systems where ASan can hang before main.
-test-all: test test-interpreter test-c test-prop test-ubsan
+test-all: test test-interpreter test-c test-prop test-r5rs test-stress test-ubsan
 
 clean:
 	rm -f $(OBJS) $(DEBUG_OBJS) $(SAN_OBJS) $(UBSAN_OBJS) $(TARGET) \

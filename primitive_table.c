@@ -23,7 +23,7 @@ static const primitive_binding builtins[] = {
     // Logic
     {"not", PNOT},
     {"eq?", PEQ},
-    {"eqv?", PEQ},
+    {"eqv?", PEQV},
     {"equal?", PEQUALP},
 
     // List operations

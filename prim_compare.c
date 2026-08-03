@@ -93,9 +93,44 @@ static bool compare_number_pair(unsigned prev, unsigned curr, cmp_op op,
         return true;
     }
 
-    if (is_exact_real_number(prev) && is_exact_real_number(curr)) {
+    bool prev_exact = is_exact_real_number(prev);
+    bool curr_exact = is_exact_real_number(curr);
+
+    if (prev_exact && curr_exact) {
         int cmp;
         if (!compare_exact_reals(prev, curr, &cmp))
+            return false;
+        *ok_out = APPLY_CMP_OP(op, cmp, 0);
+        return true;
+    }
+
+    // Mixed exact/inexact: convert the inexact side to an exact rational and
+    // compare mathematically. Converting the exact side to double instead
+    // would collapse values that differ beyond 53 bits of precision
+    // (e.g. (= (+ (expt 2 53) 1) (exact->inexact (expt 2 53)))).
+    if (prev_exact != curr_exact) {
+        double d = to_double(prev_exact ? curr : prev);
+        if (isnan(d)) {
+            *ok_out = false; // every comparison with nan is false
+            return true;
+        }
+        if (isinf(d)) {
+            // An infinity is beyond every exact (finite) value
+            int cmp = prev_exact ? (d > 0 ? -1 : 1) : (d > 0 ? 1 : -1);
+            *ok_out = APPLY_CMP_OP(op, cmp, 0);
+            return true;
+        }
+        GC_GUARD;
+        gc_protect(&prev);
+        gc_protect(&curr);
+        unsigned converted = prim_inexact_to_exact(prev_exact ? curr : prev);
+        if (converted == TOK_ERROR)
+            return false;
+        int cmp;
+        bool cmp_ok = prev_exact
+                          ? compare_exact_reals(prev, converted, &cmp)
+                          : compare_exact_reals(converted, curr, &cmp);
+        if (!cmp_ok)
             return false;
         *ok_out = APPLY_CMP_OP(op, cmp, 0);
         return true;

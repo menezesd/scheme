@@ -683,6 +683,15 @@ unsigned prim_div(unsigned argc, unsigned *argv);
 unsigned prim_modulo(unsigned argc, unsigned *argv);
 unsigned numeric_compare(unsigned argc, unsigned *argv, cmp_op op);
 
+// Convert an inexact real to an exact integer or rational (exactly).
+// Errors on inf/nan. Defined in prim_numtower.c.
+unsigned prim_inexact_to_exact(unsigned x);
+
+// Run a division-family primitive with R7RS inexact-integer contagion.
+// Defined in prim_numeric.c.
+unsigned prim_divlike_inexact(unsigned (*fn)(unsigned, unsigned *),
+                              unsigned argc, unsigned *argv, const char *name);
+
 static inline unsigned apply_binary_primitive(unsigned a, unsigned b,
                                               unsigned (*prim)(unsigned,
                                                                unsigned *))
@@ -840,8 +849,9 @@ static inline unsigned binary_mod(unsigned a, unsigned b)
             r += vb;
         return store(r);
     }
-    // Fall back to full modulo with bignum support
-    return apply_binary_primitive(a, b, prim_modulo);
+    // Fall back to full modulo with bignum and inexact-integer support
+    unsigned args[2] = {a, b};
+    return prim_divlike_inexact(prim_modulo, 2, args, "modulo");
 }
 
 // Binary less-than comparison: a < b

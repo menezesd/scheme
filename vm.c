@@ -1324,8 +1324,10 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
     vm->running = true;
     vm->error = false;
 
-    // Register VM with GC system
+    // Register VM with GC system. Link to the suspended enclosing VM so the
+    // GC can forward the entire chain, not just the innermost VM.
     vm_state *saved_active_vm = active_vm;
+    vm->parent = saved_active_vm;
     active_vm = vm;
 
     while (vm->running) {
@@ -1753,8 +1755,10 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 if (IS_MULTIVAL(result)) {
                     unsigned vals = car(result);
                     unsigned consumer_argc = 0;
-                    if (!vm_push_multiple_values(vm, vals, &consumer_argc))
+                    if (!vm_push_multiple_values(vm, vals, &consumer_argc)) {
+                        gc_unprotect(1); // consumer
                         break;
+                    }
                     vm_apply(vm, consumer, consumer_argc, false);
                 } else {
                     // Single value - pass as single argument
@@ -1901,33 +1905,11 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             break;
         }
 
-        case OP_CALLWITHVALUES: {
-            // Stack: [producer, consumer]
-            unsigned consumer = vm_pop(vm);
-            unsigned producer = vm_pop(vm);
-            GC_GUARD;
-            gc_protect(&consumer);
-            gc_protect(&producer);
-
-            // Call producer with no args
-            vm_apply(vm, producer, 0, false);
-
-            // After producer returns, get result
-            // If result is multival, unpack it; otherwise use as single arg
-            unsigned result = vm_pop(vm);
-            gc_protect(&result);
-            if (IS_MULTIVAL(result)) {
-                unsigned vals = car(result);
-                unsigned argc = 0;
-                if (!vm_push_multiple_values(vm, vals, &argc))
-                    break;
-                vm_apply(vm, consumer, argc, false);
-            } else {
-                vm_push(vm, result);
-                vm_apply(vm, consumer, 1, false);
-            }
-            break;
-        }
+        // OP_CALLWITHVALUES intentionally has no handler: no compiler path
+        // emits it (call-with-values goes through OP_PRIM), and a bytecode
+        // producer cannot be run to completion from the middle of the
+        // dispatch loop. Emitting it is a compiler bug, reported as an
+        // unknown opcode below.
 
         case OP_DEFSYNTAX: {
             int64_t sym_id = vm->code->code[vm->ip++];
@@ -3203,6 +3185,7 @@ vm_dispatch_error:
 
     // Unregister VM from GC system
     active_vm = saved_active_vm;
+    vm->parent = NULL;
 
     if (vm->error) {
         show_error("VM error: %s", vm->error_msg);

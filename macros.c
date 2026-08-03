@@ -3036,6 +3036,15 @@ unsigned syntax_expand(unsigned tmpl, unsigned bindings, unsigned mark,
 
     // List template
     if (IS_PAIR(tmpl)) {
+        // R7RS ellipsis escape: (<ellipsis> <template>) expands to
+        // <template> with ellipses inside treated as ordinary identifiers.
+        // Passing -1 as the ellipsis id disables ellipsis handling below.
+        if (syntax_is_ellipsis(car(tmpl), ellipsis_id) &&
+            IS_PAIR(cdr(tmpl)) && !cddr(tmpl)) {
+            unsigned escaped = syntax_expand(cadr(tmpl), bindings, mark, -1);
+            gc_unprotect(2); // bindings, tmpl
+            return escaped;
+        }
         // Check for ellipsis: (tmpl ... rest)
         if (IS_PAIR(cdr(tmpl)) && syntax_is_ellipsis(cadr(tmpl), ellipsis_id)) {
             unsigned elem_tmpl = car(tmpl);
@@ -3386,7 +3395,10 @@ static bool syntax_transformer_well_formed(unsigned transformer, unsigned input,
 
 unsigned apply_syntax(unsigned transformer, unsigned input, unsigned use_env)
 {
-    // Protect parameters that may be in nursery - GC can run during expansion
+    // Protect parameters that may be in nursery - GC can run during
+    // expansion. GC_GUARD releases every protection below on any return
+    // path, so no manual unprotect accounting is needed at the exits.
+    GC_GUARD;
     gc_protect(&transformer);
     gc_protect(&input);
     gc_protect(&use_env);
@@ -3401,7 +3413,6 @@ unsigned apply_syntax(unsigned transformer, unsigned input, unsigned use_env)
     if (!syntax_transformer_well_formed(transformer, input, &syn_data,
                                         &closure_env, &ellipsis_id, &literals,
                                         &rules)) {
-        gc_unprotect(3);
         show_error("syntax transformer: invalid structure");
         return TOK_ERROR;
     }
@@ -3507,39 +3518,22 @@ unsigned apply_syntax(unsigned transformer, unsigned input, unsigned use_env)
             // Apply free variable renames to template
             unsigned renamed_tmpl = rename_free_ids(tmpl, rename_map);
             gc_protect(&renamed_tmpl);
-            if (renamed_tmpl == TOK_ERROR) {
-                gc_unprotect(11);
+            if (renamed_tmpl == TOK_ERROR)
                 return TOK_ERROR;
-            }
 
             // Hygienize template: rename introduced bindings to gensyms
             unsigned hygienic_tmpl = hygienize_template(renamed_tmpl, bindings);
             gc_protect(&hygienic_tmpl);
-            if (hygienic_tmpl == TOK_ERROR) {
-                gc_unprotect(12);
+            if (hygienic_tmpl == TOK_ERROR)
                 return TOK_ERROR;
-            }
             unsigned result =
                 syntax_expand(hygienic_tmpl, bindings, mark, ellipsis_id);
             gc_protect(&result);
-            if (result == TOK_ERROR) {
-                gc_unprotect(13);
+            if (result == TOK_ERROR)
                 return TOK_ERROR;
-            }
-            result = unwrap_protected(result);
-            if (result == TOK_ERROR) {
-                gc_unprotect(13);
-                return TOK_ERROR;
-            }
-            gc_unprotect(
-                13); // result, hygienic_tmpl, renamed_tmpl, rename_map,
-                     // free_ids, bindings, tmpl, rules, closure_env, literals,
-                     // use_env, input, transformer
-            return result;
+            return unwrap_protected(result);
         }
     }
-    gc_unprotect(
-        7); // tmpl, rules, closure_env, literals, use_env, input, transformer
 
     show_error("syntax-rules: no matching pattern");
     return TOK_ERROR;

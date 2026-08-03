@@ -9,7 +9,17 @@
  * Convert an inexact real number to an exact rational.
  * Uses IEEE754 representation: value = mantissa * 2^exponent
  */
-static unsigned prim_inexact_to_exact(unsigned x)
+// Apply rationalize's exactness contagion to a computed exact result
+static unsigned rationalize_result(unsigned value, bool inexact)
+{
+    if (value == TOK_ERROR || !inexact)
+        return value;
+    GC_GUARD;
+    gc_protect(&value);
+    return store_inexact(to_double(value));
+}
+
+unsigned prim_inexact_to_exact(unsigned x)
 {
     double d = to_double(x);
 
@@ -122,8 +132,24 @@ static unsigned rational_component(unsigned x, bool numerator, const char *name)
         double d = to_double(x);
         if (isfinite(d) && floor(d) == d)
             return numerator ? store_inexact(d) : store_inexact(1.0);
-        show_error("%s: inexact non-integer", name);
-        return TOK_ERROR;
+        if (!isfinite(d)) {
+            show_error("%s: no rational representation", name);
+            return TOK_ERROR;
+        }
+        // R7RS: convert to exact, take the component, convert back
+        // (e.g. (denominator (inexact 6/4)) => 2.0)
+        GC_GUARD;
+        unsigned exact = prim_inexact_to_exact(x);
+        if (exact == TOK_ERROR)
+            return TOK_ERROR;
+        gc_protect(&exact);
+        unsigned part;
+        if (IS_RATIONAL(exact))
+            part = numerator ? CELL_CAR(exact) : CELL_CDR(exact);
+        else
+            part = numerator ? exact : store(1);
+        gc_protect(&part);
+        return store_inexact(to_double(part));
     }
     default:
         show_error("%s: not a rational", name);
@@ -293,8 +319,6 @@ unsigned apply_numtower_primitive(unsigned prim_id, unsigned argc,
         double ang = to_double(argv[1]);
         double real = mag * cos(ang);
         double imag = mag * sin(ang);
-        if (fabs(imag) < 1e-15)
-            imag = 0.0;
         return make_complex_inexact(real, imag);
     }
     case PREALPART: {
@@ -355,6 +379,9 @@ unsigned apply_numtower_primitive(unsigned prim_id, unsigned argc,
         if (!require_real(argv[0], "rationalize") ||
             !require_real(argv[1], "rationalize"))
             return TOK_ERROR;
+        // R7RS exactness contagion: an inexact argument makes the result
+        // inexact (e.g. (rationalize .3 1/10) => #i1/3)
+        bool inexact_result = !is_exact(argv[0]) || !is_exact(argv[1]);
         // Find simplest rational within epsilon using continued fractions
         double x = to_double(argv[0]);
         double epsilon = fabs(to_double(argv[1]));
@@ -371,17 +398,19 @@ unsigned apply_numtower_primitive(unsigned prim_id, unsigned argc,
         }
         if (x >= 0x1p63) {
             if (negative && x == 0x1p63 && epsilon >= 0.0) {
-                return store(INT64_MIN);
+                return rationalize_result(store(INT64_MIN), inexact_result);
             }
             show_error("rationalize: magnitude too large");
             return TOK_ERROR;
         }
         int64_t n = (int64_t)floor(x);
         if (x - n <= epsilon) {
-            return store(negative ? -n : n);
+            return rationalize_result(store(negative ? -n : n),
+                                      inexact_result);
         }
         if (n + 1 - x <= epsilon) {
-            return store(negative ? -(n + 1) : n + 1);
+            return rationalize_result(store(negative ? -(n + 1) : n + 1),
+                                      inexact_result);
         }
 
         // Continued fraction approximation (Stern-Brocot)
@@ -401,7 +430,8 @@ unsigned apply_numtower_primitive(unsigned prim_id, unsigned argc,
                 // Found it - return as rational
                 if (negative)
                     mid_n = -mid_n;
-                return normalize_rational(mid_n, mid_d);
+                return rationalize_result(normalize_rational(mid_n, mid_d),
+                                          inexact_result);
             }
 
             if (mid < x) {
@@ -416,7 +446,8 @@ unsigned apply_numtower_primitive(unsigned prim_id, unsigned argc,
         // Fallback: return best approximation found
         if (negative)
             mid_n = -mid_n;
-        return normalize_rational(mid_n, mid_d);
+        return rationalize_result(normalize_rational(mid_n, mid_d),
+                                  inexact_result);
     }
     default:
         return TOK_ERROR;

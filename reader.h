@@ -6,6 +6,10 @@
 // Read and return the next token from input
 unsigned read_token(void);
 
+// Parse a decimal literal as an exact number (e.g. "1.5" => 3/2).
+// Sets *handled to false if the string is not a plain decimal literal.
+unsigned read_exact_decimal_number(const char *s, bool *handled);
+
 // Read and parse the next object from input (from stdin)
 unsigned read_obj(void);
 

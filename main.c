@@ -384,8 +384,11 @@ int main(int argc, char **argv)
     bool interactive = isatty(fileno(stdin));
     panic_jmp_set = true;
     if (setjmp(panic_jmp) != 0) {
-        // Recovered from a fatal error - reset and continue
+        // Recovered from a fatal error - reset and continue. The longjmp
+        // skipped every GC_GUARD cleanup, so drop the dangling shadow-stack
+        // roots before running a collection.
         fprintf(stderr, "Returning to REPL...\n");
+        gc_recover_after_panic();
         env = gc(env);
     }
 

@@ -65,15 +65,16 @@ bool handle_lambda(unsigned id, unsigned env, unsigned cont)
         tramp_error();
         return true;
     }
+    gc_protect(&params);
+    gc_protect(&body);
+    gc_protect(&env);
+    gc_protect(&cont);
+    // lambda_params_valid allocates, so locals must be protected first
     if (!lambda_params_valid(params)) {
         show_error("lambda: invalid formals");
         tramp_error();
         return true;
     }
-    gc_protect(&params);
-    gc_protect(&body);
-    gc_protect(&env);
-    gc_protect(&cont);
     unsigned body_env = alloc_cons(body, env);
     unsigned p = make_typed_cell(BT_FUNCTION, params, body_env);
     tramp_apply(p, cont);
@@ -193,6 +194,12 @@ bool handle_define(unsigned id, unsigned env, unsigned cont)
         unsigned name = car(vid);
         unsigned params = cdr(vid);
         unsigned body = cddr(id);
+        gc_protect(&name);
+        gc_protect(&params);
+        gc_protect(&body); // Must protect - used in alloc_cons
+        gc_protect(&env);
+        gc_protect(&cont);
+        // lambda_params_valid allocates, so locals must be protected first
         if (!identifier_valid(name) || !body ||
             !list_length_checked(body, NULL, "define") ||
             !lambda_params_valid(params)) {
@@ -200,11 +207,6 @@ bool handle_define(unsigned id, unsigned env, unsigned cont)
             tramp_error();
             return true;
         }
-        gc_protect(&name);
-        gc_protect(&params);
-        gc_protect(&body); // Must protect - used in alloc_cons
-        gc_protect(&env);
-        gc_protect(&cont);
         unsigned body_env = alloc_cons(body, env);
         unsigned p = make_typed_cell(BT_FUNCTION, params, body_env);
         gc_protect(&p);
@@ -692,6 +694,12 @@ bool handle_define_macro(unsigned id, unsigned env, unsigned cont)
     unsigned name = car(sig);
     unsigned params = cdr(sig);
     unsigned mbody = cddr(id);
+    // Protect all values before lambda_params_valid, which allocates
+    gc_protect(&name);
+    gc_protect(&params);
+    gc_protect(&mbody); // Must protect - used in alloc_cons
+    gc_protect(&env);
+    gc_protect(&cont);
     if (!identifier_valid(name) || !mbody ||
         !list_length_checked(mbody, NULL, "define-macro") ||
         !lambda_params_valid(params)) {
@@ -699,12 +707,6 @@ bool handle_define_macro(unsigned id, unsigned env, unsigned cont)
         tramp_error();
         return true;
     }
-    // Protect all values used after allocations
-    gc_protect(&name);
-    gc_protect(&params);
-    gc_protect(&mbody); // Must protect - used in alloc_cons
-    gc_protect(&env);
-    gc_protect(&cont);
     unsigned mbody_env = alloc_cons(mbody, env);
     unsigned p = make_typed_cell(BT_MACRO, params, mbody_env);
     gc_protect(&p);
@@ -767,13 +769,9 @@ bool handle_let_syntax(unsigned id, unsigned env, unsigned cont)
         tramp_error();
         return true;
     }
+    // If no bindings, use outer env directly (transparent for internal defines)
     if (!bindings) {
-        GC_GUARD;
-        gc_protect(&body);
-        gc_protect(&env);
-        gc_protect(&cont);
-        unsigned new_env = extend_env_empty(env);
-        eval_body(body, new_env, cont);
+        eval_body(body, env, cont);
         return true;
     }
     GC_GUARD;
@@ -804,13 +802,9 @@ bool handle_letrec_syntax(unsigned id, unsigned env, unsigned cont)
         tramp_error();
         return true;
     }
+    // If no bindings, use outer env directly (transparent for internal defines)
     if (!bindings) {
-        GC_GUARD;
-        gc_protect(&body);
-        gc_protect(&env);
-        gc_protect(&cont);
-        unsigned new_env = extend_env_empty(env);
-        eval_body(body, new_env, cont);
+        eval_body(body, env, cont);
         return true;
     }
     GC_GUARD;

@@ -525,31 +525,20 @@ static void compile_ellipsis(unsigned pattern, pattern_compile_ctx *pctx)
     unsigned elem = car(pattern);
     unsigned rest = cddr(pattern);  // Skip the ellipsis symbol
 
-    // Strategy: greedy with backtracking
-    // Loop that tries rest first, on failure matches one element and retries.
+    // Strategy: greedy with backtracking. Consume as many elements as
+    // possible; each iteration leaves a choice point that falls back to
+    // matching rest with the elements consumed so far. R7RS requires the
+    // greedy split: (x ... . r) on (1 2 3) binds x=(1 2 3), r=(), not
+    // x=() r=(1 2 3) as a lazy (rest-first) strategy would produce.
 
-    // Loop start
-    unsigned loop_start = pattern_current_pos(pctx->pattern);
-
-    // Push choice point: if rest fails, jump to elem_path
-    pattern_emit(pctx->pattern, PAT_CHOICE_POINT, 0);  // Placeholder
-    unsigned choice_patch = pattern_current_pos(pctx->pattern) - 1;
-
-    // Try matching rest (success path) — at current depth, so post-ellipsis
-    // trailing patterns are NOT registered as ellipsis-bound variables.
-    compile_pattern_node(rest, pctx);
-    pattern_emit(pctx->pattern, PAT_COMMIT, 0);
-
-    // Jump to success (skip elem path) - placeholder
-    pattern_emit(pctx->pattern, PAT_JUMP, 0);
-    unsigned success_patch = pattern_current_pos(pctx->pattern) - 1;
-
-    // Now increment depth: element vars ARE ellipsis-bound.
+    // Element loop: vars inside are ellipsis-bound at depth+1
     pctx->ellipsis_depth++;
 
-    // Elem path: match one element, accumulate it, consume it, retry
-    unsigned elem_path = pattern_current_pos(pctx->pattern);
-    pattern_patch(pctx->pattern, choice_patch, elem_path);
+    unsigned loop_start = pattern_current_pos(pctx->pattern);
+
+    // Choice point: when consuming another element fails, match rest
+    pattern_emit(pctx->pattern, PAT_CHOICE_POINT, 0); // Placeholder
+    unsigned choice_patch = pattern_current_pos(pctx->pattern) - 1;
 
     // Check that we have more input
     pattern_emit(pctx->pattern, PAT_CHECK_PAIR, 0);
@@ -570,12 +559,18 @@ static void compile_ellipsis(unsigned pattern, pattern_compile_ctx *pctx)
 
     pattern_emit(pctx->pattern, PAT_JUMP, loop_start);
 
-    // Emit depth-based ELLIPSIS_LIST to finalize all vars at this depth
-    unsigned success_pos = pattern_current_pos(pctx->pattern);
-    pattern_emit(pctx->pattern, PAT_ELLIPSIS_LIST, pctx->ellipsis_depth);
+    // Rest path (reached by backtracking out of the loop) — compiled at the
+    // enclosing depth, so post-ellipsis trailing patterns are NOT registered
+    // as ellipsis-bound variables.
+    unsigned rest_path = pattern_current_pos(pctx->pattern);
+    pattern_patch(pctx->pattern, choice_patch, rest_path);
 
-    // Patch success jump to point here (after ELLIPSIS_LIST instruction)
-    pattern_patch(pctx->pattern, success_patch, success_pos);
+    pctx->ellipsis_depth--;
+    compile_pattern_node(rest, pctx);
+    pctx->ellipsis_depth++;
+
+    // Finalize all vars accumulated at this depth
+    pattern_emit(pctx->pattern, PAT_ELLIPSIS_LIST, pctx->ellipsis_depth);
 
     pctx->ellipsis_depth--;
 }
@@ -775,12 +770,14 @@ static void free_match_arrays(pat_match_state *state)
 {
     free(state->input_stack);
     free(state->bindings);
+    free(state->bound);
     free(state->ellipsis_lists);
     free(state->ellipsis_tails);
     free(state->inner_lists);
     free(state->inner_tails);
     state->input_stack = NULL;
     state->bindings = NULL;
+    state->bound = NULL;
     state->ellipsis_lists = NULL;
     state->ellipsis_tails = NULL;
     state->inner_lists = NULL;
@@ -790,11 +787,13 @@ static void free_match_arrays(pat_match_state *state)
 static void free_choice_snapshot(pat_choice_point *cp)
 {
     free(cp->bindings);
+    free(cp->bound);
     free(cp->ellipsis_lists);
     free(cp->ellipsis_tails);
     free(cp->inner_lists);
     free(cp->inner_tails);
     cp->bindings = NULL;
+    cp->bound = NULL;
     cp->ellipsis_lists = NULL;
     cp->ellipsis_tails = NULL;
     cp->inner_lists = NULL;
@@ -823,6 +822,8 @@ static bool init_match_state(pat_match_state *state, compiled_pattern *pat,
     if (pat->var_count > 0) {
         state->bindings =
             checked_calloc_array(pat->var_count, sizeof(unsigned));
+        state->bound =
+            checked_calloc_array(pat->var_count, sizeof(unsigned));
         state->ellipsis_lists =
             checked_calloc_array(pat->var_count, sizeof(unsigned));
         state->ellipsis_tails =
@@ -831,7 +832,7 @@ static bool init_match_state(pat_match_state *state, compiled_pattern *pat,
             checked_calloc_array(pat->var_count, sizeof(unsigned));
         state->inner_tails =
             checked_calloc_array(pat->var_count, sizeof(unsigned));
-        if (!state->bindings || !state->ellipsis_lists ||
+        if (!state->bindings || !state->bound || !state->ellipsis_lists ||
             !state->ellipsis_tails || !state->inner_lists ||
             !state->inner_tails) {
             free_match_arrays(state);
@@ -925,6 +926,7 @@ static void push_choice(pat_match_state *state, unsigned retry_ip)
 
     unsigned n = state->pattern ? state->pattern->var_count : 0;
     cp->bindings = copy_choice_array(state->bindings, n);
+    cp->bound = copy_choice_array(state->bound, n);
     cp->ellipsis_lists = copy_choice_array(state->ellipsis_lists, n);
     cp->ellipsis_tails = copy_choice_array(state->ellipsis_tails, n);
     cp->inner_lists = copy_choice_array(state->inner_lists, n);
@@ -950,12 +952,23 @@ static bool backtrack(pat_match_state *state)
     unsigned n = state->pattern ? state->pattern->var_count : 0;
     if (n) {
         memcpy(state->bindings, cp->bindings, n * sizeof(unsigned));
+        memcpy(state->bound, cp->bound, n * sizeof(unsigned));
         memcpy(state->ellipsis_lists, cp->ellipsis_lists,
                n * sizeof(unsigned));
         memcpy(state->ellipsis_tails, cp->ellipsis_tails,
                n * sizeof(unsigned));
         memcpy(state->inner_lists, cp->inner_lists, n * sizeof(unsigned));
         memcpy(state->inner_tails, cp->inner_tails, n * sizeof(unsigned));
+        // ELLIPSIS_ACCUM appends by mutating the shared tail cells in
+        // place, so restoring the head/tail pointers alone would leave
+        // elements accumulated after this snapshot spliced into the lists.
+        // Sever the restored tails to drop them.
+        for (unsigned i = 0; i < n; i++) {
+            if (IS_PAIR(state->ellipsis_tails[i]))
+                cell_set_cdr(state->ellipsis_tails[i], 0);
+            if (IS_PAIR(state->inner_tails[i]))
+                cell_set_cdr(state->inner_tails[i], 0);
+        }
     }
     free_choice_snapshot(cp);
 
@@ -974,15 +987,6 @@ static unsigned build_bindings_alist(pat_match_state *state)
 
         if (state->pattern->var_slots[i].is_ellipsis) {
             value = state->ellipsis_lists[i];
-            // Convert CELL_ATOM_TRUE sentinels (empty inner ellipsis)
-            // back to nil in the binding list
-            if (state->pattern->var_slots[i].depth >= 2 && value) {
-                // Walk the list and replace #t with ()
-                for (unsigned p = value; p && IS_PAIR(p); p = cdr(p)) {
-                    if (car(p) == CELL_ATOM_TRUE)
-                        cell_set_car(p, 0); // nil = empty list
-                }
-            }
         } else {
             value = state->bindings[i];
         }
@@ -1132,6 +1136,7 @@ unsigned execute_pattern(compiled_pattern *pat, unsigned input)
 
         case PAT_BIND_VAR:
             state.bindings[instr->operand] = state.input;
+            state.bound[instr->operand] = 1;
             break;
 
         case PAT_BIND_UNDERSCORE:
@@ -1165,8 +1170,11 @@ unsigned execute_pattern(compiled_pattern *pat, unsigned input)
             unsigned *tails = (depth <= 1) ? state.ellipsis_tails
                                            : state.inner_tails;
             for (unsigned i = 0; i < pat->var_count; i++) {
+                // The bound flag (not a nonzero binding) decides whether this
+                // iteration produced a value: a variable matching the empty
+                // list binds 0 and must still be accumulated
                 if (pat->var_slots[i].is_ellipsis &&
-                    pat->var_slots[i].depth >= depth && state.bindings[i]) {
+                    pat->var_slots[i].depth >= depth && state.bound[i]) {
                     unsigned val = state.bindings[i];
                     gc_protect(&val);
                     unsigned new_cell = alloc_cons(val, 0);
@@ -1178,6 +1186,9 @@ unsigned execute_pattern(compiled_pattern *pat, unsigned input)
                         lists[i] = new_cell;
                     }
                     tails[i] = new_cell;
+                    // Consume the binding: the next iteration must set it
+                    // again before it is accumulated
+                    state.bound[i] = 0;
                 }
             }
             break;
@@ -1188,16 +1199,14 @@ unsigned execute_pattern(compiled_pattern *pat, unsigned input)
             // operand = depth level being finalized.
             unsigned depth = instr->operand;
             if (depth >= 2) {
-                // Inner ellipsis: finalize inner_lists into bindings
-                // so the outer ACCUM can pick them up.
-                // Use CELL_ATOM_TRUE as sentinel for "matched but empty"
-                // (distinguishes from 0 = "never matched")
+                // Inner ellipsis: finalize inner_lists into bindings so the
+                // outer ACCUM can pick them up. An empty group binds () with
+                // the bound flag set, so no sentinel value is needed.
                 for (unsigned i = 0; i < pat->var_count; i++) {
                     if (pat->var_slots[i].is_ellipsis &&
                         pat->var_slots[i].depth >= depth) {
-                        state.bindings[i] = state.inner_lists[i]
-                            ? state.inner_lists[i]
-                            : CELL_ATOM_TRUE; // sentinel for empty
+                        state.bindings[i] = state.inner_lists[i];
+                        state.bound[i] = 1;
                         state.inner_lists[i] = 0;
                         state.inner_tails[i] = 0;
                     }
@@ -1210,6 +1219,7 @@ unsigned execute_pattern(compiled_pattern *pat, unsigned input)
                     if (pat->var_slots[i].is_ellipsis &&
                         pat->var_slots[i].depth >= 1) {
                         state.bindings[i] = 0;
+                        state.bound[i] = 0;
                     }
                 }
             }
