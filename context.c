@@ -62,114 +62,127 @@ lisp_context ctx = {.hptr = HEAP_RESERVED,
 tramp_state tramp;
 unsigned gensym_counter = 0;
 
+// Registries below track live heap-allocated external objects (vectors,
+// bignums, ports, ...) so a raw pointer stashed in a cell can be validated
+// before use (defends against use-after-free / corrupted cells). They are
+// hash tables keyed by pointer value, not linked lists: with potentially
+// tens of thousands of live objects of a given kind, a linear scan per
+// register/unregister/lookup call - and these run on essentially every
+// vector/bignum/port operation, not just allocation - would make each call
+// O(n), i.e. O(n^2) total for a loop that touches n objects.
 typedef struct ptr_registry_node {
     void *ptr;
+    unsigned len; // unused (0) for registries that don't need a size
     struct ptr_registry_node *next;
 } ptr_registry_node;
 
-typedef struct sized_ptr_registry_node {
-    void *ptr;
-    unsigned len;
-    struct sized_ptr_registry_node *next;
-} sized_ptr_registry_node;
+typedef struct ptr_registry {
+    ptr_registry_node **buckets;
+    size_t bucket_count;
+    size_t count;
+} ptr_registry;
 
-static ptr_registry_node *vm_continuation_registry = NULL;
-static ptr_registry_node *file_port_registry = NULL;
-static ptr_registry_node *string_port_registry = NULL;
-static ptr_registry_node *hash_table_registry = NULL;
-static ptr_registry_node *bignum_registry = NULL;
-static ptr_registry_node *string_registry = NULL;
-static sized_ptr_registry_node *vector_registry = NULL;
-static sized_ptr_registry_node *bytevec_registry = NULL;
+static ptr_registry vm_continuation_registry;
+static ptr_registry file_port_registry;
+static ptr_registry string_port_registry;
+static ptr_registry hash_table_registry;
+static ptr_registry bignum_registry;
+static ptr_registry string_registry;
+static ptr_registry vector_registry;
+static ptr_registry bytevec_registry;
 
 // Error recovery for fatal errors
 jmp_buf panic_jmp;
 bool panic_jmp_set = false;
 
-static void ptr_registry_register(ptr_registry_node **registry, void *ptr,
-                                  const char *malloc_error)
+#define PTR_REGISTRY_INITIAL_BUCKETS 64
+
+static size_t ptr_registry_hash(const void *ptr, size_t bucket_count)
+{
+    // Pointers from malloc are at least a few bits aligned, so shift those
+    // constant low bits out before spreading the rest (Fibonacci hashing).
+    uintptr_t v = (uintptr_t)ptr >> 4;
+    v *= 0x9E3779B97F4A7C15ULL;
+    return (size_t)(v & (bucket_count - 1));
+}
+
+static void ptr_registry_rehash(ptr_registry *registry, size_t new_count)
+{
+    ptr_registry_node **new_buckets =
+        checked_malloc_size(sizeof(ptr_registry_node *) * new_count);
+    LISP_ASSERT_MSG(new_buckets != NULL, "ptr_registry: rehash malloc failed");
+    for (size_t i = 0; i < new_count; i++)
+        new_buckets[i] = NULL;
+    for (size_t i = 0; i < registry->bucket_count; i++) {
+        ptr_registry_node *node = registry->buckets[i];
+        while (node) {
+            ptr_registry_node *next = node->next;
+            size_t idx = ptr_registry_hash(node->ptr, new_count);
+            node->next = new_buckets[idx];
+            new_buckets[idx] = node;
+            node = next;
+        }
+    }
+    free(registry->buckets);
+    registry->buckets = new_buckets;
+    registry->bucket_count = new_count;
+}
+
+static void ptr_registry_register(ptr_registry *registry, void *ptr,
+                                  unsigned len, const char *malloc_error)
 {
     if (!ptr)
         return;
-    for (ptr_registry_node *node = *registry; node; node = node->next) {
-        if (node->ptr == ptr)
-            return;
+    if (registry->buckets) {
+        size_t idx = ptr_registry_hash(ptr, registry->bucket_count);
+        for (ptr_registry_node *node = registry->buckets[idx]; node;
+             node = node->next) {
+            if (node->ptr == ptr)
+                return;
+        }
+    }
+
+    if (!registry->buckets) {
+        ptr_registry_rehash(registry, PTR_REGISTRY_INITIAL_BUCKETS);
+    } else if (registry->count + 1 > registry->bucket_count - registry->bucket_count / 4) {
+        ptr_registry_rehash(registry, registry->bucket_count * 2);
     }
 
     ptr_registry_node *node = checked_malloc_size(sizeof(*node));
     LISP_ASSERT_MSG(node != NULL, malloc_error);
     node->ptr = ptr;
-    node->next = *registry;
-    *registry = node;
+    node->len = len;
+    size_t idx = ptr_registry_hash(ptr, registry->bucket_count);
+    node->next = registry->buckets[idx];
+    registry->buckets[idx] = node;
+    registry->count++;
 }
 
-static void ptr_registry_unregister(ptr_registry_node **registry, void *ptr)
+static void ptr_registry_unregister(ptr_registry *registry, void *ptr)
 {
-    ptr_registry_node **prev = registry;
+    if (!ptr || !registry->buckets)
+        return;
+    size_t idx = ptr_registry_hash(ptr, registry->bucket_count);
+    ptr_registry_node **prev = &registry->buckets[idx];
     while (*prev) {
         ptr_registry_node *node = *prev;
         if (node->ptr == ptr) {
             *prev = node->next;
             free(node);
+            registry->count--;
             return;
         }
         prev = &node->next;
     }
 }
 
-static bool ptr_registry_contains(const ptr_registry_node *registry,
-                                  const void *ptr)
+static const ptr_registry_node *ptr_registry_find(const ptr_registry *registry,
+                                                  const void *ptr)
 {
-    if (!ptr)
-        return false;
-    for (const ptr_registry_node *node = registry; node; node = node->next) {
-        if (node->ptr == ptr)
-            return true;
-    }
-    return false;
-}
-
-static void sized_ptr_registry_register(sized_ptr_registry_node **registry,
-                                        void *ptr, unsigned len,
-                                        const char *malloc_error)
-{
-    if (!ptr)
-        return;
-    for (sized_ptr_registry_node *node = *registry; node; node = node->next) {
-        if (node->ptr == ptr)
-            return;
-    }
-
-    sized_ptr_registry_node *node = checked_malloc_size(sizeof(*node));
-    LISP_ASSERT_MSG(node != NULL, malloc_error);
-    node->ptr = ptr;
-    node->len = len;
-    node->next = *registry;
-    *registry = node;
-}
-
-static void sized_ptr_registry_unregister(sized_ptr_registry_node **registry,
-                                          void *ptr)
-{
-    sized_ptr_registry_node **prev = registry;
-    while (*prev) {
-        sized_ptr_registry_node *node = *prev;
-        if (node->ptr == ptr) {
-            *prev = node->next;
-            free(node);
-            return;
-        }
-        prev = &node->next;
-    }
-}
-
-static const sized_ptr_registry_node *
-sized_ptr_registry_find(const sized_ptr_registry_node *registry,
-                        const void *ptr)
-{
-    if (!ptr)
+    if (!ptr || !registry->buckets)
         return NULL;
-    for (const sized_ptr_registry_node *node = registry; node;
+    size_t idx = ptr_registry_hash(ptr, registry->bucket_count);
+    for (const ptr_registry_node *node = registry->buckets[idx]; node;
          node = node->next) {
         if (node->ptr == ptr)
             return node;
@@ -177,11 +190,17 @@ sized_ptr_registry_find(const sized_ptr_registry_node *registry,
     return NULL;
 }
 
+static bool ptr_registry_contains(const ptr_registry *registry,
+                                  const void *ptr)
+{
+    return ptr_registry_find(registry, ptr) != NULL;
+}
+
 void vm_continuation_register(vm_continuation *cont)
 {
     if (!cont)
         return;
-    ptr_registry_register(&vm_continuation_registry, cont,
+    ptr_registry_register(&vm_continuation_registry, cont, 0,
                           "vm_continuation_register: malloc failed");
 }
 
@@ -192,7 +211,7 @@ void vm_continuation_unregister(vm_continuation *cont)
 
 bool vm_continuation_is_registered(const vm_continuation *cont)
 {
-    return ptr_registry_contains(vm_continuation_registry, cont);
+    return ptr_registry_contains(&vm_continuation_registry, cont);
 }
 
 bool is_vm_continuation_object(unsigned value)
@@ -205,7 +224,7 @@ void file_port_register(file_port *port)
 {
     if (!port)
         return;
-    ptr_registry_register(&file_port_registry, port,
+    ptr_registry_register(&file_port_registry, port, 0,
                           "file_port_register: malloc failed");
 }
 
@@ -216,14 +235,14 @@ void file_port_unregister(file_port *port)
 
 bool file_port_is_registered(const file_port *port)
 {
-    return ptr_registry_contains(file_port_registry, port);
+    return ptr_registry_contains(&file_port_registry, port);
 }
 
 void string_port_register(string_port *port)
 {
     if (!port)
         return;
-    ptr_registry_register(&string_port_registry, port,
+    ptr_registry_register(&string_port_registry, port, 0,
                           "string_port_register: malloc failed");
 }
 
@@ -234,14 +253,14 @@ void string_port_unregister(string_port *port)
 
 bool string_port_is_registered(const string_port *port)
 {
-    return ptr_registry_contains(string_port_registry, port);
+    return ptr_registry_contains(&string_port_registry, port);
 }
 
 void hash_table_register(hash_table_data *table)
 {
     if (!table)
         return;
-    ptr_registry_register(&hash_table_registry, table,
+    ptr_registry_register(&hash_table_registry, table, 0,
                           "hash_table_register: malloc failed");
 }
 
@@ -252,14 +271,14 @@ void hash_table_unregister(hash_table_data *table)
 
 bool hash_table_is_registered(const hash_table_data *table)
 {
-    return ptr_registry_contains(hash_table_registry, table);
+    return ptr_registry_contains(&hash_table_registry, table);
 }
 
 void bignum_register(bignum *bn)
 {
     if (!bn)
         return;
-    ptr_registry_register(&bignum_registry, bn,
+    ptr_registry_register(&bignum_registry, bn, 0,
                           "bignum_register: malloc failed");
 }
 
@@ -270,14 +289,14 @@ void bignum_unregister(bignum *bn)
 
 bool bignum_is_registered(const bignum *bn)
 {
-    return ptr_registry_contains(bignum_registry, bn);
+    return ptr_registry_contains(&bignum_registry, bn);
 }
 
 void string_register(char *string)
 {
     if (!string)
         return;
-    ptr_registry_register(&string_registry, string,
+    ptr_registry_register(&string_registry, string, 0,
                           "string_register: malloc failed");
 }
 
@@ -288,43 +307,43 @@ void string_unregister(char *string)
 
 bool string_is_registered(const char *string)
 {
-    return ptr_registry_contains(string_registry, string);
+    return ptr_registry_contains(&string_registry, string);
 }
 
 void vector_register(vector_data *vector)
 {
     if (!vector)
         return;
-    sized_ptr_registry_register(&vector_registry, vector, vector->len,
-                                "vector_register: malloc failed");
+    ptr_registry_register(&vector_registry, vector, vector->len,
+                          "vector_register: malloc failed");
 }
 
 void vector_unregister(vector_data *vector)
 {
-    sized_ptr_registry_unregister(&vector_registry, vector);
+    ptr_registry_unregister(&vector_registry, vector);
 }
 
 bool vector_is_registered(const vector_data *vector)
 {
-    return sized_ptr_registry_find(vector_registry, vector) != NULL;
+    return ptr_registry_find(&vector_registry, vector) != NULL;
 }
 
 void bytevec_register(bytevec_data *bytevec)
 {
     if (!bytevec)
         return;
-    sized_ptr_registry_register(&bytevec_registry, bytevec, bytevec->len,
-                                "bytevec_register: malloc failed");
+    ptr_registry_register(&bytevec_registry, bytevec, bytevec->len,
+                          "bytevec_register: malloc failed");
 }
 
 void bytevec_unregister(bytevec_data *bytevec)
 {
-    sized_ptr_registry_unregister(&bytevec_registry, bytevec);
+    ptr_registry_unregister(&bytevec_registry, bytevec);
 }
 
 bool bytevec_is_registered(const bytevec_data *bytevec)
 {
-    return sized_ptr_registry_find(bytevec_registry, bytevec) != NULL;
+    return ptr_registry_find(&bytevec_registry, bytevec) != NULL;
 }
 
 void init_heap(void)
@@ -1291,8 +1310,7 @@ bool atom_is_valid(unsigned atom)
 
 bool vector_data_well_formed(const vector_data *vd)
 {
-    const sized_ptr_registry_node *node =
-        sized_ptr_registry_find(vector_registry, vd);
+    const ptr_registry_node *node = ptr_registry_find(&vector_registry, vd);
     if (!node)
         return false;
     return node->len == vd->len &&
@@ -1302,8 +1320,7 @@ bool vector_data_well_formed(const vector_data *vd)
 
 bool bytevec_data_well_formed(const bytevec_data *bv)
 {
-    const sized_ptr_registry_node *node =
-        sized_ptr_registry_find(bytevec_registry, bv);
+    const ptr_registry_node *node = ptr_registry_find(&bytevec_registry, bv);
     if (!node)
         return false;
     return node->len == bv->len &&

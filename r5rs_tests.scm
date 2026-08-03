@@ -670,6 +670,14 @@
       v))
 (test "force simple" 3 (force (delay (+ 1 2))))
 (test "force memoized" '(3 3) (let ((p (delay (+ 1 2)))) (list (force p) (force p))))
+;; force used to recurse through a delay-force chain (one C/interpreter
+;; stack frame per link), so a long chain of delay-forced promises - the
+;; standard lazy-stream idiom - could overflow the stack. force is now
+;; iterative, so this must complete in constant stack space per R7RS 4.2.5.
+(define (%delay-force-chain n)
+  (delay-force (if (= n 0) (delay 'done) (%delay-force-chain (- n 1)))))
+(test "delay-force chain runs in constant stack space" 'done
+    (force (%delay-force-chain 100000)))
 
 (test-section "Hygiene edge cases")
 (test "else as binding" 'ok (let ((else 1)) (cond (else 'ok) (#t 'bad))))

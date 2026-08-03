@@ -636,18 +636,23 @@
 (define (force promise)
   (if (not (promise? promise))
       (error "force: not a promise")
-      (if (vector-ref promise 1)
-          (vector-ref promise 2)
-          (let ((result ((vector-ref promise 2))))
-            (if (promise? result)
-                (let ((value (force result)))
-                  (vector-set! promise 1 #t)
-                  (vector-set! promise 2 value)
-                  value)
-                (begin
-                  (vector-set! promise 1 #t)
-                  (vector-set! promise 2 result)
-                  result))))))
+      ; Iterative, not recursive: a chain of delay-force promises (the
+      ; standard lazy-stream idiom) must force in constant stack space per
+      ; R7RS 4.2.5. Recursing via (force result) here would grow the stack
+      ; by one frame per link in the chain.
+      (let loop ((p promise))
+        (if (vector-ref p 1)
+            (vector-ref p 2)
+            (let ((result ((vector-ref p 2))))
+              (if (promise? result)
+                  (begin
+                    (vector-set! p 1 (vector-ref result 1))
+                    (vector-set! p 2 (vector-ref result 2))
+                    (loop p))
+                  (begin
+                    (vector-set! p 1 #t)
+                    (vector-set! p 2 result)
+                    result)))))))
 
 (define-syntax delay-force
   (syntax-rules ()

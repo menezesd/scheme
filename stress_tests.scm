@@ -99,7 +99,12 @@
 
 (test "binary tree depth 15" 32768 (count-leaves (make-tree 15)))
 
-;; Vector allocation stress
+;; Vector allocation stress. The vector registry used to be a linked list
+;; scanned linearly on every register/unregister/lookup (allocation AND
+;; every vector-ref/vector-set! well-formedness check), making a loop that
+;; touches n vectors cost O(n^2) overall - at this n, the difference is
+;; ~0.2s (hash table) vs. ~20s (linear scan), so a regression here should
+;; show up immediately as the test suite slowing down.
 (define (vector-alloc-stress n)
   (let loop ((i n) (acc 0))
     (if (= i 0)
@@ -108,6 +113,7 @@
           (loop (- i 1) (+ acc (vector-ref v 25)))))))
 
 (test "vector allocation 2000" 2001000 (vector-alloc-stress 2000))
+(test "vector allocation 100000" 5000050000 (vector-alloc-stress 100000))
 
 ;; String allocation stress
 (define (string-alloc-stress n)
