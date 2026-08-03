@@ -115,6 +115,13 @@
 (test "vector allocation 2000" 2001000 (vector-alloc-stress 2000))
 (test "vector allocation 100000" 5000050000 (vector-alloc-stress 100000))
 
+;; string-pad-left/right built their padding via one string-append per
+;; character (repeat-string), which is O(width^2) - at this width the
+;; difference is near-instant vs. multiple seconds, so a regression here
+;; should show up as the test suite noticeably slowing down.
+(test "string-pad-left large width" 500000 (string-length (string-pad-left "x" 500000)))
+(test "string-pad-right large width" 500000 (string-length (string-pad-right "x" 500000)))
+
 ;; String allocation stress
 (define (string-alloc-stress n)
   (let loop ((i n) (acc ""))

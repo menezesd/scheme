@@ -1017,6 +1017,78 @@
               (lambda () (churn 500000 '()) (values 1 2))
               +))))
 
+(test-section "let-values/let*-values/define-values formals")
+;; A multi-value <formals> is the same grammar as a lambda parameter list:
+;; (var ...), a bare identifier collecting all values as a list, or a
+;; dotted (var ... . rest). These used to only accept (var ...).
+(test "let-values proper list formals" 6
+    (let-values (((a b c) (values 1 2 3))) (+ a b c)))
+(test "let-values bare identifier formals" '(1 2 3)
+    (let-values ((all (values 1 2 3))) all))
+(test "let-values dotted formals" '(1 2 (3 4))
+    (let-values (((a b . rest) (values 1 2 3 4))) (list a b rest)))
+(test "let*-values bare identifier formals" '((1 2) 1)
+    (let*-values ((all (values 1 2)) ((x) (values (car all)))) (list all x)))
+(test "let*-values dotted formals" '(1 (2 3))
+    (let*-values (((a . rest) (values 1 2 3))) (list a rest)))
+(test "define-values proper list formals" '(1 2)
+    (let ()
+      (define-values (a b) (values 1 2))
+      (list a b)))
+(test "define-values bare identifier formals" '(5 6 7)
+    (let ()
+      (define-values all (values 5 6 7))
+      all))
+(test "define-values dotted formals" '(1 2 (3 4))
+    (let ()
+      (define-values (a b . rest) (values 1 2 3 4))
+      (list a b rest)))
+
+(test-section "parameterize converter semantics")
+;; parameterize must apply the converter when installing a new value, but
+;; restore the dynamic extent's original value as-is on exit - that value
+;; is already-converted, so reapplying the converter would apply it twice
+;; for any converter that isn't idempotent (R7RS 4.2.6).
+(test "parameterize restores without reconverting" 11
+    (let ((p (make-parameter 10 (lambda (x) (+ x 1)))))
+      (parameterize ((p 20)) (p))
+      (p)))
+(test "parameterize converts the new value while active" 21
+    (let ((p (make-parameter 10 (lambda (x) (+ x 1)))))
+      (parameterize ((p 20)) (p))))
+(test "parameterize nesting restores each level without reconverting" '(31 21 11)
+    (let ((p (make-parameter 10 (lambda (x) (+ x 1)))) (log '()))
+      (parameterize ((p 20))
+        (parameterize ((p 30))
+          (set! log (cons (p) log)))
+        (set! log (cons (p) log)))
+      (set! log (cons (p) log))
+      (reverse log)))
+
+(test-section "Bytevector ports: peek-u8/u8-ready?")
+;; peek-u8/u8-ready? are C primitives that only understand real ports;
+;; they used to error ("argument must be input port") on the vector-based
+;; bytevector input ports that read-u8/read-bytevector already support.
+(test "peek-u8 on bytevector port does not consume" '(1 1)
+    (let ((p (open-input-bytevector (bytevector 1 2 3))))
+      (list (peek-u8 p) (peek-u8 p))))
+(test "peek-u8 then read-u8 on bytevector port" '(1 1 2)
+    (let ((p (open-input-bytevector (bytevector 1 2 3))))
+      (list (peek-u8 p) (read-u8 p) (read-u8 p))))
+(test "peek-u8 at end of bytevector port is eof" #t
+    (let ((p (open-input-bytevector (bytevector 1))))
+      (read-u8 p)
+      (eof-object? (peek-u8 p))))
+(test "u8-ready? on open bytevector port" #t
+    (u8-ready? (open-input-bytevector (bytevector 1 2 3))))
+(test "u8-ready? on exhausted bytevector port" #t
+    (let ((p (open-input-bytevector (bytevector 1))))
+      (read-u8 p)
+      (u8-ready? p)))
+(test "peek-u8/u8-ready? still work on ordinary ports" '(97 #t)
+    (let ((p (open-input-string "abc")))
+      (list (peek-u8 p) (u8-ready? p))))
+
 (test-section "SRFI-1/R7RS-large stdlib procedures")
 (test "hash-table-update! calls the default as a thunk" 11
     (let ((h (make-strong-eqv-hash-table)))

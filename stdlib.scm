@@ -175,6 +175,35 @@
         (else
          (prim-read-bytevector k port)))))))
 
+;; peek-u8/u8-ready? are C primitives that only understand real ports;
+;; wrap them the same way read-u8/read-bytevector are wrapped above so
+;; they also accept the vector-based bytevector input ports.
+(let ((primitive-peek-u8 peek-u8)
+      (primitive-u8-ready? u8-ready?))
+  (set! peek-u8
+    (lambda opt-port
+      (let ((port (if (pair? opt-port) (car opt-port) (current-input-port))))
+        (cond
+          ((bytevector-input-port-open? port)
+           (let* ((bv (vector-ref port 1))
+                  (pos (vector-ref port 2)))
+             (if (>= pos (bytevector-length bv))
+                 (eof-object)
+                 (bytevector-u8-ref bv pos))))
+          ((bytevector-input-port? port)
+           (error "peek-u8: port is closed"))
+          (else
+           (apply primitive-peek-u8 opt-port))))))
+  (set! u8-ready?
+    (lambda opt-port
+      (let ((port (if (pair? opt-port) (car opt-port) (current-input-port))))
+        (cond
+          ((bytevector-input-port-open? port) #t)
+          ((bytevector-input-port? port)
+           (error "u8-ready?: port is closed"))
+          (else
+           (apply primitive-u8-ready? opt-port)))))))
+
 (let ((primitive-input-port? input-port?)
       (primitive-output-port? output-port?)
       (primitive-input-port-open? input-port-open?)
@@ -1505,6 +1534,15 @@
 ;;; SRFI-39/R7RS parameters
 ;;; ============================================================================
 
+;; Private sentinel: a second argument eq? to this tells the parameter
+;; procedure to store its first argument as-is, bypassing the converter.
+;; parameterize uses this to restore the old value on exit - that value is
+;; already-converted (it came from a previous call to the parameter), so
+;; running it through the converter again would apply it twice and corrupt
+;; state for any converter that isn't idempotent (R7RS 4.2.6: the dynamic
+;; extent's original value is restored, not reconverted).
+(define %parameter-raw-set-tag (list 'parameter-raw-set))
+
 (define (make-parameter init . maybe-converter)
   (let ((converter (if (null? maybe-converter)
                        (lambda (x) x)
@@ -1516,6 +1554,8 @@
              (vector-ref cell 1))
             ((null? (cdr args))
              (vector-set! cell 1 (converter (car args))))
+            ((and (null? (cddr args)) (eq? (cadr args) %parameter-raw-set-tag))
+             (vector-set! cell 1 (car args)))
             (else
              (error "parameter: expected zero or one argument"))))))
 
@@ -1530,7 +1570,7 @@
          (dynamic-wind
           (lambda () (p new-value))
           (lambda () (parameterize (rest ...) body ...))
-          (lambda () (p old-value))))))))
+          (lambda () (p old-value %parameter-raw-set-tag))))))))
 
 ;;; ============================================================================
 ;;; SRFI-9: Defining Record Types
@@ -2084,47 +2124,62 @@
 ;;; R7RS multiple-value binding forms
 ;;; ============================================================================
 
-(define-syntax define-values
+;; A multi-value <formals> is the same grammar as a lambda's parameter list:
+;; (var ...), a bare identifier (collects all values as a list), or a
+;; dotted (var ... . rest). %define-values-declare!/define-values-set!
+;; recurse on it the same way a variadic lambda would - matching (var . more)
+;; first (a pair, whether the overall shape is proper or dotted) and falling
+;; back to a bare identifier only once that no longer matches.
+(define-syntax %define-values-declare!
   (syntax-rules ()
-    ((define-values (var ...) expression)
-     (begin
-       (define var #f) ...
-       (let ((vals (call-with-values (lambda () expression) list)))
-         (define-values-set! (var ...) vals))))))
+    ((%define-values-declare! ()) (if #f #f))
+    ((%define-values-declare! (var . more))
+     (begin (define var #f) (%define-values-declare! more)))
+    ((%define-values-declare! var) (define var #f))))
 
 (define-syntax define-values-set!
   (syntax-rules ()
     ((define-values-set! () vals)
      (if #f #f))
-    ((define-values-set! (var rest ...) vals)
+    ((define-values-set! (var . more) vals)
      (begin
        (set! var (car vals))
-       (define-values-set! (rest ...) (cdr vals))))))
+       (define-values-set! more (cdr vals))))
+    ((define-values-set! var vals)
+     (set! var vals))))
+
+(define-syntax define-values
+  (syntax-rules ()
+    ((define-values formals expression)
+     (begin
+       (%define-values-declare! formals)
+       (let ((vals (call-with-values (lambda () expression) list)))
+         (define-values-set! formals vals))))))
 
 (define-syntax let-values-bind
   (syntax-rules ()
     ((let-values-bind () body ...)
      (let () body ...))
-    ((let-values-bind ((vals (var ...)) rest ...) body ...)
+    ((let-values-bind ((vals formals) rest ...) body ...)
      (call-with-values
        (lambda () (apply values vals))
-       (lambda (var ...)
+       (lambda formals
          (let-values-bind (rest ...) body ...))))))
 
 (define-syntax let-values
   (syntax-rules ()
-    ((let-values (((var ...) expression) ...) body ...)
+    ((let-values ((formals expression) ...) body ...)
      (let ((vals (call-with-values (lambda () expression) list)) ...)
-       (let-values-bind ((vals (var ...)) ...) body ...)))))
+       (let-values-bind ((vals formals) ...) body ...)))))
 
 (define-syntax let*-values
   (syntax-rules ()
     ((let*-values () body ...)
      (let () body ...))
-    ((let*-values (((var ...) expression) rest ...) body ...)
+    ((let*-values ((formals expression) rest ...) body ...)
      (call-with-values
        (lambda () expression)
-       (lambda (var ...)
+       (lambda formals
          (let*-values (rest ...) body ...))))))
 
 ;;; ============================================================================
@@ -2438,11 +2493,21 @@
             (else
              (loop (+ i 1) start parts))))))))
 
+;; Repeats via one string-append per remaining copy, each on a string that
+;; has grown by one more `piece`, is O(count^2 * (string-length piece))
+;; overall - noticeable once count reaches the tens of thousands (e.g.
+;; string-pad-left/right on a large target width). Halving instead gives
+;; O(log count) appends, each on progressively doubling strings, for
+;; O(count * (string-length piece)) total work.
 (define (repeat-string piece count)
-  (let loop ((n count) (out ""))
-    (if (<= n 0)
-        out
-        (loop (- n 1) (string-append out piece)))))
+  (cond
+    ((<= count 0) "")
+    ((= count 1) piece)
+    (else
+     (let ((half (repeat-string piece (quotient count 2))))
+       (if (even? count)
+           (string-append half half)
+           (string-append half half piece))))))
 
 (define (string-padder . args)
   (let ((where (keyword-arg args 'where 'leading))
