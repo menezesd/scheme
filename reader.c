@@ -1597,19 +1597,13 @@ unsigned read_token(void)
         if (c == ';') {
             while ((c = reader_getchar()) != '\n' && c != EOF)
                 ;
-            if (c == EOF) {
-                if (reader_port == NULL && reader_obj_depth <= 1)
-                    exit(0);
+            if (c == EOF)
                 return TOK_EOF;
-            }
             continue;
         }
 
-        if (c == EOF) {
-            if (reader_port == NULL && reader_obj_depth <= 1)
-                exit(0);
+        if (c == EOF)
             return TOK_EOF;
-        }
 
         switch (c) {
         case '(':

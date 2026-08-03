@@ -392,6 +392,13 @@ int main(int argc, char **argv)
         env = gc(env);
     }
 
+    // Piped/non-interactive input behaves like running a script: report
+    // failure via the exit code if any top-level form errored, matching
+    // the file-argument path below. An interactive session keeps exiting
+    // 0 on EOF regardless (matching common REPL convention - the user has
+    // already seen and moved past any earlier error).
+    bool had_error = false;
+
     for (;;) {
         if (interactive) {
             printf("]=> ");
@@ -403,16 +410,23 @@ int main(int argc, char **argv)
         unsigned expr = read_obj();
         if (is_eof_object(expr))
             break;
-        if (expr == TOK_ERROR)
+        if (expr == TOK_ERROR) {
+            had_error = true;
             continue;
+        }
         if (expr == TOK_CLOSE || expr == TOK_DOT) {
             show_error("unexpected reader token at top level");
+            had_error = true;
             continue;
         }
         unsigned x = eval_expr(expr, env);
+        if (x == TOK_ERROR)
+            had_error = true;
         printf("\n;Value: ");
         write_obj(x);
         puts("");
         env = gc(env);
     }
+
+    return (!interactive && had_error) ? 1 : 0;
 }

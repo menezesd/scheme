@@ -31,7 +31,7 @@ UBSAN_OBJS = $(SRCS:.c=.ubsan.o)
 UBSAN_CFLAGS = $(DEBUG_CFLAGS) -fsanitize=undefined
 UBSAN_LDFLAGS = $(LDFLAGS) -fsanitize=undefined
 
-.PHONY: all clean distclean debug sanitize ubsan test test-interpreter test-c test-prop test-r5rs test-stress test-sanitize test-ubsan test-all unicode-tables
+.PHONY: all clean distclean debug sanitize ubsan test test-interpreter test-c test-prop test-r5rs test-stress test-sanitize test-ubsan test-repl-exit test-all unicode-tables
 
 all: $(TARGET)
 
@@ -220,9 +220,20 @@ test-ubsan: ubsan test_bignum_ubsan
 	@python3 tools/run_sanitize_smoke.py ./$(UBSAN_TARGET)
 	@./test_bignum_ubsan
 
+# Piped/non-interactive REPL input should report failure via the exit code
+# when a top-level form errors, just like the file-argument path does.
+test-repl-exit: $(TARGET)
+	@for mode in "" "--interpreter"; do \
+		echo '(car (quote ()))' | ./$(TARGET) $$mode >/dev/null 2>&1; \
+		[ $$? -eq 1 ] || { echo "FAIL: piped error should exit 1 (mode=$$mode)"; exit 1; }; \
+		echo '(+ 1 2)' | ./$(TARGET) $$mode >/dev/null 2>&1; \
+		[ $$? -eq 0 ] || { echo "FAIL: piped success should exit 0 (mode=$$mode)"; exit 1; }; \
+	done
+	@echo "PASS: REPL exit code reflects piped errors"
+
 # Run all tests, including the UBSan-only smoke path that works on macOS
 # systems where ASan can hang before main.
-test-all: test test-interpreter test-c test-prop test-r5rs test-stress test-ubsan
+test-all: test test-interpreter test-c test-prop test-r5rs test-stress test-ubsan test-repl-exit
 
 clean:
 	rm -f $(OBJS) $(DEBUG_OBJS) $(SAN_OBJS) $(UBSAN_OBJS) $(TARGET) \

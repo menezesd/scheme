@@ -945,6 +945,25 @@
                  n)))
       (list (counter-maker) (counter-maker))))
 
+(test-section "letrec with 3+ bindings")
+;; The CPS interpreter's letrec-init continuation used to silently swap
+;; bindings whenever 3+ were in scope (a saved-value list built most-
+;; recent-first was replayed as if it were oldest-first). The bytecode VM
+;; was never affected; these check the interpreter matches it.
+(test "three sequential bindings stay in order" '(1 2 3)
+    (letrec* ((a 1) (b 2) (d (+ a b))) (list a b d)))
+(test "four sequential bindings stay in order" '(1 2 3 6)
+    (letrec* ((a 1) (b 2) (c 3) (d (+ a b c))) (list a b c d)))
+(test "ten sequential bindings stay in order" '(0 1 2 3 4 5 6 7 8 9 45)
+    (letrec* ((v0 0) (v1 1) (v2 2) (v3 3) (v4 4) (v5 5) (v6 6) (v7 7)
+              (v8 8) (v9 9) (s (+ v0 v1 v2 v3 v4 v5 v6 v7 v8 v9)))
+      (list v0 v1 v2 v3 v4 v5 v6 v7 v8 v9 s)))
+(test "mutual recursion across 3 letrec-bound procedures" '(f-done g-done h-done)
+    (letrec ((f (lambda (n) (if (= n 0) 'f-done (g (- n 1)))))
+             (g (lambda (n) (if (= n 0) 'g-done (h (- n 1)))))
+             (h (lambda (n) (if (= n 0) 'h-done (f (- n 1))))))
+      (list (f 0) (g 0) (h 0))))
+
 (test-section "call-with-values continuations")
 (test "continuation escapes and resumes call-with-values" 5
     (let ((k #f))

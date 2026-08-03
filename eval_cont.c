@@ -349,7 +349,9 @@ void handle_cont_letrec_init(unsigned val, unsigned data, unsigned env,
                              unsigned next)
 {
     // Data structure: (bindings . (vals_ptr . (all_vals . (saved . body))))
-    // saved = list of saved car values for cells from all_vals to vals_ptr
+    // saved = list of saved car values for cells from all_vals to vals_ptr,
+    // stored MOST-RECENT-FIRST (each step prepends the value it just
+    // computed - see "Build new saved list" below).
     unsigned bindings = car(data);
     unsigned inner = cdr(data);
     unsigned vals_ptr = car(inner);
@@ -359,12 +361,38 @@ void handle_cont_letrec_init(unsigned val, unsigned data, unsigned env,
     unsigned saved = car(inner3);
     unsigned body = cdr(inner3);
 
-    // Restore all values from the saved state (for reinvoked continuations)
-    // This resets any modifications made by set! after initialization
-    unsigned v = all_vals;
-    unsigned s = saved;
-    for (; v && v != vals_ptr && s; v = cdr(v), s = cdr(s)) {
-        cell_set_car(v, car(s));
+    // Restore all values from the saved state (for reinvoked continuations).
+    // This resets any modifications made by set! after initialization.
+    // `saved` is most-recent-first but `all_vals` walks oldest-first, so a
+    // straight parallel walk pairs each cell with the WRONG saved value
+    // once there are 2+ prior entries (3+ letrec bindings) - silently
+    // swapping bindings on every ordinary (non-reentrant) pass, since this
+    // restore runs unconditionally on every step. Reverse a copy of
+    // `saved` first so the two walk in the same order.
+    if (saved) {
+        GC_GUARD;
+        gc_protect(&val);
+        gc_protect(&bindings);
+        gc_protect(&vals_ptr);
+        gc_protect(&all_vals);
+        gc_protect(&saved);
+        gc_protect(&body);
+        gc_protect(&env);
+        gc_protect(&next);
+        unsigned saved_forward = 0;
+        gc_protect(&saved_forward);
+        // The walk cursor must be protected too (not just its head `saved`)
+        // so its current cell is updated if alloc_cons triggers a GC.
+        unsigned s = saved;
+        gc_protect(&s);
+        for (; s; s = cdr(s))
+            saved_forward = alloc_cons(car(s), saved_forward);
+
+        unsigned v = all_vals;
+        unsigned sf = saved_forward;
+        for (; v && v != vals_ptr && sf; v = cdr(v), sf = cdr(sf)) {
+            cell_set_car(v, car(sf));
+        }
     }
 
     // Store the new value
