@@ -475,6 +475,38 @@ unsigned qq_transform_cps(unsigned x, unsigned env)
     return qq_transform(x, env, 1);
 }
 
+// Route a C-level error through the Scheme exception system (CPS mirror of
+// vm_signal_error): build an error object and apply the current
+// *current-exception-handler* with a CONT_ERR_RETURN continuation. A handler
+// that jumps to a continuation (guard, call/cc) replaces this continuation
+// via its captured frame chain; one that returns normally lands in
+// handle_cont_err_return and terminates (R7RS raise semantics).
+static void cps_signal_error(const char *msg, unsigned env, unsigned cont)
+{
+    if (!msg)
+        msg = "unknown error";
+    unsigned handler = lookup_silent(intern("*current-exception-handler*"),
+                                     env);
+    if (handler == TOK_ERROR) {
+        tramp_error();
+        return;
+    }
+    GC_GUARD;
+    gc_protect(&handler);
+    gc_protect(&env);
+    gc_protect(&cont);
+    unsigned error_obj = make_error_object_c(msg, env);
+    if (error_obj == TOK_ERROR) {
+        tramp_error();
+        return;
+    }
+    gc_protect(&error_obj);
+    unsigned args = alloc_cons(error_obj, 0);
+    gc_protect(&args);
+    unsigned err_cont = make_cont(CONT_ERR_RETURN, handler, env, cont);
+    apply_function(handler, args, env, err_cont);
+}
+
 // ============================================================================
 // CPS Evaluator - Eval Step
 // ============================================================================
@@ -527,7 +559,9 @@ static void eval_step(void)
         eval_reset_macro_expansion_depth();
         unsigned val = lookup(CELL_ID(id), env);
         if (val == TOK_ERROR) {
-            tramp_error();
+            cps_signal_error(ctx.last_error[0] ? ctx.last_error
+                                               : "undefined variable",
+                             env, cont);
             return;
         }
         tramp_apply(val, cont);
@@ -700,6 +734,36 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
             return;
         }
 
+        // Special handling for raise - CPS mirror of vm_handle_raise: pass the
+        // object to the current handler with a CONT_ERR_RETURN continuation
+        // whose data records the dispatched handler, so handle_cont_err_return
+        // can tell the default handler (silent unhandled) from a user handler
+        // (R7RS violation). Cannot go through apply_primitive - raising is
+        // engine machinery, not a pure primitive.
+        if (prim_id == PRAISENOW) {
+            if (!args || cdr(args)) {
+                show_error("raise expects exactly one argument");
+                tramp_error();
+                return;
+            }
+            unsigned obj = car(args);
+            unsigned handler = lookup_silent(
+                intern("*current-exception-handler*"), env);
+            if (handler == TOK_ERROR) {
+                tramp_error();
+                return;
+            }
+            GC_GUARD;
+            gc_protect(&handler);
+            gc_protect(&obj);
+            gc_protect(&env);
+            gc_protect(&cont);
+            unsigned err_cont = make_cont(CONT_ERR_RETURN, handler, env, cont);
+            unsigned raise_args = alloc_cons(obj, 0);
+            apply_function(handler, raise_args, env, err_cont);
+            return;
+        }
+
         // Special handling for eval
         if (prim_id == PEVAL) {
             if (!args || !cdr(args) || cddr(args)) {
@@ -841,7 +905,9 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
             gc_protect(&cont);
             unsigned result = apply_primitive(prim_id, args);
             if (result == TOK_ERROR) {
-                tramp_error();
+                cps_signal_error(ctx.last_error[0] ? ctx.last_error
+                                                   : "primitive error",
+                                 env, cont);
                 return;
             }
             tramp_apply(result, cont);

@@ -29,6 +29,7 @@ static int eval_depth = 0;
 // Evaluate expression (interpreter or bytecode depending on mode)
 static unsigned eval_expr(unsigned expr, unsigned env)
 {
+    unsigned result;
     if (use_bytecode) {
         code_object *code = compile_toplevel(expr, env);
         if (!code) {
@@ -38,7 +39,7 @@ static unsigned eval_expr(unsigned expr, unsigned env)
         vm_state vm;
         vm_init(&vm);
         eval_depth++;
-        unsigned result = vm_run(&vm, code, env);
+        result = vm_run(&vm, code, env);
         eval_depth--;
         vm_free(&vm);
         // Only sweep unreachable code objects at top level
@@ -47,10 +48,26 @@ static unsigned eval_expr(unsigned expr, unsigned env)
             gc_sweep_code_objects();
             gc_sweep_patterns();
         }
-        return result;
     } else {
-        return eval_obj(expr, env);
+        eval_depth++;
+        result = eval_obj(expr, env);
+        eval_depth--;
     }
+    // Error boundary: a non-local exit that escaped every Scheme handler
+    // (e.g. the OP_ERROR_RETURN marker terminal) may have torn exception
+    // state - a stale with-exception-handler wrapper left as the current
+    // handler, leftover *wind-stack* frames. Restore the baseline at the
+    // top level so the next REPL expression starts clean; nested eval
+    // (load/eval callbacks) must not reset while an outer guard could
+    // still catch the error.
+    if (result == TOK_ERROR && eval_depth == 0) {
+        unsigned dflt = lookup_silent(intern("*default-exception-handler*"),
+                                      env);
+        if (dflt != TOK_ERROR)
+            setvar(intern("*current-exception-handler*"), dflt, env);
+        setvar(intern("*wind-stack*"), 0, env);
+    }
+    return result;
 }
 
 // Load and evaluate expressions from a port

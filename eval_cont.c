@@ -225,29 +225,44 @@ static void handle_cont_cond_arrow(unsigned val, unsigned data, unsigned env,
 
 /**
  * CONT_LET_VALS: Accumulate let binding values.
- * data = (vars . (vals . (remaining-bindings . body)))
- * Stores val in vals list, then evaluates next binding or body.
+ * data = (vars . (vals_ptr . (rest_bindings . (vals . body))))
+ * vars/vals are the complete, fixed-length lists for ALL bindings,
+ * pre-allocated once by handle_let (mirroring handle_letrec's approach).
+ * vals_ptr points at the specific, already-existing cell for the binding
+ * whose result we're receiving; each step only ever writes that one
+ * cell's car and passes an ADVANCED COPY of the pointer to the next
+ * step - it never restructures the vars/vals lists themselves.
+ *
+ * This matters for multi-shot call/cc: the previous implementation grew a
+ * shared vars/vals list in place via cell_set_cdr as each binding's value
+ * arrived. Since a continuation captured mid-let holds a direct reference
+ * to that same list, reinvoking an EARLIER step's continuation (e.g. after
+ * later steps had already run once and grown the list) made
+ * list_last(vals) resolve to a cell claimed by a later binding, so the
+ * write landed on the wrong slot and the list kept growing with duplicate
+ * entries on every reinvocation. Writing through a per-step vals_ptr
+ * captured by value sidesteps this entirely: reinvoking any step's
+ * continuation always targets exactly the cell it originally captured.
  */
 void handle_cont_let_vals(unsigned val, unsigned data, unsigned env,
                           unsigned next)
 {
     unsigned vars = car(data);
-    unsigned vals = cadr(data);
-    unsigned rest_and_body = cddr(data);
-    unsigned rest_bindings = car(rest_and_body);
-    unsigned body = cdr(rest_and_body);
+    unsigned rest1 = cdr(data);
+    unsigned vals_ptr = car(rest1);
+    unsigned rest2 = cdr(rest1);
+    unsigned rest_bindings = car(rest2);
+    unsigned rest3 = cdr(rest2);
+    unsigned vals = car(rest3);
+    unsigned body = cdr(rest3);
 
-    unsigned v = list_last(vals);
-    if (!v) {
-        show_error("internal error: empty vals in let continuation");
-        tramp_error();
-        return;
-    }
-    cell_set_car(v, val);
+    cell_set_car(vals_ptr, val);
 
     if (!rest_bindings) {
-        // Protect body and next across extend_env which allocates
+        // Protect vars, vals, body and next across extend_env which allocates
         GC_GUARD;
+        gc_protect(&vars);
+        gc_protect(&vals);
         gc_protect(&body);
         gc_protect(&next);
         unsigned new_env = extend_env(vars, vals, env);
@@ -255,37 +270,30 @@ void handle_cont_let_vals(unsigned val, unsigned data, unsigned env,
     } else {
         GC_GUARD;
         unsigned bind = car(rest_bindings);
-        unsigned new_vars = vars;
-        unsigned new_vals = vals;
 
         // Protect everything before any allocations (including next)
-        gc_protect(&new_vars);
-        gc_protect(&new_vals);
+        gc_protect(&vars);
+        gc_protect(&vals);
         gc_protect(&bind);
-        gc_protect(&v);
+        gc_protect(&vals_ptr);
         gc_protect(&rest_bindings);
         gc_protect(&body);
         gc_protect(&env);
         gc_protect(&next);
-        unsigned vt = 0;
-        gc_protect(&vt);
 
-        vt = list_last(new_vars);
-        unsigned new_vc = alloc_cons(car(bind), 0);
-        cell_set_cdr(vt, new_vc);
-
-        // v is already list_last(vals), which equals list_last(new_vals)
-        unsigned new_valc = alloc_cons(0, 0);
-        cell_set_cdr(v, new_valc);
-
+        unsigned next_vals_ptr = cdr(vals_ptr);
+        gc_protect(&next_vals_ptr);
         unsigned next_val_expr = cadr(bind);
         gc_protect(&next_val_expr);
-        unsigned inner = 0, middle = 0;
-        gc_protect(&inner);
-        gc_protect(&middle);
-        inner = alloc_cons(cdr(rest_bindings), body);
-        middle = alloc_cons(new_vals, inner);
-        unsigned new_data = alloc_cons(new_vars, middle);
+
+        unsigned inner3 = 0, inner2 = 0, inner1 = 0;
+        gc_protect(&inner3);
+        gc_protect(&inner2);
+        gc_protect(&inner1);
+        inner3 = alloc_cons(vals, body);
+        inner2 = alloc_cons(cdr(rest_bindings), inner3);
+        inner1 = alloc_cons(next_vals_ptr, inner2);
+        unsigned new_data = alloc_cons(vars, inner1);
         unsigned k2 = make_cont(CONT_LET_VALS, new_data, env, next);
         tramp_eval(next_val_expr, env, k2);
     }
@@ -633,6 +641,29 @@ void handle_cont_callwithvalues(unsigned val, unsigned data, unsigned env,
     apply_function(consumer, consumer_args, env, next);
 }
 
+/**
+ * CONT_ERR_RETURN: An exception handler dispatched by cps_signal_error or
+ * raise-now returned normally instead of jumping to a continuation. data
+ * holds the dispatched handler. If it was the default handler, the error was
+ * already reported ("Unhandled exception: ...") - propagate silently.
+ * Otherwise a handler returned from a non-continuable raise, which R7RS
+ * makes an error; terminate. Re-dispatching would loop on the returning
+ * handler.
+ */
+void handle_cont_err_return(unsigned val, unsigned data, unsigned env,
+                            unsigned next)
+{
+    (void)val;
+    (void)next;
+    unsigned dflt = lookup_silent(intern("*default-exception-handler*"), env);
+    if (dflt != TOK_ERROR && data == dflt) {
+        tramp_error();
+        return;
+    }
+    show_error("handler returned from non-continuable exception");
+    tramp_error();
+}
+
 // ============================================================================
 // Continuation Handler Dispatch Table
 // ============================================================================
@@ -657,4 +688,5 @@ const cont_handler_t cont_handlers[CONT_COUNT] = {
     [CONT_APPLY_FUNC] = handle_cont_apply_func,
     [CONT_MACRO_EXPAND] = handle_cont_macro_expand,
     [CONT_CALLWITHVALUES] = handle_cont_callwithvalues,
+    [CONT_ERR_RETURN] = handle_cont_err_return,
 };

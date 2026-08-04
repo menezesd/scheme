@@ -297,12 +297,17 @@
   (and (error-object? obj) (eq? (vector-ref obj 1) 'file)))
 
 ;; Simple exception system using continuations
-(define *current-exception-handler*
-  (lambda (exn)
-    (display "Unhandled exception: ")
-    (display exn)
-    (newline)
-    (exit 1)))
+;; The default handler prints and returns. It deliberately does not exit:
+;; unhandled errors propagate as TOK_ERROR to the C boundary, which restores
+;; the baseline exception state (see eval_expr in main.c), so an interactive
+;; REPL survives an unhandled error instead of losing the session.
+(define (*default-exception-handler* exn)
+  (display "Unhandled exception: ")
+  (display exn)
+  (newline)
+  (set! *wind-stack* '())
+  #f)
+(define *current-exception-handler* *default-exception-handler*)
 
 ;; Per R7RS 6.11, a handler invoked by raise/raise-continuable must run
 ;; with the PREVIOUS handler in effect (not itself), so that a handler
@@ -324,9 +329,12 @@
         thunk
         (lambda () (set! *current-exception-handler* old-handler))))))
 
+;; raise dispatches through raise-now (engine machinery) with a pinned
+;; return marker: a default-handler return IS the designed unhandled path
+;; (already reported), a user-handler return is the R7RS violation, and a
+;; handler that jumps to a continuation (guard) resumes normally.
 (define (raise obj)
-  (*current-exception-handler* obj)
-  (primitive-error "handler returned from non-continuable exception" obj))
+  (raise-now obj))
 
 (define (raise-continuable obj)
   (*current-exception-handler* obj))
@@ -1506,6 +1514,15 @@
                     to)))
       (converge from1 to1)))
   (set! *wind-stack* to))
+
+; exit runs dynamic-wind after-thunks before terminating (R7RS 6.11: exit
+; behaves like a non-local exit, so before/after thunks must run).
+; emergency-exit is the escape hatch that skips them.
+(define (exit . args)
+  (do-wind *wind-stack* '())
+  (if (null? args)
+      (primitive-exit 0)
+      (apply primitive-exit args)))
 
 ; dynamic-wind: establish before/after thunks around body
 (define dynamic-wind

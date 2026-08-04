@@ -952,6 +952,102 @@ static code_object *get_cwv_finish_code(void)
     return code;
 }
 
+// Pinned singleton code object that exception-handler frames return into:
+// [OP_ERROR_RETURN]. When a handler dispatched by vm_signal_error returns
+// normally instead of jumping to a continuation, this marker fires and
+// raises the R7RS "handler returned from a non-continuable exception"
+// error (Scheme's raise semantics).
+static code_object *error_return_code = NULL;
+
+static code_object *get_error_return_code(void)
+{
+    if (error_return_code)
+        return error_return_code;
+    code_object *code = code_new();
+    if (!code)
+        return NULL;
+    code_emit(code, OP_ERROR_RETURN);
+    code->gc_pinned = true;
+    error_return_code = code;
+    return code;
+}
+
+// Route a C-level error (primitive failure, undefined variable) through the
+// Scheme exception system instead of aborting the VM: build an error object
+// and invoke the current *current-exception-handler* in a new frame whose
+// return address is the pinned OP_ERROR_RETURN marker. A handler that jumps
+// to a continuation (guard, call/cc) replaces this frame via
+// restore_continuation; one that returns normally falls into the marker and
+// signals the "handler returned" error. Returns false (falling back to
+// VM_ERROR) if the stdlib exception machinery is unavailable.
+static bool vm_signal_error(vm_state *vm, const char *msg)
+{
+    if (!msg)
+        msg = "unknown error";
+    unsigned handler = lookup_silent(intern("*current-exception-handler*"),
+                                     vm->env);
+    if (handler == TOK_ERROR) {
+        VM_ERROR(vm, msg);
+        return false;
+    }
+    code_object *marker = get_error_return_code();
+    if (!marker) {
+        VM_ERROR(vm, msg);
+        return false;
+    }
+    GC_GUARD;
+    gc_protect(&handler);
+    unsigned error_obj = make_error_object_c(msg, vm->env);
+    if (error_obj == TOK_ERROR) {
+        VM_ERROR(vm, msg);
+        return false;
+    }
+    // Run the handler with the marker as its return address.
+    vm->signal_handler = handler;
+    vm->code = marker;
+    vm->ip = 0;
+    vm_push(vm, error_obj);
+    vm_apply(vm, handler, 1, false);
+    return true;
+}
+
+// Scheme raise: dispatch OBJ (any object, not just an error object) to the
+// current *current-exception-handler* with the pinned OP_ERROR_RETURN marker
+// as its return address, so a returning handler falls into the marker which
+// distinguishes the default handler (unhandled - already reported, propagate
+// silently) from a user handler (R7RS violation). The stdlib raise is
+// (raise-now obj); raise-now itself never returns normally - the marker
+// terminates, or a handler that jumps to a continuation replaces this frame.
+static void vm_handle_raise(vm_state *vm, unsigned argc, unsigned *argv)
+{
+    if (argc != 1) {
+        vm->sp -= argc;
+        VM_ERROR(vm, "raise: expected 1 argument");
+        return;
+    }
+    unsigned obj = argv[0];
+    vm->sp -= argc;
+    unsigned handler = lookup_silent(intern("*current-exception-handler*"),
+                                     vm->env);
+    if (handler == TOK_ERROR) {
+        VM_ERROR(vm, "raise: no exception handler");
+        return;
+    }
+    code_object *marker = get_error_return_code();
+    if (!marker) {
+        VM_ERROR(vm, "raise: no exception handler");
+        return;
+    }
+    GC_GUARD;
+    gc_protect(&handler);
+    gc_protect(&obj);
+    vm->signal_handler = handler;
+    vm->code = marker;
+    vm->ip = 0;
+    vm_push(vm, obj);
+    vm_apply(vm, handler, 1, false);
+}
+
 static bool vm_require_proper_list(vm_state *vm, unsigned list,
                                    const char *msg)
 {
@@ -1131,14 +1227,19 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
             return;
         }
 
+        if (prim_id == PRAISENOW) {
+            vm_handle_raise(vm, argc, argv);
+            return;
+        }
+
         // Regular primitive - pass stack values directly as argv
         // Note: We keep argv on the stack during the call for GC protection,
         // then pop and push result in one operation (replacing args with result)
         unsigned result = apply_primitive_argv(prim_id, argc, argv);
         vm->sp -= argc; // Pop args after primitive returns
         if (result == TOK_ERROR) {
-            VM_ERROR(vm, ctx.last_error[0] ? ctx.last_error
-                                           : "primitive error");
+            vm_signal_error(vm, ctx.last_error[0] ? ctx.last_error
+                                                  : "primitive error");
             return;
         }
         vm_push(vm, result);
@@ -1410,8 +1511,8 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 continue;
             }
             vm_show_undefined_variable(sym_id);
-            VM_ERROR(vm, ctx.last_error);
-            break;
+            vm_signal_error(vm, ctx.last_error);
+            continue; // continue the dispatch loop (handler may have been set up)
         }
 
         switch (op) {
@@ -1452,8 +1553,8 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             unsigned val = ic_lookup(sym_id, vm->env, cache_slot);
             if (val == TOK_ERROR) {
                 vm_show_undefined_variable(sym_id);
-                VM_ERROR(vm, ctx.last_error[0] ? ctx.last_error
-                                               : "undefined variable");
+                vm_signal_error(vm, ctx.last_error[0] ? ctx.last_error
+                                                      : "undefined variable");
                 break;
             }
             vm_push(vm, vm_unbox_fixnum_if_possible(val));
@@ -1692,6 +1793,24 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             break;
         }
 
+        case OP_ERROR_RETURN: {
+            // An exception handler dispatched by vm_signal_error returned
+            // normally instead of jumping to a continuation. If it was the
+            // default handler, its return IS the designed unhandled-error
+            // path (it already printed "Unhandled exception: ..."); propagate
+            // TOK_ERROR silently to the C boundary, which restores baseline
+            // exception state. Any other handler returning from a
+            // non-continuable exception is an R7RS error.
+            unsigned dflt = lookup_silent(
+                intern("*default-exception-handler*"), vm->env);
+            if (dflt != TOK_ERROR && vm->signal_handler == dflt) {
+                VM_ERROR_BREAK(vm, NULL);
+            } else {
+                VM_ERROR_BREAK(
+                    vm, "handler returned from non-continuable exception");
+            }
+        }
+
         case OP_CWV_FINISH: {
             // The producer arranged by PCALLWITHVALUES has returned.
             // Stack: [.., consumer, producer-result]. Unpack the result and
@@ -1754,6 +1873,11 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             // Handle special primitives that need full apply treatment
             if (prim_id == PAPPLY) {
                 vm_handle_apply(vm, argc, argv, false);
+                break;
+            }
+
+            if (prim_id == PRAISENOW) {
+                vm_handle_raise(vm, argc, argv);
                 break;
             }
 
@@ -1915,8 +2039,8 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             unsigned result = apply_primitive_argv(prim_id, argc, argv);
             vm->sp -= argc; // Pop args after primitive returns
             if (result == TOK_ERROR) {
-                VM_ERROR(vm, ctx.last_error[0] ? ctx.last_error
-                                               : "primitive error");
+                vm_signal_error(vm, ctx.last_error[0] ? ctx.last_error
+                                                      : "primitive error");
                 break;
             }
             vm_push(vm, result);
@@ -3210,8 +3334,9 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             unsigned n = ic_lookup(sym_id, vm->env, cache_slot);
             if (n == TOK_ERROR) {
                 vm_show_undefined_variable(sym_id);
-                VM_ERROR_BREAK(vm, ctx.last_error[0] ? ctx.last_error
-                                                     : "undefined variable");
+                vm_signal_error(vm, ctx.last_error[0] ? ctx.last_error
+                                                      : "undefined variable");
+                break;
             }
             if (IS_FIXNUM(n)) {
                 int32_t val = FIXNUM_VALUE(n);
@@ -3249,8 +3374,9 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             unsigned n = ic_lookup(sym_id, vm->env, cache_slot);
             if (n == TOK_ERROR) {
                 vm_show_undefined_variable(sym_id);
-                VM_ERROR_BREAK(vm, ctx.last_error[0] ? ctx.last_error
-                                                     : "undefined variable");
+                vm_signal_error(vm, ctx.last_error[0] ? ctx.last_error
+                                                      : "undefined variable");
+                break;
             }
             if (IS_FIXNUM(n)) {
                 int32_t val = FIXNUM_VALUE(n);
@@ -3286,7 +3412,24 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             break;
         }
 vm_dispatch_error:
-        ;
+        // A VM-level error is a Scheme error (R7RS): signal it through the
+        // exception system so guard can catch C-level failures such as type
+        // errors in quickened opcodes. vm_signal_error dispatches the
+        // current handler with the pinned OP_ERROR_RETURN marker as its
+        // return address; a handler that jumps to a continuation restores
+        // the VM (execution resumes), while one that returns normally falls
+        // into the marker and this loop terminates below.
+        if (vm->error) {
+            if (vm->code == error_return_code) {
+                break; // marker: handler returned normally - terminal
+            }
+            const char *msg = vm->error_msg ? vm->error_msg : "primitive error";
+            vm->error = false;
+            vm->running = true;
+            if (!vm_signal_error(vm, msg)) {
+                break; // dispatch failed - terminal
+            }
+        }
     }
 
     // Unregister VM from GC system
@@ -3294,7 +3437,11 @@ vm_dispatch_error:
     vm->parent = NULL;
 
     if (vm->error) {
-        show_error("VM error: %s", vm->error_msg);
+        // error_msg is NULL when the default exception handler returned from
+        // a raise/error dispatch - that path already printed "Unhandled
+        // exception: ..." and propagates TOK_ERROR silently.
+        if (vm->error_msg)
+            show_error("VM error: %s", vm->error_msg);
         return TOK_ERROR;
     }
 

@@ -2516,6 +2516,30 @@ static unsigned apply_transcript_primitive(unsigned prim_id, unsigned argc,
     }
 }
 
+unsigned make_error_object_c(const char *msg, unsigned env)
+{
+    GC_GUARD;
+    unsigned tag = lookup_silent(intern("*error-object-tag*"), env);
+    if (tag == TOK_ERROR)
+        return TOK_ERROR;
+    gc_protect(&tag);
+    unsigned error_kind = alloc();
+    CELL_TYPE(error_kind) = BT_ATOM;
+    CELL_ID(error_kind) = intern("error");
+    gc_protect(&error_kind);
+    unsigned msg_str = make_string_copy(msg ? msg : "unknown error");
+    if (msg_str == TOK_ERROR)
+        return TOK_ERROR;
+    gc_protect(&msg_str);
+    unsigned vec = make_vector(4, 0);
+    if (vec == TOK_ERROR)
+        return TOK_ERROR;
+    vector_set_elem(vec, 0, tag);
+    vector_set_elem(vec, 1, error_kind);
+    vector_set_elem(vec, 2, msg_str);
+    return vec;
+}
+
 static unsigned report_error_primitive(unsigned argc, unsigned *argv)
 {
     fprintf(stderr, "error: ");
@@ -2525,6 +2549,14 @@ static unsigned report_error_primitive(unsigned argc, unsigned *argv)
             fprintf(stderr, " ");
     }
     fprintf(stderr, "\n");
+    // Refresh ctx.last_error so a later primitive failure cannot reuse a
+    // stale message from an earlier error as its own (see vm_signal_error).
+    if (argc > 0 && IS_STRING(argv[0])) {
+        snprintf(ctx.last_error, sizeof(ctx.last_error), "%s",
+                 GET_STRING_PTR(argv[0]));
+    } else {
+        snprintf(ctx.last_error, sizeof(ctx.last_error), "error");
+    }
     return TOK_ERROR;
 }
 
@@ -2728,6 +2760,10 @@ static unsigned unsupported_special_primitive(unsigned prim_id)
     case PINTERACTIONENV:
         message = "interaction-environment: internal error - should be "
                   "handled in apply_function";
+        break;
+    case PRAISENOW:
+        message = "raise-now: internal error - should be handled in "
+                  "apply_function";
         break;
     default:
         message = "primitive: unsupported special primitive";

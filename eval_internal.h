@@ -777,6 +777,8 @@ void handle_cont_macro_expand(unsigned val, unsigned data, unsigned env,
                               unsigned next);
 void handle_cont_callwithvalues(unsigned val, unsigned data, unsigned env,
                                 unsigned next);
+void handle_cont_err_return(unsigned val, unsigned data, unsigned env,
+                            unsigned next);
 
 // Continuation handler dispatch table (indexed by cont_type)
 extern const cont_handler_t cont_handlers[CONT_COUNT];

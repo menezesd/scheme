@@ -206,6 +206,11 @@ enum opcode {
     OP_LT_INT_JUMPIFNOT,  // Fixnum compare+branch
     OP_NUMEQ_INT_JUMPIFNOT,
 
+    // Marker for exception-handler return frames (never emitted by the
+    // compiler; see vm_signal_error). Firing it signals the R7RS
+    // "handler returned from a non-continuable exception" error.
+    OP_ERROR_RETURN,
+
     OP_COUNT // Number of opcodes (must be last)
 };
 
@@ -366,6 +371,14 @@ typedef struct vm_state {
     bool running;          // True while VM is executing
     bool error;            // True if error occurred
     const char *error_msg; // Error message (if error)
+
+    // The exception handler dispatched by the most recent vm_signal_error
+    // (cell index). When a handler returns normally and lands on the
+    // OP_ERROR_RETURN marker, this identifies whether the default handler
+    // returned (designed unhandled-error path - propagate silently) or a
+    // user handler returned (R7RS error - "handler returned from a
+    // non-continuable exception").
+    unsigned signal_handler;
 
     // Enclosing suspended VM when this VM was entered via a nested vm_run
     // (e.g. a closure called from C). GC must trace the whole chain, not

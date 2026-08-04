@@ -110,6 +110,10 @@ enum cont_type {
     CONT_MACRO_EXPAND, // Macro expansion done; data = 0, env, next
     CONT_CALLWITHVALUES, // call-with-values producer done; data = consumer,
                          // env, next
+    CONT_ERR_RETURN,     // Exception handler dispatched by cps_signal_error
+                         // returned normally (R7RS: a non-continuable
+                         // exception whose handler returns is itself an
+                         // error). Terminal - data unused.
     CONT_COUNT           // Number of continuation types (must be last)
 };
 
@@ -627,6 +631,7 @@ enum primitive_id {
     PWRITESIMPLE,
     PSTRINGTOUTF8,
     PUTF8TOSTRING,
+    PRAISENOW, // raise dispatcher (handled specially by vm.c / eval.c)
     PRIM_COUNT // Total number of primitives
 };
 

@@ -180,8 +180,9 @@ static const primitive_binding builtins[] = {
     {"random-real", PRANDOMREAL},
     {"random-seed!", PRANDOMSEED},
 
-    // Process control
-    {"exit", PEXIT},
+    // Process control (exit is a Scheme wrapper in stdlib.scm that runs
+    // dynamic-wind after-thunks first; this is the raw primitive behind it)
+    {"primitive-exit", PEXIT},
 
     // Bitwise operations
     {"bitwise-and", PBITWISEAND},
@@ -237,6 +238,7 @@ static const primitive_binding builtins[] = {
 
     // Misc
     {"error", PERROR},
+    {"raise-now", PRAISENOW},
     {"gensym", PGENSYM},
     {"gc-flip", PGCFLIP},
     {"gc-stats", PGCSTATS},
