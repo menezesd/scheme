@@ -799,4 +799,7 @@ unsigned qq_transform_cps(unsigned x, unsigned env);
 
 void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont);
 
+// Route evaluator/continuation failures through the active Scheme handler.
+void cps_signal_current_error(unsigned env, unsigned cont);
+
 #endif // EVAL_INTERNAL_H

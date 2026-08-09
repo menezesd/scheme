@@ -77,7 +77,9 @@
 #include "macros.h"
 #include "compiled_pattern.h"
 #include "context.h"
+#include "eval_internal.h"
 #include "env.h"
+#include <limits.h>
 #include <string.h>
 
 // External gensym counter
@@ -112,7 +114,7 @@ static bool generated_gensym_atom(unsigned atom)
 // ============================================================================
 
 static bool same_literal_binding(unsigned literal, unsigned input,
-                                 unsigned closure_env, unsigned use_env)
+                                unsigned closure_env, unsigned use_env)
 {
     if (!IS_ATOM(input) || CELL_ID(input) != CELL_ID(literal))
         return false;
@@ -121,6 +123,248 @@ static bool same_literal_binding(unsigned literal, unsigned input,
     unsigned literal_binding = env_find_binding_cell(id, closure_env);
     unsigned input_binding = env_find_binding_cell(id, use_env);
     return literal_binding == input_binding;
+}
+
+static void append_bindings_chain(unsigned *dst, unsigned src)
+{
+    if (!dst)
+        return;
+    if (!src)
+        return;
+
+    if (!*dst) {
+        *dst = src;
+        return;
+    }
+
+    unsigned tail = *dst;
+    while (IS_PAIR(tail) && cdr(tail))
+        tail = cdr(tail);
+
+    if (IS_PAIR(tail))
+        cell_set_cdr(tail, src);
+}
+
+unsigned expand_form(unsigned expr, unsigned syn_env, unsigned *bindings_out);
+
+static unsigned expand_form_list(unsigned list, unsigned syn_env,
+                                unsigned *bindings_out);
+
+static unsigned expand_form_vector(unsigned vec, unsigned syn_env,
+                                  unsigned *bindings_out)
+{
+    unsigned len = vector_len(vec);
+    bool changed = false;
+
+    if (!len)
+        return vec;
+
+    unsigned data_snapshot[len];
+    for (unsigned i = 0; i < len; i++) {
+        unsigned *old_data = vector_data_ptr(vec);
+        unsigned expanded = expand_form(old_data[i], syn_env, bindings_out);
+        if (expanded == TOK_ERROR)
+            return TOK_ERROR;
+        if (expanded != old_data[i])
+            changed = true;
+        data_snapshot[i] = expanded;
+    }
+
+    if (!changed)
+        return vec;
+
+    unsigned new_vec = make_vector(len, 0);
+    if (new_vec == TOK_ERROR)
+        return TOK_ERROR;
+    unsigned *new_data = vector_data_ptr(new_vec);
+    for (unsigned i = 0; i < len; i++)
+        new_data[i] = data_snapshot[i];
+
+    return new_vec;
+}
+
+static unsigned expand_form_list(unsigned list, unsigned syn_env,
+                                unsigned *bindings_out)
+{
+    if (!list)
+        return 0;
+
+    GC_GUARD;
+    gc_protect(&list);
+    if (!IS_PAIR(list))
+        return expand_form(list, syn_env, bindings_out);
+
+    unsigned out = 0;
+    unsigned out_tail = 0;
+    gc_protect(&out);
+    gc_protect(&out_tail);
+
+    unsigned it = list;
+    gc_protect(&it);
+    while (IS_PAIR(it)) {
+        unsigned elem = car(it);
+        gc_protect(&elem);
+        unsigned expanded = expand_form(elem, syn_env, bindings_out);
+        if (expanded == TOK_ERROR)
+            return TOK_ERROR;
+        unsigned next = alloc_cons(expanded, 0);
+        gc_protect(&next);
+        if (!out)
+            out = next;
+        else
+            cell_set_cdr(out_tail, next);
+        out_tail = next;
+        it = cdr(it);
+    }
+
+    unsigned tail = expand_form(it, syn_env, bindings_out);
+    if (tail == TOK_ERROR)
+        return TOK_ERROR;
+    if (!out)
+        return tail;
+
+    if (tail)
+        cell_set_cdr(out_tail, tail);
+
+    return out;
+}
+
+static unsigned expand_let_syntax(unsigned form, unsigned syn_env,
+                                 unsigned *bindings_out)
+{
+    const char *syn_arity =
+        (CELL_ID(car(form)) == ctx.kw_let_syntax) ? "let-syntax" :
+                                                   "letrec-syntax";
+    if (!syntax_arity_checked(form, 2, UINT_MAX, syn_arity))
+        return TOK_ERROR;
+
+    unsigned bindings = cadr(form);
+    unsigned body = cddr(form);
+    if (!binding_list_valid(bindings, syn_arity) ||
+        !list_length_checked(body, NULL, syn_arity)) {
+        return TOK_ERROR;
+    }
+
+    if (!bindings) {
+        unsigned expanded_body = expand_form_list(body, syn_env, bindings_out);
+        if (expanded_body == TOK_ERROR)
+            return TOK_ERROR;
+        return alloc_cons(car(form), alloc_cons(bindings, expanded_body));
+    }
+
+    GC_GUARD;
+    gc_protect(&bindings);
+    gc_protect(&body);
+    gc_protect(&syn_env);
+
+    unsigned expanded_env = extend_env_empty(syn_env);
+    gc_protect(&expanded_env);
+    int64_t ellipsis_id =
+        syntax_default_ellipsis_id((CELL_ID(car(form)) == ctx.kw_let_syntax)
+                                       ? syn_env
+                                       : expanded_env);
+
+    unsigned b = bindings;
+    gc_protect(&b);
+    while (b) {
+        unsigned binding = car(b);
+        if (!IS_PAIR(binding) || !identifier_valid(car(binding)) ||
+            !is_syntax_rules(cadr(binding))) {
+            return TOK_ERROR;
+        }
+
+        unsigned name = car(binding);
+        unsigned transformer_form = cadr(binding);
+        if (!syntax_rules_valid(transformer_form, ellipsis_id, syn_arity))
+            return TOK_ERROR;
+
+        unsigned p = make_syntax_transformer(
+            transformer_form,
+            (CELL_ID(car(form)) == ctx.kw_let_syntax) ? syn_env :
+                                                        expanded_env);
+        if (p == TOK_ERROR)
+            return TOK_ERROR;
+
+        if (defvar(name, p, expanded_env) == TOK_ERROR)
+            return TOK_ERROR;
+
+        b = cdr(b);
+    }
+
+    unsigned expanded_body = expand_form_list(body, expanded_env, bindings_out);
+    if (expanded_body == TOK_ERROR)
+        return TOK_ERROR;
+
+    return alloc_cons(car(form), alloc_cons(bindings, expanded_body));
+}
+
+unsigned expand_form(unsigned expr, unsigned syn_env, unsigned *bindings_out)
+{
+    if (!expr || !IS_CELL(expr))
+        return expr;
+
+    if (IS_VECTOR(expr))
+        return expand_form_vector(expr, syn_env, bindings_out);
+
+    if (!IS_PAIR(expr))
+        return expr;
+
+    unsigned head = car(expr);
+    if (IS_ATOM(head)) {
+        unsigned kw = CELL_ID(head);
+        if (kw != ctx.kw_quote && kw != ctx.kw_quasiquote &&
+            kw != ctx.kw_cond_expand) {
+            unsigned binding = lookup_silent(kw, syn_env);
+            if (binding != TOK_ERROR && IS_SYNTAX(binding)) {
+                unsigned produced_bindings = 0;
+                gc_protect(&produced_bindings);
+                unsigned expanded =
+                    apply_syntax(binding, expr, syn_env, &produced_bindings);
+                if (expanded == TOK_ERROR)
+                    return TOK_ERROR;
+
+                if (bindings_out && produced_bindings)
+                    append_bindings_chain(bindings_out, produced_bindings);
+
+                return expand_form(expanded, syn_env, bindings_out);
+            }
+        }
+
+        if (kw == ctx.kw_quote || kw == ctx.kw_quasiquote ||
+            kw == ctx.kw_cond_expand)
+            return expr;
+
+        if (kw == ctx.kw_define_syntax) {
+            if (!syntax_arity_checked(expr, 2, 2, "define-syntax"))
+                return TOK_ERROR;
+
+            unsigned name = cadr(expr);
+            unsigned transformer_form = caddr(expr);
+            if (!identifier_valid(name)) {
+                show_error("define-syntax: expected name");
+                return TOK_ERROR;
+            }
+            if (!syntax_rules_valid(transformer_form,
+                                   syntax_default_ellipsis_id(syn_env),
+                                   "define-syntax")) {
+                return TOK_ERROR;
+            }
+
+            unsigned p =
+                make_syntax_transformer(transformer_form, syn_env);
+            if (p == TOK_ERROR)
+                return TOK_ERROR;
+            if (defvar(name, p, syn_env) == TOK_ERROR)
+                return TOK_ERROR;
+
+            return expr;
+        }
+
+        if (kw == ctx.kw_let_syntax || kw == ctx.kw_letrec_syntax)
+            return expand_let_syntax(expr, syn_env, bindings_out);
+    }
+
+    return expand_form_list(expr, syn_env, bindings_out);
 }
 
 static bool pattern_literals_match(unsigned pattern, unsigned input,
@@ -614,13 +858,16 @@ static unsigned add_lambda_bounds(unsigned bindings, unsigned params)
     gc_protect(&bindings);
     gc_protect(&params);
 
-    for (unsigned p = params; p; p = IS_PAIR(p) ? cdr(p) : 0) {
+    unsigned p = params;
+    gc_protect(&p);
+    for (; p; p = IS_PAIR(p) ? cdr(p) : 0) {
         unsigned param = IS_PAIR(p) ? car(p) : p;
         if (IS_ATOM(param))
             bindings = add_lexical_bound(bindings, param);
         if (!IS_PAIR(p))
             break;
     }
+    gc_unprotect(1);
 
     return bindings;
 }
@@ -631,7 +878,9 @@ static unsigned add_let_bounds(unsigned bindings, unsigned binding_list)
     gc_protect(&bindings);
     gc_protect(&binding_list);
 
-    for (unsigned bl = binding_list; IS_PAIR(bl); bl = cdr(bl)) {
+    unsigned bl = binding_list;
+    gc_protect(&bl);
+    for (; IS_PAIR(bl); bl = cdr(bl)) {
         unsigned binding = car(bl);
         if (!let_binding_has_value(binding))
             continue;
@@ -639,6 +888,7 @@ static unsigned add_let_bounds(unsigned bindings, unsigned binding_list)
         if (IS_ATOM(var))
             bindings = add_lexical_bound(bindings, var);
     }
+    gc_unprotect(1);
 
     return bindings;
 }
@@ -679,7 +929,9 @@ static unsigned collect_free_ids_let(unsigned tmpl, unsigned bindings,
     if (is_letrec)
         body_bindings = add_let_bounds(body_bindings, binding_list);
 
-    for (unsigned bl = binding_list; IS_PAIR(bl); bl = cdr(bl)) {
+    unsigned bl = binding_list;
+    gc_protect(&bl);
+    for (; IS_PAIR(bl); bl = cdr(bl)) {
         unsigned binding = car(bl);
         if (!let_binding_has_value(binding))
             continue;
@@ -694,6 +946,7 @@ static unsigned collect_free_ids_let(unsigned tmpl, unsigned bindings,
         if (is_letstar && !is_letrec && IS_ATOM(car(binding)))
             body_bindings = add_lexical_bound(body_bindings, car(binding));
     }
+    gc_unprotect(1);
 
     if (!is_letstar && !is_letrec)
         body_bindings = add_let_bounds(body_bindings, binding_list);
@@ -722,7 +975,9 @@ static unsigned collect_free_ids_named_let(unsigned tmpl, unsigned bindings,
         return collect_free_ids(body, bindings, collected, ellipsis_id,
                                 closure_env);
 
-    for (unsigned bl = binding_list; IS_PAIR(bl); bl = cdr(bl)) {
+    unsigned bl = binding_list;
+    gc_protect(&bl);
+    for (; IS_PAIR(bl); bl = cdr(bl)) {
         unsigned binding = car(bl);
         if (!let_binding_has_value(binding))
             continue;
@@ -730,6 +985,7 @@ static unsigned collect_free_ids_named_let(unsigned tmpl, unsigned bindings,
             collect_free_ids(cadr(binding), bindings, collected, ellipsis_id,
                              closure_env);
     }
+    gc_unprotect(1);
 
     unsigned body_bindings = add_named_let_bounds(bindings, name, binding_list);
     gc_protect(&body_bindings);
@@ -2142,6 +2398,7 @@ static unsigned hygienize_named_let(unsigned tmpl, unsigned bindings)
             gc_unprotect(3);
         }
     }
+    gc_unprotect(1);
 
     unsigned new_name = name;
     unsigned new_binding_list = binding_list;
@@ -2150,10 +2407,18 @@ static unsigned hygienize_named_let(unsigned tmpl, unsigned bindings)
     gc_protect(&new_binding_list);
     gc_protect(&new_body);
 
-    for (unsigned r = renames; r; r = cdr(r)) {
+    unsigned r = renames;
+    gc_protect(&r);
+    for (; r; r = cdr(r)) {
         unsigned rename = car(r);
         unsigned old_sym = car(rename);
         unsigned new_sym = cdr(rename);
+        // new_sym is reachable only through `r`, so the allocations below
+        // (alloc_cons and list_append in the binding loop) can relocate the
+        // cell and leave this raw local stale - which is then spliced into
+        // the rebuilt binding list and the renamed body. hygienize_let and
+        // hygienize_lambda protect the same value for the same reason.
+        gc_protect(&new_sym);
         int64_t old_id = CELL_ID(old_sym);
 
         if (IS_ATOM(new_name) && CELL_ID(new_name) == old_id)
@@ -2162,7 +2427,9 @@ static unsigned hygienize_named_let(unsigned tmpl, unsigned bindings)
         unsigned renamed_bindings = 0, renamed_tail = 0;
         gc_protect(&renamed_bindings);
         gc_protect(&renamed_tail);
-        for (unsigned bl = new_binding_list; IS_PAIR(bl); bl = cdr(bl)) {
+        unsigned bl = new_binding_list;
+        gc_protect(&bl);
+        for (; IS_PAIR(bl); bl = cdr(bl)) {
             unsigned binding = car(bl);
             if (!let_binding_has_value(binding)) {
                 list_append(&renamed_bindings, &renamed_tail, binding);
@@ -2183,18 +2450,25 @@ static unsigned hygienize_named_let(unsigned tmpl, unsigned bindings)
             list_append(&renamed_bindings, &renamed_tail, new_bind);
             gc_unprotect(4);
         }
+        gc_unprotect(1);
         gc_unprotect(2);
         new_binding_list = renamed_bindings;
 
         new_body = rename_in_template(new_body, old_id, new_sym);
-        if (new_body == TOK_ERROR)
+        if (new_body == TOK_ERROR) {
+            gc_unprotect(1);
             return TOK_ERROR;
+        }
+        gc_unprotect(1); // new_sym
     }
+    gc_unprotect(1);
 
     unsigned final_bindings = 0, final_tail = 0;
     gc_protect(&final_bindings);
     gc_protect(&final_tail);
-    for (unsigned bl = new_binding_list; IS_PAIR(bl); bl = cdr(bl)) {
+    unsigned bl = new_binding_list;
+    gc_protect(&bl);
+    for (; IS_PAIR(bl); bl = cdr(bl)) {
         unsigned binding = car(bl);
         if (!let_binding_has_value(binding)) {
             list_append(&final_bindings, &final_tail, binding);
@@ -2216,6 +2490,7 @@ static unsigned hygienize_named_let(unsigned tmpl, unsigned bindings)
         list_append(&final_bindings, &final_tail, new_binding);
         gc_unprotect(5);
     }
+    gc_unprotect(1);
 
     unsigned final_body = hygienize_body_sequence(new_body, bindings);
     if (final_body == TOK_ERROR)
@@ -2248,7 +2523,9 @@ static unsigned hygienize_lambda(unsigned tmpl, unsigned bindings)
 
     // Handle both proper list and dotted list params
     // Skip ellipsis (...) which appears in macro templates
-    for (unsigned p = params; p; p = IS_PAIR(p) ? cdr(p) : 0) {
+    unsigned p = params;
+    gc_protect(&p);
+    for (; p; p = IS_PAIR(p) ? cdr(p) : 0) {
         unsigned param = IS_PAIR(p) ? car(p) : p;
         if (identifier_valid(param)) {
             int64_t param_id = CELL_ID(param);
@@ -2267,6 +2544,7 @@ static unsigned hygienize_lambda(unsigned tmpl, unsigned bindings)
         if (!IS_PAIR(p))
             break;
     }
+    gc_unprotect(1);
 
     if (!renames) {
         // No introduced params - just hygienize body
@@ -2420,7 +2698,9 @@ static unsigned hygienize_body_sequence(unsigned body, unsigned bindings)
     unsigned renames = 0;
     gc_protect(&renames);
 
-    for (unsigned exprs = body; exprs; exprs = cdr(exprs)) {
+    unsigned exprs = body;
+    gc_protect(&exprs);
+    for (; exprs; exprs = cdr(exprs)) {
         unsigned expr = car(exprs);
         unsigned target = define_target_name(expr);
         if (!target)
@@ -2439,24 +2719,32 @@ static unsigned hygienize_body_sequence(unsigned body, unsigned bindings)
             gc_unprotect(3);
         }
     }
+    gc_unprotect(1);
 
     unsigned renamed_body = body;
     gc_protect(&renamed_body);
-    for (unsigned r = renames; r; r = cdr(r)) {
+    unsigned r = renames;
+    gc_protect(&r);
+    for (; r; r = cdr(r)) {
         unsigned entry = car(r);
         unsigned old_sym = car(entry);
         unsigned new_sym = cdr(entry);
         renamed_body =
             rename_in_template(renamed_body, CELL_ID(old_sym), new_sym);
-        if (renamed_body == TOK_ERROR)
+        if (renamed_body == TOK_ERROR) {
+            gc_unprotect(1);
             return TOK_ERROR;
+        }
     }
+    gc_unprotect(1);
 
     unsigned new_body = 0, new_tail = 0;
     gc_protect(&new_body);
     gc_protect(&new_tail);
 
-    for (unsigned exprs = renamed_body; exprs; exprs = cdr(exprs)) {
+    exprs = renamed_body;
+    gc_protect(&exprs);
+    for (; exprs; exprs = cdr(exprs)) {
         unsigned expr = car(exprs);
         gc_protect(&expr);
         unsigned new_expr;
@@ -2464,12 +2752,16 @@ static unsigned hygienize_body_sequence(unsigned body, unsigned bindings)
             new_expr = hygienize_define_no_target_rename(expr, bindings);
         else
             new_expr = hygienize_template(expr, bindings);
-        if (new_expr == TOK_ERROR)
+        if (new_expr == TOK_ERROR) {
+            gc_unprotect(1);
             return TOK_ERROR;
+        }
         gc_protect(&new_expr);
         list_append(&new_body, &new_tail, new_expr);
         gc_unprotect(2);
     }
+
+    gc_unprotect(1);
 
     return new_body;
 }
@@ -3397,7 +3689,8 @@ static bool syntax_transformer_well_formed(unsigned transformer, unsigned input,
     return true;
 }
 
-unsigned apply_syntax(unsigned transformer, unsigned input, unsigned use_env)
+unsigned apply_syntax(unsigned transformer, unsigned input, unsigned use_env,
+                      unsigned *bindings_out)
 {
     // Protect parameters that may be in nursery - GC can run during
     // expansion. GC_GUARD releases every protection below on any return
@@ -3406,6 +3699,9 @@ unsigned apply_syntax(unsigned transformer, unsigned input, unsigned use_env)
     gc_protect(&transformer);
     gc_protect(&input);
     gc_protect(&use_env);
+
+    if (bindings_out)
+        *bindings_out = 0;
 
     // Extract transformer structure:
     // CAR = (ellipsis_cell . (literals . rules)), CDR = closure_env
@@ -3428,13 +3724,19 @@ unsigned apply_syntax(unsigned transformer, unsigned input, unsigned use_env)
 
     unsigned tmpl = 0;
     gc_protect(&tmpl);
+    unsigned pattern = 0;
+    unsigned input_args = 0;
+    gc_protect(&pattern);
+    gc_protect(&input_args);
+
+    unsigned produced_bindings = 0;
+    gc_protect(&produced_bindings);
 
     // Try each rule (rules now contain compiled patterns)
     for (; rules; rules = cdr(rules)) {
         unsigned rule = car(rules);
         unsigned rule_head = car(rule);
         unsigned cpat_cell;
-        unsigned pattern = 0;
         if (IS_PAIR(rule_head)) {
             cpat_cell = car(rule_head);
             pattern = cdr(rule_head);
@@ -3447,7 +3749,7 @@ unsigned apply_syntax(unsigned transformer, unsigned input, unsigned use_env)
         compiled_pattern *cpat = (compiled_pattern *)CELL_PTR(cpat_cell);
 
         // Skip the keyword in input
-        unsigned input_args = cdr(input);
+        input_args = cdr(input);
 
         // Execute compiled pattern
         unsigned bindings = execute_pattern(cpat, input_args);
@@ -3482,8 +3784,31 @@ unsigned apply_syntax(unsigned transformer, unsigned input, unsigned use_env)
                 // Look up in closure environment (macro definition site)
                 unsigned closure_val = lookup_silent(free_id, closure_env);
 
-                if (closure_val != TOK_ERROR && !generated_gensym_atom(free_atom)) {
-                    // Found in closure env - create gensym and bind in use_env.
+                // If the identifier already denotes the very same binding at
+                // the use site as it does at the definition site, renaming it
+                // would be a no-op: the alias we would install in use_env
+                // resolves to exactly the cell the original name already
+                // reaches. Skipping it keeps referential transparency intact
+                // and, critically, mints no gensym - so a macro expanded in a
+                // loop (the CPS interpreter re-expands on every evaluation)
+                // does not consume one permanent atom-table slot per call.
+                // Only the cells are compared, never retained: neither lookup
+                // allocates, so no GC can intervene before the comparison.
+                bool same_binding_at_use_site = false;
+                if (closure_val != TOK_ERROR) {
+                    unsigned def_cell =
+                        env_find_binding_cell(free_id, closure_env);
+                    same_binding_at_use_site =
+                        def_cell != 0 &&
+                        def_cell == env_find_binding_cell(free_id, use_env);
+                }
+
+                if (same_binding_at_use_site) {
+                    // No rename needed - fall through to the next free id.
+                } else if (closure_val != TOK_ERROR &&
+                           !generated_gensym_atom(free_atom)) {
+                    // Found in closure env - create gensym and record the
+                    // binding needed to materialize it at the call site.
                     // An identifier that is ALREADY a generated gensym (e.g.
                     // from the compiler's own definition-time hygiene
                     // renaming for define-syntax/let-syntax) is left alone:
@@ -3500,18 +3825,28 @@ unsigned apply_syntax(unsigned transformer, unsigned input, unsigned use_env)
 
                     unsigned target_val_cell =
                         env_find_binding_cell(free_id, closure_env);
-                    if (target_val_cell)
-                        defvar_alias(gensym, free_atom, target_val_cell,
-                                     use_env);
-                    else
-                        defvar(gensym, closure_val, use_env);
+                    if (target_val_cell) {
+                        unsigned binding_ref = make_binding_ref_cell(
+                            free_atom, target_val_cell);
+                        gc_protect(&binding_ref);
+                        unsigned entry = alloc_cons(gensym, binding_ref);
+                        gc_protect(&entry);
+                        produced_bindings = alloc_cons(entry, produced_bindings);
+                        gc_unprotect(2);
+                    } else {
+                        unsigned entry = alloc_cons(gensym, closure_val);
+                        gc_protect(&entry);
+                        produced_bindings = alloc_cons(entry,
+                                                      produced_bindings);
+                        gc_unprotect(1);
+                    }
 
                     // Add to rename map: (free_atom . gensym)
                     unsigned entry = alloc_cons(free_atom, gensym);
                     gc_protect(&entry);
                     rename_map = alloc_cons(entry, rename_map);
 
-                    gc_unprotect(3); // entry, gensym, closure_val
+                    gc_unprotect(2); // gensym, closure_val
                 } else if (!generated_gensym_atom(free_atom) &&
                            lookup_silent(free_id, use_env) != TOK_ERROR) {
                     // The identifier was introduced by the transformer, but
@@ -3545,10 +3880,43 @@ unsigned apply_syntax(unsigned transformer, unsigned input, unsigned use_env)
             gc_protect(&result);
             if (result == TOK_ERROR)
                 return TOK_ERROR;
+
+            if (bindings_out)
+                append_bindings_chain(bindings_out, produced_bindings);
             return unwrap_protected(result);
         }
     }
 
     show_error("syntax-rules: no matching pattern");
     return TOK_ERROR;
+}
+
+void apply_syntax_bindings(unsigned env, unsigned bindings)
+{
+    if (!bindings)
+        return;
+
+    GC_GUARD;
+    unsigned b = bindings;
+    gc_protect(&b);
+    for (; b; b = cdr(b)) {
+        unsigned entry = car(b);
+        gc_protect(&entry);
+        if (!IS_PAIR(entry) || !IS_ATOM(car(entry))) {
+            gc_unprotect(1);
+            continue;
+        }
+
+        unsigned gensym = car(entry);
+        unsigned target = cdr(entry);
+        gc_protect(&target);
+        if (IS_BINDING_REF(target)) {
+            unsigned target_var = cdr(target);
+            unsigned target_val_cell = CELL_CAR(target);
+            defvar_alias(gensym, target_var, target_val_cell, env);
+        } else {
+            defvar(gensym, target, env);
+        }
+        gc_unprotect(2);
+    }
 }

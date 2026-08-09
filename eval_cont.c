@@ -66,7 +66,7 @@ void handle_cont_set(unsigned val, unsigned data, unsigned env, unsigned next)
 {
     unsigned result = setvar(CELL_ID(data), val, env);
     if (result == TOK_ERROR) {
-        tramp_error();
+        cps_signal_current_error(env, next);
         return;
     }
     tramp_apply(val, next);
@@ -85,7 +85,7 @@ void handle_cont_define(unsigned val, unsigned data, unsigned env,
     gc_protect(&env);
     gc_protect(&next);
     if (defvar(data, val, env) == TOK_ERROR) {
-        tramp_error();
+        cps_signal_current_error(env, next);
         return;
     }
     tramp_apply(data, next);
@@ -337,8 +337,9 @@ void handle_cont_letstar_vals(unsigned val, unsigned data, unsigned env,
     gc_protect(&var_cell);
     var_cell = alloc_cons(var, 0);
     unsigned val_cell = alloc_cons(val, 0);
+    gc_protect(&val_cell);
     unsigned new_env = extend_env(var_cell, val_cell, env);
-    gc_unprotect(1);
+    gc_unprotect(2);
     unsigned rest = cdr(bindings); // bindings is protected
     if (!rest) {
         eval_body(body, new_env, next);
@@ -472,7 +473,7 @@ void handle_cont_eval_fn(unsigned val, unsigned data, unsigned env,
         gc_protect(&frame);
         frame = bind_params(params, arg_exprs);
         if (frame == TOK_ERROR) {
-            tramp_error();
+            cps_signal_current_error(env, next);
             return;
         }
         unsigned menv = alloc_cons(frame, macroenv);
@@ -499,20 +500,25 @@ void handle_cont_eval_fn(unsigned val, unsigned data, unsigned env,
 
     // Handle syntax transformers
     if (IS_SYNTAX(fn)) {
+        GC_GUARD;
         gc_protect(&fn);
         gc_protect(&arg_exprs);
         if (!eval_note_macro_expansion()) {
-            tramp_error();
+            cps_signal_current_error(env, next);
             return;
         }
+        unsigned bindings = 0;
+        gc_protect(&bindings);
         unsigned input = alloc_cons(0, arg_exprs);
         gc_protect(&input);
-        unsigned expanded = apply_syntax(fn, input, env);
+        unsigned expanded = apply_syntax(fn, input, env, &bindings);
         gc_protect(&expanded);
         if (expanded == TOK_ERROR) {
-            tramp_error();
+            cps_signal_current_error(env, next);
             return;
         }
+        if (bindings)
+            apply_syntax_bindings(env, bindings);
         tramp_eval(expanded, env, next);
         return;
     }
@@ -610,7 +616,7 @@ void handle_cont_macro_expand(unsigned val, unsigned data, unsigned env,
 {
     (void)data;
     if (!eval_note_macro_expansion()) {
-        tramp_error();
+        cps_signal_current_error(env, next);
         return;
     }
     tramp_eval(val, env, next);
@@ -626,7 +632,7 @@ void handle_cont_callwithvalues(unsigned val, unsigned data, unsigned env,
     if (IS_MULTIVAL(val)) {
         consumer_args = CELL_CAR(val);
         if (!list_length_checked(consumer_args, NULL, "call-with-values")) {
-            tramp_error();
+            cps_signal_current_error(env, next);
             return;
         }
     } else {

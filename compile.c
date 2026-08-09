@@ -33,8 +33,7 @@ unsigned qq_expand_cps(unsigned x, unsigned env);
 #define MAX_COMPILE_MACRO_EXPANSION_DEPTH 1000
 
 // Forward declaration for helper
-static void emit_gensym_definitions(compile_ctx *cctx, unsigned old_gensym,
-                                    unsigned new_gensym);
+static void emit_gensym_definitions(compile_ctx *cctx, unsigned bindings);
 static void emit(compile_ctx *cctx, unsigned op);
 static void emit2(compile_ctx *cctx, unsigned op, unsigned arg);
 static void emit3(compile_ctx *cctx, unsigned op, unsigned arg1,
@@ -435,12 +434,15 @@ static unsigned add_template_lambda_bounds(unsigned pattern_vars,
     gc_protect(&pattern_vars);
     gc_protect(&params);
 
-    for (unsigned p = params; p; p = IS_PAIR(p) ? cdr(p) : 0) {
+    unsigned p = params;
+    gc_protect(&p);
+    for (; p; p = IS_PAIR(p) ? cdr(p) : 0) {
         unsigned param = IS_PAIR(p) ? car(p) : p;
         pattern_vars = add_template_bound_var(pattern_vars, param);
         if (!IS_PAIR(p))
             break;
     }
+    gc_unprotect(1);
 
     return pattern_vars;
 }
@@ -452,11 +454,14 @@ static unsigned add_template_let_bounds(unsigned pattern_vars,
     gc_protect(&pattern_vars);
     gc_protect(&binding_list);
 
-    for (unsigned bl = binding_list; IS_PAIR(bl); bl = cdr(bl)) {
+    unsigned bl = binding_list;
+    gc_protect(&bl);
+    for (; IS_PAIR(bl); bl = cdr(bl)) {
         unsigned binding = car(bl);
         if (let_binding_has_value(binding))
             pattern_vars = add_template_bound_var(pattern_vars, car(binding));
     }
+    gc_unprotect(1);
 
     return pattern_vars;
 }
@@ -468,11 +473,14 @@ static unsigned add_template_syntax_bounds(unsigned pattern_vars,
     gc_protect(&pattern_vars);
     gc_protect(&bindings);
 
-    for (unsigned b = bindings; IS_PAIR(b); b = cdr(b)) {
+    unsigned b = bindings;
+    gc_protect(&b);
+    for (; IS_PAIR(b); b = cdr(b)) {
         unsigned binding = car(b);
         if (IS_PAIR(binding))
             pattern_vars = add_template_bound_var(pattern_vars, car(binding));
     }
+    gc_unprotect(1);
 
     return pattern_vars;
 }
@@ -503,7 +511,9 @@ static unsigned collect_template_free_vars_let(unsigned tmpl,
     if (is_letrec)
         body_vars = add_template_let_bounds(body_vars, binding_list);
 
-    for (unsigned bl = binding_list; IS_PAIR(bl); bl = cdr(bl)) {
+    unsigned bl = binding_list;
+    gc_protect(&bl);
+    for (; IS_PAIR(bl); bl = cdr(bl)) {
         unsigned binding = car(bl);
         if (!let_binding_has_value(binding))
             continue;
@@ -516,6 +526,7 @@ static unsigned collect_template_free_vars_let(unsigned tmpl,
         if (is_letstar && !is_letrec)
             body_vars = add_template_bound_var(body_vars, car(binding));
     }
+    gc_unprotect(1);
 
     if (!is_letstar && !is_letrec)
         body_vars = add_template_let_bounds(body_vars, binding_list);
@@ -545,13 +556,16 @@ static unsigned collect_template_free_vars_named_let(unsigned tmpl,
         return collect_template_free_vars(body, pattern_vars, collected,
                                           ellipsis, env);
 
-    for (unsigned bl = binding_list; IS_PAIR(bl); bl = cdr(bl)) {
+    unsigned bl = binding_list;
+    gc_protect(&bl);
+    for (; IS_PAIR(bl); bl = cdr(bl)) {
         unsigned binding = car(bl);
         if (!let_binding_has_value(binding))
             continue;
         collected = collect_template_free_vars(cadr(binding), pattern_vars,
                                                collected, ellipsis, env);
     }
+    gc_unprotect(1);
 
     unsigned body_vars = add_template_bound_var(pattern_vars, name);
     gc_protect(&body_vars);
@@ -672,6 +686,11 @@ static unsigned collect_template_free_vars(unsigned tmpl, unsigned pattern_vars,
             !template_id_bound(pattern_vars, ctx.kw_quote) &&
             !template_keyword_bound_as_value(ctx.kw_quote, env))
             return collected;
+        if (IS_ATOM(car(tmpl)) && CELL_ID(car(tmpl)) == ctx.kw_begin &&
+            !template_id_bound(pattern_vars, ctx.kw_begin) &&
+            !template_keyword_bound_as_value(ctx.kw_begin, env))
+            return collect_template_free_vars(
+                cdr(tmpl), pattern_vars, collected, ellipsis, env);
         if (syntax_rules_form_like(tmpl) &&
             !template_id_bound(pattern_vars, ctx.kw_syntax_rules) &&
             !template_keyword_bound_as_value(ctx.kw_syntax_rules, env))
@@ -901,7 +920,9 @@ static unsigned rename_map_without_id(unsigned rename_map, int64_t id)
     gc_protect(&tail);
     bool changed = false;
 
-    for (unsigned m = rename_map; m; m = cdr(m)) {
+    unsigned m = rename_map;
+    gc_protect(&m);
+    for (; m; m = cdr(m)) {
         unsigned entry = car(m);
         if (IS_ATOM(car(entry)) && CELL_ID(car(entry)) == id) {
             changed = true;
@@ -909,6 +930,7 @@ static unsigned rename_map_without_id(unsigned rename_map, int64_t id)
         }
         list_append(&filtered, &tail, entry);
     }
+    gc_unprotect(1);
 
     return changed ? filtered : rename_map;
 }
@@ -927,12 +949,15 @@ static unsigned rename_map_without_lambda_bounds(unsigned rename_map,
     gc_protect(&rename_map);
     gc_protect(&params);
 
-    for (unsigned p = params; p; p = IS_PAIR(p) ? cdr(p) : 0) {
+    unsigned p = params;
+    gc_protect(&p);
+    for (; p; p = IS_PAIR(p) ? cdr(p) : 0) {
         unsigned param = IS_PAIR(p) ? car(p) : p;
         rename_map = rename_map_without_atom(rename_map, param);
         if (!IS_PAIR(p))
             break;
     }
+    gc_unprotect(1);
 
     return rename_map;
 }
@@ -944,11 +969,14 @@ static unsigned rename_map_without_let_bounds(unsigned rename_map,
     gc_protect(&rename_map);
     gc_protect(&binding_list);
 
-    for (unsigned bl = binding_list; IS_PAIR(bl); bl = cdr(bl)) {
+    unsigned bl = binding_list;
+    gc_protect(&bl);
+    for (; IS_PAIR(bl); bl = cdr(bl)) {
         unsigned binding = car(bl);
         if (let_binding_has_value(binding))
             rename_map = rename_map_without_atom(rename_map, car(binding));
     }
+    gc_unprotect(1);
 
     return rename_map;
 }
@@ -1041,6 +1069,7 @@ static unsigned rename_template_vars_let(unsigned tmpl, unsigned rename_map,
         if (is_letstar && !is_letrec)
             body_map = rename_map_without_atom(body_map, var);
     }
+    gc_unprotect(1);
 
     if (!is_letstar && !is_letrec)
         body_map = rename_map_without_let_bounds(body_map, binding_list);
@@ -1092,7 +1121,9 @@ static unsigned rename_template_vars_named_let(unsigned tmpl,
     gc_protect(&new_tail);
     bool changed = false;
 
-    for (unsigned bl = binding_list; IS_PAIR(bl); bl = cdr(bl)) {
+    unsigned bl = binding_list;
+    gc_protect(&bl);
+    for (; IS_PAIR(bl); bl = cdr(bl)) {
         unsigned binding = car(bl);
         if (!let_binding_has_value(binding)) {
             list_append(&new_bindings, &new_tail, binding);
@@ -1116,6 +1147,7 @@ static unsigned rename_template_vars_named_let(unsigned tmpl,
             changed = true;
         gc_unprotect(5);
     }
+    gc_unprotect(1);
 
     unsigned body_map = rename_map_without_atom(rename_map, name);
     gc_protect(&body_map);
@@ -1483,28 +1515,30 @@ static unsigned collect_pattern_vars(unsigned pattern, unsigned collected,
 
 // Emit bytecode to define gensyms created during macro expansion
 // This ensures gensyms from referential transparency are available at runtime
-static void emit_gensym_definitions(compile_ctx *cctx, unsigned old_gensym,
-                                    unsigned new_gensym)
+static void emit_gensym_definitions(compile_ctx *cctx, unsigned bindings)
 {
-    for (unsigned g = old_gensym; g < new_gensym; g++) {
-        char name[20];
-        snprintf(name, sizeof(name), "##gensym##%u", g);
-        unsigned atom = atom_from_string(name);
-        int64_t gensym_id = CELL_ID(atom);
+    for (unsigned b = bindings; b; b = cdr(b)) {
+        unsigned entry = car(b);
+        if (!IS_PAIR(entry) || !IS_ATOM(car(entry)))
+            continue;
 
-        unsigned binding_cell = env_find_binding_cell(gensym_id, cctx->env);
-        if (binding_cell && IS_BINDING_REF(car(binding_cell))) {
-            unsigned binding_ref = car(binding_cell);
+        unsigned gensym = car(entry);
+        unsigned target = cdr(entry);
+        int64_t gensym_id = CELL_ID(gensym);
+
+        if (IS_BINDING_REF(target)) {
+            unsigned binding_ref = target;
             unsigned target_cell = CELL_CAR(binding_ref);
             unsigned target_val = car(target_cell);
             unsigned target_var = cdr(binding_ref);
+
             if (IS_SYNTAX(target_val) || IS_MACRO(target_val)) {
                 emit2(cctx, OP_CONST, code_add_const(cctx->code, target_val));
                 emit2(cctx, OP_DEFINE, gensym_id);
                 continue;
             }
-            unsigned resolved_target =
-                lookup_silent(CELL_ID(target_var), cctx->env);
+
+            unsigned resolved_target = lookup_silent(CELL_ID(target_var), cctx->env);
             if (resolved_target != TOK_ERROR &&
                 (IS_SYNTAX(resolved_target) || IS_MACRO(resolved_target))) {
                 emit2(cctx, OP_CONST,
@@ -1512,38 +1546,27 @@ static void emit_gensym_definitions(compile_ctx *cctx, unsigned old_gensym,
                 emit2(cctx, OP_DEFINE, gensym_id);
                 continue;
             }
-            // A VM stack local has no heap binding cell to reference (its
-            // value lives in a VM register, not an environment frame), so
-            // it must be captured by value at expansion time.
+
             int local_slot = find_stack_local_slot(cctx, CELL_ID(target_var));
             if (local_slot >= 0) {
                 emit_local_get_slot(cctx, local_slot);
                 emit2(cctx, OP_DEFINE, gensym_id);
                 continue;
             }
-            // If the free reference resolved to the persistent global
-            // environment, embed that binding cell directly rather than
-            // re-resolving target_var by name at runtime (OP_DEFINE_ALIAS):
-            // a name-based lookup would find whatever binding shadows that
-            // name at the use site instead of the one the macro's free
-            // reference actually meant, breaking hygiene.
+
             if (binding_cell_is_stable_global(cctx, CELL_ID(target_var),
-                                              target_cell)) {
+                                             target_cell)) {
                 emit3(cctx, OP_DEFINE_ALIAS_REF, gensym_id,
                       code_add_const(cctx->code, binding_ref));
                 continue;
             }
+
             emit3(cctx, OP_DEFINE_ALIAS, gensym_id, CELL_ID(target_var));
             continue;
         }
 
-        // Look up the gensym value in the compile-time environment
-        unsigned val = lookup_silent(gensym_id, cctx->env);
-        if (val != TOK_ERROR) {
-            // Emit const and define
-            emit2(cctx, OP_CONST, code_add_const(cctx->code, val));
-            emit2(cctx, OP_DEFINE, gensym_id);
-        }
+        emit2(cctx, OP_CONST, code_add_const(cctx->code, target));
+        emit2(cctx, OP_DEFINE, gensym_id);
     }
 }
 
@@ -1572,21 +1595,23 @@ static bool compile_macro_binding(unsigned mac, unsigned expr,
     cctx->macro_expansion_depth++;
 
     if (IS_SYNTAX(mac)) {
-        unsigned old_gensym = gensym_counter;
-        unsigned expanded = apply_syntax(mac, expr, cctx->env);
+        unsigned bindings = 0;
+        gc_protect(&bindings);
+        unsigned expanded = apply_syntax(mac, expr, cctx->env, &bindings);
         if (expanded == TOK_ERROR) {
             show_error("macro expansion failed");
             *result = emit_syntax_error(cctx, "macro expansion failed");
             cctx->macro_expansion_depth--;
+            gc_unprotect(1);
             return true;
         }
         // Expansion may be a large newly allocated tree.  The gensym setup
         // below allocates before compilation starts, so keep that tree rooted
         // across the setup rather than relying on incidental heap headroom.
         gc_protect(&expanded);
-        emit_gensym_definitions(cctx, old_gensym, gensym_counter);
+        emit_gensym_definitions(cctx, bindings);
         *result = compile_expr_internal(expanded, cctx);
-        gc_unprotect(1);
+        gc_unprotect(2);
         cctx->macro_expansion_depth--;
         return true;
     }
@@ -2589,7 +2614,9 @@ static compile_result compile_lambda(unsigned expr, compile_ctx *cctx)
         gc_protect(&vars_tail);
         gc_protect(&vals_tail);
 
-        for (unsigned p = params; p; p = IS_PAIR(p) ? cdr(p) : 0) {
+        unsigned p = params;
+        gc_protect(&p);
+        for (; p; p = IS_PAIR(p) ? cdr(p) : 0) {
             unsigned var = IS_PAIR(p) ? car(p) : p;
             gc_protect(&var);
             unsigned vc = alloc_cons(var, 0);
@@ -2608,6 +2635,8 @@ static compile_result compile_lambda(unsigned expr, compile_ctx *cctx)
             if (!IS_PAIR(p))
                 break; // rest param
         }
+
+        gc_unprotect(1);
 
         if (vars) {
             unsigned frame = alloc_cons(vars, vals);
@@ -2790,7 +2819,9 @@ static unsigned extend_compile_env_with_names(unsigned env, unsigned names)
     gc_protect(&env);
     gc_protect(&names);
 
-    FORLIST(n, names) {
+    unsigned n = names;
+    gc_protect(&n);
+    for (; n; n = cdr(n)) {
         unsigned var = car(n);
         gc_protect(&var);
         unsigned vc = alloc_cons(var, frame_vars);
@@ -2799,6 +2830,7 @@ static unsigned extend_compile_env_with_names(unsigned env, unsigned names)
         frame_vals = val;
         gc_unprotect(1);
     }
+    gc_unprotect(1);
 
     unsigned frame = alloc_cons(frame_vars, frame_vals);
     gc_protect(&frame);
@@ -2867,7 +2899,9 @@ static unsigned extend_compile_env(unsigned env, unsigned bindings)
     gc_protect(&env);
     gc_protect(&bindings);
 
-    FORLIST(b, bindings) {
+    unsigned b = bindings;
+    gc_protect(&b);
+    for (; b; b = cdr(b)) {
         unsigned var = car(car(b));
         gc_protect(&var);
         unsigned vc = alloc_cons(var, frame_vars);
@@ -2876,6 +2910,7 @@ static unsigned extend_compile_env(unsigned env, unsigned bindings)
         frame_vals = val;
         gc_unprotect(1);
     }
+    gc_unprotect(1);
 
     unsigned frame = alloc_cons(frame_vars, frame_vals);
     gc_protect(&frame);
@@ -2908,11 +2943,14 @@ static compile_result compile_named_let(unsigned expr, compile_ctx *cctx)
     gc_protect(&args);
     gc_protect(&args_tail);
 
-    FORLIST(b, bindings) {
+    unsigned b = bindings;
+    gc_protect(&b);
+    for (; b; b = cdr(b)) {
         unsigned binding = car(b);
         list_append(&params, &params_tail, car(binding));
         list_append(&args, &args_tail, cadr(binding));
     }
+    gc_unprotect(1);
 
     unsigned argc = list_length(args);
     bool tail = cctx->tail_position;
@@ -3029,7 +3067,9 @@ static compile_result compile_let(unsigned expr, compile_ctx *cctx)
     // Only track non-self-referential lambdas (self-ref needs letrec semantics)
     unsigned saved_known = cctx->known_lambdas;
     gc_protect(&saved_known);
-    FORLIST(b, bindings) {
+    unsigned b = bindings;
+    gc_protect(&b);
+    for (; b; b = cdr(b)) {
         unsigned binding = car(b);
         unsigned var = car(binding);
         unsigned val_expr = cadr(binding);
@@ -3050,6 +3090,7 @@ static compile_result compile_let(unsigned expr, compile_ctx *cctx)
             }
         }
     }
+    gc_unprotect(1);
 
     // Compile body in the same tail context as the let expression.
     cctx->tail_position = tail;
@@ -3095,7 +3136,9 @@ static compile_result compile_letstar(unsigned expr, compile_ctx *cctx)
     // Compile and define each binding sequentially
     // Each binding extends the compile-time environment for subsequent bindings
     cctx->tail_position = false;
-    FORLIST(b, bindings) {
+    unsigned b = bindings;
+    gc_protect(&b);
+    for (; b; b = cdr(b)) {
         unsigned binding = car(b);
         gc_protect(&binding);
         compile_expr_internal(cadr(binding), cctx);
@@ -3107,6 +3150,7 @@ static compile_result compile_letstar(unsigned expr, compile_ctx *cctx)
         cctx->env = extend_compile_env(cctx->env, single_binding);
         gc_unprotect(2);
     }
+    gc_unprotect(1);
 
     // Compile body in the same tail context as the let* expression.
     cctx->tail_position = tail;
@@ -3145,7 +3189,9 @@ static compile_result compile_letrec(unsigned expr, compile_ctx *cctx)
     emit_pushenv(cctx);
 
     // First pass: define all variables with undefined values
-    FORLIST(b, bindings) {
+    unsigned b = bindings;
+    gc_protect(&b);
+    for (; b; b = cdr(b)) {
         unsigned binding = car(b);
         emit2(cctx, OP_CONST, code_add_const(cctx->code, 0));
         emit2(cctx, OP_DEFINE, CELL_ID(car(binding)));
@@ -3224,7 +3270,8 @@ static compile_result compile_letrec(unsigned expr, compile_ctx *cctx)
     gc_protect(&cctx->loop_params);
     cctx->loop_arity = loop_arity;
     cctx->loop_pending = loop_var >= 0;
-    FORLIST(b, bindings) {
+    b = bindings;
+    for (; b; b = cdr(b)) {
         unsigned binding = car(b);
         gc_protect(&binding);
         compile_expr_internal(cadr(binding), cctx);
@@ -3232,6 +3279,7 @@ static compile_result compile_letrec(unsigned expr, compile_ctx *cctx)
         emit(cctx, OP_POP); // Discard set! result
         gc_unprotect(1);
     }
+    gc_unprotect(1);
     cctx->loop_var_id = saved_loop_var;
     cctx->loop_params = saved_loop_params;
     cctx->loop_arity = saved_loop_arity;
@@ -3779,14 +3827,16 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
                                               arg_vals);
                     }
 
-                    // Evaluate primitive at compile time (suppress error output)
-                    static FILE *devnull = NULL;
-                    if (!devnull) devnull = fopen("/dev/null", "w");
-                    FILE *saved_stderr = stderr;
-                    if (devnull)
-                        stderr = devnull;
+                    // Evaluate the primitive at compile time. A failure here
+                    // is not a user-visible error - the compiler simply
+                    // declines to fold - so the diagnostic is suppressed
+                    // while still being recorded in ctx.last_error. Saved and
+                    // restored rather than cleared, so a nested fold cannot
+                    // re-enable output for its enclosing one.
+                    bool saved_suppress = ctx.suppress_error_output;
+                    ctx.suppress_error_output = true;
                     unsigned result = apply_primitive(prim_id, arg_vals);
-                    stderr = saved_stderr;
+                    ctx.suppress_error_output = saved_suppress;
                     gc_unprotect(1);
                     gc_unprotect((int)protected_arg_count + 1);
                     ctx.last_error[0] = '\0';

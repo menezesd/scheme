@@ -33,9 +33,8 @@
  */
 bool handle_quote(unsigned id, unsigned env, unsigned cont)
 {
-    (void)env;
     if (!syntax_arity_checked(id, 1, 1, "quote")) {
-        tramp_error();
+        cps_signal_current_error(env, cont);
         return true;
     }
     tramp_apply(cadr(id), cont);
@@ -56,13 +55,13 @@ bool handle_lambda(unsigned id, unsigned env, unsigned cont)
     unsigned rest = cdr(id);
     if (!IS_PAIR(rest)) {
         show_error("lambda: expected formals and body");
-        tramp_error();
+        cps_signal_current_error(env, cont);
         return true;
     }
     unsigned params = car(rest);
     unsigned body = cdr(rest);
     if (!body || !list_length_checked(body, NULL, "lambda")) {
-        tramp_error();
+        cps_signal_current_error(env, cont);
         return true;
     }
     gc_protect(&params);
@@ -72,10 +71,29 @@ bool handle_lambda(unsigned id, unsigned env, unsigned cont)
     // lambda_params_valid allocates, so locals must be protected first
     if (!lambda_params_valid(params)) {
         show_error("lambda: invalid formals");
-        tramp_error();
+        cps_signal_current_error(env, cont);
         return true;
     }
-    unsigned body_env = alloc_cons(body, env);
+    unsigned expansion_env = extend_env_empty(env);
+    unsigned macro_bindings = 0;
+    gc_protect(&expansion_env);
+    gc_protect(&macro_bindings);
+    unsigned expanded_body = expand_form(body, expansion_env, &macro_bindings);
+    gc_protect(&expanded_body);
+    if (expanded_body == TOK_ERROR) {
+        cps_signal_current_error(env, cont);
+        return true;
+    }
+
+    unsigned closure_env = env;
+    gc_protect(&closure_env);
+    if (macro_bindings)
+        closure_env = extend_env_empty(env);
+    if (macro_bindings)
+        apply_syntax_bindings(closure_env, macro_bindings);
+
+    unsigned body_env = alloc_cons(expanded_body, closure_env);
+    gc_protect(&body_env);
     unsigned p = make_typed_cell(BT_FUNCTION, params, body_env);
     tramp_apply(p, cont);
     return true;
@@ -92,7 +110,7 @@ bool handle_if(unsigned id, unsigned env, unsigned cont)
 {
     GC_GUARD;
     if (!syntax_arity_checked(id, 2, 3, "if")) {
-        tramp_error();
+        cps_signal_current_error(env, cont);
         return true;
     }
     unsigned test = cadr(id);
@@ -119,7 +137,7 @@ bool handle_begin(unsigned id, unsigned env, unsigned cont)
 {
     unsigned seq = cdr(id);
     if (!syntax_arity_checked(id, 0, UINT_MAX, "begin")) {
-        tramp_error();
+        cps_signal_current_error(env, cont);
         return true;
     }
     if (!seq) {
@@ -153,14 +171,14 @@ bool handle_set(unsigned id, unsigned env, unsigned cont)
 {
     GC_GUARD;
     if (!syntax_arity_checked(id, 2, 2, "set!")) {
-        tramp_error();
+        cps_signal_current_error(env, cont);
         return true;
     }
     unsigned var = cadr(id);
     unsigned val_expr = caddr(id);
     if (!identifier_valid(var)) {
         show_error("set!: expected variable");
-        tramp_error();
+        cps_signal_current_error(env, cont);
         return true;
     }
     gc_protect(&var);
@@ -185,7 +203,7 @@ bool handle_define(unsigned id, unsigned env, unsigned cont)
 {
     GC_GUARD;
     if (!syntax_arity_checked(id, 2, UINT_MAX, "define")) {
-        tramp_error();
+        cps_signal_current_error(env, cont);
         return true;
     }
     unsigned vid = cadr(id);
@@ -204,14 +222,14 @@ bool handle_define(unsigned id, unsigned env, unsigned cont)
             !list_length_checked(body, NULL, "define") ||
             !lambda_params_valid(params)) {
             show_error("define: invalid syntax");
-            tramp_error();
+            cps_signal_current_error(env, cont);
             return true;
         }
         unsigned body_env = alloc_cons(body, env);
         unsigned p = make_typed_cell(BT_FUNCTION, params, body_env);
         gc_protect(&p);
         if (defvar(name, p, env) == TOK_ERROR) {
-            tramp_error();
+            cps_signal_current_error(env, cont);
             return true;
         }
         tramp_apply(name, cont);
@@ -219,7 +237,7 @@ bool handle_define(unsigned id, unsigned env, unsigned cont)
     }
     if (!identifier_valid(vid) || cdddr(id)) {
         show_error("define: invalid syntax");
-        tramp_error();
+        cps_signal_current_error(env, cont);
         return true;
     }
     unsigned val_expr = caddr(id);
@@ -243,7 +261,7 @@ bool handle_and(unsigned id, unsigned env, unsigned cont)
 {
     unsigned seq = cdr(id);
     if (!syntax_arity_checked(id, 0, UINT_MAX, "and")) {
-        tramp_error();
+        cps_signal_current_error(env, cont);
         return true;
     }
     if (!seq) {
@@ -277,7 +295,7 @@ bool handle_or(unsigned id, unsigned env, unsigned cont)
 {
     unsigned seq = cdr(id);
     if (!syntax_arity_checked(id, 0, UINT_MAX, "or")) {
-        tramp_error();
+        cps_signal_current_error(env, cont);
         return true;
     }
     if (!seq) {
@@ -311,7 +329,7 @@ bool handle_cond(unsigned id, unsigned env, unsigned cont)
 {
     unsigned clauses = cdr(id);
     if (!cond_clauses_valid(clauses, "cond", env)) {
-        tramp_error();
+        cps_signal_current_error(env, cont);
         return true;
     }
     if (!clauses) {
@@ -360,7 +378,7 @@ bool handle_cond_expand(unsigned id, unsigned env, unsigned cont)
 {
     unsigned clauses = cdr(id);
     if (!list_length_checked(clauses, NULL, "cond-expand")) {
-        tramp_error();
+        cps_signal_current_error(env, cont);
         return true;
     }
 
@@ -368,13 +386,13 @@ bool handle_cond_expand(unsigned id, unsigned env, unsigned cont)
         unsigned clause = car(c);
         if (!IS_PAIR(clause)) {
             show_error("cond-expand: invalid clause");
-            tramp_error();
+            cps_signal_current_error(env, cont);
             return true;
         }
         unsigned requirement = car(clause);
         unsigned body = cdr(clause);
         if (!list_length_checked(body, NULL, "cond-expand")) {
-            tramp_error();
+            cps_signal_current_error(env, cont);
             return true;
         }
         bool is_else = IS_KEYWORD(requirement, ctx.kw_else) &&
@@ -396,7 +414,7 @@ bool handle_cond_expand(unsigned id, unsigned env, unsigned cont)
 static bool handle_named_let(unsigned id, unsigned env, unsigned cont)
 {
     if (!syntax_arity_checked(id, 3, UINT_MAX, "let")) {
-        tramp_error();
+        cps_signal_current_error(env, cont);
         return true;
     }
 
@@ -406,7 +424,7 @@ static bool handle_named_let(unsigned id, unsigned env, unsigned cont)
     if (!identifier_valid(name) || !binding_list_valid(bindings, "let") ||
         !list_length_checked(body, NULL, "let")) {
         show_error("let: invalid named let syntax");
-        tramp_error();
+        cps_signal_current_error(env, cont);
         return true;
     }
 
@@ -424,11 +442,14 @@ static bool handle_named_let(unsigned id, unsigned env, unsigned cont)
     gc_protect(&args);
     gc_protect(&args_tail);
 
-    FORLIST(b, bindings) {
+    unsigned b = bindings;
+    gc_protect(&b);
+    for (; b; b = cdr(b)) {
         unsigned binding = car(b);
         list_append(&params, &params_tail, car(binding));
         list_append(&args, &args_tail, cadr(binding));
     }
+    gc_unprotect(1);
 
     unsigned name_cell = 0, val_cell = 0, new_env = 0;
     gc_protect(&name_cell);
@@ -476,7 +497,7 @@ static bool handle_named_let(unsigned id, unsigned env, unsigned cont)
 bool handle_let(unsigned id, unsigned env, unsigned cont)
 {
     if (!syntax_arity_checked(id, 2, UINT_MAX, "let")) {
-        tramp_error();
+        cps_signal_current_error(env, cont);
         return true;
     }
     unsigned bindings = cadr(id);
@@ -486,7 +507,7 @@ bool handle_let(unsigned id, unsigned env, unsigned cont)
     unsigned body = cddr(id);
     if (!binding_list_valid(bindings, "let") ||
         !list_length_checked(body, NULL, "let")) {
-        tramp_error();
+        cps_signal_current_error(env, cont);
         return true;
     }
     if (!bindings) {
@@ -565,14 +586,14 @@ bool handle_let(unsigned id, unsigned env, unsigned cont)
 bool handle_letstar(unsigned id, unsigned env, unsigned cont)
 {
     if (!syntax_arity_checked(id, 2, UINT_MAX, "let*")) {
-        tramp_error();
+        cps_signal_current_error(env, cont);
         return true;
     }
     unsigned bindings = cadr(id);
     unsigned body = cddr(id);
     if (!binding_list_valid(bindings, "let*") ||
         !list_length_checked(body, NULL, "let*")) {
-        tramp_error();
+        cps_signal_current_error(env, cont);
         return true;
     }
     if (!bindings) {
@@ -607,14 +628,14 @@ bool handle_letstar(unsigned id, unsigned env, unsigned cont)
 bool handle_letrec(unsigned id, unsigned env, unsigned cont)
 {
     if (!syntax_arity_checked(id, 2, UINT_MAX, "letrec")) {
-        tramp_error();
+        cps_signal_current_error(env, cont);
         return true;
     }
     unsigned bindings = cadr(id);
     unsigned body = cddr(id);
     if (!binding_list_valid(bindings, "letrec") ||
         !list_length_checked(body, NULL, "letrec")) {
-        tramp_error();
+        cps_signal_current_error(env, cont);
         return true;
     }
 
@@ -693,7 +714,7 @@ bool handle_quasiquote(unsigned id, unsigned env, unsigned cont)
 {
     GC_GUARD;
     if (!syntax_arity_checked(id, 1, 1, "quasiquote")) {
-        tramp_error();
+        cps_signal_current_error(env, cont);
         return true;
     }
     unsigned tmpl = cadr(id);
@@ -705,7 +726,7 @@ bool handle_quasiquote(unsigned id, unsigned env, unsigned cont)
     unsigned expr = qq_transform_cps(tmpl, env);
     gc_protect(&expr);
     if (expr == TOK_ERROR) {
-        tramp_error();
+        cps_signal_current_error(env, cont);
         return true;
     }
     tramp_eval(expr, env, cont);
@@ -716,13 +737,13 @@ bool handle_define_macro(unsigned id, unsigned env, unsigned cont)
 {
     GC_GUARD;
     if (!syntax_arity_checked(id, 2, UINT_MAX, "define-macro")) {
-        tramp_error();
+        cps_signal_current_error(env, cont);
         return true;
     }
     unsigned sig = cadr(id);
     if (!IS_PAIR(sig)) {
         show_error("define-macro: invalid syntax");
-        tramp_error();
+        cps_signal_current_error(env, cont);
         return true;
     }
     unsigned name = car(sig);
@@ -738,14 +759,14 @@ bool handle_define_macro(unsigned id, unsigned env, unsigned cont)
         !list_length_checked(mbody, NULL, "define-macro") ||
         !lambda_params_valid(params)) {
         show_error("define-macro: invalid syntax");
-        tramp_error();
+        cps_signal_current_error(env, cont);
         return true;
     }
     unsigned mbody_env = alloc_cons(mbody, env);
     unsigned p = make_typed_cell(BT_MACRO, params, mbody_env);
     gc_protect(&p);
     if (defvar(name, p, env) == TOK_ERROR) {
-        tramp_error();
+        cps_signal_current_error(env, cont);
         return true;
     }
     tramp_apply(name, cont);
@@ -756,14 +777,14 @@ bool handle_define_syntax(unsigned id, unsigned env, unsigned cont)
 {
     GC_GUARD;
     if (!syntax_arity_checked(id, 2, 2, "define-syntax")) {
-        tramp_error();
+        cps_signal_current_error(env, cont);
         return true;
     }
     unsigned name = cadr(id);
     unsigned transformer_form = caddr(id);
     if (!identifier_valid(name)) {
         show_error("define-syntax: expected name");
-        tramp_error();
+        cps_signal_current_error(env, cont);
         return true;
     }
     gc_protect(&name);
@@ -772,17 +793,17 @@ bool handle_define_syntax(unsigned id, unsigned env, unsigned cont)
     gc_protect(&cont);
     if (!syntax_rules_valid(transformer_form, syntax_default_ellipsis_id(env),
                             "define-syntax")) {
-        tramp_error();
+        cps_signal_current_error(env, cont);
         return true;
     }
     unsigned p = make_syntax_transformer(transformer_form, env);
     if (p == TOK_ERROR) {
-        tramp_error();
+        cps_signal_current_error(env, cont);
         return true;
     }
     gc_protect(&p);
     if (defvar(name, p, env) == TOK_ERROR) {
-        tramp_error();
+        cps_signal_current_error(env, cont);
         return true;
     }
     tramp_apply(name, cont);
@@ -793,14 +814,14 @@ bool handle_let_syntax(unsigned id, unsigned env, unsigned cont)
 {
     // (let-syntax ((name (syntax-rules ...)) ...) body ...)
     if (!syntax_arity_checked(id, 2, UINT_MAX, "let-syntax")) {
-        tramp_error();
+        cps_signal_current_error(env, cont);
         return true;
     }
     unsigned bindings = cadr(id);
     unsigned body = cddr(id);
     if (!binding_list_valid(bindings, "let-syntax") ||
         !list_length_checked(body, NULL, "let-syntax")) {
-        tramp_error();
+        cps_signal_current_error(env, cont);
         return true;
     }
     // If no bindings, use outer env directly (transparent for internal defines)
@@ -826,14 +847,14 @@ bool handle_letrec_syntax(unsigned id, unsigned env, unsigned cont)
 {
     // (letrec-syntax ((name (syntax-rules ...)) ...) body ...)
     if (!syntax_arity_checked(id, 2, UINT_MAX, "letrec-syntax")) {
-        tramp_error();
+        cps_signal_current_error(env, cont);
         return true;
     }
     unsigned bindings = cadr(id);
     unsigned body = cddr(id);
     if (!binding_list_valid(bindings, "letrec-syntax") ||
         !list_length_checked(body, NULL, "letrec-syntax")) {
-        tramp_error();
+        cps_signal_current_error(env, cont);
         return true;
     }
     // If no bindings, use outer env directly (transparent for internal defines)
@@ -878,14 +899,19 @@ bool dispatch_special_form(int64_t kw, unsigned id, unsigned env, unsigned cont)
             gc_protect(&cont);
             gc_protect(&binding);
             if (!eval_note_macro_expansion()) {
-                tramp_error();
+                cps_signal_current_error(env, cont);
                 return true;
             }
-            unsigned expanded = apply_syntax(binding, id, env);
+            unsigned bindings = 0;
+            gc_protect(&bindings);
+            unsigned expanded = apply_syntax(binding, id, env, &bindings);
+            gc_protect(&expanded);
             if (expanded == TOK_ERROR) {
-                tramp_error();
+                cps_signal_current_error(env, cont);
                 return true;
             }
+            if (bindings)
+                apply_syntax_bindings(env, bindings);
             tramp_eval(expanded, env, cont);
             return true;
         }
