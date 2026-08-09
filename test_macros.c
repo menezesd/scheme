@@ -352,7 +352,7 @@ TEST(expand_malformed_binding_entry_ignores_entry)
 TEST(apply_syntax_rejects_non_syntax_transformer)
 {
     unsigned input = alloc_cons(atom("m"), 0);
-    unsigned result = apply_syntax(store(1), input, 0);
+    unsigned result = apply_syntax(store(1), input, 0, 0);
 
     ASSERT_EQ(result, TOK_ERROR);
     PASS();
@@ -362,7 +362,7 @@ TEST(apply_syntax_rejects_malformed_input)
 {
     unsigned transformer = alloc_cons(store(1), 0);
     CELL_TYPE(transformer) = BT_SYNTAX;
-    unsigned result = apply_syntax(transformer, store(2), 0);
+    unsigned result = apply_syntax(transformer, store(2), 0, 0);
 
     ASSERT_EQ(result, TOK_ERROR);
     PASS();
@@ -376,7 +376,7 @@ TEST(apply_syntax_rejects_malformed_rules)
     CELL_TYPE(transformer) = BT_SYNTAX;
     unsigned input = alloc_cons(atom("m"), 0);
 
-    unsigned result = apply_syntax(transformer, input, 0);
+    unsigned result = apply_syntax(transformer, input, 0, 0);
 
     ASSERT_EQ(result, TOK_ERROR);
     PASS();
@@ -397,7 +397,7 @@ TEST(apply_syntax_rejects_unregistered_compiled_pattern)
     unsigned transformer = alloc_cons(syn_data, 0);
     CELL_TYPE(transformer) = BT_SYNTAX;
 
-    unsigned result = apply_syntax(transformer, input, 0);
+    unsigned result = apply_syntax(transformer, input, 0, 0);
 
     ASSERT_EQ(result, TOK_ERROR);
     CELL_TYPE(cpat_cell) = BT_FREE;

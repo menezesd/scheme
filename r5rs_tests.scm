@@ -1,5 +1,7 @@
 ;;; R5RS Conformance Tests
 ;;; Tests core R5RS features for compliance
+;; This file is intentionally loaded as a large source file; its macro and
+;; continuation sections also exercise streaming top-level loading.
 
 ;; Test framework
 (define test-pass 0)
@@ -682,15 +684,14 @@
 (test-section "Hygiene edge cases")
 (test "else as binding" 'ok (let ((else 1)) (cond (else 'ok) (#t 'bad))))
 (test "=> as binding" 'ok (let ((=> 1)) (cond (#t => 'ok))))
-;; These edge cases require runtime quasiquote/ellipsis shadowing, not supported in bytecode mode
-;; (test "unquote as binding" '(,foo) (let ((unquote 1)) `(,foo)))
-;; (test "unquote-splicing as binding" '(,@foo) (let ((unquote-splicing 1)) `(,@foo)))
-;; (test "... as binding" 'ok
-;;     (let ((... 2))
-;;       (let-syntax ((s (syntax-rules ()
-;;                         ((_ x ...) 'bad)
-;;                         ((_ . r) 'ok))))
-;;         (s a b c))))
+(test "unquote as binding" '((unquote foo)) (let ((unquote 1)) `(,foo)))
+(test "unquote-splicing as binding" '((unquote-splicing foo)) (let ((unquote-splicing 1)) `(,@foo)))
+(test "... as binding" 'ok
+    (let ((... 2))
+      (let-syntax ((s (syntax-rules ()
+                        ((_ x ...) 'bad)
+                        ((_ . r) 'ok))))
+        (s a b c))))
 (test "let-syntax internal def" 'ok (let ()
             (let-syntax ()
               (define internal-def 'ok))
@@ -716,6 +717,13 @@
            (add (lambda (s) (set! path (cons s path)))))
       (dynamic-wind (lambda () (add 'a)) (lambda () (add 'b)) (lambda () (add 'c)))
       (reverse path)))
+(test "dynamic-wind preserves direct multiple values" '(1 2)
+    (call-with-values
+      (lambda ()
+        (dynamic-wind (lambda () #f)
+                      (lambda () (values 1 2))
+                      (lambda () #f)))
+      list))
 
 (test "dynamic-wind with continuation" '(connect talk1 disconnect connect talk2 disconnect)
     (let ((path '())
@@ -901,12 +909,31 @@
         (raise 'boom))))
 (test "guard with matching clause catches normally" '(caught x)
     (guard (e (#t (list 'caught e))) (raise 'x)))
+(test "guard catches malformed special forms" 'caught
+    (guard (e (#t 'caught)) (if)))
+(test "guard catches syntax transformer errors" 'caught
+    (guard (e (#t 'caught))
+      (let-syntax ((m (syntax-rules () ((_ x) x))))
+        (m))))
+(test "guard catches invalid call/cc arity" 'caught
+    (guard (e (#t 'caught)) (call/cc)))
+(test "guard catches invalid apply arity" 'caught
+    (guard (e (#t 'caught)) (apply)))
 (test "raise-continuable returns handler value to raise point" 16
     (with-exception-handler
       (lambda (e) (+ e 1))
       (lambda () (+ 10 (raise-continuable 5)))))
 (test "error object carries message through guard" "boom"
     (guard (e (#t (error-object-message e))) (error "boom" 1 2)))
+(test "dynamic-wind runs after thunk when body raises" '(caught (before after))
+    (let ((events '()))
+      (list
+       (guard (e (#t 'caught))
+         (dynamic-wind
+           (lambda () (set! events (cons 'before events)))
+           (lambda () (error "boom"))
+           (lambda () (set! events (cons 'after events)))))
+       (reverse events))))
 (test "deep re-raise chain terminates at the matching guard" '(caught-deep deep)
     (letrec ((nest (lambda (n)
                      (if (= n 0)
@@ -972,6 +999,80 @@
                  (bump!) (bump!) (bump!)
                  n)))
       (list (counter-maker) (counter-maker))))
+
+(test-section "Hygiene: no-op free-identifier renames are skipped")
+;; apply_syntax used to mint a fresh gensym for EVERY free identifier on
+;; EVERY expansion, then alias it into the use-site frame. When the
+;; identifier already denotes the same binding cell at the use site as at
+;; the definition site, that rename is a no-op, so it is now skipped - one
+;; permanent atom-table slot per expansion was the cost, which exhausted
+;; the table in --interpreter mode (the CPS evaluator re-expands a macro on
+;; every evaluation, unlike the VM which expands once at compile time).
+;; These pin the boundaries of that skip: it must NOT fire whenever the
+;; identifier genuinely resolves somewhere else at the use site.
+(define noop-rename-x 5)
+(define-syntax noop-rename-inc (syntax-rules () ((_ v) (+ v 1))))
+
+;; Skip fires here: `+` is the same global at both sites.
+(test "unshadowed free identifier still resolves" 6
+    (noop-rename-inc noop-rename-x))
+(test "skip path stays correct across repeated expansions" '(6 6 6)
+    (list (noop-rename-inc 5) (noop-rename-inc 5) (noop-rename-inc 5)))
+
+;; Skip must NOT fire below - the definition-site binding must win.
+(test "free identifier shadowed by a let at the use site" 11
+    (let ((+ -)) (noop-rename-inc 10)))
+(test "free identifier shadowed by a lambda parameter" 11
+    ((lambda (+) (noop-rename-inc 10)) -))
+(test "free identifier shadowed by an internal define, repeated calls" '(11 21)
+    (letrec ((shadowing
+               (lambda (n)
+                 (define + -)
+                 (noop-rename-inc n))))
+      (list (shadowing 10) (shadowing 20))))
+
+;; A transformer-introduced identifier that is bound only at the use site
+;; must still be renamed to an unbound gensym, so the use-site binding
+;; cannot capture it.
+(define-syntax noop-rename-usey (syntax-rules () ((_) noop-rename-free-y)))
+(test "use-site binding cannot capture a macro-introduced identifier" 'unbound
+    (let ((noop-rename-free-y 99))
+      (guard (e (#t 'unbound)) (noop-rename-usey))))
+
+(test-section "Macro expansion timing")
+(define-syntax redefine-hygiene-m (syntax-rules () ((_ x) (+ x 1))))
+(define (redefine-hygiene-f) (redefine-hygiene-m 5))
+(define-syntax redefine-hygiene-m (syntax-rules () ((_ x) (* x 10))))
+(test "macro use in previously defined procedure uses definition-time macro" 6
+    (redefine-hygiene-f))
+
+(test-section "Named-let hygiene under allocation pressure")
+;; hygienize_named_let held new_sym (the gensym for a renamed named-let
+;; variable) as a raw local across alloc_cons/list_append calls in its binding
+;; loop, reachable only through the rename list - so a GC mid-loop could
+;; relocate the cell and splice a stale index into the rebuilt bindings.
+;; hygienize_let and hygienize_lambda both protect the same value. The
+;; make-vector below forces collections while the macro is expanded
+;; repeatedly. Verified against MIT.
+(define-syntax named-let-churn
+  (syntax-rules ()
+    ((_ a b) (let loop ((x a) (y b) (z 1) (w 2) (v 3))
+               (if (= x 0) (+ y z w v) (loop (- x 1) y z w v))))))
+(test "named-let expansion survives GC pressure" 7
+    (let churn ((n 20000) (acc 7))
+      (if (= n 0)
+          acc
+          (churn (- n 1)
+                 (begin (make-vector 40 n)
+                        (modulo (named-let-churn 3 acc) 1000))))))
+
+(define named-let-outer 99)
+(define-syntax named-let-shadow
+  (syntax-rules ()
+    ((_ a) (let loop ((named-let-outer a) (k 0))
+             (if (= named-let-outer 0) k (loop (- named-let-outer 1) (+ k 1)))))))
+(test "named-let variable does not capture a use-site binding" '(5 99)
+    (list (named-let-shadow 5) named-let-outer))
 
 (test-section "letrec with 3+ bindings")
 ;; The CPS interpreter's letrec-init continuation used to silently swap
@@ -1086,9 +1187,8 @@
       (reverse log)))
 
 (test-section "Bytevector ports: peek-u8/u8-ready?")
-;; peek-u8/u8-ready? are C primitives that only understand real ports;
-;; they used to error ("argument must be input port") on the vector-based
-;; bytevector input ports that read-u8/read-bytevector already support.
+;; Byte-oriented operations require binary ports.  The wrappers support the
+;; vector-based bytevector input ports, while textual ports are rejected.
 (test "peek-u8 on bytevector port does not consume" '(1 1)
     (let ((p (open-input-bytevector (bytevector 1 2 3))))
       (list (peek-u8 p) (peek-u8 p))))
@@ -1105,13 +1205,12 @@
     (let ((p (open-input-bytevector (bytevector 1))))
       (read-u8 p)
       (u8-ready? p)))
-(test "peek-u8/u8-ready? still work on ordinary ports" '(97 #t)
+(test "peek-u8/u8-ready? reject textual ports" '(#t #t)
     (let ((p (open-input-string "abc")))
-      (list (peek-u8 p) (u8-ready? p))))
+      (list (guard (e (#t #t)) (peek-u8 p) #f)
+            (guard (e (#t #t)) (u8-ready? p) #f))))
 
-(test-section "string-upper-case?/string-lower-case? with no cased letters")
-;; "is every alphabetic character uppercase/lowercase" is vacuously true
-;; when there are no alphabetic characters at all, matching MIT Scheme.
+(test-section "string-upper-case?/string-lower-case? with no letters")
 (test "string-upper-case? on digits" #t (string-upper-case? "123"))
 (test "string-upper-case? on empty string" #t (string-upper-case? ""))
 (test "string-upper-case? on punctuation" #t (string-upper-case? "!!!"))
@@ -1124,12 +1223,12 @@
 (test "hash-table-update! calls the default as a thunk" 11
     (let ((h (make-strong-eqv-hash-table)))
       (hash-table-update! h 'y (lambda (v) (+ v 1)) (lambda () 10))
-      (hash-table-ref h 'y #f)))
+      (hash-table-ref/default h 'y #f)))
 (test "hash-table-update! on an existing key" 6
     (let ((h (make-strong-eqv-hash-table)))
       (hash-table-set! h 'x 5)
       (hash-table-update! h 'x (lambda (v) (+ v 1)))
-      (hash-table-ref h 'x #f)))
+      (hash-table-ref/default h 'x #f)))
 (test "member accepts an optional compare procedure" '(5.0 6)
     (member 5 (list 1 2 5.0 6) =))
 (test "assoc accepts an optional compare procedure" '(2 . b)

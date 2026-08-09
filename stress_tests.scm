@@ -370,6 +370,18 @@
 
 (test "recursive-like macro" 15 (sum-to-macro 5))
 
+;; Macro introducing fresh template bindings in a loop (should not exhaust gensyms
+;; across expansions in CPS mode).
+(define-syntax leak-regression
+  (syntax-rules ()
+    ((_ a) (let ((tmp a)) (+ tmp 1)))))
+
+(test "template-introduced bindings stay bounded across many iterations" 20000
+      (let loop ((n 20000) (acc 0))
+        (if (= n 0)
+            acc
+            (loop (- n 1) (leak-regression acc)))))
+
 ;; ============================================================================
 ;; Dynamic-wind Stress
 ;; ============================================================================
@@ -517,6 +529,25 @@
             (loop (- d 1) (+ acc 1))))))))
 
 (test "deep recursion with escape" 'found (deep-with-escape 10000 500))
+
+;; ============================================================================
+;; Merge / sort stack depth
+;; ============================================================================
+;; merge's inner loop used to be (cons x (loop ...)), recursing once per
+;; merged element, so the final merge of a large sort exceeded the VM call
+;; stack: (sort <100000-element list> <) died with "call stack overflow".
+;; This merges two 50000-element lists, which is exactly the 100000-deep case
+;; that used to fail. Lives here rather than in test.scm because test.scm also
+;; runs under --interpreter, where this takes ~20s.
+(test "merge of two 50000-element lists does not overflow" 100000
+      (length (merge < (iota 50000) (iota 50000))))
+
+(test "merge result is ordered" #t
+      (let loop ((l (merge < (iota 20000) (iota 20000))))
+        (cond ((null? l) #t)
+              ((null? (cdr l)) #t)
+              ((> (car l) (cadr l)) #f)
+              (else (loop (cdr l))))))
 
 ;; ============================================================================
 ;; Summary
