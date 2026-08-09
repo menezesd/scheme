@@ -30,6 +30,7 @@ make test-c   # Run C unit tests
 make test-sanitize # Run bounded AddressSanitizer/UBSan smoke tests
 make test-ubsan # Run bounded UBSan-only smoke tests
 make test-all # Run all tests
+make test-diff # Compare semantic probes, in both engines, against MIT Scheme (requires mit-scheme)
 make clean    # Remove build artifacts
 ```
 

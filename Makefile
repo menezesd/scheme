@@ -31,7 +31,7 @@ UBSAN_OBJS = $(SRCS:.c=.ubsan.o)
 UBSAN_CFLAGS = $(DEBUG_CFLAGS) -fsanitize=undefined
 UBSAN_LDFLAGS = $(LDFLAGS) -fsanitize=undefined
 
-.PHONY: all clean distclean debug sanitize ubsan test test-interpreter test-c test-prop test-r5rs test-stress test-sanitize test-ubsan test-repl-exit test-all unicode-tables
+.PHONY: all clean distclean debug sanitize ubsan test test-interpreter test-c test-prop test-r5rs test-stress test-sanitize test-ubsan test-repl-exit test-diff test-all unicode-tables
 
 all: $(TARGET)
 
@@ -133,18 +133,22 @@ run: $(TARGET)
 	./$(TARGET)
 
 # Run Scheme tests
+# The gate is `grep -q '^All tests passed!'`, as in test-r5rs and test-stress.
+# Taking the exit status of the display grep instead would always succeed: that
+# pattern matches the PASS lines present in every run, so a failing suite still
+# reported success.
 test: $(TARGET)
 	@tmp=$$(mktemp "$${TMPDIR:-/tmp}/vesper-test.XXXXXX") || exit 1; \
-	./$(TARGET) < test.scm >"$$tmp" 2>&1; rc=$$?; \
-	if [ $$rc -ne 0 ]; then cat "$$tmp"; rm -f "$$tmp"; exit $$rc; fi; \
-	grep -E '(^===|PASS|FAIL|^Tests:|passed|FAILED)' "$$tmp"; rc=$$?; \
+	./$(TARGET) < test.scm >"$$tmp" 2>&1; \
+	grep -E '(^===|PASS|FAIL|^Tests:|passed|FAILED)' "$$tmp"; \
+	grep -q '^All tests passed!' "$$tmp"; rc=$$?; \
 	rm -f "$$tmp"; exit $$rc
 
 test-interpreter: $(TARGET)
 	@tmp=$$(mktemp "$${TMPDIR:-/tmp}/vesper-test.XXXXXX") || exit 1; \
-	./$(TARGET) --interpreter < test.scm >"$$tmp" 2>&1; rc=$$?; \
-	if [ $$rc -ne 0 ]; then cat "$$tmp"; rm -f "$$tmp"; exit $$rc; fi; \
-	grep -E '(^===|PASS|FAIL|^Tests:|passed|FAILED)' "$$tmp"; rc=$$?; \
+	./$(TARGET) --interpreter < test.scm >"$$tmp" 2>&1; \
+	grep -E '(^===|PASS|FAIL|^Tests:|passed|FAILED)' "$$tmp"; \
+	grep -q '^All tests passed!' "$$tmp"; rc=$$?; \
 	rm -f "$$tmp"; exit $$rc
 
 # C unit tests
@@ -230,6 +234,10 @@ test-repl-exit: $(TARGET)
 		[ $$? -eq 0 ] || { echo "FAIL: piped success should exit 0 (mode=$$mode)"; exit 1; }; \
 	done
 	@echo "PASS: REPL exit code reflects piped errors"
+
+# Compare a stable semantic probe set against MIT/GNU Scheme.
+test-diff: $(TARGET)
+	@python3 tools/run_mit_differential.py
 
 # Run all tests, including the UBSan-only smoke path that works on macOS
 # systems where ASan can hang before main.

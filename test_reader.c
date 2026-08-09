@@ -214,6 +214,7 @@ TEST(read_simple_string)
     ASSERT(CELL_TYPE(x) == BT_STRING);
     const char *str = GET_STRING_PTR(x);
     ASSERT_STR_EQ(str, "hello");
+    ASSERT(string_is_immutable(str));
     PASS();
 }
 

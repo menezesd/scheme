@@ -596,6 +596,47 @@ TEST(disassemble_ellipsis)
     PASS();
 }
 
+TEST(disassemble_every_opcode_is_named)
+{
+    // PAT_INPUT_VECREF was missing from the disassembler's name table, so
+    // vector patterns disassembled with a bare "???" in place of the
+    // mnemonic. The table is indexed by designated initializer, so a new
+    // opcode added to the enum without a matching entry silently leaves a
+    // NULL hole. Assert the whole enum is covered rather than just that
+    // one opcode, so the next omission fails here too.
+    for (unsigned op = 0; op < PAT_OPCODE_COUNT; op++) {
+        const char *name = pattern_opcode_name(op);
+        ASSERT(name != NULL);
+        if (strcmp(name, "???") == 0)
+            printf("  opcode %u has no mnemonic\n", op);
+        ASSERT(strcmp(name, "???") != 0);
+    }
+    PASS();
+}
+
+TEST(disassemble_vector_pattern_names_vecref)
+{
+    // Pattern: #(x y) - compiles to PAT_INPUT_VECREF for each element.
+    unsigned pat = make_vector(2, 0);
+    unsigned *data = vector_data_ptr(pat);
+    data[0] = atom("x");
+    data[1] = atom("y");
+
+    compiled_pattern *cpat = compile_pattern(pat, 0, ctx.kw_ellipsis);
+    ASSERT(cpat != NULL);
+
+    bool saw_vecref = false;
+    for (unsigned i = 0; i < cpat->code_len; i++) {
+        if (cpat->code[i].opcode == PAT_INPUT_VECREF) {
+            saw_vecref = true;
+            ASSERT_STR_EQ(pattern_opcode_name(PAT_INPUT_VECREF),
+                          "INPUT_VECREF");
+        }
+    }
+    ASSERT(saw_vecref);
+    PASS();
+}
+
 // ============================================================================
 // Main
 // ============================================================================
@@ -644,6 +685,8 @@ int main(void)
     // Visual inspection
     printf("\nVisual Inspection:\n");
     RUN_TEST(disassemble_ellipsis);
+    RUN_TEST(disassemble_every_opcode_is_named);
+    RUN_TEST(disassemble_vector_pattern_names_vecref);
 
     TEST_SUMMARY("Pattern");
 }

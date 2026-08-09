@@ -75,20 +75,23 @@ static unsigned compiled_eval_string(const char *src, unsigned env)
     return result;
 }
 
-static void assert_eval_compiled_equal(const char *src)
+static bool eval_compiled_equal(const char *src)
 {
-    unsigned eval_env = default_environment();
-    unsigned compiled_env = default_environment();
-    unsigned eval_result = eval_string(src, eval_env);
-    ASSERT(eval_result != TOK_ERROR);
-
     GC_GUARD;
+    unsigned eval_env = default_environment();
+    gc_protect(&eval_env);
+    unsigned compiled_env = default_environment();
+    gc_protect(&compiled_env);
+    unsigned eval_result = eval_string(src, eval_env);
+    if (eval_result == TOK_ERROR)
+        return false;
     gc_protect(&eval_result);
     unsigned compiled_result = compiled_eval_string(src, compiled_env);
-    ASSERT(compiled_result != TOK_ERROR);
+    if (compiled_result == TOK_ERROR)
+        return false;
     gc_protect(&compiled_result);
 
-    ASSERT(deep_equal(eval_result, compiled_result));
+    return deep_equal(eval_result, compiled_result);
 }
 
 static unsigned read_expr_from_string(const char *src)
@@ -1321,6 +1324,27 @@ TEST(gc_preserves_continuations)
     PASS();
 }
 
+TEST(cps_primitive_error_roots_environment_across_gc)
+{
+    unsigned env = default_environment();
+    unsigned result = eval_string_gc(
+        "(append (iota 100000) '(2 . 3) '())",
+        &env);
+    ASSERT_EQ(result, TOK_ERROR);
+    PASS();
+}
+
+TEST(letstar_binding_cell_survives_gc)
+{
+    unsigned env = default_environment();
+    unsigned result = eval_string_gc(
+        "(let ((junk (make-vector 200000 0))) "
+        "  (let* ((x 1) (y 42)) y))",
+        &env);
+    ASSERT(is_int(result, 42));
+    PASS();
+}
+
 TEST(gc_preserves_current_input_string_port)
 {
     unsigned env = default_environment();
@@ -2142,6 +2166,24 @@ TEST(eval_hash_table_handles_cyclic_equal_keys)
                          "  (hash-table-ref h y))",
                          env);
     ASSERT(is_int(result, 43));
+    PASS();
+}
+
+TEST(hash_table_enumeration_survives_gc_rehash)
+{
+    unsigned env = default_environment();
+    const char *source =
+        "(let ((h (make-strong-eq-hash-table))) "
+        "  (let loop ((i 0)) "
+        "    (if (= i 4000) "
+        "        (= (length (hash-table-keys h)) 4000) "
+        "        (begin (hash-table-set! h (cons i i) i) "
+        "               (loop (+ i 1))))))";
+    unsigned result = eval_string_gc(source, &env);
+    ASSERT(is_bool(result, 1));
+
+    result = compiled_eval_string(source, env);
+    ASSERT(is_bool(result, 1));
     PASS();
 }
 
@@ -2975,25 +3017,25 @@ TEST(compiled_modulo_int64_min_by_negative_one)
 
 TEST(eval_compiled_parity_bignum_promotion)
 {
-    assert_eval_compiled_equal(
+    ASSERT(eval_compiled_equal(
         "(let ((x 9223372036854775807) "
         "      (y -9223372036854775808)) "
-        "  (list (+ x 1) (- y 1) (* x 4) (/ y -1)))");
+        "  (list (+ x 1) (- y 1) (* x 4) (/ y -1)))"));
     PASS();
 }
 
 TEST(eval_compiled_parity_exact_rationals)
 {
-    assert_eval_compiled_equal(
+    ASSERT(eval_compiled_equal(
         "(let ((x 12345678901234567890/7) "
         "      (y 98765432109876543210/11)) "
-        "  (list (+ x y) (- y x) (* x y) (/ y x)))");
+        "  (list (+ x y) (- y x) (* x y) (/ y x)))"));
     PASS();
 }
 
 TEST(eval_compiled_parity_macro_introduced_bindings)
 {
-    assert_eval_compiled_equal(
+    ASSERT(eval_compiled_equal(
         "(let-syntax ((swap-list "
         "              (syntax-rules () "
         "                ((_ a b) "
@@ -3001,7 +3043,25 @@ TEST(eval_compiled_parity_macro_introduced_bindings)
         "                   (let ((a b) (b tmp)) "
         "                     (list a b))))))) "
         "  (let ((tmp 'outer) (a 'left) (b 'right)) "
-        "    (list tmp (swap-list a b))))");
+        "    (list tmp (swap-list a b))))"));
+    PASS();
+}
+
+TEST(compiled_macro_pattern_roots_survive_rational_gc)
+{
+    ASSERT(eval_compiled_equal(
+        "(let ((x 12345678901234567890/7) "
+        "      (y 98765432109876543210/11)) "
+        "  (list (+ x y) (- y x) (* x y) (/ y x)))"));
+    ASSERT(eval_compiled_equal(
+        "(let-syntax ((swap-list "
+        "              (syntax-rules () "
+        "                ((_ a b) "
+        "                 (let ((tmp a)) "
+        "                   (let ((a b) (b tmp)) "
+        "                     (list a b))))))) "
+        "  (let ((tmp 'outer) (a 'left) (b 'right)) "
+        "    (list tmp (swap-list a b))))"));
     PASS();
 }
 
@@ -4994,6 +5054,60 @@ TEST(syntax_rules_expands_large_flat_executable_template_without_stack_overflow)
     PASS();
 }
 
+TEST(syntax_rules_hygienizes_large_begin_definition_sequence)
+{
+    static const char prefix[] =
+        "(let-syntax ((m (syntax-rules () ((_ ) (begin ";
+    static const char suffix[] = "))))) (m))";
+    const size_t count = 5000;
+    size_t prefix_len = strlen(prefix);
+    size_t suffix_len = strlen(suffix);
+    size_t capacity = prefix_len + count * 18 + suffix_len + 1;
+    char *src = malloc(capacity);
+    ASSERT(src != NULL);
+
+    size_t pos = 0;
+    memcpy(src + pos, prefix, prefix_len);
+    pos += prefix_len;
+    for (size_t i = 0; i < count; i++)
+        pos += (size_t)snprintf(src + pos, capacity - pos,
+                                "(define x%zu 0) ", i);
+    pos += (size_t)snprintf(src + pos, capacity - pos, "x%zu", count - 1);
+    memcpy(src + pos, suffix, suffix_len + 1);
+
+    unsigned eval_env = default_environment();
+    ASSERT(is_int(eval_string(src, eval_env), 0));
+    unsigned compiled_env = default_environment();
+    ASSERT(is_int(compiled_eval_string(src, compiled_env), 0));
+    free(src);
+    PASS();
+}
+
+TEST(large_named_let_binding_sequence_survives_gc)
+{
+    static const char prefix[] = "(let loop (";
+    static const char suffix[] = ") x2999)";
+    const size_t count = 3000;
+    size_t capacity = strlen(prefix) + count * 18 + strlen(suffix) + 1;
+    char *src = malloc(capacity);
+    ASSERT(src != NULL);
+
+    size_t pos = 0;
+    memcpy(src + pos, prefix, strlen(prefix));
+    pos += strlen(prefix);
+    for (size_t i = 0; i < count; i++)
+        pos += (size_t)snprintf(src + pos, capacity - pos,
+                                "(x%zu 0) ", i);
+    memcpy(src + pos, suffix, strlen(suffix) + 1);
+
+    unsigned eval_env = default_environment();
+    ASSERT(is_int(eval_string(src, eval_env), 0));
+    unsigned compiled_env = default_environment();
+    ASSERT(is_int(compiled_eval_string(src, compiled_env), 0));
+    free(src);
+    PASS();
+}
+
 TEST(syntax_rules_matches_large_flat_pattern_without_stack_overflow)
 {
     static const char prefix[] = "(let-syntax ((m (syntax-rules () ((m ";
@@ -5583,6 +5697,8 @@ int main(void)
     RUN_TEST(gc_shadow_stack_letrec);
     RUN_TEST(gc_preserves_closures);
     RUN_TEST(gc_preserves_continuations);
+    RUN_TEST(cps_primitive_error_roots_environment_across_gc);
+    RUN_TEST(letstar_binding_cell_survives_gc);
     RUN_TEST(gc_preserves_current_input_string_port);
     RUN_TEST(eval_read_string_port_preserves_unread_delimiter);
     RUN_TEST(textual_port_operations_use_utf8_character_boundaries);
@@ -5635,6 +5751,7 @@ int main(void)
     RUN_TEST(eval_rejects_circular_list_operations);
     RUN_TEST(eval_equal_handles_cycles);
     RUN_TEST(eval_hash_table_handles_cyclic_equal_keys);
+    RUN_TEST(hash_table_enumeration_survives_gc_rehash);
     RUN_TEST(eval_append);
     RUN_TEST(eval_gc_stats_shape);
     RUN_TEST(eval_string_to_symbol_preserves_numeric_text);
@@ -5703,6 +5820,7 @@ int main(void)
     RUN_TEST(eval_compiled_parity_bignum_promotion);
     RUN_TEST(eval_compiled_parity_exact_rationals);
     RUN_TEST(eval_compiled_parity_macro_introduced_bindings);
+    RUN_TEST(compiled_macro_pattern_roots_survive_rational_gc);
     RUN_TEST(compiled_letrec_tail_call_many_args);
     RUN_TEST(compiled_let_forms_preserve_enclosing_tail_context);
     RUN_TEST(compiled_cond_arrow_preserves_tail_context);
@@ -5789,6 +5907,8 @@ int main(void)
     RUN_TEST(compiled_syntax_rules_vector_template_repeats_compound_elements);
     RUN_TEST(
         syntax_rules_expands_large_flat_executable_template_without_stack_overflow);
+    RUN_TEST(syntax_rules_hygienizes_large_begin_definition_sequence);
+    RUN_TEST(large_named_let_binding_sequence_survives_gc);
     RUN_TEST(
         syntax_rules_matches_large_flat_pattern_without_stack_overflow);
     RUN_TEST(syntax_rules_expands_large_flat_template_without_stack_overflow);

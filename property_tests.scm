@@ -2,7 +2,6 @@
 ;;; Uses random generation to test invariants
 
 ;; Set random seed for reproducibility
-;; (Some random sequences can trigger subtle GC issues that are still being investigated)
 (random-seed! 12345)
 
 ;; Configuration

@@ -21,6 +21,14 @@
 #include <string.h>
 #include <unistd.h>
 
+static unsigned test_gc_collector_from;
+static unsigned test_gc_collector_to;
+
+static unsigned test_gc_forward_one(unsigned value)
+{
+    return value == test_gc_collector_from ? test_gc_collector_to : value;
+}
+
 // ============================================================================
 // Context Tests - Allocation
 // ============================================================================
@@ -286,6 +294,88 @@ TEST(equal_hash_table_handles_cyclic_numeric_payload)
     PASS();
 }
 
+TEST(hash_table_enumeration_survives_gc_rehash)
+{
+    enum { ENTRY_COUNT = 32 };
+    GC_GUARD;
+    unsigned table = apply_primitive_argv(PMAKEEQUALHASHTABLE, 0, NULL);
+    ASSERT(IS_HASHTABLE(table));
+    gc_protect(&table);
+
+    for (unsigned i = 0; i < ENTRY_COUNT; i++) {
+        unsigned key = alloc_cons(MAKE_FIXNUM((int)i),
+                                  MAKE_FIXNUM((int)(i + 100)));
+        unsigned args[3] = {table, key, MAKE_FIXNUM((int)i)};
+        ASSERT_EQ(apply_primitive_argv(PHASHTABLESET, 3, args), 0);
+    }
+
+    if (ctx.card_table) {
+        unsigned nursery_end =
+            (ctx.mmin < SEMISPACE_SIZE) ? SEMISPACE_SIZE : 2 * SEMISPACE_SIZE;
+        ctx.nursery_ptr = nursery_end;
+    }
+
+    unsigned args[1] = {table};
+    unsigned alist = apply_primitive_argv(PHASHTABLEALIST, 1, args);
+    ASSERT(IS_PAIR(alist));
+    bool seen[ENTRY_COUNT] = {false};
+    unsigned count = 0;
+    for (unsigned it = alist; IS_PAIR(it); it = cdr(it)) {
+        unsigned entry = car(it);
+        ASSERT(IS_PAIR(entry));
+        ASSERT(IS_FIXNUM(cdr(entry)));
+        int64_t value = FIXNUM_VALUE(cdr(entry));
+        ASSERT(value >= 0 && value < ENTRY_COUNT);
+        ASSERT(!seen[value]);
+        seen[value] = true;
+        count++;
+    }
+    ASSERT_EQ(count, ENTRY_COUNT);
+    for (unsigned i = 0; i < ENTRY_COUNT; i++)
+        ASSERT(seen[i]);
+    PASS();
+}
+
+TEST(error_rejects_malformed_string_message)
+{
+    unsigned bad = alloc();
+    CELL_TYPE(bad) = BT_STRING;
+    CELL_PTR(bad) = (void *)(uintptr_t)1;
+    unsigned args[1] = {bad};
+
+    ASSERT_EQ(apply_primitive_argv(PERROR, 1, args), TOK_ERROR);
+    CELL_PTR(bad) = NULL;
+    PASS();
+}
+
+TEST(string_port_rejects_malformed_source_string)
+{
+    unsigned bad = alloc();
+    CELL_TYPE(bad) = BT_STRING;
+    CELL_PTR(bad) = (void *)(uintptr_t)1;
+
+    string_port *sp = checked_calloc_array(1, sizeof(string_port));
+    ASSERT(sp != NULL);
+    sp->data = (char *)(uintptr_t)1;
+    sp->len = 1;
+    sp->cap = 2;
+    sp->source_string = bad;
+    sp->source_end = 1;
+    string_port_register(sp);
+
+    unsigned port = alloc();
+    CELL_TYPE(port) = BT_STRINPORT;
+    CELL_PTR(port) = sp;
+    unsigned args[1] = {port};
+    ASSERT_EQ(apply_primitive_argv(PPORTOPENP, 1, args), ctx.atom_false);
+
+    CELL_PTR(port) = NULL;
+    string_port_unregister(sp);
+    free(sp);
+    CELL_PTR(bad) = NULL;
+    PASS();
+}
+
 TEST(malformed_rational_payload_is_not_numeric)
 {
     unsigned bad_num = alloc();
@@ -450,6 +540,25 @@ TEST(vector_data_access)
     ASSERT_EQ(CELL_ID(data[0]), 10);
     ASSERT_EQ(CELL_ID(data[1]), 20);
     ASSERT_EQ(CELL_ID(data[2]), 30);
+    PASS();
+}
+
+TEST(vector_primitive_roots_arguments_across_gc)
+{
+    unsigned args[2] = {store(11), store(22)};
+    if (ctx.card_table) {
+        unsigned nursery_end =
+            (ctx.mmin < SEMISPACE_SIZE) ? SEMISPACE_SIZE : 2 * SEMISPACE_SIZE;
+        ctx.nursery_ptr = nursery_end;
+    }
+    unsigned v = apply_vector_primitive(PVECTOR, 2, args);
+    ASSERT(CELL_TYPE(v) == BT_VECTOR);
+    unsigned *data = vector_data_ptr(v);
+    ASSERT(data != NULL);
+    ASSERT(CELL_TYPE(data[0]) == BT_NUM);
+    ASSERT(CELL_TYPE(data[1]) == BT_NUM);
+    ASSERT_EQ(CELL_ID(data[0]), 11);
+    ASSERT_EQ(CELL_ID(data[1]), 22);
     PASS();
 }
 
@@ -768,6 +877,19 @@ TEST(last_pair_rejects_circular_list)
     PASS();
 }
 
+TEST(metadata_list_helpers_reject_circular_lists)
+{
+    unsigned x = atom_from_string("metadata-cycle");
+    unsigned cycle = alloc_cons(x, 0);
+    cell_set_cdr(cycle, cycle);
+
+    ASSERT(!binding_list_binds_id(cycle, CELL_ID(x)));
+    ASSERT(!lambda_params_bind_id(cycle, CELL_ID(x)));
+    ASSERT(!atom_list_contains_id(cycle, CELL_ID(x)));
+    ASSERT(!assoc_list_has_atom_key_id(cycle, CELL_ID(x)));
+    PASS();
+}
+
 TEST(list_length_three)
 {
     unsigned lst =
@@ -786,6 +908,30 @@ TEST(list_append_builds_list)
     ASSERT_EQ(CELL_ID(car(head)), 1);
     ASSERT_EQ(CELL_ID(cadr(head)), 2);
     ASSERT_EQ(CELL_ID(caddr(head)), 3);
+    PASS();
+}
+
+TEST(append_primitive_roots_arguments_across_gc)
+{
+    unsigned first = alloc_cons(store(1), alloc_cons(store(2), 0));
+    unsigned second = alloc_cons(store(3), alloc_cons(store(4), 0));
+    unsigned args[2] = {first, second};
+    if (ctx.card_table) {
+        unsigned nursery_end =
+            (ctx.mmin < SEMISPACE_SIZE) ? SEMISPACE_SIZE : 2 * SEMISPACE_SIZE;
+        ctx.nursery_ptr = nursery_end;
+    }
+    unsigned result = apply_primitive_argv(PAPPEND, 2, args);
+    ASSERT(result != TOK_ERROR);
+    ASSERT(CELL_TYPE(result) == BT_CONS);
+    ASSERT_EQ(CELL_ID(car(result)), 1);
+    result = cdr(result);
+    ASSERT_EQ(CELL_ID(car(result)), 2);
+    result = cdr(result);
+    ASSERT_EQ(CELL_ID(car(result)), 3);
+    result = cdr(result);
+    ASSERT_EQ(CELL_ID(car(result)), 4);
+    ASSERT_EQ(cdr(result), 0);
     PASS();
 }
 
@@ -867,6 +1013,35 @@ TEST(primitive_arithmetic_handles_direct_fixnums)
     unsigned quotient = apply_primitive_argv(PQUOTIENT, 2, quotient_args);
     ASSERT(CELL_TYPE(quotient) == BT_NUM);
     ASSERT_EQ(CELL_ID(quotient), 3);
+    PASS();
+}
+
+TEST(primitive_arithmetic_roots_arguments_across_gc)
+{
+    unsigned args[2] = {store_rational(1, 2), store_rational(1, 3)};
+    if (ctx.card_table) {
+        unsigned nursery_end =
+            (ctx.mmin < SEMISPACE_SIZE) ? SEMISPACE_SIZE : 2 * SEMISPACE_SIZE;
+        ctx.nursery_ptr = nursery_end;
+    }
+    unsigned result = apply_primitive_argv(PPLUS, 2, args);
+    ASSERT(result != TOK_ERROR);
+    ASSERT(CELL_TYPE(result) == BT_RATIONAL);
+    ASSERT_EQ(CELL_ID(car(result)), 5);
+    ASSERT_EQ(CELL_ID(cdr(result)), 6);
+    PASS();
+}
+
+TEST(numeric_compare_roots_previous_operand_across_gc)
+{
+    unsigned args[3] = {store_rational(1, 2), store_rational(1, 2),
+                        store_rational(1, 2)};
+    if (ctx.card_table) {
+        unsigned nursery_end =
+            (ctx.mmin < SEMISPACE_SIZE) ? SEMISPACE_SIZE : 2 * SEMISPACE_SIZE;
+        ctx.nursery_ptr = nursery_end;
+    }
+    ASSERT(apply_primitive_argv(PEQUAL, 3, args) == ctx.atom_true);
     PASS();
 }
 
@@ -1616,6 +1791,33 @@ TEST(vm_run_rejects_truncated_bytecode)
 
     ASSERT_EQ(result, TOK_ERROR);
     code_free(code);
+    PASS();
+}
+
+TEST(vm_memq_rejects_circular_list)
+{
+    unsigned obj = atom_from_string("memq-cycle");
+    unsigned list = alloc_cons(obj, 0);
+    cell_set_cdr(list, list);
+
+    code_object *code = code_new();
+    ASSERT(code != NULL);
+    unsigned obj_idx = code_add_const(code, obj);
+    unsigned list_idx = code_add_const(code, list);
+    code_emit(code, OP_CONST);
+    code_emit(code, obj_idx);
+    code_emit(code, OP_CONST);
+    code_emit(code, list_idx);
+    code_emit(code, OP_MEMQ);
+    code_emit(code, OP_HALT);
+
+    vm_state vm;
+    vm_init(&vm);
+    unsigned result = vm_run(&vm, code, empty_environment());
+    vm_free(&vm);
+    code_free(code);
+
+    ASSERT_EQ(result, TOK_ERROR);
     PASS();
 }
 
@@ -2581,6 +2783,19 @@ TEST(vm_continuation_capture_copies_after_gc)
     PASS();
 }
 
+TEST(gc_updates_vm_signal_handler_root)
+{
+    vm_state vm = {0};
+    test_gc_collector_from = store(41);
+    test_gc_collector_to = store(42);
+    vm.signal_handler = test_gc_collector_from;
+
+    gc_update_vm_roots_minor(&vm, test_gc_forward_one);
+
+    ASSERT_EQ(vm.signal_handler, test_gc_collector_to);
+    PASS();
+}
+
 TEST(gc_closes_unreachable_file_port)
 {
     FILE *f = tmpfile();
@@ -2726,6 +2941,68 @@ TEST(lookup_silent_rejects_malformed_frame)
     PASS();
 }
 
+TEST(environment_cycle_is_rejected)
+{
+    unsigned x = atom_from_string("cyclic-environment");
+    unsigned frame = alloc_cons(0, 0);
+    unsigned env = alloc_cons(frame, 0);
+    cell_set_cdr(env, env);
+
+    ASSERT_EQ(lookup_silent(CELL_ID(x), env), TOK_ERROR);
+    ASSERT_EQ(env_find_binding_cell(CELL_ID(x), env), 0);
+    ASSERT_EQ(setvar(CELL_ID(x), store(1), env), TOK_ERROR);
+    PASS();
+}
+
+TEST(environment_frame_binding_cycle_is_rejected)
+{
+    unsigned x = atom_from_string("cyclic-frame-bindings");
+    unsigned vars = alloc_cons(x, 0);
+    cell_set_cdr(vars, vars);
+    unsigned frame = alloc_cons(vars, alloc_cons(store(1), 0));
+    unsigned env = alloc_cons(frame, 0);
+
+    ASSERT_EQ(lookup_silent(CELL_ID(x), env), TOK_ERROR);
+    ASSERT_EQ(env_find_binding_cell(CELL_ID(x), env), 0);
+    ASSERT_EQ(setvar(CELL_ID(x), store(2), env), TOK_ERROR);
+    ASSERT_EQ(defvar(x, store(3), env), TOK_ERROR);
+    PASS();
+}
+
+TEST(acyclic_verdict_cache_does_not_leak_between_frames)
+{
+    // env_binding_list_acyclic memoizes its verdict per binding-list head
+    // cell (it runs on every lookup and dominated the profile otherwise).
+    // The hazard is cross-contamination: a cached "acyclic" verdict being
+    // reused for a different frame, which would turn a corrupt environment
+    // into a silently accepted one. Probe a healthy frame first so a verdict
+    // is definitely cached, then confirm a cyclic frame is still rejected,
+    // then confirm the healthy frame still resolves.
+    unsigned good_var = atom_from_string("acyclic-cache-good");
+    unsigned good_vars = alloc_cons(good_var, 0);
+    unsigned good_frame = alloc_cons(good_vars, alloc_cons(store(42), 0));
+    unsigned good_env = alloc_cons(good_frame, 0);
+
+    ASSERT_EQ(CELL_ID(lookup_silent(CELL_ID(good_var), good_env)), 42);
+    // Repeat: this one is served from the memo rather than a fresh walk.
+    ASSERT_EQ(CELL_ID(lookup_silent(CELL_ID(good_var), good_env)), 42);
+
+    unsigned bad_var = atom_from_string("acyclic-cache-bad");
+    unsigned bad_vars = alloc_cons(bad_var, 0);
+    cell_set_cdr(bad_vars, bad_vars);
+    unsigned bad_frame = alloc_cons(bad_vars, alloc_cons(store(7), 0));
+    unsigned bad_env = alloc_cons(bad_frame, 0);
+
+    ASSERT_EQ(lookup_silent(CELL_ID(bad_var), bad_env), TOK_ERROR);
+    ASSERT_EQ(env_find_binding_cell(CELL_ID(bad_var), bad_env), 0);
+    // The rejection must be stable across repeats too, not just the first.
+    ASSERT_EQ(lookup_silent(CELL_ID(bad_var), bad_env), TOK_ERROR);
+
+    // The healthy frame must be unaffected by the corrupt one.
+    ASSERT_EQ(CELL_ID(lookup_silent(CELL_ID(good_var), good_env)), 42);
+    PASS();
+}
+
 TEST(setvar_rejects_malformed_environment)
 {
     unsigned x = atom_from_string("malformed-setvar");
@@ -2753,6 +3030,140 @@ TEST(defvar_rejects_malformed_environment)
     PASS();
 }
 
+TEST(environment_metadata_does_not_collide_with_hygiene_symbol)
+{
+    unsigned env = empty_environment();
+    unsigned protected_name = atom_from_string("##protected##");
+    unsigned another_name = atom_from_string("ordinary-after-protected");
+
+    ASSERT(defvar(protected_name, store(1), env) != TOK_ERROR);
+    ASSERT(!environment_is_immutable(env));
+    ASSERT(defvar(another_name, store(2), env) != TOK_ERROR);
+    ASSERT_EQ(CELL_ID(lookup(CELL_ID(another_name), env)), 2);
+    PASS();
+}
+
+TEST(immutable_environment_is_detected_and_enforced)
+{
+    // environment_is_immutable now reads position 0 instead of scanning the
+    // whole binding list, relying on the invariant that the marker is consed
+    // onto the front and that defvar refuses to extend an already-immutable
+    // environment. Pin both halves of that invariant.
+    unsigned env = empty_environment();
+    unsigned before = atom_from_string("immutable-before-marking");
+    unsigned after = atom_from_string("immutable-after-marking");
+
+    ASSERT(defvar(before, store(1), env) != TOK_ERROR);
+    ASSERT(!environment_is_immutable(env));
+
+    mark_immutable_environment(env);
+    ASSERT(environment_is_immutable(env));
+
+    // Bindings present before marking must remain visible...
+    ASSERT_EQ(CELL_ID(lookup(CELL_ID(before), env)), 1);
+    // ...and no new binding may be added, which is what keeps the marker at
+    // position 0 and therefore keeps the O(1) check correct.
+    ASSERT_EQ(defvar(after, store(2), env), TOK_ERROR);
+    ASSERT(environment_is_immutable(env));
+
+    // Marking is idempotent and must not stack a second marker.
+    mark_immutable_environment(env);
+    ASSERT(environment_is_immutable(env));
+    ASSERT_EQ(CELL_ID(lookup(CELL_ID(before), env)), 1);
+
+    // A sibling environment must be unaffected.
+    unsigned other = empty_environment();
+    ASSERT(!environment_is_immutable(other));
+    ASSERT(defvar(after, store(3), other) != TOK_ERROR);
+    PASS();
+}
+
+TEST(environment_rejects_malformed_r7rs_atoms)
+{
+    unsigned bad = alloc();
+    CELL_TYPE(bad) = BT_ATOM;
+    CELL_ID(bad) = INT64_MAX;
+    unsigned spec = alloc_cons(atom_from_string("scheme"),
+                               alloc_cons(bad, 0));
+    unsigned specs = alloc_cons(spec, 0);
+
+    unsigned result = environment_with_imports(default_environment(), specs);
+    ASSERT_EQ(result, TOK_ERROR);
+
+    unsigned source = empty_environment();
+    unsigned frame = car(source);
+    unsigned bad_vars = alloc_cons(bad, 0);
+    unsigned bad_vals = alloc_cons(store(1), 0);
+    cell_set_car(frame, bad_vars);
+    cell_set_cdr(frame, bad_vals);
+    unsigned valid_spec = alloc_cons(atom_from_string("scheme"),
+                                     alloc_cons(atom_from_string("base"), 0));
+    unsigned valid_specs = alloc_cons(valid_spec, 0);
+    ASSERT(environment_with_imports(source, valid_specs) == TOK_ERROR);
+
+    unsigned mismatch_source = empty_environment();
+    unsigned mismatch_frame = car(mismatch_source);
+    cell_set_car(mismatch_frame, alloc_cons(atom_from_string("+"),
+                                            alloc_cons(atom_from_string("-"), 0)));
+    cell_set_cdr(mismatch_frame, alloc_cons(store(1), 0));
+    ASSERT(environment_with_imports(mismatch_source, valid_specs) == TOK_ERROR);
+    PASS();
+}
+
+TEST(environment_validates_source_before_r7rs_name_filtering)
+{
+    unsigned source = empty_environment();
+    unsigned frame = car(source);
+    unsigned vars = alloc_cons(atom_from_string("+"), 0);
+    cell_set_car(frame, vars);
+    cell_set_cdr(vars, vars);
+
+    unsigned only = alloc_cons(atom_from_string("only"),
+                               alloc_cons(alloc_cons(atom_from_string("scheme"),
+                                                    alloc_cons(atom_from_string("base"), 0)),
+                                          alloc_cons(atom_from_string("+"), 0)));
+    unsigned specs = alloc_cons(only, 0);
+    ASSERT_EQ(environment_with_imports(source, specs), TOK_ERROR);
+    PASS();
+}
+
+TEST(environment_imports_visible_shadowing_binding)
+{
+    unsigned outer = empty_environment();
+    unsigned inner = empty_environment();
+    unsigned plus = atom_from_string("+");
+    unsigned spec = alloc_cons(atom_from_string("scheme"),
+                               alloc_cons(atom_from_string("base"), 0));
+
+    ASSERT(defvar(plus, store(1), outer) != TOK_ERROR);
+    cell_set_cdr(inner, outer);
+    ASSERT(defvar(plus, store(2), inner) != TOK_ERROR);
+
+    unsigned result = environment_with_imports(inner, alloc_cons(spec, 0));
+    ASSERT(result != TOK_ERROR);
+    ASSERT_EQ(CELL_ID(lookup(CELL_ID(plus), result)), 2);
+    PASS();
+}
+
+TEST(clone_environment_preserves_frame_order)
+{
+    unsigned outer = empty_environment();
+    unsigned inner = empty_environment();
+    unsigned x = atom_from_string("clone-shadow-x");
+    unsigned y = atom_from_string("clone-outer-y");
+
+    ASSERT(defvar(x, store(1), outer) != TOK_ERROR);
+    ASSERT(defvar(y, store(3), outer) != TOK_ERROR);
+    cell_set_cdr(inner, outer);
+    ASSERT(defvar(x, store(2), inner) != TOK_ERROR);
+
+    unsigned copy = clone_environment(inner);
+    ASSERT(copy != TOK_ERROR);
+    ASSERT_EQ(CELL_ID(lookup(CELL_ID(x), copy)), 2);
+    ASSERT_EQ(CELL_ID(lookup(CELL_ID(y), copy)), 3);
+    PASS();
+}
+
 TEST(bind_params_simple)
 {
     unsigned params =
@@ -2777,6 +3188,18 @@ TEST(bind_params_rejects_invalid_formals)
     unsigned frame = bind_params(params, args);
 
     ASSERT_EQ(frame, TOK_ERROR);
+    PASS();
+}
+
+TEST(bind_params_rejects_circular_formals)
+{
+    unsigned x = atom_from_string("circular-formal");
+    unsigned params = alloc_cons(x, 0);
+    cell_set_cdr(params, params);
+    unsigned args = alloc_cons(store(1), 0);
+
+    ASSERT_EQ(lambda_params_valid(params), false);
+    ASSERT_EQ(bind_params(params, args), TOK_ERROR);
     PASS();
 }
 
@@ -3108,6 +3531,9 @@ int main(void)
     RUN_TEST(malformed_symbol_payload_is_safe);
     RUN_TEST(out_of_range_value_is_not_a_cell);
     RUN_TEST(equal_hash_table_handles_cyclic_numeric_payload);
+    RUN_TEST(hash_table_enumeration_survives_gc_rehash);
+    RUN_TEST(error_rejects_malformed_string_message);
+    RUN_TEST(string_port_rejects_malformed_source_string);
     RUN_TEST(malformed_rational_payload_is_not_numeric);
     RUN_TEST(malformed_complex_payload_is_not_numeric);
     RUN_TEST(store_bignum_test);
@@ -3126,6 +3552,7 @@ int main(void)
     RUN_TEST(make_vector_empty);
     RUN_TEST(make_vector_with_fill);
     RUN_TEST(vector_data_access);
+    RUN_TEST(vector_primitive_roots_arguments_across_gc);
     RUN_TEST(writer_handles_direct_fixnum);
     RUN_TEST(writer_handles_out_of_range_value);
     RUN_TEST(writer_handles_vector_containing_direct_fixnum);
@@ -3149,8 +3576,10 @@ int main(void)
     RUN_TEST(list_length_non_pair_is_zero);
     RUN_TEST(proper_list_silent_rejects_circular_list);
     RUN_TEST(last_pair_rejects_circular_list);
+    RUN_TEST(metadata_list_helpers_reject_circular_lists);
     RUN_TEST(list_length_three);
     RUN_TEST(list_append_builds_list);
+    RUN_TEST(append_primitive_roots_arguments_across_gc);
 
     // Deep equality
     RUN_TEST(deep_equal_numbers);
@@ -3158,6 +3587,8 @@ int main(void)
     RUN_TEST(deep_equal_rejects_token_sentinels);
     RUN_TEST(primitive_eq_handles_fixnum_and_boxed_integer);
     RUN_TEST(primitive_arithmetic_handles_direct_fixnums);
+    RUN_TEST(primitive_arithmetic_roots_arguments_across_gc);
+    RUN_TEST(numeric_compare_roots_previous_operand_across_gc);
     RUN_TEST(bytevector_primitives_reject_direct_fixnum);
     RUN_TEST(bytevector_primitives_reject_malformed_payload);
     RUN_TEST(string_primitives_reject_malformed_payload);
@@ -3199,6 +3630,7 @@ int main(void)
     RUN_TEST(disassemble_handles_cyclic_children);
     RUN_TEST(peephole_optimize_does_not_thread_into_operand);
     RUN_TEST(vm_run_rejects_truncated_bytecode);
+    RUN_TEST(vm_memq_rejects_circular_list);
     RUN_TEST(vm_run_rejects_inconsistent_code_storage_metadata);
     RUN_TEST(vm_run_rejects_invalid_constant_index);
     RUN_TEST(vm_run_rejects_unknown_opcode);
@@ -3238,6 +3670,7 @@ int main(void)
     RUN_TEST(gc_updates_vm_continuation_letrec_roots);
     RUN_TEST(gc_ignores_malformed_vm_continuation_arrays);
     RUN_TEST(vm_continuation_capture_copies_after_gc);
+    RUN_TEST(gc_updates_vm_signal_handler_root);
     RUN_TEST(gc_closes_unreachable_file_port);
     RUN_TEST(gc_forgets_unreachable_file_port_reader_state);
     RUN_TEST(gc_preserves_current_file_port_until_replaced);
@@ -3250,11 +3683,21 @@ int main(void)
     RUN_TEST(setvar_updates);
     RUN_TEST(lookup_rejects_malformed_environment);
     RUN_TEST(lookup_silent_rejects_malformed_frame);
+    RUN_TEST(environment_cycle_is_rejected);
+    RUN_TEST(environment_frame_binding_cycle_is_rejected);
+    RUN_TEST(acyclic_verdict_cache_does_not_leak_between_frames);
     RUN_TEST(setvar_rejects_malformed_environment);
     RUN_TEST(env_find_binding_cell_rejects_malformed_environment);
     RUN_TEST(defvar_rejects_malformed_environment);
+    RUN_TEST(environment_metadata_does_not_collide_with_hygiene_symbol);
+    RUN_TEST(immutable_environment_is_detected_and_enforced);
+    RUN_TEST(environment_rejects_malformed_r7rs_atoms);
+    RUN_TEST(environment_validates_source_before_r7rs_name_filtering);
+    RUN_TEST(environment_imports_visible_shadowing_binding);
+    RUN_TEST(clone_environment_preserves_frame_order);
     RUN_TEST(bind_params_simple);
     RUN_TEST(bind_params_rejects_invalid_formals);
+    RUN_TEST(bind_params_rejects_circular_formals);
     RUN_TEST(bind_params_rejects_duplicate_formals);
     RUN_TEST(bind_params_rest_only_collects_all_args);
     RUN_TEST(mk_primop_test);
