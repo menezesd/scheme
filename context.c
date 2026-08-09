@@ -31,6 +31,7 @@
 #include "primitives.h"
 #include "feature_table.h"
 #include "reader.h"
+#include "utf8.h"
 #include <ctype.h>
 #include <errno.h>
 #include <locale.h>
@@ -88,6 +89,8 @@ static ptr_registry string_port_registry;
 static ptr_registry hash_table_registry;
 static ptr_registry bignum_registry;
 static ptr_registry string_registry;
+static ptr_registry immutable_string_registry;
+static ptr_registry string_view_registry;
 static ptr_registry vector_registry;
 static ptr_registry bytevec_registry;
 
@@ -238,6 +241,21 @@ bool file_port_is_registered(const file_port *port)
     return ptr_registry_contains(&file_port_registry, port);
 }
 
+bool file_port_is_binary_file(FILE *file)
+{
+    if (!file || !file_port_registry.buckets)
+        return false;
+    for (size_t i = 0; i < file_port_registry.bucket_count; i++) {
+        for (ptr_registry_node *node = file_port_registry.buckets[i]; node;
+             node = node->next) {
+            file_port *port = (file_port *)node->ptr;
+            if (port->file == file)
+                return port->binary;
+        }
+    }
+    return false;
+}
+
 void string_port_register(string_port *port)
 {
     if (!port)
@@ -308,6 +326,124 @@ void string_unregister(char *string)
 bool string_is_registered(const char *string)
 {
     return ptr_registry_contains(&string_registry, string);
+}
+
+void string_view_register(string_view_data *view)
+{
+    if (!view)
+        return;
+    ptr_registry_register(&string_view_registry, view, 0,
+                          "string_view_register: malloc failed");
+}
+
+void string_view_unregister(string_view_data *view)
+{
+    ptr_registry_unregister(&string_view_registry, view);
+}
+
+bool string_view_is_registered(const string_view_data *view)
+{
+    return ptr_registry_contains(&string_view_registry, view);
+}
+
+bool string_cell_is_view(unsigned value)
+{
+    return IS_CELL(value) && CELL_TYPE(value) == BT_STRING &&
+           string_view_is_registered(
+               (const string_view_data *)CELL_PTR(value));
+}
+
+char *string_cell_data(unsigned value)
+{
+    if (!IS_CELL(value) || CELL_TYPE(value) != BT_STRING)
+        return NULL;
+    string_view_data *view = (string_view_data *)CELL_PTR(value);
+    return string_view_is_registered(view) ? view->data : (char *)view;
+}
+
+size_t string_cell_byte_length(unsigned value)
+{
+    char *data = string_cell_data(value);
+    return data ? strlen(data) : 0;
+}
+
+bool string_cell_is_immutable(unsigned value)
+{
+    if (string_cell_is_view(value))
+        return ((string_view_data *)CELL_PTR(value))->immutable;
+    return string_is_immutable(string_cell_data(value));
+}
+
+static bool string_view_refresh(string_view_data *view, unsigned depth)
+{
+    if (!string_view_is_registered(view) || depth > 1024)
+        return false;
+    if (string_cell_is_view(view->parent)) {
+        if (!string_view_refresh(
+                (string_view_data *)CELL_PTR(view->parent), depth + 1))
+            return false;
+    }
+    char *parent = string_cell_data(view->parent);
+    if (!parent)
+        return false;
+    size_t start_byte = 0;
+    size_t end_byte = 0;
+    const char *error = NULL;
+    if (!scheme_utf8_byte_offset_for_index(parent, view->start, true,
+                                           &start_byte, &error) ||
+        !scheme_utf8_byte_offset_for_index(parent, view->end, true,
+                                           &end_byte, &error) ||
+        end_byte < start_byte)
+        return false;
+    char *copy = checked_string_copy_len(parent + start_byte,
+                                         end_byte - start_byte);
+    if (!copy)
+        return false;
+    string_unregister(view->data);
+    free(view->data);
+    view->data = copy;
+    string_register(copy);
+    return true;
+}
+
+static bool string_view_has_ancestor(unsigned value, unsigned ancestor,
+                                     unsigned depth)
+{
+    if (!string_cell_is_view(value) || depth > 1024)
+        return false;
+    string_view_data *view = (string_view_data *)CELL_PTR(value);
+    return view->parent == ancestor ||
+           string_view_has_ancestor(view->parent, ancestor, depth + 1);
+}
+
+void string_views_refresh(unsigned parent)
+{
+    if (!string_view_registry.buckets)
+        return;
+    for (size_t i = 0; i < string_view_registry.bucket_count; i++) {
+        for (ptr_registry_node *node = string_view_registry.buckets[i]; node;
+             node = node->next) {
+            string_view_data *view = (string_view_data *)node->ptr;
+            // The parent/range metadata is authoritative; refreshing every
+            // view whose ancestry contains the changed cell is safe.
+            if (view->parent == parent ||
+                string_view_has_ancestor(view->parent, parent, 0))
+                string_view_refresh(view, 0);
+        }
+    }
+}
+
+void string_mark_immutable(char *string)
+{
+    if (!string)
+        return;
+    ptr_registry_register(&immutable_string_registry, string, 0,
+                          "string_mark_immutable: malloc failed");
+}
+
+bool string_is_immutable(const char *string)
+{
+    return ptr_registry_contains(&immutable_string_registry, string);
 }
 
 void vector_register(vector_data *vector)
@@ -727,9 +863,20 @@ static void free_external_cell_data(unsigned x)
         }
         CELL_PTR(x) = NULL;
     } else if (CELL_TYPE(x) == BT_STRING) {
+        string_view_data *view = (string_view_data *)CELL_PTR(x);
+        if (string_view_is_registered(view)) {
+            string_view_unregister(view);
+            string_unregister(view->data);
+            free(view->data);
+            free(view);
+            CELL_PTR(x) = NULL;
+            return;
+        }
         char *s = (char *)CELL_PTR(x);
         if (string_is_registered(s)) {
             string_unregister(s);
+            if (string_is_immutable(s))
+                ptr_registry_unregister(&immutable_string_registry, s);
             free(s);
         }
         CELL_PTR(x) = NULL;
@@ -745,7 +892,8 @@ static void free_external_cell_data(unsigned x)
         string_port *sp = (string_port *)CELL_PTR(x);
         if (string_port_is_registered(sp)) {
             string_port_unregister(sp);
-            free(sp->data);
+            if (!sp->borrowed_data)
+                free(sp->data);
             free(sp);
         }
         CELL_PTR(x) = NULL;
@@ -1277,7 +1425,6 @@ unsigned make_vector(unsigned len, unsigned fill)
     }
     vd->len = len;
     vector_register(vd);
-
     unsigned p = alloc();
     CELL_TYPE(p) = BT_VECTOR;
     CELL_PTR(p) = vd;
@@ -1791,6 +1938,8 @@ bool let_binding_has_value(unsigned binding)
 
 bool binding_list_binds_id(unsigned binding_list, int64_t id)
 {
+    if (pair_chain_is_circular(binding_list))
+        return false;
     for (unsigned bl = binding_list; IS_PAIR(bl); bl = cdr(bl)) {
         unsigned binding = car(bl);
         if (let_binding_has_value(binding) && IS_ATOM(car(binding)) &&
@@ -1802,6 +1951,8 @@ bool binding_list_binds_id(unsigned binding_list, int64_t id)
 
 bool lambda_params_bind_id(unsigned params, int64_t id)
 {
+    if (pair_chain_is_circular(params))
+        return false;
     for (unsigned p = params; p; p = IS_PAIR(p) ? cdr(p) : 0) {
         unsigned param = IS_PAIR(p) ? car(p) : p;
         if (IS_ATOM(param) && CELL_ID(param) == id)
@@ -1814,6 +1965,8 @@ bool lambda_params_bind_id(unsigned params, int64_t id)
 
 bool atom_list_contains_id(unsigned list, int64_t id)
 {
+    if (pair_chain_is_circular(list))
+        return false;
     for (; IS_PAIR(list); list = cdr(list)) {
         if (IS_ATOM(car(list)) && CELL_ID(car(list)) == id)
             return true;
@@ -1847,6 +2000,8 @@ bool syntax_rules_form_like(unsigned expr)
 
 bool assoc_list_has_atom_key_id(unsigned assoc_list, int64_t id)
 {
+    if (pair_chain_is_circular(assoc_list))
+        return false;
     for (unsigned p = assoc_list; p; p = cdr(p)) {
         unsigned entry = car(p);
         if (IS_PAIR(entry) && IS_ATOM(car(entry)) && CELL_ID(car(entry)) == id)
@@ -1933,6 +2088,24 @@ bool identifier_valid(unsigned x)
     return IS_ATOM(x) && x != ctx.atom_true && x != ctx.atom_false;
 }
 
+static bool pair_chain_acyclic(unsigned list)
+{
+    unsigned slow = list;
+    unsigned fast = list;
+    while (IS_PAIR(fast)) {
+        fast = cdr(fast);
+        if (!IS_PAIR(fast))
+            return true;
+        fast = cdr(fast);
+        if (!IS_PAIR(slow))
+            return true;
+        slow = cdr(slow);
+        if (fast == slow)
+            return false;
+    }
+    return true;
+}
+
 bool lambda_params_valid(unsigned params)
 {
     GC_GUARD;
@@ -1941,6 +2114,8 @@ bool lambda_params_valid(unsigned params)
     if (identifier_valid(params))
         return true;
     if (!IS_PAIR(params))
+        return false;
+    if (!pair_chain_acyclic(params))
         return false;
 
     unsigned seen = 0;
@@ -2494,6 +2669,10 @@ unsigned collect(unsigned x)
         CELL_ID(xx) = CELL_ID(x);
         CELL_TYPE(x) = BT_BROKENHEART;
         CELL_CAR(x) = xx;
+        if (string_cell_is_view(xx)) {
+            string_view_data *view = (string_view_data *)CELL_PTR(xx);
+            view->parent = collect(view->parent);
+        }
         if (CELL_TYPE(xx) == BT_HASHTABLE) {
             hash_table_data *ht = (hash_table_data *)CELL_PTR(xx);
             if (!hash_table_data_well_formed(ht))
@@ -2520,6 +2699,10 @@ unsigned collect(unsigned x)
         CELL_ID(xx) = CELL_ID(x);
         CELL_TYPE(x) = BT_BROKENHEART;
         CELL_CAR(x) = xx;
+        if (string_cell_is_view(xx)) {
+            string_view_data *view = (string_view_data *)CELL_PTR(xx);
+            view->parent = collect_to_old(view->parent);
+        }
         return xx;
     }
 
@@ -2552,6 +2735,9 @@ unsigned collect(unsigned x)
         CELL_PTR(xx) = CELL_PTR(x);
         CELL_TYPE(x) = BT_BROKENHEART;
         CELL_CAR(x) = xx;
+        string_port *sp = (string_port *)CELL_PTR(xx);
+        if (sp->source_string != ctx.atom_false)
+            sp->source_string = collect(sp->source_string);
         return xx;
     }
 
@@ -2623,6 +2809,7 @@ unsigned gc(unsigned root)
     ctx.current_input_cell = collect(ctx.current_input_cell);
     ctx.current_output_cell = collect(ctx.current_output_cell);
     ctx.current_error_cell = collect(ctx.current_error_cell);
+    ctx.r7rs_environment = collect(ctx.r7rs_environment);
     reader_update_datum_labels(collect);
 
     // Collect shadow stack entries - these are pointers to local C variables
@@ -2795,6 +2982,10 @@ unsigned collect_to_old(unsigned x)
         CELL_ID(xx) = CELL_ID(x);
         CELL_TYPE(x) = BT_BROKENHEART;
         CELL_CAR(x) = xx;
+        if (string_cell_is_view(xx)) {
+            string_view_data *view = (string_view_data *)CELL_PTR(xx);
+            view->parent = collect_to_old(view->parent);
+        }
         if (CELL_TYPE(xx) == BT_HASHTABLE) {
             hash_table_data *ht = (hash_table_data *)CELL_PTR(xx);
             if (!hash_table_data_well_formed(ht))
@@ -2853,6 +3044,9 @@ unsigned collect_to_old(unsigned x)
         CELL_PTR(xx) = CELL_PTR(x);
         CELL_TYPE(x) = BT_BROKENHEART;
         CELL_CAR(x) = xx;
+        string_port *sp = (string_port *)CELL_PTR(xx);
+        if (sp->source_string != ctx.atom_false)
+            sp->source_string = collect_to_old(sp->source_string);
         return xx;
     }
 
@@ -2914,6 +3108,7 @@ unsigned minor_gc(unsigned root)
     ctx.current_input_cell = collect_to_old(ctx.current_input_cell);
     ctx.current_output_cell = collect_to_old(ctx.current_output_cell);
     ctx.current_error_cell = collect_to_old(ctx.current_error_cell);
+    ctx.r7rs_environment = collect_to_old(ctx.r7rs_environment);
     reader_update_datum_labels(collect_to_old);
 
     // Collect shadow stack entries

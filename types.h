@@ -235,6 +235,18 @@ typedef struct {
     size_t len; // Current length
     size_t cap; // Allocated capacity
     size_t pos; // Read position (for input ports)
+    size_t last_read_pos;
+    size_t last_read_len;
+    int last_read_char;
+    bool last_read_valid;
+    // For input ports opened on a Scheme string, retain the source cell so
+    // mutations and GC relocation are visible to the port.  Owned buffers
+    // use ctx.atom_false as the sentinel and are freed with the port.
+    unsigned source_string;
+    size_t source_start;
+    size_t source_end;
+    size_t source_pos_chars;
+    bool borrowed_data;
 } string_port;
 
 // ============================================================================
@@ -334,6 +346,8 @@ typedef struct {
     unsigned current_input_cell;  // Current input port cell (0 = use FILE*)
     unsigned current_output_cell; // Current output port cell (0 = use FILE*)
     unsigned current_error_cell;  // Current error port cell (0 = use FILE*)
+    // Immutable template used to construct isolated R7RS import environments.
+    unsigned r7rs_environment;
     FILE *transcript;             // NULL if not recording
     // Callbacks for VM special primitives (set by main.c)
     unsigned (*load_callback)(const char *filename,
@@ -342,6 +356,11 @@ typedef struct {
                               unsigned env); // Returns result or TOK_ERROR
     // Last error message for better error reporting
     char last_error[256];
+    // When true, show_error/show_warning record the message in last_error but
+    // print nothing. Used for speculative work whose failure is not a user
+    // error, such as compile-time constant folding. Must be saved and
+    // restored around the speculative region by the code that sets it.
+    bool suppress_error_output;
 } lisp_context;
 
 // ============================================================================
@@ -394,6 +413,7 @@ enum primitive_id {
     PSTRREF,
     PSTRAPP,
     PSUBSTR,
+    PSTRSLICE,
     PSTR2SYM,
     PSYM2STR,
     PNUM2STR,
@@ -410,6 +430,8 @@ enum primitive_id {
     PVEC2LIST,
     // I/O
     PREADCHAR,
+    PREADCHARNOHANG,
+    PUNREADCHAR,
     PPEEKCHAR,
     PEOF,
     PEOFOBJECT,
@@ -543,6 +565,7 @@ enum primitive_id {
     PEVAL,
     PSCHEMEENV,
     PNULLENV,
+    PR7RSENV,
     PINTERACTIONENV,
     // String ports
     POPENOUTPUTSTRING,
@@ -623,6 +646,11 @@ enum primitive_id {
     PHASHTABLEKEYS,
     PHASHTABLEVALUES,
     PHASHTABLEALIST,
+    PHASHTABLECOPY,
+    PHASHTABLEEQUIV,
+    PHASHTABLEHASH,
+    PHASH,
+    PHASHBYIDENTITY,
     PCURRENTJIFFY,
     PJIFFIESPERSECOND,
     PGETENVS,
@@ -632,6 +660,10 @@ enum primitive_id {
     PSTRINGTOUTF8,
     PUTF8TOSTRING,
     PRAISENOW, // raise dispatcher (handled specially by vm.c / eval.c)
+    PCHARCOMBINING,
+    PUNICODEASSIGNED,
+    PUNICODEPUNCTUATION,
+    PUNICODESYMBOL,
     PRIM_COUNT // Total number of primitives
 };
 
@@ -661,21 +693,33 @@ const char *reader_get_filename(void);
 
 // Error with location info (file:line:col format)
 // Also stores message in ctx.last_error for programmatic access
+// ctx.suppress_error_output silences the printed diagnostic while still
+// recording it in ctx.last_error. Compile-time constant folding uses it: a
+// fold that fails is not a user-visible error, the compiler just declines to
+// fold. It replaces an earlier approach that assigned devnull to `stderr` and
+// restored it afterwards - a lisp_panic inside the fold longjmps to the REPL
+// recovery point, skipping the restore and silencing every diagnostic for the
+// rest of the session. (Assigning to `stderr` is also not portable C11; it
+// need not be a modifiable lvalue.)
 #define show_error(...)                                                        \
     do {                                                                       \
-        fprintf(stderr, "%s:%d:%d: error: ", reader_get_filename(),            \
-                reader_get_line(), reader_get_col());                          \
-        fprintf(stderr, __VA_ARGS__);                                          \
-        fprintf(stderr, "\n");                                                 \
+        if (!ctx.suppress_error_output) {                                      \
+            fprintf(stderr, "%s:%d:%d: error: ", reader_get_filename(),        \
+                    reader_get_line(), reader_get_col());                      \
+            fprintf(stderr, __VA_ARGS__);                                      \
+            fprintf(stderr, "\n");                                             \
+        }                                                                      \
         snprintf(ctx.last_error, sizeof(ctx.last_error), __VA_ARGS__);         \
     } while (0)
 
 #define show_warning(...)                                                      \
     do {                                                                       \
-        fprintf(stderr, "%s:%d:%d: warning: ", reader_get_filename(),          \
-                reader_get_line(), reader_get_col());                          \
-        fprintf(stderr, __VA_ARGS__);                                          \
-        fprintf(stderr, "\n");                                                 \
+        if (!ctx.suppress_error_output) {                                      \
+            fprintf(stderr, "%s:%d:%d: warning: ", reader_get_filename(),      \
+                    reader_get_line(), reader_get_col());                      \
+            fprintf(stderr, __VA_ARGS__);                                      \
+            fprintf(stderr, "\n");                                             \
+        }                                                                      \
     } while (0)
 
 // ============================================================================
@@ -767,7 +811,7 @@ static inline int32_t FIXNUM_VALUE(unsigned v)
 // ============================================================================
 
 #define CELL_PTR(c) (ctx.cons_cells[(c)].ptr)
-#define GET_STRING_PTR(c) ((char *)CELL_PTR(c))
+#define GET_STRING_PTR(c) string_cell_data(c)
 #define GET_VECTOR_PTR(c) ((vector_data *)CELL_PTR(c))
 #define GET_FILE_PORT_PTR(c) ((file_port *)CELL_PTR(c))
 #define GET_PORT_PTR(c)                                                        \

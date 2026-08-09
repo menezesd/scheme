@@ -249,6 +249,11 @@ static unsigned read_bytevector_from_port(unsigned count_arg,
         show_error("%s: not an input port", name);
         return TOK_ERROR;
     }
+    file_port *port = GET_FILE_PORT_PTR(port_arg);
+    if (!file_port_well_formed(port) || !port->binary) {
+        show_error("%s: not a binary input port", name);
+        return TOK_ERROR;
+    }
     if (!bytevector_length_fits((uint64_t)count, name, "count"))
         return TOK_ERROR;
     FILE *f = file_port_file(port_arg);
@@ -499,7 +504,7 @@ static unsigned make_string_from_char_list(unsigned lst, const char *name)
         i += encoded_len;
     }
     s[i] = '\0';
-    return make_string_owned(s);
+    return make_string_immutable_owned(s);
 }
 
 static unsigned make_string_from_chars(unsigned argc, unsigned *argv,
@@ -538,15 +543,20 @@ static unsigned make_string_from_chars(unsigned argc, unsigned *argv,
         pos += encoded_len;
     }
     s[pos] = '\0';
-    return make_string_owned(s);
+    return make_string_immutable_owned(s);
 }
 
 static unsigned fill_string_range(unsigned argc, unsigned *argv,
                                   const char *name)
 {
+    GC_GUARD;
     char *s = require_string_ptr(argv[0], name);
     if (!s)
         return TOK_ERROR;
+    if (string_cell_is_immutable(argv[0])) {
+        show_error("%s: cannot modify immutable string", name);
+        return TOK_ERROR;
+    }
     int c;
     if (!expect_char_value(argv[1], &c, name))
         return TOK_ERROR;
@@ -566,6 +576,34 @@ static unsigned fill_string_range(unsigned argc, unsigned *argv,
     size_t start_byte, end_byte;
     if (!utf8_range_offsets(s, start, end, &start_byte, &end_byte, name))
         return TOK_ERROR;
+
+    if (string_cell_is_view(argv[0])) {
+        unsigned root = argv[0];
+        int64_t absolute_start = start;
+        int64_t absolute_end = end;
+        unsigned depth = 0;
+        while (string_cell_is_view(root) && depth++ < 1024) {
+            string_view_data *view = (string_view_data *)CELL_PTR(root);
+            if ((uint64_t)absolute_end > view->end - view->start) {
+                show_error("%s: invalid string range", name);
+                return TOK_ERROR;
+            }
+            absolute_start += (int64_t)view->start;
+            absolute_end += (int64_t)view->start;
+            root = view->parent;
+        }
+        if (string_cell_is_view(root) || depth >= 1024) {
+            show_error("%s: invalid string view", name);
+            return TOK_ERROR;
+        }
+        unsigned start_value = 0;
+        unsigned end_value = 0;
+        GC_PROTECT_GUARD4(&root, &argv[1], &start_value, &end_value);
+        start_value = store(absolute_start);
+        end_value = store(absolute_end);
+        unsigned root_args[4] = {root, argv[1], start_value, end_value};
+        return fill_string_range(4, root_args, name);
+    }
     size_t fill_count = (size_t)(end - start);
     size_t old_byte_len = strlen(s);
     size_t removed = end_byte - start_byte;
@@ -595,6 +633,7 @@ static unsigned fill_string_range(unsigned argc, unsigned *argv,
     free(s);
     CELL_PTR(argv[0]) = result;
     string_register(result);
+    string_views_refresh(argv[0]);
     return 0;
 }
 
@@ -648,7 +687,12 @@ static unsigned make_string_from_symbol(unsigned sym, const char *name)
         show_error("%s: invalid symbol", name);
         return TOK_ERROR;
     }
-    return make_string_copy(ctx.atom_table[CELL_ID(sym)]);
+    char *copy = checked_string_copy(ctx.atom_table[CELL_ID(sym)]);
+    if (!copy) {
+        show_error("%s: out of memory", name);
+        return TOK_ERROR;
+    }
+    return make_string_immutable_owned(copy);
 }
 
 static unsigned length_value(unsigned value, const char *name)
@@ -827,15 +871,46 @@ static unsigned string_ref_value(unsigned str, unsigned index,
 static unsigned string_set_value(unsigned str, unsigned index,
                                  unsigned value, const char *name)
 {
+    GC_GUARD;
     char *s = require_string_ptr(str, name);
     if (!s)
         return TOK_ERROR;
+    if (string_cell_is_immutable(str)) {
+        show_error("%s: cannot modify immutable string", name);
+        return TOK_ERROR;
+    }
     int64_t idx;
     if (!expect_nonneg_int64(index, &idx, name))
         return TOK_ERROR;
     int c;
     if (!expect_char_value(value, &c, name))
         return TOK_ERROR;
+
+    if (string_cell_is_view(str)) {
+        unsigned root = str;
+        int64_t absolute = idx;
+        unsigned depth = 0;
+        while (string_cell_is_view(root) && depth++ < 1024) {
+            string_view_data *view = (string_view_data *)CELL_PTR(root);
+            if (absolute < 0 ||
+                (uint64_t)absolute >= view->end - view->start) {
+                show_error("%s: index out of bounds", name);
+                return TOK_ERROR;
+            }
+            absolute += (int64_t)view->start;
+            root = view->parent;
+        }
+        if (string_cell_is_view(root) || depth >= 1024) {
+            show_error("%s: invalid string view", name);
+            return TOK_ERROR;
+        }
+        gc_protect(&root);
+        unsigned absolute_index = store(absolute);
+        unsigned result = string_set_value(root, absolute_index, value, name);
+        if (result != TOK_ERROR)
+            string_views_refresh(root);
+        return result;
+    }
     char encoded[4];
     size_t encoded_len;
     if (!utf8_encode_char(c, encoded, &encoded_len, name))
@@ -869,6 +944,7 @@ static unsigned string_set_value(unsigned str, unsigned index,
     free(s);
     CELL_PTR(str) = result;
     string_register(result);
+    string_views_refresh(str);
     return 0;
 }
 
@@ -1101,7 +1177,7 @@ static unsigned utf8_to_string_value(unsigned argc, unsigned *argv,
         show_error("%s: out of memory", name);
         return TOK_ERROR;
     }
-    return make_string_owned(copy);
+    return make_string_immutable_owned(copy);
 }
 
 static unsigned apply_bytevector_primitive(unsigned prim_id, unsigned argc,
@@ -1168,52 +1244,89 @@ typedef enum {
 static unsigned bitwise_fold(unsigned argc, unsigned *argv, const char *name,
                              bitwise_op op)
 {
-    int64_t result;
-    if (!expect_exact_int64(argv[0], &result, name))
+    if (argc == 0)
+        return store(op == BITWISE_AND ? -1 : 0);
+
+    bignum *result = to_bignum(argv[0]);
+    if (!result) {
+        show_error("%s: expected exact integer", name);
         return TOK_ERROR;
-    for (unsigned i = 1; i < argc; i++) {
-        int64_t b;
-        if (!expect_exact_int64(argv[i], &b, name))
-            return TOK_ERROR;
-        switch (op) {
-        case BITWISE_AND:
-            result &= b;
-            break;
-        case BITWISE_IOR:
-            result |= b;
-            break;
-        case BITWISE_XOR:
-            result ^= b;
-            break;
-        }
     }
-    return store(result);
+    for (unsigned i = 1; i < argc; i++) {
+        bignum *operand = to_bignum(argv[i]);
+        if (!operand) {
+            bn_free(result);
+            show_error("%s: expected exact integer", name);
+            return TOK_ERROR;
+        }
+        bignum *next = bn_bitwise(result, operand, (int)op);
+        bn_free(result);
+        bn_free(operand);
+        if (!next) {
+            show_error("%s: out of memory", name);
+            return TOK_ERROR;
+        }
+        result = next;
+    }
+    return store_integer(result);
 }
 
 static unsigned bitwise_not_value(unsigned value, const char *name)
 {
-    int64_t a;
-    if (!expect_exact_int64(value, &a, name))
+    bignum *input = to_bignum(value);
+    if (!input) {
+        show_error("%s: expected exact integer", name);
         return TOK_ERROR;
-    return store(~a);
+    }
+    bignum *result = bn_bitwise_not(input);
+    bn_free(input);
+    if (!result) {
+        show_error("%s: out of memory", name);
+        return TOK_ERROR;
+    }
+    return store_integer(result);
 }
 
 static unsigned arithmetic_shift_value(unsigned value_arg,
                                        unsigned count_arg,
                                        const char *name)
 {
-    int64_t val, count;
-    if (!expect_exact_int64(value_arg, &val, name) ||
-        !expect_exact_int64(count_arg, &count, name))
+    bignum *count_value = to_bignum(count_arg);
+    if (!count_value) {
+        show_error("%s: expected exact integer", name);
         return TOK_ERROR;
-    if (count >= 0) {
-        if ((uint64_t)count > SIZE_MAX) {
+    }
+    int64_t count;
+    if (bn_to_int64(count_value, &count) != 0) {
+        if (bn_sign(count_value) > 0) {
+            bn_free(count_value);
             show_error("%s: count too large", name);
             return TOK_ERROR;
         }
-        bignum *bn = bn_from_int(val);
-        bignum *shifted = bn ? bn_lshift(bn, (size_t)count) : NULL;
-        bn_free(bn);
+        bignum *value = to_bignum(value_arg);
+        bn_free(count_value);
+        if (!value) {
+            show_error("%s: expected exact integer", name);
+            return TOK_ERROR;
+        }
+        bool negative = bn_sign(value) < 0;
+        bn_free(value);
+        return store(negative ? -1 : 0);
+    }
+    bn_free(count_value);
+    bignum *value = to_bignum(value_arg);
+    if (!value) {
+        show_error("%s: expected exact integer", name);
+        return TOK_ERROR;
+    }
+    if (count >= 0) {
+        if ((uint64_t)count > SIZE_MAX) {
+            bn_free(value);
+            show_error("%s: count too large", name);
+            return TOK_ERROR;
+        }
+        bignum *shifted = bn_lshift(value, (size_t)count);
+        bn_free(value);
         if (!shifted) {
             show_error("%s: out of memory", name);
             return TOK_ERROR;
@@ -1221,9 +1334,18 @@ static unsigned arithmetic_shift_value(unsigned value_arg,
         return store_integer(shifted);
     } else {
         uint64_t shift = -(uint64_t)count;
-        if (shift >= 63)
-            return store(val < 0 ? -1 : 0);
-        return store(val >> shift);
+        if (shift > SIZE_MAX) {
+            bn_free(value);
+            show_error("%s: count too large", name);
+            return TOK_ERROR;
+        }
+        bignum *shifted = bn_arshift(value, (size_t)shift);
+        bn_free(value);
+        if (!shifted) {
+            show_error("%s: out of memory", name);
+            return TOK_ERROR;
+        }
+        return store_integer(shifted);
     }
 }
 
@@ -1239,7 +1361,7 @@ static unsigned number_to_string_value(unsigned num, int radix,
                            : "out of memory");
             return TOK_ERROR;
         }
-        return make_string_owned(s);
+        return make_string_immutable_owned(s);
     } else if (IS_RATIONAL(num)) {
         bool too_large;
         char *s = rational_to_string(num, radix, &too_large);
@@ -1248,7 +1370,7 @@ static unsigned number_to_string_value(unsigned num, int radix,
                        too_large ? "result too large" : "out of memory");
             return TOK_ERROR;
         }
-        return make_string_owned(s);
+        return make_string_immutable_owned(s);
     } else if (IS_INEXACT(num)) {
         if (radix != 10) {
             show_error("%s: inexact numbers require radix 10", name);
@@ -1257,7 +1379,7 @@ static unsigned number_to_string_value(unsigned num, int radix,
         double d = to_double(num);
         char buf[NUMBER_BUF_SIZE];
         format_double_repr(buf, sizeof(buf), d);
-        return make_string_copy(buf);
+        return make_string_immutable_owned(checked_string_copy(buf));
     } else if (IS_COMPLEX(num)) {
         if (radix != 10) {
             show_error("%s: complex numbers require radix 10", name);
@@ -1266,7 +1388,7 @@ static unsigned number_to_string_value(unsigned num, int radix,
         char *buf = object_to_string(num, name);
         if (!buf)
             return TOK_ERROR;
-        return make_string_owned(buf);
+        return make_string_immutable_owned(buf);
     } else {
         show_error("%s: not a number", name);
         return TOK_ERROR;
@@ -1518,6 +1640,8 @@ static unsigned apply_string_primitive(unsigned prim_id, unsigned argc,
         return prim_string_append(argc, argv);
     case PSUBSTR:
         return prim_substring(argc, argv);
+    case PSTRSLICE:
+        return prim_string_slice(argc, argv);
     case PSTR2SYM:
         REQUIRE_ARGC(argc, 1, 1, "string->symbol");
         return make_symbol_from_string(argv[0], "string->symbol");
@@ -1595,13 +1719,13 @@ static unsigned apply_bitwise_primitive(unsigned prim_id, unsigned argc,
 {
     switch (prim_id) {
     case PBITWISEAND:
-        REQUIRE_ARGC(argc, 1, 999, "bitwise-and");
+        REQUIRE_ARGC(argc, 0, (unsigned)-1, "bitwise-and");
         return bitwise_fold(argc, argv, "bitwise-and", BITWISE_AND);
     case PBITWISEIOR:
-        REQUIRE_ARGC(argc, 1, 999, "bitwise-ior");
+        REQUIRE_ARGC(argc, 0, (unsigned)-1, "bitwise-ior");
         return bitwise_fold(argc, argv, "bitwise-ior", BITWISE_IOR);
     case PBITWISEXOR:
-        REQUIRE_ARGC(argc, 1, 999, "bitwise-xor");
+        REQUIRE_ARGC(argc, 0, (unsigned)-1, "bitwise-xor");
         return bitwise_fold(argc, argv, "bitwise-xor", BITWISE_XOR);
     case PBITWISENOT:
         REQUIRE_ARGC(argc, 1, 1, "bitwise-not");
@@ -1705,6 +1829,12 @@ static unsigned scheme_environment(unsigned version_arg, const char *name)
 {
     if (!expect_r5rs_environment_version(version_arg, name))
         return TOK_ERROR;
+    // The report environment includes the standard library bindings loaded at
+    // startup, not just the primitive table used to bootstrap it.  Clone the
+    // pristine source so definitions made through eval do not affect later
+    // calls.
+    if (ctx.r7rs_environment)
+        return clone_environment(ctx.r7rs_environment);
     return default_environment();
 }
 
@@ -1938,7 +2068,7 @@ static unsigned write_to_string_value(unsigned value, const char *name)
     char *buf = object_to_string(value, name);
     if (!buf)
         return TOK_ERROR;
-    return make_string_owned(buf);
+    return make_string_immutable_owned(buf);
 }
 
 static unsigned open_binary_input_file(unsigned filename_arg,
@@ -1969,6 +2099,11 @@ static unsigned write_bytevector_to_port(unsigned bv_arg, unsigned port_arg,
         show_error("%s: not an output port", name);
         return TOK_ERROR;
     }
+    file_port *port = GET_FILE_PORT_PTR(port_arg);
+    if (!file_port_well_formed(port) || !port->binary) {
+        show_error("%s: not a binary output port", name);
+        return TOK_ERROR;
+    }
     FILE *f = file_port_file(port_arg);
     if (!f) {
         show_error("%s: port is closed", name);
@@ -1991,6 +2126,11 @@ static unsigned read_bytevector_into(unsigned argc, unsigned *argv,
         return TOK_ERROR;
     if (!IS_INPORT(port_arg)) {
         show_error("%s: not an input port", name);
+        return TOK_ERROR;
+    }
+    file_port *port = GET_FILE_PORT_PTR(port_arg);
+    if (!file_port_well_formed(port) || !port->binary) {
+        show_error("%s: not a binary input port", name);
         return TOK_ERROR;
     }
     FILE *f = file_port_file(port_arg);
@@ -2062,6 +2202,13 @@ static uint64_t scheme_hash(unsigned key)
                    : PRIM_FNV_OFFSET_BASIS;
     case BT_NUM:
     case BT_CHAR:
+    // BT_INEXACT belongs in this group: deep_equal (the equal? used by
+    // hash_key_equal) compares inexacts by CELL_ID, which holds the double's
+    // bit pattern, so hashing by CELL_ID is exactly consistent with it.
+    // Falling through to the default below hashed by *cell index* instead,
+    // making two equal? flonums hash differently - a flonum key, or any list
+    // or complex containing one, could never be found again.
+    case BT_INEXACT:
         return (uint64_t)CELL_ID(key) * PRIM_FNV_PRIME;
     case BT_STRING: {
         char *s = GET_STRING_PTR(key);
@@ -2435,30 +2582,117 @@ static unsigned hash_table_entries_list(unsigned table_arg, const char *name,
     hash_table_data *ht = require_hash_table(table_arg, name);
     if (!ht)
         return TOK_ERROR;
+
+    // Building the result list allocates Scheme cells and may trigger GC.
+    // For equal-based tables, GC can rehash the table after moving compound
+    // keys, rewriting every entry's `next` link.  Snapshot the entries before
+    // the first allocation so enumeration is independent of that mutation.
+    hash_entry **entries = NULL;
+    if (ht->size > 0) {
+        entries = checked_malloc_array(ht->size, sizeof(*entries));
+        if (!entries) {
+            show_error("%s: out of memory", name);
+            return TOK_ERROR;
+        }
+    }
+    unsigned entry_count = 0;
+    for (unsigned i = 0; i < ht->capacity; i++) {
+        for (hash_entry *entry = ht->buckets[i]; entry;
+             entry = entry->next) {
+            if (entry_count >= ht->size) {
+                free(entries);
+                show_error("%s: malformed hash table", name);
+                return TOK_ERROR;
+            }
+            entries[entry_count++] = entry;
+        }
+    }
+    if (entry_count != ht->size) {
+        free(entries);
+        show_error("%s: malformed hash table", name);
+        return TOK_ERROR;
+    }
+
     GC_GUARD;
     unsigned result = 0;
     gc_protect(&result);
-    for (unsigned i = 0; i < ht->capacity; i++) {
-        for (hash_entry *entry = ht->buckets[i]; entry; entry = entry->next) {
-            unsigned item = 0;
-            gc_protect(&item);
-            if (mode == 0) {
-                item = entry->key;
-            } else if (mode == 1) {
-                item = entry->value;
-            } else {
-                unsigned key = entry->key;
-                unsigned value = entry->value;
-                gc_protect(&key);
-                gc_protect(&value);
-                item = alloc_cons(key, value);
-                gc_unprotect(2);
-            }
-            result = alloc_cons(item, result);
-            gc_unprotect(1);
+    for (unsigned i = 0; i < entry_count; i++) {
+        hash_entry *entry = entries[i];
+        unsigned item = 0;
+        gc_protect(&item);
+        if (mode == 0) {
+            item = entry->key;
+        } else if (mode == 1) {
+            item = entry->value;
+        } else {
+            unsigned key = entry->key;
+            unsigned value = entry->value;
+            gc_protect(&key);
+            gc_protect(&value);
+            item = alloc_cons(key, value);
+            gc_unprotect(2);
+        }
+        result = alloc_cons(item, result);
+        gc_unprotect(1);
+    }
+    free(entries);
+    return result;
+}
+
+static unsigned hash_table_copy_value(unsigned table_arg, const char *name)
+{
+    hash_table_data *source = require_hash_table(table_arg, name);
+    if (!source)
+        return TOK_ERROR;
+    GC_GUARD;
+    unsigned copy = make_hash_table_value(source->equiv, 0, NULL, name);
+    if (copy == TOK_ERROR)
+        return TOK_ERROR;
+    gc_protect(&copy);
+    for (unsigned i = 0; i < source->capacity; i++) {
+        for (hash_entry *entry = source->buckets[i]; entry;
+             entry = entry->next) {
+            if (hash_table_set_value(copy, entry->key, entry->value, name) ==
+                TOK_ERROR)
+                return TOK_ERROR;
         }
     }
-    return result;
+    return copy;
+}
+
+static unsigned hash_table_hash_value(unsigned argc, unsigned *argv,
+                                      const char *name)
+{
+    hash_table_data *ht = require_hash_table(argv[0], name);
+    if (!ht)
+        return TOK_ERROR;
+    uint64_t bound = INT64_MAX;
+    if (argc == 3) {
+        int64_t requested;
+        if (!expect_nonneg_int64(argv[2], &requested, name) || requested <= 0)
+            return TOK_ERROR;
+        bound = (uint64_t)requested;
+    }
+    uint64_t hash = hash_key_for_table(ht, argv[1]);
+    return store((int64_t)(hash % bound));
+}
+
+static unsigned object_hash_value(unsigned argc, unsigned *argv,
+                                  hash_equiv equiv, const char *name)
+{
+    uint64_t bound = INT64_MAX;
+    if (argc == 2) {
+        int64_t requested;
+        if (!expect_nonneg_int64(argv[1], &requested, name) || requested <= 0)
+            return TOK_ERROR;
+        bound = (uint64_t)requested;
+    }
+    hash_table_data table = {.size = 0,
+                             .capacity = 0,
+                             .equiv = equiv,
+                             .buckets = NULL};
+    uint64_t hash = hash_key_for_table(&table, argv[0]);
+    return store((int64_t)(hash % bound));
 }
 
 static unsigned make_public_gensym(void)
@@ -2552,8 +2786,12 @@ static unsigned report_error_primitive(unsigned argc, unsigned *argv)
     // Refresh ctx.last_error so a later primitive failure cannot reuse a
     // stale message from an earlier error as its own (see vm_signal_error).
     if (argc > 0 && IS_STRING(argv[0])) {
-        snprintf(ctx.last_error, sizeof(ctx.last_error), "%s",
-                 GET_STRING_PTR(argv[0]));
+        char *message = GET_STRING_PTR(argv[0]);
+        if (message && string_is_registered(message)) {
+            snprintf(ctx.last_error, sizeof(ctx.last_error), "%s", message);
+        } else {
+            snprintf(ctx.last_error, sizeof(ctx.last_error), "error");
+        }
     } else {
         snprintf(ctx.last_error, sizeof(ctx.last_error), "error");
     }
@@ -2570,6 +2808,15 @@ static unsigned apply_environment_primitive(unsigned prim_id, unsigned argc,
     case PNULLENV:
         REQUIRE_ARGC(argc, 1, 1, "null-environment");
         return null_environment(argv[0], "null-environment");
+    case PR7RSENV:
+        REQUIRE_ARGC(argc, 0, 1, "%r7rs-environment");
+        if (!ctx.r7rs_environment) {
+            show_error("%%r7rs-environment: standard environment unavailable");
+            return TOK_ERROR;
+        }
+        if (argc == 0)
+            return clone_environment(ctx.r7rs_environment);
+        return environment_with_imports(ctx.r7rs_environment, argv[0]);
     default:
         show_error("environment primitive: unsupported id %u", prim_id);
         return TOK_ERROR;
@@ -2731,6 +2978,35 @@ static unsigned apply_misc_primitive(unsigned prim_id, unsigned argc,
     case PHASHTABLEALIST:
         REQUIRE_ARGC(argc, 1, 1, "hash-table->alist");
         return hash_table_entries_list(argv[0], "hash-table->alist", 2);
+    case PHASHTABLECOPY:
+        REQUIRE_ARGC(argc, 1, 1, "hash-table-copy");
+        return hash_table_copy_value(argv[0], "hash-table-copy");
+    case PHASHTABLEEQUIV: {
+        REQUIRE_ARGC(argc, 1, 1, "hash-table-equivalence-function");
+        hash_table_data *ht =
+            require_hash_table(argv[0], "hash-table-equivalence-function");
+        if (!ht)
+            return TOK_ERROR;
+        switch (ht->equiv) {
+        case HASH_EQ:
+            return mk_primop(PEQ);
+        case HASH_EQV:
+            return mk_primop(PEQV);
+        case HASH_EQUAL:
+            return mk_primop(PEQUALP);
+        }
+        show_error("hash-table-equivalence-function: invalid equivalence");
+        return TOK_ERROR;
+    }
+    case PHASHTABLEHASH:
+        REQUIRE_ARGC(argc, 2, 3, "%hash-table-hash");
+        return hash_table_hash_value(argc, argv, "%hash-table-hash");
+    case PHASH:
+        REQUIRE_ARGC(argc, 1, 2, "hash");
+        return object_hash_value(argc, argv, HASH_EQUAL, "hash");
+    case PHASHBYIDENTITY:
+        REQUIRE_ARGC(argc, 1, 2, "hash-by-identity");
+        return object_hash_value(argc, argv, HASH_EQ, "hash-by-identity");
     default:
         show_error("misc primitive: unsupported id %u", prim_id);
         return TOK_ERROR;
@@ -2853,6 +3129,8 @@ unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
     case PNEWLINE:
     case PREAD:
     case PREADCHAR:
+    case PREADCHARNOHANG:
+    case PUNREADCHAR:
     case PPEEKCHAR:
     case PWRITECHAR:
     case PEOF:
@@ -2897,6 +3175,7 @@ unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
     case PSTRSET:
     case PSTRAPP:
     case PSUBSTR:
+    case PSTRSLICE:
     case PSTR2SYM:
     case PSYM2STR:
     case PNUM2STR:
@@ -2950,6 +3229,10 @@ unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
     case PCHARWHITE:
     case PCHARUPPER:
     case PCHARLOWER:
+    case PCHARCOMBINING:
+    case PUNICODEASSIGNED:
+    case PUNICODEPUNCTUATION:
+    case PUNICODESYMBOL:
         return apply_char_primitive(prim_id, argc, argv);
 
     // Vector operations - delegated to prim_vector.c
@@ -3033,8 +3316,24 @@ unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
     case PHASHTABLEKEYS:
     case PHASHTABLEVALUES:
     case PHASHTABLEALIST:
+    case PHASHTABLECOPY:
+    case PHASHTABLEEQUIV:
+    case PHASHTABLEHASH:
+    case PHASH:
+    case PHASHBYIDENTITY:
         return apply_misc_primitive(prim_id, argc, argv);
-    // PGCFLIP is handled specially in eval.c (needs environment as root)
+
+    // The CPS interpreter intercepts gc-flip before this dispatch (eval.c) so
+    // it can pass the current environment as the collection root. The VM
+    // reaches here instead, and needs no such root: gc() walks every active
+    // vm_state via gc_update_vm_roots(), so the VM's stack and frames are
+    // rooted independently of the argument. Without this case the VM fell
+    // through to "unknown primitive" and gc-flip was simply dead in the
+    // default mode.
+    case PGCFLIP:
+        REQUIRE_ARGC(argc, 0, 0, "gc-flip");
+        gc(0);
+        return ctx.atom_true;
 
     // Numeric tower operations - delegated to prim_numtower.c
     case PNUMERATOR:
@@ -3061,6 +3360,7 @@ unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
     // R5RS environment procedures
     case PSCHEMEENV:
     case PNULLENV:
+    case PR7RSENV:
         return apply_environment_primitive(prim_id, argc, argv);
 
     // Special cases handled elsewhere

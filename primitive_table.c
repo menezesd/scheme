@@ -62,6 +62,8 @@ static const primitive_binding builtins[] = {
     {"newline", PNEWLINE},
     {"read", PREAD},
     {"read-char", PREADCHAR},
+    {"read-char-no-hang", PREADCHARNOHANG},
+    {"unread-char", PUNREADCHAR},
     {"peek-char", PPEEKCHAR},
     {"write-char", PWRITECHAR},
     {"eof-object", PEOFOBJECT},
@@ -86,6 +88,7 @@ static const primitive_binding builtins[] = {
     {"string-set!", PSTRSET},
     {"string-append", PSTRAPP},
     {"substring", PSUBSTR},
+    {"string-slice", PSTRSLICE},
     {"string->symbol", PSTR2SYM},
     {"symbol->string", PSYM2STR},
     {"number->string", PNUM2STR},
@@ -276,6 +279,7 @@ static const primitive_binding builtins[] = {
     {"eval", PEVAL},
     {"scheme-report-environment", PSCHEMEENV},
     {"null-environment", PNULLENV},
+    {"%r7rs-environment", PR7RSENV},
     {"interaction-environment", PINTERACTIONENV},
 
     // String ports
@@ -315,6 +319,11 @@ static const primitive_binding builtins[] = {
     {"hash-table-keys", PHASHTABLEKEYS},
     {"hash-table-values", PHASHTABLEVALUES},
     {"hash-table->alist", PHASHTABLEALIST},
+    {"hash-table-copy", PHASHTABLECOPY},
+    {"hash-table-equivalence-function", PHASHTABLEEQUIV},
+    {"%hash-table-hash", PHASHTABLEHASH},
+    {"hash", PHASH},
+    {"hash-by-identity", PHASHBYIDENTITY},
 
     // R7RS-ish port predicates
     {"port-open?", PPORTOPENP},

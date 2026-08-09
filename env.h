@@ -63,6 +63,12 @@ unsigned make_binding_ref_cell(unsigned target_var, unsigned target_val_cell);
 // Find the value cell for a variable in an environment, or 0 if absent
 unsigned env_find_binding_cell(int64_t var, unsigned env);
 
+// Reject cyclic environment parent chains before traversing them.
+bool env_chain_acyclic(unsigned env);
+
+// Reject cyclic variable lists in an environment frame before traversing them.
+bool env_binding_list_acyclic(unsigned vars);
+
 // Set an existing variable (error if not found)
 unsigned setvar(int64_t var, unsigned aval, unsigned env);
 
@@ -86,5 +92,16 @@ unsigned mk_primop(int64_t id);
 
 // Create and initialize the default environment with primitives
 unsigned default_environment(void);
+
+// Clone an environment's frame structure for an isolated R7RS eval target.
+unsigned clone_environment(unsigned env);
+
+// Build an isolated environment containing only the exports selected by the
+// R7RS import-set list. The source environment is not mutated.
+unsigned environment_with_imports(unsigned source, unsigned specs);
+
+// Mark an environment root as immutable and query that marker.
+void mark_immutable_environment(unsigned env);
+bool environment_is_immutable(unsigned env);
 
 #endif // ENV_H

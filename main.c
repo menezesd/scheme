@@ -104,6 +104,22 @@ static unsigned eval_batch(unsigned exprs, unsigned env)
     return eval_expr(begin_form, env);
 }
 
+static bool eval_pending_batch(unsigned *batch, unsigned *batch_tail,
+                               unsigned env, bool warn_on_error)
+{
+    if (!*batch)
+        return true;
+    unsigned result = eval_batch(*batch, env);
+    if (result == TOK_ERROR) {
+        if (warn_on_error)
+            fprintf(stderr, "Warning: error during load\n");
+        return false;
+    }
+    *batch = 0;
+    *batch_tail = 0;
+    return true;
+}
+
 static bool load_from_port(FILE *f, unsigned *env, bool warn_on_error,
                            const char *filename)
 {
@@ -112,10 +128,12 @@ static bool load_from_port(FILE *f, unsigned *env, bool warn_on_error,
     reader_set_filename(filename);
     reader_reset_position();
 
-    // Read all expressions first
-    unsigned all_exprs = 0, all_tail = 0;
-    gc_protect(&all_exprs);
-    gc_protect(&all_tail);
+    // Evaluate expressions as they are read, batching consecutive
+    // non-macro expressions for call/cc support.  Streaming avoids retaining
+    // the entire input file in the heap and keeps the GC root set bounded.
+    unsigned batch = 0, batch_tail = 0;
+    gc_protect(&batch);
+    gc_protect(&batch_tail);
 
     for (;;) {
         unsigned expr = read_obj_port(f);
@@ -131,46 +149,18 @@ static bool load_from_port(FILE *f, unsigned *env, bool warn_on_error,
             return false;
         }
 
-        gc_protect(&expr);
-        list_append(&all_exprs, &all_tail, expr);
-        gc_unprotect(1); // expr - per-iteration cleanup
-        *env = maybe_gc(*env, 75);
-    }
-
-    if (!all_exprs) {
-        *env = gc(*env);
-        restore_reader_context(old_filename);
-        return true;
-    }
-
-    // Evaluate expressions, batching consecutive non-macro expressions
-    // for call/cc support, but evaluating define-syntax immediately
-    // so macros are available for subsequent expressions.
-    unsigned batch = 0, batch_tail = 0;
-    gc_protect(&batch);
-    gc_protect(&batch_tail);
-    gc_protect(&all_exprs);
-
-    // Protect loop variable - it can become stale if GC runs during eval
-    unsigned exprs = all_exprs;
-    gc_protect(&exprs);
-
-    for (; exprs; exprs = cdr(exprs)) {
-        unsigned expr = car(exprs);
         // Protect expr - it can become stale if GC runs during eval_batch
         gc_protect(&expr);
 
         if (is_define_syntax(expr)) {
             // Evaluate any pending batch first
             if (batch) {
-                unsigned result = eval_batch(batch, *env);
-                if (result == TOK_ERROR) {
+                if (!eval_pending_batch(&batch, &batch_tail, *env,
+                                        warn_on_error)) {
+                    gc_unprotect(1);
                     restore_reader_context(old_filename);
-                    if (warn_on_error)
-                        fprintf(stderr, "Warning: error during load\n");
                     return false;
                 }
-                batch = batch_tail = 0;
             }
             // Evaluate define-syntax immediately
             unsigned result = eval_expr(expr, *env);
@@ -188,15 +178,15 @@ static bool load_from_port(FILE *f, unsigned *env, bool warn_on_error,
             list_append(&batch, &batch_tail, expr);
             gc_unprotect(1); // expr - per-iteration cleanup
         }
+
+        *env = maybe_gc(*env, 75);
     }
 
     // Evaluate final batch
     if (batch) {
-        unsigned result = eval_batch(batch, *env);
-        if (result == TOK_ERROR) {
+        if (!eval_pending_batch(&batch, &batch_tail, *env,
+                                warn_on_error)) {
             restore_reader_context(old_filename);
-            if (warn_on_error)
-                fprintf(stderr, "Warning: error during load\n");
             return false;
         }
     }
@@ -367,12 +357,48 @@ int main(int argc, char **argv)
     // Create default environment with primitives
     unsigned env = default_environment();
 
+    // This implementation detail is needed while bootstrapping the standard
+    // library, but does not belong in every freshly-created user environment.
+    // Keeping it out of default_environment also avoids making internal
+    // bootstrap bindings part of the public primitive set.
+    GC_GUARD;
+    gc_protect(&env);
+    unsigned assigned_name = atom_from_string("%unicode-assigned?");
+    gc_protect(&assigned_name);
+    unsigned assigned_prim = mk_primop(PUNICODEASSIGNED);
+    gc_protect(&assigned_prim);
+    defvar(assigned_name, assigned_prim, env);
+    unsigned combining_name = atom_from_string("%char-combining?");
+    gc_protect(&combining_name);
+    unsigned combining_prim = mk_primop(PCHARCOMBINING);
+    gc_protect(&combining_prim);
+    defvar(combining_name, combining_prim, env);
+    unsigned punctuation_name = atom_from_string("%unicode-punctuation?");
+    gc_protect(&punctuation_name);
+    unsigned punctuation_prim = mk_primop(PUNICODEPUNCTUATION);
+    gc_protect(&punctuation_prim);
+    defvar(punctuation_name, punctuation_prim, env);
+    unsigned symbol_name = atom_from_string("%unicode-symbol?");
+    gc_protect(&symbol_name);
+    unsigned symbol_prim = mk_primop(PUNICODESYMBOL);
+    gc_protect(&symbol_prim);
+    defvar(symbol_name, symbol_prim, env);
+
     // Set up automatic GC during allocation
     set_alloc_gc_root(&env);
 
     // Load standard library
     if (!load_stdlib(&env))
         return 1;
+
+    // Keep a pristine standard-library environment as the source for
+    // isolated R7RS import environments.  User definitions added to the
+    // interaction environment after this point must not leak into eval.
+    ctx.r7rs_environment = clone_environment(env);
+    if (ctx.r7rs_environment == TOK_ERROR) {
+        fprintf(stderr, "Error: could not clone standard environment\n");
+        return 1;
+    }
 
     if (!use_bytecode) {
         fprintf(
@@ -403,7 +429,11 @@ int main(int argc, char **argv)
     if (setjmp(panic_jmp) != 0) {
         // Recovered from a fatal error - reset and continue. The longjmp
         // skipped every GC_GUARD cleanup, so drop the dangling shadow-stack
-        // roots before running a collection.
+        // roots before running a collection. It also skipped any restore of
+        // suppress_error_output, so clear it here or a panic raised inside
+        // compile-time constant folding would silence diagnostics for the
+        // rest of the session.
+        ctx.suppress_error_output = false;
         fprintf(stderr, "Returning to REPL...\n");
         gc_recover_after_panic();
         env = gc(env);

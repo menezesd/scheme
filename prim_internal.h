@@ -15,6 +15,7 @@
 #include "env.h"
 #include "reader.h"
 #include "writer.h"
+#include "utf8.h"
 #include <ctype.h>
 #include <inttypes.h>
 #include <limits.h>
@@ -560,7 +561,7 @@ static inline char *require_string_ptr(unsigned value, const char *name)
         return NULL;
     }
     char *s = GET_STRING_PTR(value);
-    if (!string_is_registered(s)) {
+    if (!s || (!string_cell_is_view(value) && !string_is_registered(s))) {
         show_error("%s: invalid string", name);
         return NULL;
     }
@@ -592,6 +593,15 @@ static inline file_port *file_port_new(FILE *file, bool binary, bool input,
 static inline bool file_port_well_formed(const file_port *port)
 {
     return file_port_is_registered(port);
+}
+
+static inline bool require_textual_file_port(FILE *file, const char *name)
+{
+    if (file_port_is_binary_file(file)) {
+        show_error("%s: not a textual port", name);
+        return false;
+    }
+    return true;
 }
 
 static inline FILE *file_port_file(unsigned value)
@@ -979,6 +989,15 @@ static inline string_port *strport_alloc_with_data(char *data, size_t len,
     sp->len = len;
     sp->cap = cap;
     sp->pos = 0;
+    sp->last_read_pos = 0;
+    sp->last_read_len = 0;
+    sp->last_read_char = 0;
+    sp->last_read_valid = false;
+    sp->source_string = ctx.atom_false;
+    sp->source_start = 0;
+    sp->source_end = 0;
+    sp->source_pos_chars = 0;
+    sp->borrowed_data = false;
     string_port_register(sp);
     return sp;
 }
@@ -1001,6 +1020,77 @@ static inline string_port *strport_from_string(const char *s)
     if (!data)
         return NULL;
     return strport_alloc_with_data(data, len, len + 1);
+}
+
+static inline string_port *strport_from_string_cell(unsigned source,
+                                                     size_t start,
+                                                     size_t end)
+{
+    if (!IS_STRING(source))
+        return NULL;
+    char *s = GET_STRING_PTR(source);
+    const char *utf8_error = NULL;
+    size_t start_byte;
+    size_t end_byte;
+    if (!scheme_utf8_byte_offset_for_index(s, start, true, &start_byte,
+                                           &utf8_error) ||
+        !scheme_utf8_byte_offset_for_index(s, end, true, &end_byte,
+                                           &utf8_error))
+        return NULL;
+    string_port *sp = checked_malloc_size(sizeof(string_port));
+    if (!sp)
+        return NULL;
+    sp->data = s + start_byte;
+    sp->len = end_byte - start_byte;
+    sp->cap = sp->len + 1;
+    sp->pos = 0;
+    sp->last_read_pos = 0;
+    sp->last_read_len = 0;
+    sp->last_read_char = 0;
+    sp->last_read_valid = false;
+    sp->source_string = source;
+    sp->source_start = start;
+    sp->source_end = end;
+    sp->source_pos_chars = 0;
+    sp->borrowed_data = true;
+    string_port_register(sp);
+    return sp;
+}
+
+static inline bool strport_sync_source(string_port *sp)
+{
+    if (sp->source_string == ctx.atom_false)
+        return true;
+    if (!IS_STRING(sp->source_string))
+        return false;
+    char *s = GET_STRING_PTR(sp->source_string);
+    // The type tag alone is not enough: corrupted string cells can contain
+    // arbitrary pointers, and the UTF-8 helpers dereference the buffer.
+    if (!s || !string_is_registered(s))
+        return false;
+    if (sp->source_start > sp->source_end)
+        return false;
+    const char *utf8_error = NULL;
+    size_t start_byte;
+    size_t end_byte;
+    size_t pos_byte;
+    if (sp->source_pos_chars > sp->source_end - sp->source_start)
+        return false;
+    if (!scheme_utf8_byte_offset_for_index(s, sp->source_start, true,
+                                           &start_byte, &utf8_error) ||
+        !scheme_utf8_byte_offset_for_index(s, sp->source_end, true,
+                                           &end_byte, &utf8_error) ||
+        !scheme_utf8_byte_offset_for_index(
+            s, sp->source_start + sp->source_pos_chars, true, &pos_byte,
+            &utf8_error))
+        return false;
+    sp->data = s + start_byte;
+    sp->len = end_byte - start_byte;
+    sp->cap = sp->len + 1;
+    if (pos_byte < start_byte || pos_byte > end_byte)
+        return false;
+    sp->pos = pos_byte - start_byte;
+    return true;
 }
 
 static inline bool strport_grow(string_port *sp)
@@ -1071,7 +1161,8 @@ static inline void strport_free(string_port *sp)
 {
     if (sp) {
         string_port_unregister(sp);
-        free(sp->data);
+        if (!sp->borrowed_data)
+            free(sp->data);
         free(sp);
     }
 }
@@ -1083,9 +1174,10 @@ static inline void strport_free(string_port *sp)
 // Port direction for extract_port
 typedef enum { PORT_INPUT, PORT_OUTPUT } port_dir;
 
-static inline bool string_port_well_formed(const string_port *sp)
+static inline bool string_port_well_formed(string_port *sp)
 {
-    return string_port_is_registered(sp) && sp->data && sp->cap > 0 &&
+    return string_port_is_registered(sp) && strport_sync_source(sp) &&
+           sp->data && sp->cap > 0 &&
            sp->len < sp->cap && sp->pos <= sp->len;
 }
 
@@ -1255,6 +1347,17 @@ static inline unsigned make_string_owned(char *s)
     return p;
 }
 
+// Most string-producing procedures return immutable strings.  Keep this
+// separate from make_string_owned because make-string and string-copy are
+// specified to produce mutable strings.
+static inline unsigned make_string_immutable_owned(char *s)
+{
+    unsigned p = make_string_owned(s);
+    if (p != TOK_ERROR)
+        string_mark_immutable(GET_STRING_PTR(p));
+    return p;
+}
+
 // Create a string cell by copying a C string (handles allocation + error)
 static inline unsigned make_string_copy(const char *s)
 {
@@ -1290,6 +1393,7 @@ unsigned prim_reverse(unsigned argc, unsigned *argv);
 // String operations (prim_string.c)
 unsigned prim_string_append(unsigned argc, unsigned *argv);
 unsigned prim_substring(unsigned argc, unsigned *argv);
+unsigned prim_string_slice(unsigned argc, unsigned *argv);
 unsigned prim_string_normalize(unsigned prim_id, unsigned argc,
                                unsigned *argv);
 

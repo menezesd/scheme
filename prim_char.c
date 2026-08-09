@@ -5,6 +5,7 @@
 
 #include "prim_internal.h"
 #include "unicode_char_tables.h"
+#include "unicode_norm_tables.h"
 
 static bool unicode_range_contains(const unicode_range *ranges, size_t count,
                                    uint32_t code)
@@ -19,6 +20,31 @@ static bool unicode_range_contains(const unicode_range *ranges, size_t count,
             hi = mid;
     }
     return lo < count && ranges[lo].start <= code && code <= ranges[lo].end;
+}
+
+static bool unicode_char_has_combining_class(uint32_t code)
+{
+    size_t lo = 0;
+    size_t hi = UNICODE_CCC_COUNT;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (unicode_ccc_table[mid].code < code)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo < UNICODE_CCC_COUNT && unicode_ccc_table[lo].code == code &&
+           unicode_ccc_table[lo].combining_class != 0;
+}
+
+static unsigned unicode_assigned_value(unsigned arg, const char *name)
+{
+    int code;
+    if (!expect_char_value(arg, &code, name))
+        return TOK_ERROR;
+    return scheme_bool(unicode_range_contains(
+        unicode_assigned_ranges, UNICODE_ASSIGNED_RANGES_COUNT,
+        (uint32_t)code));
 }
 
 static uint32_t lookup_simple_mapping(const unicode_simple_fold_entry *entries,
@@ -226,6 +252,33 @@ unsigned apply_char_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
     }
 
     switch (prim_id) {
+    case PUNICODEASSIGNED:
+        REQUIRE_ARGC(argc, 1, 1, "%unicode-assigned?");
+        return unicode_assigned_value(argv[0], "%unicode-assigned?");
+    case PUNICODEPUNCTUATION:
+    case PUNICODESYMBOL: {
+        const char *name = prim_id == PUNICODEPUNCTUATION
+                               ? "%unicode-punctuation?"
+                               : "%unicode-symbol?";
+        REQUIRE_ARGC(argc, 1, 1, name);
+        int c;
+        if (!expect_char_value(argv[0], &c, name))
+            return TOK_ERROR;
+        const unicode_range *ranges = prim_id == PUNICODEPUNCTUATION
+                                           ? unicode_punctuation_ranges
+                                           : unicode_symbol_ranges;
+        size_t count = prim_id == PUNICODEPUNCTUATION
+                           ? UNICODE_PUNCTUATION_RANGES_COUNT
+                           : UNICODE_SYMBOL_RANGES_COUNT;
+        return scheme_bool(unicode_range_contains(ranges, count, (uint32_t)c));
+    }
+    case PCHARCOMBINING: {
+        REQUIRE_ARGC(argc, 1, 1, "%char-combining?");
+        int c;
+        if (!expect_char_value(argv[0], &c, "%char-combining?"))
+            return TOK_ERROR;
+        return scheme_bool(unicode_char_has_combining_class((uint32_t)c));
+    }
     case PCHARCODE:
         REQUIRE_ARGC(argc, 1, 1, "char->integer");
         return char_code_value(argv[0], "char->integer");

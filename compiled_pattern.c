@@ -402,6 +402,7 @@ static const char *opcode_names[] = {
     [PAT_INPUT_CDR] = "INPUT_CDR",
     [PAT_INPUT_POP] = "INPUT_POP",
     [PAT_INPUT_ADVANCE] = "INPUT_ADVANCE",
+    [PAT_INPUT_VECREF] = "INPUT_VECREF",
     [PAT_CHECK_PAIR] = "CHECK_PAIR",
     [PAT_CHECK_NULL] = "CHECK_NULL",
     [PAT_CHECK_ATOM] = "CHECK_ATOM",
@@ -425,6 +426,13 @@ static const char *opcode_names[] = {
     [PAT_JUMP] = "JUMP",
     [PAT_SUCCESS] = "SUCCESS",
 };
+
+const char *pattern_opcode_name(unsigned op)
+{
+    if (op >= PAT_OPCODE_COUNT || !opcode_names[op])
+        return "???";
+    return opcode_names[op];
+}
 
 static bool pattern_jump_target_is_valid(compiled_pattern *pat,
                                          unsigned target)
@@ -498,10 +506,7 @@ void pattern_disassemble(compiled_pattern *pat)
     for (unsigned i = 0; i < pat->code_len; i++) {
         unsigned op = pat->code[i].opcode;
         unsigned operand = pat->code[i].operand;
-        const char *name = (op < PAT_OPCODE_COUNT)
-                               ? opcode_names[op]
-                               : "???";
-        printf("  %3u: %-16s %u\n", i, name ? name : "???", operand);
+        printf("  %3u: %-16s %u\n", i, pattern_opcode_name(op), operand);
     }
     printf("========================\n");
 }

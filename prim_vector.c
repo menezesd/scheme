@@ -22,6 +22,11 @@ static bool vector_index(unsigned value, unsigned vec, int64_t *idx,
 
 static unsigned make_vector_from_argv(unsigned len, unsigned *argv)
 {
+    GC_GUARD;
+    // make_vector may trigger GC.  Keep every argument current until it has
+    // been copied into the newly allocated vector.
+    for (unsigned i = 0; i < len; i++)
+        gc_protect(&argv[i]);
     unsigned vec = make_vector(len, 0);
     if (vec == TOK_ERROR)
         return TOK_ERROR;

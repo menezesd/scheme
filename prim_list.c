@@ -26,6 +26,11 @@ unsigned prim_append(unsigned argc, unsigned *argv)
     if (argc == 0)
         return 0;
     GC_GUARD;
+    // Any list argument may be moved while the copied spines are allocated.
+    // Root the complete argument vector before the first allocation so both
+    // the current and not-yet-processed lists remain valid.
+    for (unsigned i = 0; i < argc; i++)
+        gc_protect(&argv[i]);
     unsigned result = 0, tail = 0;
     gc_protect(&result);
     gc_protect(&tail);

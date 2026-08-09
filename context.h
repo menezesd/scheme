@@ -36,6 +36,15 @@
 #include "bignum.h"
 #include "types.h"
 
+typedef struct string_view_data {
+    char *data;
+    unsigned parent;
+    size_t start;
+    size_t end;
+    bool immutable;
+} string_view_data;
+
+
 // ============================================================================
 // Cell Accessors
 // ============================================================================
@@ -364,6 +373,7 @@ bool checked_flex_size(size_t base_size, size_t count, size_t elem_size,
 void file_port_register(file_port *port);
 void file_port_unregister(file_port *port);
 bool file_port_is_registered(const file_port *port);
+bool file_port_is_binary_file(FILE *file);
 void string_port_register(string_port *port);
 void string_port_unregister(string_port *port);
 bool string_port_is_registered(const string_port *port);
@@ -376,6 +386,16 @@ bool bignum_is_registered(const bignum *bn);
 void string_register(char *string);
 void string_unregister(char *string);
 bool string_is_registered(const char *string);
+void string_view_register(string_view_data *view);
+void string_view_unregister(string_view_data *view);
+bool string_view_is_registered(const string_view_data *view);
+bool string_cell_is_view(unsigned value);
+char *string_cell_data(unsigned value);
+size_t string_cell_byte_length(unsigned value);
+bool string_cell_is_immutable(unsigned value);
+void string_views_refresh(unsigned parent);
+void string_mark_immutable(char *string);
+bool string_is_immutable(const char *string);
 void vector_register(vector_data *vector);
 void vector_unregister(vector_data *vector);
 bool vector_is_registered(const vector_data *vector);

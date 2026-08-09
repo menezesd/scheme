@@ -58,14 +58,77 @@ static uint64_t xoshiro256ss(void)
     return result;
 }
 
+static bignum *random_bignum_below(const bignum *limit)
+{
+    if (!limit || limit->len == 0)
+        return NULL;
+
+    limb_t top = limit->limbs[limit->len - 1];
+    unsigned top_bits = 0;
+    while (top) {
+        top_bits++;
+        top >>= 1;
+    }
+    limb_t top_mask = top_bits == LIMB_BITS
+                           ? LIMB_MAX
+                           : (((limb_t)1 << top_bits) - 1);
+
+    for (;;) {
+        bignum *candidate = bn_from_int(0);
+        if (!candidate)
+            return NULL;
+        for (size_t i = limit->len; i > 0; i--) {
+            bignum *shifted = bn_lshift(candidate, LIMB_BITS);
+            bn_free(candidate);
+            if (!shifted)
+                return NULL;
+            limb_t word = (limb_t)xoshiro256ss();
+            if (i == limit->len)
+                word &= top_mask;
+            bignum *part = bn_from_uint(word);
+            if (!part) {
+                bn_free(shifted);
+                return NULL;
+            }
+            candidate = bn_add(shifted, part);
+            bn_free(shifted);
+            bn_free(part);
+            if (!candidate)
+                return NULL;
+        }
+        if (bn_cmp(candidate, limit) < 0)
+            return candidate;
+        bn_free(candidate);
+    }
+}
+
 static unsigned random_integer_value(unsigned x, const char *name)
 {
-    int64_t n;
-    if (!expect_exact_int64(x, &n, name))
+    bignum *limit = to_bignum(x);
+    if (!limit) {
+        show_error("%s: expected exact integer", name);
         return TOK_ERROR;
-    if (n <= 0) {
+    }
+    int64_t n;
+    if (bn_to_int64(limit, &n) == 0 && n <= 0) {
+        bn_free(limit);
         show_error("%s: expected positive integer", name);
         return TOK_ERROR;
+    }
+    if (bn_sign(limit) <= 0) {
+        bn_free(limit);
+        show_error("%s: expected positive integer", name);
+        return TOK_ERROR;
+    }
+
+    if (bn_to_int64(limit, &n) != 0) {
+        bignum *result = random_bignum_below(limit);
+        bn_free(limit);
+        if (!result) {
+            show_error("%s: out of memory", name);
+            return TOK_ERROR;
+        }
+        return store_integer(result);
     }
 
     // Reject the small prefix that would make the 2^64-sized generator
@@ -77,6 +140,7 @@ static unsigned random_integer_value(unsigned x, const char *name)
     do {
         r = xoshiro256ss();
     } while (r < threshold);
+    bn_free(limit);
     return store((int64_t)(r % (uint64_t)n));
 }
 

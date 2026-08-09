@@ -66,7 +66,7 @@ unsigned prim_string_append(unsigned argc, unsigned *argv)
 
     free_string_append_lengths(lengths, stack_lengths);
 
-    return make_string_owned(result);
+    return make_string_immutable_owned(result);
 }
 
 static bool utf8_decode_next_codepoint_string(const char *s, size_t byte_len,
@@ -147,7 +147,64 @@ unsigned prim_substring(unsigned argc, unsigned *argv)
         show_error("substring: out of memory");
         return TOK_ERROR;
     }
-    return make_string_owned(result);
+    return make_string_immutable_owned(result);
+}
+
+unsigned prim_string_slice(unsigned argc, unsigned *argv)
+{
+    GC_GUARD;
+    REQUIRE_ARGC(argc, 1, 3, "string-slice");
+    char *s = require_string_ptr(argv[0], "string-slice");
+    if (!s)
+        return TOK_ERROR;
+    size_t char_len;
+    if (!utf8_count_chars_string(s, &char_len, "string-slice"))
+        return TOK_ERROR;
+    int64_t start = 0;
+    int64_t end = (int64_t)char_len;
+    if (argc > 1 && !expect_nonneg_int64(argv[1], &start, "string-slice"))
+        return TOK_ERROR;
+    if (argc > 2 && !expect_nonneg_int64(argv[2], &end, "string-slice"))
+        return TOK_ERROR;
+    if (start < 0 || end < start || end > (int64_t)char_len) {
+        show_error("string-slice: invalid indices");
+        return TOK_ERROR;
+    }
+    size_t start_byte = 0;
+    size_t end_byte = 0;
+    if (!utf8_byte_offset_for_index_string(s, (size_t)start, &start_byte,
+                                           "string-slice") ||
+        !utf8_byte_offset_for_index_string(s, (size_t)end, &end_byte,
+                                           "string-slice"))
+        return TOK_ERROR;
+    char *copy = checked_string_copy_len(s + start_byte,
+                                         end_byte - start_byte);
+    if (!copy) {
+        show_error("string-slice: out of memory");
+        return TOK_ERROR;
+    }
+    string_view_data *view = checked_malloc_size(sizeof(*view));
+    if (!view) {
+        free(copy);
+        show_error("string-slice: out of memory");
+        return TOK_ERROR;
+    }
+    view->data = copy;
+    view->parent = argv[0];
+    view->start = (size_t)start;
+    view->end = (size_t)end;
+    view->immutable = string_cell_is_immutable(argv[0]);
+    string_register(copy);
+    string_view_register(view);
+
+    // The result cell allocation may trigger GC.  The view is external data
+    // until that cell is initialized, so protect its parent field explicitly.
+    gc_protect(&view->parent);
+    unsigned result = alloc();
+    gc_unprotect(1);
+    CELL_TYPE(result) = BT_STRING;
+    CELL_PTR(result) = view;
+    return result;
 }
 
 typedef struct {
@@ -441,7 +498,7 @@ static unsigned normalized_string_value(unsigned arg, bool compatibility,
 
     cp_buffer_free(&bytes);
     cp_buffer_free(&decomposed);
-    return make_string_owned(result);
+    return make_string_immutable_owned(result);
 }
 
 static unsigned folded_string_value(unsigned arg, const char *name)
@@ -507,7 +564,7 @@ static unsigned folded_string_value(unsigned arg, const char *name)
 
     cp_buffer_free(&bytes);
     cp_buffer_free(&folded);
-    return make_string_owned(result);
+    return make_string_immutable_owned(result);
 }
 
 typedef enum {
@@ -617,7 +674,7 @@ static unsigned make_string_from_codepoints(const codepoint_buffer *codepoints,
         result[i] = (char)bytes.data[i];
 
     cp_buffer_free(&bytes);
-    return make_string_owned(result);
+    return make_string_immutable_owned(result);
 }
 
 static unsigned cased_string_value(unsigned arg, string_case_mode mode,

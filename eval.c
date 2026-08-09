@@ -507,6 +507,77 @@ static void cps_signal_error(const char *msg, unsigned env, unsigned cont)
     apply_function(handler, args, env, err_cont);
 }
 
+// Evaluate in a caller-supplied lexical environment without losing the
+// caller's dynamic exception machinery.  The R7RS `eval` environment controls
+// variable visibility, but it must not disconnect the evaluation from an
+// enclosing guard or with-exception-handler.  Keep the two handler bindings
+// in a short-lived frame layered over the supplied environment.
+static unsigned eval_env_with_exception_handlers(unsigned eval_env,
+                                                  unsigned caller_env)
+{
+    GC_GUARD;
+    unsigned current_name = 0;
+    unsigned default_name = 0;
+    unsigned error_tag_name = 0;
+    unsigned current_handler = 0;
+    unsigned default_handler = 0;
+    unsigned error_tag = 0;
+    unsigned vars_tail = 0;
+    unsigned vars = 0;
+    unsigned vars_tail2 = 0;
+    unsigned vals_tail = 0;
+    unsigned vals = 0;
+    unsigned vals_tail2 = 0;
+    unsigned frame = 0;
+    unsigned scoped_env = 0;
+
+    gc_protect(&eval_env);
+    gc_protect(&caller_env);
+    gc_protect(&current_name);
+    gc_protect(&default_name);
+    gc_protect(&error_tag_name);
+    gc_protect(&current_handler);
+    gc_protect(&default_handler);
+    gc_protect(&error_tag);
+    gc_protect(&vars_tail);
+    gc_protect(&vars);
+    gc_protect(&vars_tail2);
+    gc_protect(&vals_tail);
+    gc_protect(&vals);
+    gc_protect(&vals_tail2);
+    gc_protect(&frame);
+    gc_protect(&scoped_env);
+
+    current_name = atom_from_string("*current-exception-handler*");
+    default_name = atom_from_string("*default-exception-handler*");
+    error_tag_name = atom_from_string("*error-object-tag*");
+    current_handler = lookup_silent(CELL_ID(current_name), caller_env);
+    default_handler = lookup_silent(CELL_ID(default_name), caller_env);
+    error_tag = lookup_silent(CELL_ID(error_tag_name), caller_env);
+
+    if (current_handler == TOK_ERROR || default_handler == TOK_ERROR ||
+        error_tag == TOK_ERROR)
+        return TOK_ERROR;
+
+    vars_tail2 = alloc_cons(error_tag_name, 0);
+    vars_tail = alloc_cons(default_name, vars_tail2);
+    vars = alloc_cons(current_name, vars_tail);
+    vals_tail2 = alloc_cons(error_tag, 0);
+    vals_tail = alloc_cons(default_handler, vals_tail2);
+    vals = alloc_cons(current_handler, vals_tail);
+    frame = alloc_cons(vars, vals);
+    scoped_env = alloc_cons(frame, eval_env);
+    if (environment_is_immutable(eval_env))
+        mark_immutable_environment(scoped_env);
+    return scoped_env;
+}
+
+void cps_signal_current_error(unsigned env, unsigned cont)
+{
+    cps_signal_error(ctx.last_error[0] ? ctx.last_error : "evaluation error",
+                     env, cont);
+}
+
 // ============================================================================
 // CPS Evaluator - Eval Step
 // ============================================================================
@@ -529,7 +600,7 @@ static void eval_step(void)
     }
     if (!IS_CELL(id)) {
         show_error("invalid expression");
-        tramp_error();
+        cps_signal_current_error(env, cont);
         return;
     }
 
@@ -586,7 +657,7 @@ static void eval_step(void)
         GC_GUARD;
         unsigned arg_exprs = cdr(id);
         if (!list_length_checked(arg_exprs, NULL, "application")) {
-            tramp_error();
+            cps_signal_current_error(env, cont);
             return;
         }
         gc_protect(&head);
@@ -601,7 +672,7 @@ static void eval_step(void)
 
     case BT_FREE:
         show_error("attempt to evaluate free memory");
-        tramp_error();
+        cps_signal_current_error(env, cont);
         return;
 
     default:
@@ -652,7 +723,7 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
         if (prim_id == PCALLCC) {
             if (!args || cdr(args)) {
                 show_error("call/cc expects exactly one argument");
-                tramp_error();
+                cps_signal_current_error(env, cont);
                 return;
             }
             GC_GUARD;
@@ -670,7 +741,7 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
         if (prim_id == PAPPLY) {
             if (!args || !cdr(args)) {
                 show_error("apply expects at least two arguments");
-                tramp_error();
+                cps_signal_current_error(env, cont);
                 return;
             }
             GC_GUARD;
@@ -683,6 +754,8 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
             gc_protect(&proc);
             gc_protect(&proc_args);
             gc_protect(&args);
+            gc_protect(&env);
+            gc_protect(&cont);
 
             // Build list of all args except last, then append last
             unsigned prefix = 0;
@@ -698,7 +771,7 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
             // later, but continuations otherwise turn a cyclic list into an
             // invalid multiple-values object.
             if (!list_length_checked(proc_args, NULL, "apply")) {
-                tramp_error();
+                cps_signal_current_error(env, cont);
                 return;
             }
 
@@ -716,7 +789,7 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
         if (prim_id == PCALLWITHVALUES) {
             if (!args || !cdr(args) || cddr(args)) {
                 show_error("call-with-values expects exactly two arguments");
-                tramp_error();
+                cps_signal_current_error(env, cont);
                 return;
             }
             GC_GUARD;
@@ -743,14 +816,14 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
         if (prim_id == PRAISENOW) {
             if (!args || cdr(args)) {
                 show_error("raise expects exactly one argument");
-                tramp_error();
+                cps_signal_current_error(env, cont);
                 return;
             }
             unsigned obj = car(args);
             unsigned handler = lookup_silent(
                 intern("*current-exception-handler*"), env);
             if (handler == TOK_ERROR) {
-                tramp_error();
+                cps_signal_current_error(env, cont);
                 return;
             }
             GC_GUARD;
@@ -768,13 +841,27 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
         if (prim_id == PEVAL) {
             if (!args || !cdr(args) || cddr(args)) {
                 show_error("eval expects exactly two arguments");
-                tramp_error();
+                cps_signal_current_error(env, cont);
                 return;
             }
             unsigned expr = car(args);
             unsigned eval_env = cadr(args);
-            // Evaluate expression in the given environment
-            tramp_eval(expr, eval_env, cont);
+            GC_GUARD;
+            gc_protect(&expr);
+            gc_protect(&eval_env);
+            gc_protect(&env);
+            gc_protect(&cont);
+            unsigned scoped_env =
+                eval_env_with_exception_handlers(eval_env, env);
+            gc_protect(&scoped_env);
+            if (scoped_env == TOK_ERROR) {
+                show_error("eval: caller has no exception handlers");
+                cps_signal_current_error(env, cont);
+                return;
+            }
+            // Evaluate expression in the given lexical environment while
+            // retaining the caller's dynamic exception handlers.
+            tramp_eval(expr, scoped_env, cont);
             return;
         }
 
@@ -782,7 +869,7 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
         if (prim_id == PINTERACTIONENV) {
             if (args) {
                 show_error("interaction-environment expects no arguments");
-                tramp_error();
+                cps_signal_current_error(env, cont);
                 return;
             }
             // Return the current environment
@@ -794,7 +881,7 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
         if (prim_id == PGCFLIP) {
             if (args) {
                 show_error("gc-flip expects no arguments");
-                tramp_error();
+                cps_signal_current_error(env, cont);
                 return;
             }
             // Trigger garbage collection with environment as root
@@ -811,33 +898,33 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
         if (prim_id == PLOAD) {
             if (!args || cdr(args)) {
                 show_error("load expects exactly one argument");
-                tramp_error();
+                cps_signal_current_error(env, cont);
                 return;
             }
             unsigned filename_arg = car(args);
             if (!IS_STRING(filename_arg)) {
                 show_error("load: expected string argument");
-                tramp_error();
+                cps_signal_current_error(env, cont);
                 return;
             }
             const char *filename = GET_STRING_PTR(filename_arg);
             if (!string_is_registered(filename)) {
                 show_error("load: invalid string");
-                tramp_error();
+                cps_signal_current_error(env, cont);
                 return;
             }
             const char *old_filename = reader_get_filename();
             char *filename_copy = checked_string_copy(filename);
             if (!filename_copy) {
                 show_error("load: out of memory");
-                tramp_error();
+                cps_signal_current_error(env, cont);
                 return;
             }
             FILE *f = fopen(filename, "r");
             if (!f) {
                 show_error("load: cannot open file: %s", filename);
                 free(filename_copy);
-                tramp_error();
+                cps_signal_current_error(env, cont);
                 return;
             }
             reader_set_filename(filename_copy);
@@ -848,6 +935,8 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
             GC_GUARD;
             gc_protect(&exprs);
             gc_protect(&exprs_tail);
+            gc_protect(&env);
+            gc_protect(&cont);
             for (;;) {
                 unsigned expr = read_obj_port(f);
                 if (expr == TOK_ERROR) {
@@ -873,7 +962,7 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
             free(filename_copy);
 
             if (load_failed) {
-                tramp_error();
+                cps_signal_current_error(env, cont);
                 return;
             }
 
@@ -898,10 +987,13 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
             return;
         }
 
-        // Protect cont across apply_primitive (which can allocate/trigger GC)
+        // Protect the dynamic environment and continuation across
+        // apply_primitive (which can allocate/trigger GC).  The environment
+        // is needed by the error dispatcher if the primitive fails after GC.
         {
             GC_GUARD;
             gc_protect(&args);
+            gc_protect(&env);
             gc_protect(&cont);
             unsigned result = apply_primitive(prim_id, args);
             if (result == TOK_ERROR) {
@@ -928,12 +1020,13 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
         gc_protect(&args);
         gc_protect(&body);
         gc_protect(&def_env);
+        gc_protect(&env);
         gc_protect(&cont);
         unsigned frame = 0;
         gc_protect(&frame);
         frame = bind_params(params, args);
         if (frame == TOK_ERROR) {
-            tramp_error();
+            cps_signal_current_error(env, cont);
             return;
         }
         unsigned new_env = alloc_cons(frame, def_env);
@@ -956,6 +1049,7 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
         GC_GUARD;
         gc_protect(&fn);
         gc_protect(&args);
+        gc_protect(&cont);
         unsigned value = values_from_list(args);
         tramp_apply(value, fn);
         return;
@@ -966,19 +1060,22 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
         GC_GUARD;
         gc_protect(&fn);
         gc_protect(&args);
+        gc_protect(&env);
         gc_protect(&cont);
         unsigned result = vm_call_closure(fn, args);
         gc_protect(&result);
         if (result == TOK_ERROR) {
-            tramp_error();
+            cps_signal_current_error(env, cont);
             return;
         }
         tramp_apply(result, cont);
         return;
     }
 
-    show_error("not a procedure, got %s", type_name(fn));
-    tramp_error();
+    char message[128];
+    snprintf(message, sizeof(message), "not a procedure, got %s",
+             type_name(fn));
+    cps_signal_error(message, env, cont);
 }
 
 // ============================================================================

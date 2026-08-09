@@ -13,6 +13,7 @@
  * ## Input Operations
  * - read: Parse an S-expression from input
  * - read-char: Read a single character
+ * - read-char-no-hang: Read without waiting on an unready interactive port
  * - peek-char: Look at next character without consuming
  * - char-ready?: Check if a character is available
  * - eof-object?: Test for end-of-file
@@ -29,6 +30,24 @@
 #include "utf8.h"
 #include <errno.h>
 #include <poll.h>
+#include <sys/stat.h>
+
+static bool count_utf8_chars_in_bytes(const char *data, size_t len,
+                                      size_t *count, const char **error_msg)
+{
+    size_t offset = 0;
+    *count = 0;
+    while (offset < len) {
+        size_t consumed = 0;
+        uint32_t codepoint;
+        if (!scheme_utf8_decode_next(data + offset, len - offset, &consumed,
+                                     &codepoint, error_msg) || consumed == 0)
+            return false;
+        offset += consumed;
+        (*count)++;
+    }
+    return true;
+}
 
 static unsigned write_arg_to_string_port(unsigned arg, string_port *sport,
                                          const char *name, bool display)
@@ -82,6 +101,8 @@ static bool flush_output_and_transcript(FILE *fport, const char *name)
 static bool write_arg_to_file_port(unsigned arg, FILE *fport, const char *name,
                                    bool display)
 {
+    if (!require_textual_file_port(fport, name))
+        return false;
     if (display && IS_STRING(arg)) {
         char *s = require_string_ptr(arg, name);
         if (!s)
@@ -166,6 +187,8 @@ static bool write_arg_to_file_port_mode(unsigned arg, FILE *fport,
                                         const char *name,
                                         void (*writer)(unsigned, FILE *))
 {
+    if (!require_textual_file_port(fport, name))
+        return false;
     writer(arg, fport);
     if (ctx.transcript && fport == ctx.current_output)
         writer(arg, ctx.transcript);
@@ -176,6 +199,8 @@ static bool write_arg_to_file_port_checked(unsigned arg, FILE *fport,
                                            const char *name,
                                            bool (*writer)(unsigned, FILE *))
 {
+    if (!require_textual_file_port(fport, name))
+        return false;
     if (!writer(arg, fport))
         return false;
     if (ctx.transcript && fport == ctx.current_output) {
@@ -187,6 +212,8 @@ static bool write_arg_to_file_port_checked(unsigned arg, FILE *fport,
 
 static bool write_newline_to_file_port(FILE *fport)
 {
+    if (!require_textual_file_port(fport, "newline"))
+        return false;
     fprintf(fport, "\n");
     if (ctx.transcript && fport == ctx.current_output)
         fprintf(ctx.transcript, "\n");
@@ -227,6 +254,8 @@ static bool write_char_to_string_port(string_port *sport, int c,
 
 static bool write_char_to_file_port(FILE *fport, int c, const char *name)
 {
+    if (!require_textual_file_port(fport, name))
+        return false;
     char encoded[4];
     size_t encoded_len;
     if (!encode_char_utf8(c, encoded, &encoded_len, name))
@@ -411,6 +440,8 @@ restore_peeked_bytes:
 static unsigned read_or_peek_char(FILE *fport, string_port *sport, int ptype,
                                   bool peek, const char *name)
 {
+    if (ptype == 0 && !require_textual_file_port(fport, name))
+        return TOK_ERROR;
     uint32_t codepoint;
     char bytes[4];
     size_t byte_len = 0;
@@ -428,6 +459,14 @@ static unsigned read_or_peek_char(FILE *fport, string_port *sport, int ptype,
         show_error("%s: %s", name,
                    utf8_error ? utf8_error : "invalid UTF-8 sequence");
         return TOK_ERROR;
+    }
+    if (ptype == 1 && !peek) {
+        sport->last_read_pos = sport->pos - byte_len;
+        sport->last_read_len = byte_len;
+        sport->last_read_char = (int)codepoint;
+        sport->last_read_valid = true;
+        if (sport->source_string != ctx.atom_false)
+            sport->source_pos_chars++;
     }
     return make_char((int)codepoint);
 }
@@ -481,6 +520,8 @@ static unsigned read_string_value(unsigned count_arg, unsigned argc,
                                       &sport, name);
     if (ptype == -1)
         return TOK_ERROR;
+    if (ptype == 0 && !require_textual_file_port(fport, name))
+        return TOK_ERROR;
     if (count == 0)
         return make_string_copy("");
     size_t cap = 16;
@@ -506,6 +547,8 @@ static unsigned read_string_value(unsigned count_arg, unsigned argc,
                        utf8_error ? utf8_error : "invalid UTF-8 sequence");
             return TOK_ERROR;
         }
+        if (ptype == 1 && sport->source_string != ctx.atom_false)
+            sport->source_pos_chars++;
         if (codepoint == 0) {
             free(buf);
             show_error("%s: null character cannot be stored in a string",
@@ -584,6 +627,8 @@ static unsigned write_string_value(unsigned argc, unsigned *argv,
                                              &sport, name);
     if (ptype == -1)
         return TOK_ERROR;
+    if (ptype == 0 && !require_textual_file_port(fport, name))
+        return TOK_ERROR;
     if (ptype == 1) {
         size_t slice_len = end_byte - start_byte;
         char *slice = checked_string_copy_len(str + start_byte, slice_len);
@@ -660,6 +705,7 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         if (ptype == -1) return TOK_ERROR;
         if (ptype == 1) {
             // String port: use fmemopen on remaining content
+            size_t source_start_pos = sport->pos;
             size_t remaining = sport->len - sport->pos;
             if (remaining == 0) {
                 return CELL_EOF_OBJECT;
@@ -683,7 +729,20 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
                 show_error("read: invalid reader pushback state");
                 return TOK_ERROR;
             }
-            sport->pos += (size_t)consumed - pending;
+            size_t advanced = (size_t)consumed - pending;
+            sport->pos += advanced;
+            if (sport->source_string != ctx.atom_false) {
+                size_t consumed_chars = 0;
+                const char *utf8_error = NULL;
+                if (!count_utf8_chars_in_bytes(
+                        sport->data + source_start_pos, advanced,
+                        &consumed_chars, &utf8_error)) {
+                    close_reader_stream(mem);
+                    show_error("read: invalid UTF-8 sequence");
+                    return TOK_ERROR;
+                }
+                sport->source_pos_chars += consumed_chars;
+            }
             reader_forget_port(mem);
             if (fclose(mem) != 0) {
                 show_error("read: close failed");
@@ -706,6 +765,64 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
                                           &sport, "read-char");
         if (ptype == -1) return TOK_ERROR;
         return read_or_peek_char(fport, sport, ptype, false, "read-char");
+    }
+    case PREADCHARNOHANG: {
+        REQUIRE_ARGC(argc, 0, 1, "read-char-no-hang");
+        FILE *fport;
+        string_port *sport;
+        int ptype = extract_optional_port(argc, argv, 1, PORT_INPUT, &fport,
+                                          &sport, "read-char-no-hang");
+        if (ptype == -1)
+            return TOK_ERROR;
+        if (ptype == 0) {
+            unsigned ready = apply_io_primitive(PCHARREADY, argc, argv);
+            if (ready == TOK_ERROR)
+                return TOK_ERROR;
+            if (ready == ctx.atom_false)
+                return ctx.atom_false;
+        }
+        return read_or_peek_char(fport, sport, ptype, false,
+                                 "read-char-no-hang");
+    }
+    case PUNREADCHAR: {
+        REQUIRE_ARGC(argc, 1, 2, "unread-char");
+        CHECK_CHAR(argv[0], "unread-char");
+        int c = GET_CHAR_CODE(argv[0]);
+        FILE *fport;
+        string_port *sport;
+        int ptype = extract_optional_port(argc, argv, 2, PORT_INPUT, &fport,
+                                          &sport, "unread-char");
+        if (ptype == -1)
+            return TOK_ERROR;
+        if (ptype == 0 && !require_textual_file_port(fport, "unread-char"))
+            return TOK_ERROR;
+        if (ptype == 1) {
+            if (!sport->last_read_valid ||
+                sport->last_read_char != c ||
+                sport->pos != sport->last_read_pos + sport->last_read_len) {
+                show_error("unread-char: character was not most recently read");
+                return TOK_ERROR;
+            }
+            sport->pos = sport->last_read_pos;
+            if (sport->source_string != ctx.atom_false &&
+                sport->source_pos_chars > 0)
+                sport->source_pos_chars--;
+            sport->last_read_valid = false;
+            return argv[0];
+        }
+        char encoded[4];
+        size_t encoded_len = 0;
+        if (!scheme_utf8_encode_scalar((uint32_t)c, encoded, &encoded_len)) {
+            show_error("unread-char: invalid character");
+            return TOK_ERROR;
+        }
+        for (size_t i = encoded_len; i > 0; i--) {
+            if (!reader_port_ungetc(fport, (unsigned char)encoded[i - 1])) {
+                show_error("unread-char: character was not most recently read");
+                return TOK_ERROR;
+            }
+        }
+        return argv[0];
     }
     case PPEEKCHAR: {
         REQUIRE_ARGC(argc, 0, 1, "peek-char");
@@ -748,6 +865,8 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         int ptype = extract_optional_port(argc, argv, 1, PORT_INPUT, &fport,
                                           &sport, "char-ready?");
         if (ptype == -1) return TOK_ERROR;
+        if (ptype == 0 && !require_textual_file_port(fport, "char-ready?"))
+            return TOK_ERROR;
 
         if (ptype == 1) {
             // String port: never blocks (a char or the eof object is ready)
@@ -777,11 +896,23 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
             show_error("char-ready?: poll failed");
             return TOK_ERROR;
         }
-        if (pfd.revents & (POLLERR | POLLNVAL)) {
-            show_error("char-ready?: port error");
-            return TOK_ERROR;
+        // POLLERR also means the operation will not block.  Some Unix
+        // special files, notably /dev/null on macOS, report EOF this way.
+        // Let the read operation surface a real I/O error; only POLLNVAL
+        // means that the descriptor itself is invalid.
+        if (pfd.revents & POLLNVAL) {
+            // poll(2) reports POLLNVAL for some valid special files on
+            // macOS (including /dev/null).  Confirm the descriptor before
+            // treating it as an actual invalid-port error.
+            struct stat st;
+            if (fstat(fd, &st) != 0) {
+                show_error("char-ready?: port error");
+                return TOK_ERROR;
+            }
+            return ctx.atom_true;
         }
-        return scheme_bool(ret > 0 && (pfd.revents & (POLLIN | POLLHUP)));
+        return scheme_bool(ret > 0 &&
+                           (pfd.revents & (POLLIN | POLLHUP | POLLERR)));
     }
     case PU8READY: {
         REQUIRE_ARGC(argc, 0, 1, "u8-ready?");
@@ -809,11 +940,16 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
             show_error("u8-ready?: poll failed");
             return TOK_ERROR;
         }
-        if (pfd.revents & (POLLERR | POLLNVAL)) {
-            show_error("u8-ready?: port error");
-            return TOK_ERROR;
+        if (pfd.revents & POLLNVAL) {
+            struct stat st;
+            if (fstat(fd, &st) != 0) {
+                show_error("u8-ready?: port error");
+                return TOK_ERROR;
+            }
+            return ctx.atom_true;
         }
-        return scheme_bool(ret > 0 && (pfd.revents & (POLLIN | POLLHUP)));
+        return scheme_bool(ret > 0 &&
+                           (pfd.revents & (POLLIN | POLLHUP | POLLERR)));
     }
     case PPEEKU8: {
         REQUIRE_ARGC(argc, 0, 1, "peek-u8");
@@ -839,6 +975,8 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         int ptype = extract_optional_port(argc, argv, 1, PORT_INPUT, &fport,
                                           &sport, "read-line");
         if (ptype == -1) return TOK_ERROR;
+        if (ptype == 0 && !require_textual_file_port(fport, "read-line"))
+            return TOK_ERROR;
 
         // Build line in temporary buffer
         size_t cap = 128;
@@ -850,6 +988,7 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         }
 
         int c;
+        size_t source_start_pos = ptype == 1 ? sport->pos : 0;
         for (;;) {
             if (ptype == 1) {
                 c = strport_getc(sport);
@@ -862,17 +1001,6 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
                 free(buf);
                 show_error("read-line: null character in string");
                 return TOK_ERROR;
-            }
-            if (c == '\r') {
-                int next = ptype == 1 ? strport_peekc(sport)
-                                      : reader_port_peekc(fport);
-                if (next == '\n') {
-                    if (ptype == 1)
-                        (void)strport_getc(sport);
-                    else
-                        (void)reader_port_getc(fport);
-                }
-                break;
             }
             if (len + 1 >= cap) {
                 if (!grow_read_buffer(&buf, &cap, "read-line", "line too long")) {
@@ -895,6 +1023,21 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
             return CELL_EOF_OBJECT;
         }
 
+        if (ptype == 1 && sport->source_string != ctx.atom_false) {
+            size_t consumed_chars = 0;
+            const char *utf8_error = NULL;
+            if (!count_utf8_chars_in_bytes(
+                    sport->data + source_start_pos,
+                    sport->pos - source_start_pos, &consumed_chars,
+                    &utf8_error)) {
+                free(buf);
+                show_error("read-line: %s",
+                           utf8_error ? utf8_error : "invalid UTF-8 sequence");
+                return TOK_ERROR;
+            }
+            sport->source_pos_chars += consumed_chars;
+        }
+
         buf[len] = '\0';
         size_t char_count;
         const char *utf8_error = NULL;
@@ -904,7 +1047,7 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
                        utf8_error ? utf8_error : "invalid UTF-8 sequence");
             return TOK_ERROR;
         }
-        return make_string_owned(buf);
+        return make_string_immutable_owned(buf);
     }
     case PEXIT: {
         // (exit) or (exit code)

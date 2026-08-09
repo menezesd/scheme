@@ -244,6 +244,10 @@ void gc_mark_pattern(compiled_pattern *pat);
 // Debug
 void pattern_disassemble(compiled_pattern *pat);
 
+// Mnemonic for a pattern opcode, or "???" if out of range or unnamed.
+// Exposed so tests can assert every opcode in the enum has a name.
+const char *pattern_opcode_name(unsigned op);
+
 // Global registry
 extern compiled_pattern *compiled_pattern_registry;
 

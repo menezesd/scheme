@@ -365,6 +365,8 @@ static bool vm_try_lookup_frame(int64_t sym_id, unsigned vars, unsigned vals,
                                 unsigned *value_out, unsigned *val_cell_out,
                                 unsigned *offset_out)
 {
+    if (!env_binding_list_acyclic(vars))
+        return false;
     unsigned offset = 0;
 
     while (vars) {
@@ -452,6 +454,9 @@ static inline unsigned ic_lookup(int64_t sym_id, unsigned env,
     }
 
     // Full lookup and fill cache
+    if (!env_chain_acyclic(env))
+        return TOK_ERROR;
+
     unsigned depth = 0;
     for (unsigned e = env; e; depth++) {
         unsigned frame = 0;
@@ -2931,6 +2936,9 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
         case OP_MEMQ: {
             unsigned list = vm_pop(vm);
             unsigned obj = vm_pop(vm);
+            if (!list_length_checked(list, NULL, "memq"))
+                VM_ERROR_BREAK(vm, ctx.last_error[0] ? ctx.last_error
+                                                     : "memq: invalid list");
             // Box obj for comparison (list elements are always boxed)
             gc_protect(&list);
             obj = ensure_boxed(obj);
@@ -3474,6 +3482,7 @@ void gc_update_vm_roots(vm_state *vm)
     // Update current environment
     vm->env = collect(vm->env);
     vm->letrec_frame = collect(vm->letrec_frame);
+    vm->signal_handler = collect(vm->signal_handler);
 
     // Update code object constants
     gc_collect_code(vm->code);
@@ -3498,4 +3507,5 @@ void gc_update_vm_roots_minor(vm_state *vm, unsigned (*collector)(unsigned))
     // Update current environment
     vm->env = collector(vm->env);
     vm->letrec_frame = collector(vm->letrec_frame);
+    vm->signal_handler = collector(vm->signal_handler);
 }

@@ -144,6 +144,9 @@ static bool compare_number_pair(unsigned prev, unsigned curr, cmp_op op,
 
 unsigned numeric_compare(unsigned argc, unsigned *argv, cmp_op op)
 {
+    GC_GUARD;
+    for (unsigned i = 0; i < argc; i++)
+        gc_protect(&argv[i]);
     if (argc == 0)
         return ctx.atom_true;
 
@@ -167,8 +170,9 @@ unsigned numeric_compare(unsigned argc, unsigned *argv, cmp_op op)
         return ctx.atom_true;
     }
 
-slow_path:;
+    slow_path:;
     unsigned prev = argv[0];
+    gc_protect(&prev);
     for (unsigned i = 1; i < argc; i++) {
         unsigned curr = argv[i];
         bool ok;

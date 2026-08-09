@@ -305,6 +305,9 @@ static unsigned inexact_complex_div_value(unsigned argc, unsigned *argv)
 
 unsigned prim_plus(unsigned argc, unsigned *argv)
 {
+    GC_GUARD;
+    for (unsigned i = 0; i < argc; i++)
+        gc_protect(&argv[i]);
     if (argc == 0)
         return store(0);
 
@@ -442,6 +445,9 @@ slow_path:;
 
 unsigned prim_mult(unsigned argc, unsigned *argv)
 {
+    GC_GUARD;
+    for (unsigned i = 0; i < argc; i++)
+        gc_protect(&argv[i]);
     if (argc == 0)
         return store(1);
 
@@ -549,6 +555,9 @@ slow_path:;
 
 unsigned prim_minus(unsigned argc, unsigned *argv)
 {
+    GC_GUARD;
+    for (unsigned i = 0; i < argc; i++)
+        gc_protect(&argv[i]);
     if (argc == 0) {
         show_error("-: requires at least one argument");
         return TOK_ERROR;
@@ -738,6 +747,9 @@ slow_path:;
 
 unsigned prim_div(unsigned argc, unsigned *argv)
 {
+    GC_GUARD;
+    for (unsigned i = 0; i < argc; i++)
+        gc_protect(&argv[i]);
     if (argc == 0) {
         show_error("/: requires at least one argument");
         return TOK_ERROR;
@@ -971,8 +983,10 @@ unsigned prim_modulo(unsigned argc, unsigned *argv)
         return store_integer(r);
     }
     int64_t a, b;
-    exact_int64_value(xa, &a);
-    exact_int64_value(xb, &b);
+    if (!exact_int64_value(xa, &a) || !exact_int64_value(xb, &b)) {
+        show_error("modulo: expected exact integer");
+        return TOK_ERROR;
+    }
     CHECK_DIV_ZERO(b, "modulo");
     if (a == INT64_MIN && b == -1)
         return store(0);
@@ -1005,8 +1019,10 @@ unsigned prim_remainder(unsigned argc, unsigned *argv)
         return store_integer(r);
     }
     int64_t a, b;
-    exact_int64_value(xa, &a);
-    exact_int64_value(xb, &b);
+    if (!exact_int64_value(xa, &a) || !exact_int64_value(xb, &b)) {
+        show_error("remainder: expected exact integer");
+        return TOK_ERROR;
+    }
     CHECK_DIV_ZERO(b, "remainder");
     if (a == INT64_MIN && b == -1)
         return store(0);
@@ -1036,8 +1052,10 @@ unsigned prim_quotient(unsigned argc, unsigned *argv)
         return store_integer(q);
     }
     int64_t a, b;
-    exact_int64_value(xa, &a);
-    exact_int64_value(xb, &b);
+    if (!exact_int64_value(xa, &a) || !exact_int64_value(xb, &b)) {
+        show_error("quotient: expected exact integer");
+        return TOK_ERROR;
+    }
     CHECK_DIV_ZERO(b, "quotient");
     if (a == INT64_MIN && b == -1) {
         bignum *result = bn_from_int(a);
@@ -1062,8 +1080,10 @@ unsigned prim_truncate_divrem(unsigned argc, unsigned *argv)
         return bignum_truncate_divrem_values(xa, xb, "truncate/");
 
     int64_t a, b;
-    exact_int64_value(xa, &a);
-    exact_int64_value(xb, &b);
+    if (!exact_int64_value(xa, &a) || !exact_int64_value(xb, &b)) {
+        show_error("truncate/: expected exact integer");
+        return TOK_ERROR;
+    }
     CHECK_DIV_ZERO(b, "truncate/");
     if (a == INT64_MIN && b == -1) {
         bignum *q = bn_from_int(a);
@@ -1098,8 +1118,10 @@ unsigned prim_floor_divrem(unsigned argc, unsigned *argv)
         return bignum_floor_divrem_values(xa, xb, "floor/");
 
     int64_t a, b;
-    exact_int64_value(xa, &a);
-    exact_int64_value(xb, &b);
+    if (!exact_int64_value(xa, &a) || !exact_int64_value(xb, &b)) {
+        show_error("floor/: expected exact integer");
+        return TOK_ERROR;
+    }
     CHECK_DIV_ZERO(b, "floor/");
     if (a == INT64_MIN && b == -1) {
         bignum *q = bn_from_int(a);

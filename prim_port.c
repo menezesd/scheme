@@ -4,14 +4,31 @@
  */
 
 #include "prim_internal.h"
+#include "utf8.h"
 #include "writer.h"
 
 static void close_string_port(unsigned port)
 {
     string_port *sp = GET_STRPORT_PTR(port);
-    if (string_port_is_registered(sp))
-        strport_free(sp);
-    CELL_ID(port) = 0;
+    if (!string_port_is_registered(sp) || !string_port_well_formed(sp))
+        return;
+    /* Keep the port cell and its registered backing object alive so that a
+       second close is harmless, as required for close-input/output-port.
+       The GC will reclaim the empty backing object with the port cell. */
+    if (!sp->borrowed_data)
+        free(sp->data);
+    sp->data = NULL;
+    sp->len = 0;
+    sp->cap = 0;
+    sp->pos = 0;
+    sp->last_read_pos = 0;
+    sp->last_read_len = 0;
+    sp->last_read_char = 0;
+    sp->last_read_valid = false;
+    sp->source_string = ctx.atom_false;
+    sp->source_start = 0;
+    sp->source_end = 0;
+    sp->source_pos_chars = 0;
 }
 
 static unsigned close_port_arg(unsigned port, bool input)
@@ -134,7 +151,7 @@ static unsigned output_string_value(unsigned port, const char *name)
         show_error("%s: out of memory", name);
         return TOK_ERROR;
     }
-    return make_string_owned(copy);
+    return make_string_immutable_owned(copy);
 }
 
 static unsigned set_current_port(unsigned port, bool input)
@@ -170,6 +187,47 @@ static unsigned set_current_port(unsigned port, bool input)
             ctx.current_output_cell = port;
         }
         return port;
+    }
+
+    /* Bytevector ports are represented by vectors in the standard library.
+       The Scheme-level binary I/O wrappers use the current-port cell, so the
+       setters must accept these ports even though they have no FILE *. */
+    if (IS_VECTOR(port) && vector_data_well_formed(GET_VECTOR_PTR(port))) {
+        unsigned *data = vector_data_ptr(port);
+        unsigned tag = data[0];
+        unsigned expected_len = input ? 3 : 2;
+        bool tag_matches = IS_ATOM(tag) &&
+                           ((input && (CELL_ID(tag) == (unsigned)intern("bvin") ||
+                                       CELL_ID(tag) == (unsigned)intern("bvin-closed"))) ||
+                            (!input && (CELL_ID(tag) == (unsigned)intern("bvout") ||
+                                        CELL_ID(tag) == (unsigned)intern("bvout-closed"))));
+        bool payload_ok = input ? IS_BYTEVEC(data[1])
+                                : (IS_PAIR(data[1]) || IS_NIL(data[1]));
+        bool input_state_ok = false;
+        if (input && payload_ok && IS_PAIR(data[2])) {
+            int64_t start;
+            int64_t end;
+            bytevec_data *bv = (bytevec_data *)CELL_PTR(data[1]);
+            input_state_ok = bytevec_data_well_formed(bv) &&
+                             exact_int64_value(CELL_CAR(data[2]), &start) &&
+                             exact_int64_value(CELL_CDR(data[2]), &end) &&
+                             start >= 0 && end >= start &&
+                             (uint64_t)end <= bv->len;
+        }
+        if (tag_matches && vector_len(port) == expected_len && payload_ok &&
+            (!input || input_state_ok)) {
+            bool open = input ? CELL_ID(tag) == (unsigned)intern("bvin")
+                              : CELL_ID(tag) == (unsigned)intern("bvout");
+            if (!open) {
+                show_error("%s: port is closed", name);
+                return TOK_ERROR;
+            }
+            if (input)
+                ctx.current_input_cell = port;
+            else
+                ctx.current_output_cell = port;
+            return port;
+        }
     }
 
     show_error("%s: not an %s port, got %s", name, direction, type_name(port));
@@ -312,13 +370,34 @@ unsigned apply_port_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         return output_string_value(argv[0], "get-output-string");
     }
     case POPENINPUTSTRING: {
-        REQUIRE_ARGC(argc, 1, 1, "open-input-string");
+        REQUIRE_ARGC(argc, 1, 3, "open-input-string");
         char *str = require_string_ptr(argv[0], "open-input-string");
         if (!str)
             return TOK_ERROR;
-        string_port *sp = strport_from_string(str);
+        size_t char_len;
+        const char *utf8_error = NULL;
+        if (!scheme_utf8_count_chars(str, &char_len, &utf8_error) ||
+            char_len > INT64_MAX) {
+            show_error("open-input-string: %s",
+                       utf8_error ? utf8_error : "string too long");
+            return TOK_ERROR;
+        }
+        int64_t start = 0;
+        int64_t end = (int64_t)char_len;
+        if (argc >= 2 && !expect_nonneg_int64(argv[1], &start,
+                                               "open-input-string"))
+            return TOK_ERROR;
+        if (argc >= 3 && !expect_nonneg_int64(argv[2], &end,
+                                               "open-input-string"))
+            return TOK_ERROR;
+        if (start > end || (uint64_t)end > char_len) {
+            show_error("open-input-string: invalid string range");
+            return TOK_ERROR;
+        }
+        string_port *sp = strport_from_string_cell(
+            argv[0], (size_t)start, (size_t)end);
         if (!sp) {
-            show_error("open-input-string: out of memory");
+            show_error("open-input-string: invalid string range or out of memory");
             return TOK_ERROR;
         }
         return make_pointer_cell(BT_STRINPORT, sp);

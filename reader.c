@@ -1459,6 +1459,7 @@ static unsigned read_string_literal(void)
     char *s = sb_finish(&sb);
     CELL_PTR(x) = s;
     string_register(s);
+    string_mark_immutable(s);
     return x;
 }
 
