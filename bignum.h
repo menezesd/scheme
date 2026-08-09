@@ -92,6 +92,12 @@ void bn_neg_ip(bignum *a);
 
 bignum *bn_lshift(const bignum *a, size_t bits);
 bignum *bn_rshift(const bignum *a, size_t bits);
+bignum *bn_arshift(const bignum *a, size_t bits);
+
+// Two's-complement bitwise operations over arbitrary-precision integers.
+// op is 0 for AND, 1 for inclusive OR, and 2 for XOR.
+bignum *bn_bitwise(const bignum *a, const bignum *b, int op);
+bignum *bn_bitwise_not(const bignum *a);
 
 // ============================================================================
 // Other Operations

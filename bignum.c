@@ -1146,6 +1146,166 @@ bignum *bn_rshift(const bignum *a, size_t bits)
     return result;
 }
 
+bignum *bn_arshift(const bignum *a, size_t bits)
+{
+    if (!a)
+        return NULL;
+    if (!a->sign || bits == 0)
+        return bn_rshift(a, bits);
+
+    // Arithmetic right shift of a negative value is floor(a / 2^bits),
+    // i.e. the negation of the rounded-up magnitude quotient.
+    bignum *magnitude = bn_abs(a);
+    if (!magnitude)
+        return NULL;
+    bool has_remainder = false;
+    size_t limb_shift = bits / LIMB_BITS;
+    size_t bit_shift = bits % LIMB_BITS;
+    if (limb_shift >= magnitude->len) {
+        has_remainder = !bn_is_zero(magnitude);
+    } else {
+        for (size_t i = 0; i < limb_shift; i++) {
+            if (magnitude->limbs[i] != 0) {
+                has_remainder = true;
+                break;
+            }
+        }
+        if (!has_remainder && bit_shift > 0) {
+            limb_t mask = ((limb_t)1 << bit_shift) - 1;
+            has_remainder = (magnitude->limbs[limb_shift] & mask) != 0;
+        }
+    }
+
+    bignum *result = bn_rshift(magnitude, bits);
+    bn_free(magnitude);
+    if (!result)
+        return NULL;
+    if (has_remainder && !bn_add_limb_ip_checked(result, 1)) {
+        bn_free(result);
+        return NULL;
+    }
+    if (!bn_is_zero(result))
+        result->sign = 1;
+    return result;
+}
+
+static bool bn_to_twos_complement(const bignum *value, limb_t *digits,
+                                  size_t width)
+{
+    if (!value || !digits || width == 0 || value->len > width)
+        return false;
+    memset(digits, 0, width * sizeof(limb_t));
+    if (value->len > 0)
+        memcpy(digits, value->limbs, value->len * sizeof(limb_t));
+    if (!value->sign)
+        return true;
+
+    for (size_t i = 0; i < width; i++)
+        digits[i] = ~digits[i];
+    dlimb_t carry = 1;
+    for (size_t i = 0; i < width && carry; i++) {
+        dlimb_t sum = (dlimb_t)digits[i] + carry;
+        digits[i] = (limb_t)sum;
+        carry = sum >> LIMB_BITS;
+    }
+    return carry == 0;
+}
+
+static bignum *bn_from_twos_complement(limb_t *digits, size_t width)
+{
+    if (!digits || width == 0)
+        return NULL;
+    bool negative = (digits[width - 1] & ((limb_t)1 << (LIMB_BITS - 1))) != 0;
+    if (negative) {
+        for (size_t i = 0; i < width; i++)
+            digits[i] = ~digits[i];
+        dlimb_t carry = 1;
+        for (size_t i = 0; i < width && carry; i++) {
+            dlimb_t sum = (dlimb_t)digits[i] + carry;
+            digits[i] = (limb_t)sum;
+            carry = sum >> LIMB_BITS;
+        }
+    }
+
+    bignum *result = bn_alloc(width);
+    if (!result)
+        return NULL;
+    memcpy(result->limbs, digits, width * sizeof(limb_t));
+    result->len = width;
+    result->sign = negative ? 1 : 0;
+    bn_normalize(result);
+    return result;
+}
+
+static bignum *bn_bitwise_with_width(const bignum *a, const bignum *b,
+                                     int op, size_t width)
+{
+    if (width == 0 || width > SIZE_MAX / sizeof(limb_t))
+        return NULL;
+    limb_t *ad = calloc(width, sizeof(limb_t));
+    limb_t *bd = calloc(width, sizeof(limb_t));
+    if (!ad || !bd) {
+        free(ad);
+        free(bd);
+        return NULL;
+    }
+    bool ok = bn_to_twos_complement(a, ad, width) &&
+              bn_to_twos_complement(b, bd, width);
+    if (!ok) {
+        free(ad);
+        free(bd);
+        return NULL;
+    }
+    for (size_t i = 0; i < width; i++) {
+        if (op == 0)
+            ad[i] &= bd[i];
+        else if (op == 1)
+            ad[i] |= bd[i];
+        else if (op == 2)
+            ad[i] ^= bd[i];
+        else {
+            free(ad);
+            free(bd);
+            return NULL;
+        }
+    }
+    free(bd);
+    bignum *result = bn_from_twos_complement(ad, width);
+    free(ad);
+    return result;
+}
+
+bignum *bn_bitwise(const bignum *a, const bignum *b, int op)
+{
+    if (!a || !b || a->len == SIZE_MAX || b->len == SIZE_MAX)
+        return NULL;
+    size_t width = a->len > b->len ? a->len : b->len;
+    if (width == SIZE_MAX)
+        return NULL;
+    return bn_bitwise_with_width(a, b, op, width + 1);
+}
+
+bignum *bn_bitwise_not(const bignum *a)
+{
+    if (!a || a->len == SIZE_MAX)
+        return NULL;
+    size_t width = a->len + 1;
+    if (width == 0)
+        return NULL;
+    limb_t *digits = calloc(width, sizeof(limb_t));
+    if (!digits)
+        return NULL;
+    if (!bn_to_twos_complement(a, digits, width)) {
+        free(digits);
+        return NULL;
+    }
+    for (size_t i = 0; i < width; i++)
+        digits[i] = ~digits[i];
+    bignum *result = bn_from_twos_complement(digits, width);
+    free(digits);
+    return result;
+}
+
 // ============================================================================
 // Other Operations
 // ============================================================================

@@ -30,21 +30,39 @@ def merge_ranges(ranges):
 
 def parse_unicode_data(path):
     props = {
+        "assigned": [],
         "decimal": [],
         "upper": [],
         "lower": [],
         "title": [],
+        "punctuation": [],
+        "symbol": [],
     }
     upper_map = {}
     lower_map = {}
     title_map = {}
+    range_start = None
+    range_category = None
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             fields = line.rstrip("\n").split(";")
             if len(fields) < 15:
                 continue
             code = int(fields[0], 16)
+            name = fields[1]
             category = fields[2]
+            if name.endswith(", First>"):
+                range_start = code
+                range_category = category
+                continue
+            if name.endswith(", Last>"):
+                if range_start is not None and range_category not in ("Cn", "Cs"):
+                    add_range(props["assigned"], range_start, code)
+                range_start = None
+                range_category = None
+                continue
+            if category not in ("Cn", "Cs"):
+                add_range(props["assigned"], code, code)
             if category == "Nd":
                 add_range(props["decimal"], code, code)
             elif category == "Lu":
@@ -53,6 +71,10 @@ def parse_unicode_data(path):
                 add_range(props["lower"], code, code)
             elif category == "Lt":
                 add_range(props["title"], code, code)
+            if category in ("Pc", "Pd", "Pe", "Pf", "Pi", "Po", "Ps"):
+                add_range(props["punctuation"], code, code)
+            if category in ("Sc", "Sk", "Sm", "So"):
+                add_range(props["symbol"], code, code)
             if fields[12]:
                 upper_map[code] = int(fields[12], 16)
             if fields[13]:
@@ -194,6 +216,7 @@ def main(argv):
             print("typedef struct { uint32_t code; uint32_t offset; uint8_t length; } unicode_full_case_entry;")
             print()
             print("#define UNICODE_CHAR_VERSION \"15.1.0\"")
+            emit_ranges("unicode_assigned_ranges", category_props["assigned"])
             emit_ranges("unicode_alphabetic_ranges", core_props["Alphabetic"])
             emit_ranges("unicode_cased_ranges", core_props["Cased"])
             emit_ranges("unicode_case_ignorable_ranges", core_props["Case_Ignorable"])
@@ -202,6 +225,8 @@ def main(argv):
             emit_ranges("unicode_uppercase_ranges", category_props["upper"])
             emit_ranges("unicode_lowercase_ranges", category_props["lower"])
             emit_ranges("unicode_titlecase_ranges", category_props["title"])
+            emit_ranges("unicode_punctuation_ranges", category_props["punctuation"])
+            emit_ranges("unicode_symbol_ranges", category_props["symbol"])
             print(f"#define UNICODE_UPCASE_COUNT {len(upper_map)}")
             print("static const unicode_simple_fold_entry unicode_upcase_table[] = {")
             for code, mapped in sorted(upper_map.items()):
