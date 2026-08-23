@@ -366,7 +366,10 @@ static inline bool syntax_template_valid_at(unsigned tmpl, unsigned pattern,
         unsigned pattern_depth = 0;
         if (syntax_pattern_var_depth(pattern, literals, ellipsis_id,
                                      CELL_ID(tmpl), &pattern_depth) &&
-            pattern_depth != template_depth) {
+            pattern_depth < template_depth) {
+            // A bare use of an ellipsis-bound variable inserts the whole
+            // matched list (R7RS 4.3.2); only a use at deeper template
+            // depth than the pattern bound is an error
             show_error("%s: invalid ellipsis in template", context);
             return false;
         }

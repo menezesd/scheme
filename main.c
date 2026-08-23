@@ -4,6 +4,7 @@
 #include "context.h"
 #include "env.h"
 #include "eval.h"
+#include "macros.h"
 #include "reader.h"
 #include "types.h"
 #include "writer.h"
@@ -436,6 +437,7 @@ int main(int argc, char **argv)
         ctx.suppress_error_output = false;
         fprintf(stderr, "Returning to REPL...\n");
         gc_recover_after_panic();
+        macros_reset_expansion_depth();
         env = gc(env);
     }
 

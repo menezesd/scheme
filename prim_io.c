@@ -403,35 +403,35 @@ static int read_or_peek_utf8_char(FILE *fport, string_port *sport, int ptype,
     if (*byte_len == 0) {
         *error_msg = "invalid UTF-8 leading byte";
         *byte_len = 1;
-        goto restore_peeked_bytes;
+        goto restore_input_pos;
     }
     for (size_t i = 1; i < *byte_len; i++) {
         c = ptype == 1 ? strport_getc(sport) : reader_port_getc(fport);
         if (c == EOF) {
             *error_msg = "truncated UTF-8 sequence";
             *byte_len = i;
-            goto restore_peeked_bytes;
+            goto restore_input_pos;
         }
         bytes[i] = (char)c;
     }
     size_t offset = 0;
     if (!scheme_utf8_decode_next(bytes, *byte_len, &offset, codepoint,
                                  error_msg))
-        goto restore_peeked_bytes;
+        goto restore_input_pos;
 
     if (!peek)
         return 1;
 
-restore_peeked_bytes:
-    if (peek) {
-        for (size_t i = *byte_len; i > 0; i--) {
-            bool restored = ptype == 1
-                ? (--sport->pos, true)
-                : reader_port_ungetc(fport, (unsigned char)bytes[i - 1]);
-            if (!restored) {
-                *error_msg = "could not restore input while peeking";
-                return -1;
-            }
+restore_input_pos:
+    // Restore on every path so a failed read leaves the port position
+    // untouched; otherwise one bad byte is silently skipped
+    for (size_t i = *byte_len; i > 0; i--) {
+        bool restored = ptype == 1
+            ? (--sport->pos, true)
+            : reader_port_ungetc(fport, (unsigned char)bytes[i - 1]);
+        if (!restored) {
+            *error_msg = "could not restore input";
+            return -1;
         }
     }
     return *error_msg ? -1 : 1;

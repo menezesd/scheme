@@ -904,6 +904,14 @@ unsigned read_exact_decimal_number(const char *s, bool *handled)
             }
             exponent = exponent * 10 + (*p++ - '0');
         }
+        // reader_pow10 builds 10^|scale| outright; exponents large enough to
+        // exhaust memory would burn CPU and RSS before failing. 1e6 digits is
+        // far beyond any legitimate exact literal.
+        if (exponent > 1000000) {
+            free(digits);
+            show_error("exact decimal literal: exponent too large");
+            return TOK_ERROR;
+        }
         if (exp_neg)
             exponent = -exponent;
     }
@@ -1434,6 +1442,11 @@ static unsigned read_string_literal(void)
                     } else {
                         reader_ungetc(c);
                     }
+                    if (val > 0377) {
+                        show_error("octal escape out of range");
+                        sb_free(&sb);
+                        return TOK_ERROR;
+                    }
                     c = val;
                 } else {
                     show_warning("unknown escape sequence: \\%c", c);
@@ -1586,6 +1599,69 @@ static unsigned read_decimal_number(void)
     return res;
 }
 
+static unsigned read_number_or_symbol_token(int c)
+{
+    // Symbol or number
+    if (c == 0) {
+        show_error("null character in token");
+        return TOK_ERROR;
+    }
+    string_buffer sb;
+    sb_init(&sb);
+    bool is_number = isdigit(c) || c == '-' || c == '+';
+    bool delimiter_unread = false;
+    sb_append_token_char(&sb, c);
+
+    for (;;) {
+        c = reader_getchar();
+        if (c == 0) {
+            show_error("null character in token");
+            sb_free(&sb);
+            return TOK_ERROR;
+        }
+        // Allow . in numbers (for decimals like 1.5)
+        if (c == '.' && is_number) {
+            int c2 = reader_getchar();
+            if (isdigit(c2) || c2 == 'e' || c2 == 'E') {
+                // It's a decimal number
+                sb_append(&sb, '.');
+                sb_append_token_char(&sb, c2);
+                continue;
+            } else if (is_delimiter(c2)) {
+                if (sb.len > 0 && isdigit((unsigned char)sb.data[sb.len - 1])) {
+                    // "5." is a complete decimal per R5RS (<uint> . <digit>*)
+                    reader_ungetc(c2);
+                    sb_append(&sb, '.');
+                    continue;
+                }
+                // Dot after a non-number token: the dotted-pair marker
+                reader_ungetc(c2);
+                reader_ungetc(c);
+                delimiter_unread = true;
+                break;
+            }
+            reader_ungetc(c2);
+            sb_append(&sb, '.');
+            continue;
+        }
+        if (is_delimiter(c))
+            break;
+        // R5RS: . + - @ are valid subsequent characters in identifiers
+        // The . as dotted-pair marker is handled in the switch above
+        sb_append_token_char(&sb, c);
+    }
+    if (!delimiter_unread)
+        reader_ungetc(c);
+    if (!validate_utf8_string(sb.data)) {
+        show_error("symbol contains invalid UTF-8");
+        sb_free(&sb);
+        return TOK_ERROR;
+    }
+    unsigned res = atom_from_string(sb.data);
+    sb_free(&sb);
+    return res;
+}
+
 unsigned read_token(void)
 {
     int c;
@@ -1623,6 +1699,11 @@ unsigned read_token(void)
             } else if (isdigit(c2)) {
                 reader_ungetc(c2);
                 return read_decimal_number();
+            } else if (!is_delimiter(c2)) {
+                // ".foo" is a symbol token, not the dotted-pair marker;
+                // the marker must be delimiter-bounded on both sides
+                reader_ungetc(c2);
+                return read_number_or_symbol_token(c);
             }
             reader_ungetc(c2);
             return TOK_DOT;
@@ -1828,61 +1909,8 @@ unsigned read_token(void)
             return read_string_literal();
         case '|':
             return read_escaped_identifier();
-        default: {
-            // Symbol or number
-            if (c == 0) {
-                show_error("null character in token");
-                return TOK_ERROR;
-            }
-            string_buffer sb;
-            sb_init(&sb);
-            bool is_number = isdigit(c) || c == '-' || c == '+';
-            bool delimiter_unread = false;
-            sb_append_token_char(&sb, c);
-
-            for (;;) {
-                c = reader_getchar();
-                if (c == 0) {
-                    show_error("null character in token");
-                    sb_free(&sb);
-                    return TOK_ERROR;
-                }
-                // Allow . in numbers (for decimals like 1.5)
-                if (c == '.' && is_number) {
-                    int c2 = reader_getchar();
-                    if (isdigit(c2) || c2 == 'e' || c2 == 'E') {
-                        // It's a decimal number
-                        sb_append(&sb, '.');
-                        sb_append_token_char(&sb, c2);
-                        continue;
-                    } else if (is_delimiter(c2)) {
-                        // End of number followed by dot (for dotted pairs)
-                        reader_ungetc(c2);
-                        reader_ungetc(c);
-                        delimiter_unread = true;
-                        break;
-                    }
-                    reader_ungetc(c2);
-                    sb_append(&sb, '.');
-                    continue;
-                }
-                if (is_delimiter(c))
-                    break;
-                // R5RS: . + - @ are valid subsequent characters in identifiers
-                // The . as dotted-pair marker is handled in the switch above
-                sb_append_token_char(&sb, c);
-            }
-            if (!delimiter_unread)
-                reader_ungetc(c);
-            if (!validate_utf8_string(sb.data)) {
-                show_error("symbol contains invalid UTF-8");
-                sb_free(&sb);
-                return TOK_ERROR;
-            }
-            unsigned res = atom_from_string(sb.data);
-            sb_free(&sb);
-            return res;
-        }
+        default:
+            return read_number_or_symbol_token(c);
         }
     }
 }

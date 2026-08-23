@@ -49,7 +49,7 @@ void format_double_repr(char *buf, size_t size, double d)
         return;
     }
     // Inexact integers show a decimal point (R5RS)
-    if (d == (double)(long long)d && d >= -1e15 && d <= 1e15) {
+    if (d >= -1e15 && d <= 1e15 && d == (double)(long long)d) {
         snprintf(buf, size, "%.1f", d);
         return;
     }
@@ -798,7 +798,10 @@ static void write_obj_fp_inner(unsigned s, bool with_quotes, FILE *fp)
         write_obj_fp(CELL_CAR(s), with_quotes, fp);
         unsigned imag = CELL_CDR(s);
         double imag_val = to_double(imag);
-        if (imag_val >= 0)
+        // format_double_repr already signs +inf.0/-inf.0/+nan.0; adding
+        // another "+" would emit unparseable forms like 1++inf.0i
+        if (imag_val >= 0 && imag_val == imag_val &&
+            imag_val < (double)INFINITY)
             fprintf(fp, "+");
         write_obj_fp(imag, with_quotes, fp);
         fprintf(fp, "i");

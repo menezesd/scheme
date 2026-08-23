@@ -965,12 +965,12 @@ TEST(reader_tracks_line)
 
 TEST(reader_preserves_multi_char_pushback_across_port_reads)
 {
-    FILE *f = fmemopen((void *)"12.\n34", 6, "r");
+    FILE *f = fmemopen((void *)"-.\n34", 5, "r");
     ASSERT(f != NULL);
 
     unsigned first = read_obj_port(f);
-    ASSERT(CELL_TYPE(first) == BT_NUM);
-    ASSERT_EQ(CELL_ID(first), 12);
+    ASSERT(CELL_TYPE(first) == BT_ATOM);
+    ASSERT_STR_EQ(ctx.atom_table[CELL_ID(first)], "-");
 
     unsigned second = read_obj_port(f);
     ASSERT(second == TOK_DOT);
@@ -981,6 +981,14 @@ TEST(reader_preserves_multi_char_pushback_across_port_reads)
 
     reader_forget_port(f);
     fclose(f);
+    PASS();
+}
+
+TEST(read_trailing_dot_decimal)
+{
+    unsigned x = read_from_string("12.");
+    ASSERT(IS_INEXACT(x));
+    ASSERT(to_double(x) == 12.0);
     PASS();
 }
 
@@ -1114,6 +1122,7 @@ int main(void)
     // Position tracking
     RUN_TEST(reader_tracks_line);
     RUN_TEST(reader_preserves_multi_char_pushback_across_port_reads);
+    RUN_TEST(read_trailing_dot_decimal);
 
     TEST_SUMMARY("reader");
 }

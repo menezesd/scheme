@@ -114,18 +114,51 @@ static compile_result emit_syntax_error(compile_ctx *cctx, const char *message)
     return dynamic_result();
 }
 
-// Look up a variable in the known_lambdas alist
-// Returns the lambda expression if found, 0 otherwise
-static unsigned lookup_known_lambda(int64_t var_id, unsigned known_lambdas)
+// Number of frames currently on the compile-time environment. Recorded
+// with each known-lambda entry so a use inside any scope that pushed
+// frames since registration (nested lambda, let, begin with defines)
+// can be rejected - those scopes may shadow the bound name.
+static unsigned compile_env_length(unsigned env)
+{
+    unsigned n = 0;
+    FORLIST(frame, env) n++;
+    return n;
+}
+
+// Look up a variable in the known_lambdas alist.
+// Returns the lambda expression if found (with the compile-env length at
+// registration in *depth_out), 0 otherwise.
+static unsigned lookup_known_lambda(int64_t var_id, unsigned known_lambdas,
+                                    unsigned *depth_out)
 {
     FORLIST(entry, known_lambdas) {
         unsigned pair = car(entry);
         if (IS_PAIR(pair) && IS_ATOM(car(pair)) &&
             CELL_ID(car(pair)) == var_id) {
-            return cdr(pair); // Return the lambda expression
+            unsigned vd = cdr(pair);
+            if (IS_PAIR(vd) && IS_NUM(cdr(vd))) {
+                *depth_out = (unsigned)CELL_ID(cdr(vd));
+                return car(vd); // The lambda expression
+            }
         }
     }
     return 0;
+}
+
+// Stamp var -> lambda into known_lambdas for escape-analysis inlining,
+// recording the current compile-env frame count so uses in scopes pushed
+// since registration are rejected (they may shadow the name).
+static void register_known_lambda(compile_ctx *cctx, unsigned var,
+                                  unsigned val_expr)
+{
+    unsigned depth_cell = store(compile_env_length(cctx->env));
+    gc_protect(&depth_cell);
+    unsigned vd = alloc_cons(val_expr, depth_cell);
+    gc_protect(&vd);
+    unsigned pair = alloc_cons(var, vd);
+    gc_protect(&pair);
+    cctx->known_lambdas = alloc_cons(pair, cctx->known_lambdas);
+    gc_unprotect(3);
 }
 
 // Forward declaration
@@ -2851,7 +2884,10 @@ static compile_result compile_begin(unsigned exprs, compile_ctx *cctx)
     }
 
     // Scan for internal defines and extend compile-time environment
-    // This ensures defines shadow any macros from enclosing scopes
+    // This ensures defines shadow any macros from enclosing scopes.
+    // The extension deliberately persists past this function: spliced
+    // define-syntax bindings must stay visible to later forms compiled in
+    // this context (see the empty-syntax-binding splice tests).
     GC_GUARD;
     gc_protect(&exprs);
     unsigned internal_defs = scan_internal_defines(exprs, cctx->env);
@@ -3081,13 +3117,8 @@ static compile_result compile_let(unsigned expr, compile_ctx *cctx)
             // Only inline if the lambda doesn't reference the bound variable
             // (self-referential lambdas need letrec semantics to work)
             unsigned lambda_body = cddr(val_expr);
-            if (!contains_reference(lambda_body, CELL_ID(var))) {
-                // Add (var . lambda-expr) to known_lambdas
-                unsigned pair = alloc_cons(var, val_expr);
-                gc_protect(&pair);
-                cctx->known_lambdas = alloc_cons(pair, cctx->known_lambdas);
-                gc_unprotect(1);
-            }
+            if (!contains_reference(lambda_body, CELL_ID(var)))
+                register_known_lambda(cctx, var, val_expr);
         }
     }
     gc_unprotect(1);
@@ -4238,8 +4269,15 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
     // If f is bound to a lambda in a let, we can inline it at the call site
     if (IS_ATOM(fn_expr) && cctx->known_lambdas) {
         int64_t var_id = CELL_ID(fn_expr);
-        unsigned lambda_expr = lookup_known_lambda(var_id, cctx->known_lambdas);
-        if (lambda_expr) {
+        unsigned reg_env_len = 0;
+        unsigned lambda_expr =
+            lookup_known_lambda(var_id, cctx->known_lambdas, &reg_env_len);
+        // Inline only while the compile-time environment is unchanged: a
+        // scope pushed since registration (nested lambda, let, begin with
+        // internal defines) may rebind var, and inlining would then use
+        // the wrong binding (non-capture-avoiding substitution).
+        if (lambda_expr &&
+            compile_env_length(cctx->env) == reg_env_len) {
             GC_GUARD;
             // Found a known lambda - construct ((lambda ...) args) and recurse
             // to use the existing lambda inlining code.
@@ -4478,13 +4516,8 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
                             builtin_keyword_unbound(ctx.kw_lambda,
                                                     cctx->env)) {
                             unsigned arg_body = cddr(val_expr);
-                            if (!contains_reference(arg_body, CELL_ID(var))) {
-                                unsigned pair = alloc_cons(var, val_expr);
-                                gc_protect(&pair);
-                                cctx->known_lambdas =
-                                    alloc_cons(pair, cctx->known_lambdas);
-                                gc_unprotect(1);
-                            }
+                            if (!contains_reference(arg_body, CELL_ID(var)))
+                                register_known_lambda(cctx, var, val_expr);
                         }
                         a = cdr(a);
                     }

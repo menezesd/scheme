@@ -20,6 +20,7 @@
  */
 
 #include "eval_internal.h"
+#include "prim_internal.h"
 #include <limits.h>
 
 // ============================================================================
@@ -49,6 +50,69 @@ bool handle_quote(unsigned id, unsigned env, unsigned cont)
  * - car = parameter list (may be dotted for rest params)
  * - cdr = (body . env) where body is the list of body expressions
  */
+// Expand a lambda's body against env (plus parameter and internal-define
+// frames) and build the closure cell. Returns TOK_ERROR when the formals
+// are invalid or an allocation fails mid-build; a macro-expansion failure
+// inside the body is NOT returned as an error - it becomes a closure that
+// raises the stored message at call time.
+static unsigned build_lambda_closure(unsigned params, unsigned body,
+                                     unsigned env)
+{
+    GC_GUARD;
+    gc_protect(&params);
+    gc_protect(&body);
+    gc_protect(&env);
+
+    // Expansion must see parameters and leading internal defines: hygiene
+    // decisions (binding-cell comparisons, literal matching, ellipsis
+    // shadowing) walk this chain, and missing names would resolve
+    // scope-sensitive forms against stale outer bindings.
+    unsigned binder_env = extend_env_with_binder_names(env, params);
+    gc_protect(&binder_env);
+    unsigned expansion_env =
+        extend_env_with_internal_defines(binder_env, body);
+    gc_protect(&expansion_env);
+
+    unsigned macro_bindings = 0;
+    gc_protect(&macro_bindings);
+    unsigned expanded_body = expand_form(body, expansion_env, &macro_bindings);
+    gc_protect(&expanded_body);
+
+    unsigned closure_env = env;
+    gc_protect(&closure_env);
+    if (expanded_body == TOK_ERROR) {
+        // Defer the expansion error to call time so it fires inside the
+        // dynamic extent that invokes the closure (the compiler likewise
+        // turns compile-time expansion failures into runtime raises at the
+        // call site); raising here instead would fire during argument
+        // evaluation, outside any guard established around later calls.
+        unsigned msg =
+            make_string_copy(ctx.last_error[0] ? ctx.last_error
+                                               : "macro expansion failed");
+        if (msg == TOK_ERROR)
+            return TOK_ERROR;
+        gc_protect(&msg);
+        unsigned raiser = mk_primop(PERROR);
+        gc_protect(&raiser);
+        unsigned call_args = alloc_cons(msg, 0);
+        gc_protect(&call_args);
+        unsigned call = alloc_cons(raiser, call_args);
+        gc_protect(&call);
+        unsigned bad_body = alloc_cons(call, 0);
+        gc_protect(&bad_body);
+        return make_typed_cell(BT_FUNCTION, params,
+                               alloc_cons(bad_body, closure_env));
+    }
+    if (macro_bindings)
+        closure_env = extend_env_empty(env);
+    if (macro_bindings)
+        apply_syntax_bindings(closure_env, macro_bindings);
+
+    unsigned body_env = alloc_cons(expanded_body, closure_env);
+    gc_protect(&body_env);
+    return make_typed_cell(BT_FUNCTION, params, body_env);
+}
+
 bool handle_lambda(unsigned id, unsigned env, unsigned cont)
 {
     GC_GUARD;
@@ -68,33 +132,16 @@ bool handle_lambda(unsigned id, unsigned env, unsigned cont)
     gc_protect(&body);
     gc_protect(&env);
     gc_protect(&cont);
-    // lambda_params_valid allocates, so locals must be protected first
     if (!lambda_params_valid(params)) {
         show_error("lambda: invalid formals");
         cps_signal_current_error(env, cont);
         return true;
     }
-    unsigned expansion_env = extend_env_empty(env);
-    unsigned macro_bindings = 0;
-    gc_protect(&expansion_env);
-    gc_protect(&macro_bindings);
-    unsigned expanded_body = expand_form(body, expansion_env, &macro_bindings);
-    gc_protect(&expanded_body);
-    if (expanded_body == TOK_ERROR) {
+    unsigned p = build_lambda_closure(params, body, env);
+    if (p == TOK_ERROR) {
         cps_signal_current_error(env, cont);
         return true;
     }
-
-    unsigned closure_env = env;
-    gc_protect(&closure_env);
-    if (macro_bindings)
-        closure_env = extend_env_empty(env);
-    if (macro_bindings)
-        apply_syntax_bindings(closure_env, macro_bindings);
-
-    unsigned body_env = alloc_cons(expanded_body, closure_env);
-    gc_protect(&body_env);
-    unsigned p = make_typed_cell(BT_FUNCTION, params, body_env);
     tramp_apply(p, cont);
     return true;
 }
@@ -225,8 +272,14 @@ bool handle_define(unsigned id, unsigned env, unsigned cont)
             cps_signal_current_error(env, cont);
             return true;
         }
-        unsigned body_env = alloc_cons(body, env);
-        unsigned p = make_typed_cell(BT_FUNCTION, params, body_env);
+        // Build through the same path as lambda so the body is
+        // macro-expanded here, against this environment - a later
+        // redefinition of an used syntax binding must not leak into calls.
+        unsigned p = build_lambda_closure(params, body, env);
+        if (p == TOK_ERROR) {
+            cps_signal_current_error(env, cont);
+            return true;
+        }
         gc_protect(&p);
         if (defvar(name, p, env) == TOK_ERROR) {
             cps_signal_current_error(env, cont);
@@ -919,7 +972,6 @@ bool dispatch_special_form(int64_t kw, unsigned id, unsigned env, unsigned cont)
     }
 
     // Check each special form
-    eval_reset_macro_expansion_depth();
     if (kw == ctx.kw_quote)
         return handle_quote(id, env, cont);
     if (kw == ctx.kw_lambda)

@@ -192,10 +192,11 @@ static unsigned set_current_port(unsigned port, bool input)
     /* Bytevector ports are represented by vectors in the standard library.
        The Scheme-level binary I/O wrappers use the current-port cell, so the
        setters must accept these ports even though they have no FILE *. */
-    if (IS_VECTOR(port) && vector_data_well_formed(GET_VECTOR_PTR(port))) {
+    unsigned expected_bv_len = input ? 3 : 2;
+    if (IS_VECTOR(port) && vector_data_well_formed(GET_VECTOR_PTR(port)) &&
+        vector_len(port) == expected_bv_len) {
         unsigned *data = vector_data_ptr(port);
         unsigned tag = data[0];
-        unsigned expected_len = input ? 3 : 2;
         bool tag_matches = IS_ATOM(tag) &&
                            ((input && (CELL_ID(tag) == (unsigned)intern("bvin") ||
                                        CELL_ID(tag) == (unsigned)intern("bvin-closed"))) ||
@@ -214,8 +215,7 @@ static unsigned set_current_port(unsigned port, bool input)
                              start >= 0 && end >= start &&
                              (uint64_t)end <= bv->len;
         }
-        if (tag_matches && vector_len(port) == expected_len && payload_ok &&
-            (!input || input_state_ok)) {
+        if (tag_matches && payload_ok && (!input || input_state_ok)) {
             bool open = input ? CELL_ID(tag) == (unsigned)intern("bvin")
                               : CELL_ID(tag) == (unsigned)intern("bvout");
             if (!open) {

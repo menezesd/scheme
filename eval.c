@@ -588,13 +588,14 @@ static void eval_step(void)
     unsigned env = tramp.env;
     unsigned cont = tramp.cont;
 
+    // Macro-expansion depth is scoped to the whole form here in eval_cps:
+    // resetting it per node (constants, variables, applications) would let
+    // self-referential macros that interleave constants escape the cap.
     if (!id) {
-        eval_reset_macro_expansion_depth();
         tramp_apply(0, cont);
         return;
     }
     if (IS_FIXNUM(id)) {
-        eval_reset_macro_expansion_depth();
         tramp_apply(id, cont);
         return;
     }
@@ -616,18 +617,15 @@ static void eval_step(void)
     case BT_BUILTIN:
     case BT_CONT:
         // Self-evaluating
-        eval_reset_macro_expansion_depth();
         tramp_apply(id, cont);
         return;
 
     case BT_ATOM: {
         if (id == ctx.atom_true || id == ctx.atom_false) {
-            eval_reset_macro_expansion_depth();
             tramp_apply(id, cont);
             return;
         }
 
-        eval_reset_macro_expansion_depth();
         unsigned val = lookup(CELL_ID(id), env);
         if (val == TOK_ERROR) {
             cps_signal_error(ctx.last_error[0] ? ctx.last_error
@@ -651,7 +649,6 @@ static void eval_step(void)
         }
 
         // Not a special form - evaluate function position first
-        eval_reset_macro_expansion_depth();
         // Protect head, arg_exprs, env and cont - use pointer version for GC
         // safety
         GC_GUARD;

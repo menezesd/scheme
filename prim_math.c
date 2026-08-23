@@ -734,7 +734,7 @@ static unsigned sqrt_value(unsigned arg, const char *name)
         double real, imag;
         if (a >= 0) {
             real = sqrt(r / 2 + a / 2);
-            imag = b / (2 * real);
+            imag = (real == 0.0) ? 0.0 : b / (2 * real);
         } else {
             imag = (b >= 0 ? 1 : -1) * sqrt(r / 2 - a / 2);
             real = b / (2 * imag);
@@ -777,8 +777,15 @@ static unsigned sqrt_value(unsigned arg, const char *name)
     }
     if (exact_integer_arg && n >= 0) {
         int64_t s = (int64_t)sqrt((double)n);
-        if (s * s == n)
+        uint64_t un = (uint64_t)n;
+        // Double rounding of n and of the root can leave the estimate one
+        // off for n > 2^53, so probe the neighbors before giving up.
+        if ((uint64_t)s * (uint64_t)s == un)
             return store(s);
+        if (s > 0 && (uint64_t)(s - 1) * (uint64_t)(s - 1) == un)
+            return store(s - 1);
+        if ((uint64_t)(s + 1) * (uint64_t)(s + 1) == un)
+            return store(s + 1);
     }
 
     if (IS_BIGNUM(arg)) {
@@ -809,7 +816,25 @@ static unsigned sqrt_value(unsigned arg, const char *name)
         GC_GUARD;
         unsigned real_part = store(0);
         gc_protect(&real_part);
-        unsigned imag_part = store_inexact(sqrt(-x));
+        unsigned imag_part;
+        // Strict: -(double)INT64_MAX rounds up to -2^63, so >= would admit
+        // x = INT64_MIN whose negation overflows the int64_t cast below
+        if (exact_integer_arg && x > -(double)INT64_MAX) {
+            int64_t m = (int64_t)(-x);
+            int64_t r = (int64_t)sqrt((double)m);
+            uint64_t um = (uint64_t)m;
+            if ((uint64_t)r * (uint64_t)r == um)
+                imag_part = store(r);
+            else if (r > 0 && (uint64_t)(r - 1) * (uint64_t)(r - 1) == um)
+                imag_part = store(r - 1);
+            else if ((uint64_t)(r + 1) * (uint64_t)(r + 1) == um)
+                imag_part = store(r + 1);
+            else
+                imag_part = store_inexact(sqrt(-x));
+        } else {
+            imag_part = store_inexact(sqrt(-x));
+        }
+        gc_protect(&imag_part);
         return store_complex(real_part, imag_part);
     }
     return store_inexact(sqrt(x));

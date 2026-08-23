@@ -523,8 +523,6 @@ void handle_cont_eval_fn(unsigned val, unsigned data, unsigned env,
         return;
     }
 
-    eval_reset_macro_expansion_depth();
-
     if (!arg_exprs) {
         apply_function(fn, 0, env, next);
         return;

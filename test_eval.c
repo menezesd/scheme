@@ -649,11 +649,19 @@ TEST(eval_rejects_malformed_special_forms)
     ASSERT(eval_string("(define-syntax m (syntax-rules () "
                        "((m x) (quote (x ...)))))",
                        env) == TOK_ERROR);
-    ASSERT(eval_string("(define-syntax m (syntax-rules () ((m x ...) x)))",
-                       env) == TOK_ERROR);
-    ASSERT(eval_string("(define-syntax m (syntax-rules () "
-                       "((m (x ...) ...) (list x ...))))",
-                       env) == TOK_ERROR);
+    // A bare use of an ellipsis-bound variable inserts the whole matched
+    // list as an expression (R7RS 4.3.2), so this transformer is legal
+    ASSERT(is_int(eval_string("(begin (define-syntax m (syntax-rules () "
+                              "((m x ...) (+ 40 (car (quote x))))))"
+                              "(m 1 2))",
+                              env),
+                       41));
+    // Ellipsis-bound variable may appear under ellipsis at any depth >= 1
+    ASSERT(is_int(eval_string("(begin (define-syntax m (syntax-rules () "
+                              "((m (x ...) ...) (+ 40 (length (quote x))))))"
+                              "(m (1 2 3) (4)))",
+                              env),
+                       42));
     ASSERT(eval_string("(define-syntax m (syntax-rules () ((m) #(... x))))",
                        env) == TOK_ERROR);
     ASSERT(eval_string("(define-syntax m (syntax-rules () "
@@ -3700,13 +3708,19 @@ TEST(compiled_rejects_malformed_special_forms)
     ASSERT(compiled_eval_string(
                "(define-syntax m (syntax-rules () ((m x) (quote (x ...)))))",
                env) == TOK_ERROR);
-    ASSERT(compiled_eval_string(
-               "(define-syntax m (syntax-rules () ((m x ...) x)))",
-               env) == TOK_ERROR);
-    ASSERT(compiled_eval_string(
-               "(define-syntax m (syntax-rules () "
-               "((m (x ...) ...) (list x ...))))",
-               env) == TOK_ERROR);
+    // Bare ellipsis-variable use inserts the whole matched list as an
+    // expression (R7RS)
+    ASSERT(is_int(compiled_eval_string(
+               "(begin (define-syntax m (syntax-rules () "
+               "((m x ...) (+ 40 (car (quote x)))))) (m 1 2))",
+               env),
+           41));
+    ASSERT(is_int(compiled_eval_string(
+               "(begin (define-syntax m (syntax-rules () "
+               "((m (x ...) ...) (+ 40 (length (quote x))))))"
+               "(m (1 2 3) (4)))",
+               env),
+           42));
     ASSERT(compiled_eval_string(
                "(define-syntax m (syntax-rules () ((m) #(... x))))",
                env) == TOK_ERROR);

@@ -154,33 +154,32 @@ static unsigned expand_form_vector(unsigned vec, unsigned syn_env,
                                   unsigned *bindings_out)
 {
     unsigned len = vector_len(vec);
-    bool changed = false;
-
     if (!len)
         return vec;
 
-    unsigned data_snapshot[len];
-    for (unsigned i = 0; i < len; i++) {
-        unsigned *old_data = vector_data_ptr(vec);
-        unsigned expanded = expand_form(old_data[i], syn_env, bindings_out);
-        if (expanded == TOK_ERROR)
-            return TOK_ERROR;
-        if (expanded != old_data[i])
-            changed = true;
-        data_snapshot[i] = expanded;
-    }
+    GC_GUARD;
+    gc_protect(&vec);
+    gc_protect(&syn_env);
 
-    if (!changed)
-        return vec;
-
+    // Build the result up front so expanded elements live in a GC-scanned
+    // container while later elements are still being expanded.
     unsigned new_vec = make_vector(len, 0);
     if (new_vec == TOK_ERROR)
         return TOK_ERROR;
-    unsigned *new_data = vector_data_ptr(new_vec);
-    for (unsigned i = 0; i < len; i++)
-        new_data[i] = data_snapshot[i];
+    gc_protect(&new_vec);
 
-    return new_vec;
+    bool changed = false;
+    for (unsigned i = 0; i < len; i++) {
+        unsigned expanded = expand_form(vector_data_ptr(vec)[i], syn_env,
+                                        bindings_out);
+        if (expanded == TOK_ERROR)
+            return TOK_ERROR;
+        if (expanded != vector_data_ptr(vec)[i])
+            changed = true;
+        vector_set_elem(new_vec, i, expanded);
+    }
+
+    return changed ? new_vec : vec;
 }
 
 static unsigned expand_form_list(unsigned list, unsigned syn_env,
@@ -191,6 +190,7 @@ static unsigned expand_form_list(unsigned list, unsigned syn_env,
 
     GC_GUARD;
     gc_protect(&list);
+    gc_protect(&syn_env);
     if (!IS_PAIR(list))
         return expand_form(list, syn_env, bindings_out);
 
@@ -235,6 +235,9 @@ static unsigned expand_let_syntax(unsigned form, unsigned syn_env,
     const char *syn_arity =
         (CELL_ID(car(form)) == ctx.kw_let_syntax) ? "let-syntax" :
                                                    "letrec-syntax";
+    GC_GUARD;
+    gc_protect(&form);
+    gc_protect(&syn_env);
     if (!syntax_arity_checked(form, 2, UINT_MAX, syn_arity))
         return TOK_ERROR;
 
@@ -298,7 +301,96 @@ static unsigned expand_let_syntax(unsigned form, unsigned syn_env,
     return alloc_cons(car(form), alloc_cons(bindings, expanded_body));
 }
 
+// The static expander recurses through macro outputs; a self-referential
+// macro referenced from inside an explicit lambda body overflows the C
+// stack before any engine-level depth check runs, so bound it here.
+#define MAX_STATIC_EXPANSION_DEPTH 10000
+
+static int expansion_depth = 0;
+
+void macros_reset_expansion_depth(void)
+{
+    expansion_depth = 0;
+}
+
+static unsigned expand_form_inner(unsigned expr, unsigned syn_env,
+                                  unsigned *bindings_out);
+
 unsigned expand_form(unsigned expr, unsigned syn_env, unsigned *bindings_out)
+{
+    if (expansion_depth >= MAX_STATIC_EXPANSION_DEPTH) {
+        show_error("macro expansion exceeded maximum depth");
+        return TOK_ERROR;
+    }
+    expansion_depth++;
+    unsigned result = expand_form_inner(expr, syn_env, bindings_out);
+    expansion_depth--;
+    return result;
+}
+
+// Bind every name in a formal-parameter list (proper or dotted) into a
+// fresh frame over parent_env. Values are irrelevant placeholders: the
+// frame exists so scope-sensitive decisions during expansion (ellipsis
+// shadowing, macro-vs-variable dispatch) see the parameters as ordinary
+// lexically bound names.
+unsigned extend_env_with_binder_names(unsigned parent_env, unsigned params)
+{
+    GC_GUARD;
+    gc_protect(&parent_env);
+    gc_protect(&params);
+    unsigned frame_env = extend_env_empty(parent_env);
+    gc_protect(&frame_env);
+
+    unsigned p = params;
+    gc_protect(&p);
+    while (IS_PAIR(p)) {
+        unsigned b = car(p);
+        gc_protect(&b);
+        if (IS_ATOM(b) &&
+            defvar(b, ctx.atom_false, frame_env) == TOK_ERROR)
+            return TOK_ERROR;
+        gc_unprotect(1);
+        p = cdr(p);
+    }
+    if (p && IS_ATOM(p) &&
+        defvar(p, ctx.atom_false, frame_env) == TOK_ERROR)
+        return TOK_ERROR;
+
+    return frame_env;
+}
+
+// Layer a frame with the names bound by a body's leading (define ...)
+// forms over env, so later forms in that body expand with those names
+// shadowing outer bindings. Mirrors the compiler's scan_internal_defines.
+unsigned extend_env_with_internal_defines(unsigned env, unsigned body)
+{
+    GC_GUARD;
+    gc_protect(&env);
+    gc_protect(&body);
+    unsigned frame = 0;
+    gc_protect(&frame);
+
+    for (unsigned it = body; IS_PAIR(it); it = cdr(it)) {
+        unsigned form = car(it);
+        if (!IS_PAIR(form) || !IS_ATOM(car(form)) ||
+            CELL_ID(car(form)) != ctx.kw_define)
+            break;
+        unsigned target = cadr(form);
+        unsigned name = IS_PAIR(target) ? car(target) : target;
+        if (!IS_ATOM(name))
+            break;
+        if (!frame) {
+            frame = extend_env_empty(env);
+        }
+        if (defvar(name, ctx.atom_false, frame) == TOK_ERROR)
+            return TOK_ERROR;
+    }
+
+    return frame ? frame : env;
+}
+
+static unsigned expand_form_inner(unsigned expr, unsigned syn_env,
+                                  unsigned *bindings_out)
 {
     if (!expr || !IS_CELL(expr))
         return expr;
@@ -311,11 +403,14 @@ unsigned expand_form(unsigned expr, unsigned syn_env, unsigned *bindings_out)
 
     unsigned head = car(expr);
     if (IS_ATOM(head)) {
-        unsigned kw = CELL_ID(head);
+        int64_t kw = CELL_ID(head);
         if (kw != ctx.kw_quote && kw != ctx.kw_quasiquote &&
             kw != ctx.kw_cond_expand) {
             unsigned binding = lookup_silent(kw, syn_env);
             if (binding != TOK_ERROR && IS_SYNTAX(binding)) {
+                GC_GUARD;
+                gc_protect(&expr);
+                gc_protect(&syn_env);
                 unsigned produced_bindings = 0;
                 gc_protect(&produced_bindings);
                 unsigned expanded =
@@ -335,11 +430,16 @@ unsigned expand_form(unsigned expr, unsigned syn_env, unsigned *bindings_out)
             return expr;
 
         if (kw == ctx.kw_define_syntax) {
+            GC_GUARD;
+            gc_protect(&expr);
+            gc_protect(&syn_env);
             if (!syntax_arity_checked(expr, 2, 2, "define-syntax"))
                 return TOK_ERROR;
 
             unsigned name = cadr(expr);
             unsigned transformer_form = caddr(expr);
+            gc_protect(&name);
+            gc_protect(&transformer_form);
             if (!identifier_valid(name)) {
                 show_error("define-syntax: expected name");
                 return TOK_ERROR;
@@ -354,6 +454,7 @@ unsigned expand_form(unsigned expr, unsigned syn_env, unsigned *bindings_out)
                 make_syntax_transformer(transformer_form, syn_env);
             if (p == TOK_ERROR)
                 return TOK_ERROR;
+            gc_protect(&p);
             if (defvar(name, p, syn_env) == TOK_ERROR)
                 return TOK_ERROR;
 
@@ -362,6 +463,13 @@ unsigned expand_form(unsigned expr, unsigned syn_env, unsigned *bindings_out)
 
         if (kw == ctx.kw_let_syntax || kw == ctx.kw_letrec_syntax)
             return expand_let_syntax(expr, syn_env, bindings_out);
+
+        // Lambda bodies expand at their own creation (handle_lambda), so
+        // the walker must not descend here: expanding them now would fire
+        // syntax errors - and bake hygiene decisions - in the enclosing
+        // scope instead of the lambda's own.
+        if (kw == ctx.kw_lambda)
+            return expr;
     }
 
     return expand_form_list(expr, syn_env, bindings_out);
@@ -1368,6 +1476,49 @@ static unsigned rename_free_ids(unsigned tmpl, unsigned rename_map)
     return rename_free_ids_inner(tmpl, rename_map, false, false);
 }
 
+// Drop rename_map entries whose key is bound by params: within this
+// lambda's body those names denote the parameters, not the free
+// identifiers the renames were minted for.
+static unsigned drop_renames_bound_by_params(unsigned rename_map,
+                                             unsigned params)
+{
+    GC_GUARD;
+    gc_protect(&rename_map);
+    gc_protect(&params);
+    unsigned out = 0;
+    unsigned tail = 0;
+    gc_protect(&out);
+    gc_protect(&tail);
+    for (unsigned m = rename_map; m; m = cdr(m)) {
+        unsigned entry = car(m);
+        if (IS_ATOM(car(entry)) &&
+            lambda_params_bind_id(params, CELL_ID(car(entry))))
+            continue;
+        list_append(&out, &tail, entry);
+    }
+    return out;
+}
+
+static unsigned drop_renames_bound_by_binding_list(unsigned rename_map,
+                                                   unsigned binding_list)
+{
+    GC_GUARD;
+    gc_protect(&rename_map);
+    gc_protect(&binding_list);
+    unsigned out = 0;
+    unsigned tail = 0;
+    gc_protect(&out);
+    gc_protect(&tail);
+    for (unsigned m = rename_map; m; m = cdr(m)) {
+        unsigned entry = car(m);
+        if (IS_ATOM(car(entry)) &&
+            binding_list_binds_id(binding_list, CELL_ID(car(entry))))
+            continue;
+        list_append(&out, &tail, entry);
+    }
+    return out;
+}
+
 static unsigned rename_free_ids_inner(unsigned tmpl, unsigned rename_map,
                                       bool quote_shadowed,
                                       bool quasiquote_shadowed)
@@ -1414,8 +1565,11 @@ static unsigned rename_free_ids_inner(unsigned tmpl, unsigned rename_map,
                 bool body_quasiquote_shadowed =
                     quasiquote_shadowed ||
                     lambda_params_bind_id(cadr(tmpl), ctx.kw_quasiquote);
+                unsigned body_map =
+                    drop_renames_bound_by_params(rename_map, cadr(tmpl));
+                gc_protect(&body_map);
                 unsigned new_body = rename_free_ids_inner(
-                    cddr(tmpl), rename_map, body_quote_shadowed,
+                    cddr(tmpl), body_map, body_quote_shadowed,
                     body_quasiquote_shadowed);
                 if (new_body == TOK_ERROR)
                     return TOK_ERROR;
@@ -1446,8 +1600,12 @@ static unsigned rename_free_ids_inner(unsigned tmpl, unsigned rename_map,
                 bool body_quasiquote_shadowed =
                     quasiquote_shadowed ||
                     binding_list_binds_id(binding_list, ctx.kw_quasiquote);
+                unsigned body_map =
+                    drop_renames_bound_by_binding_list(rename_map,
+                                                       binding_list);
+                gc_protect(&body_map);
                 unsigned new_body = rename_free_ids_inner(
-                    body, rename_map, body_quote_shadowed,
+                    body, body_map, body_quote_shadowed,
                     body_quasiquote_shadowed);
                 if (new_body == TOK_ERROR)
                     return TOK_ERROR;
@@ -3003,288 +3161,6 @@ static unsigned hygienize_template(unsigned tmpl, unsigned bindings)
 
     gc_unprotect(2);
     return tmpl;
-}
-
-// ============================================================================
-// Pattern Matching
-// ============================================================================
-
-unsigned syntax_match(unsigned pattern, unsigned input, unsigned literals,
-                      unsigned bindings, int64_t ellipsis_id)
-{
-    // Protect all parameters - this function is recursive and allocates
-    gc_protect(&pattern);
-    gc_protect(&input);
-    gc_protect(&literals);
-    gc_protect(&bindings);
-
-    if (!pattern) {
-        gc_unprotect(4);
-        return input ? TOK_ERROR : bindings;
-    }
-
-    // Atom pattern
-    if (IS_ATOM(pattern)) {
-        int64_t sym = CELL_ID(pattern);
-
-        // Literal must match exactly
-        if (atom_list_contains_id(literals, sym)) {
-            gc_unprotect(4);
-            if (IS_ATOM(input) && CELL_ID(input) == sym)
-                return bindings;
-            return TOK_ERROR;
-        }
-
-        if (syntax_is_underscore(pattern)) {
-            gc_unprotect(4);
-            return bindings;
-        }
-
-        if (!identifier_valid(pattern)) {
-            gc_unprotect(4);
-            if (IS_ATOM(input) && CELL_ID(input) == sym)
-                return bindings;
-            return TOK_ERROR;
-        }
-
-        // Pattern variable - bind it
-        unsigned binding = 0;
-        gc_protect(&binding);
-        binding = alloc_cons(pattern, input);
-        unsigned result = alloc_cons(binding, bindings);
-        gc_unprotect(5);
-        return result;
-    }
-
-    // Vector pattern - must match vector input element by element
-    if (IS_VECTOR(pattern)) {
-        if (!IS_VECTOR(input)) {
-            gc_unprotect(4);
-            return TOK_ERROR;
-        }
-
-        unsigned pat_len = vector_len(pattern);
-        unsigned inp_len = vector_len(input);
-        unsigned *pat_data = vector_data_ptr(pattern);
-
-        // Check for ellipsis in vector pattern
-        unsigned ellipsis_pos = pat_len;
-        for (unsigned i = 0; i < pat_len; i++) {
-            if (syntax_is_ellipsis(pat_data[i], ellipsis_id)) {
-                ellipsis_pos = i;
-                break;
-            }
-        }
-
-        if (ellipsis_pos < pat_len) {
-            // Pattern has ellipsis at position ellipsis_pos
-            // Element before ellipsis is the repeated pattern
-            if (ellipsis_pos == 0) {
-                gc_unprotect(4);
-                return TOK_ERROR; // No pattern before ellipsis
-            }
-
-            unsigned elem_pattern = pat_data[ellipsis_pos - 1];
-            unsigned pre_count =
-                ellipsis_pos - 1; // Elements before repeated pattern
-            unsigned post_count =
-                pat_len - ellipsis_pos - 1; // Elements after ellipsis
-
-            if (inp_len < pre_count + post_count) {
-                gc_unprotect(4);
-                return TOK_ERROR;
-            }
-
-            // Match elements before the ellipsis pattern
-            for (unsigned i = 0; i < pre_count; i++) {
-                // Refresh pointers - GC may have moved vectors
-                pat_data = vector_data_ptr(pattern);
-                unsigned *inp_data = vector_data_ptr(input);
-                bindings = syntax_match(pat_data[i], inp_data[i], literals,
-                                        bindings, ellipsis_id);
-                if (bindings == TOK_ERROR) {
-                    gc_unprotect(4);
-                    return TOK_ERROR;
-                }
-            }
-
-            // Collect matches for the ellipsis pattern
-            unsigned matches = 0, matches_tail = 0;
-            gc_protect(&matches);
-            gc_protect(&matches_tail);
-            unsigned repeat_count = inp_len - pre_count - post_count;
-            for (unsigned i = 0; i < repeat_count; i++) {
-                // Refresh pointer - GC may have moved input vector
-                unsigned *inp_data = vector_data_ptr(input);
-                unsigned inp_elem = inp_data[pre_count + i];
-                unsigned elem_bindings = syntax_match(elem_pattern, inp_elem,
-                                                      literals, 0, ellipsis_id);
-                if (elem_bindings == TOK_ERROR) {
-                    gc_unprotect(6);
-                    return TOK_ERROR;
-                }
-                list_append(&matches, &matches_tail, inp_elem);
-            }
-
-            // Add ellipsis binding
-            // Refresh elem_pattern - GC may have moved pattern vector
-            pat_data = vector_data_ptr(pattern);
-            elem_pattern = pat_data[ellipsis_pos - 1];
-            unsigned ellipsis_binding = 0;
-            gc_protect(&ellipsis_binding);
-            ellipsis_binding = alloc_cons(elem_pattern, matches);
-            bindings = alloc_cons(ellipsis_binding, bindings);
-            gc_unprotect(1);
-
-            // Match elements after ellipsis
-            for (unsigned i = 0; i < post_count; i++) {
-                // Refresh pointers - GC may have moved vectors
-                pat_data = vector_data_ptr(pattern);
-                unsigned *inp_data = vector_data_ptr(input);
-                unsigned pat_idx = ellipsis_pos + 1 + i;
-                unsigned inp_idx = inp_len - post_count + i;
-                bindings = syntax_match(pat_data[pat_idx], inp_data[inp_idx],
-                                        literals, bindings, ellipsis_id);
-                if (bindings == TOK_ERROR) {
-                    gc_unprotect(6);
-                    return TOK_ERROR;
-                }
-            }
-
-            gc_unprotect(6);
-            return bindings;
-        }
-
-        // No ellipsis - lengths must match exactly
-        if (pat_len != inp_len) {
-            gc_unprotect(4);
-            return TOK_ERROR;
-        }
-
-        for (unsigned i = 0; i < pat_len; i++) {
-            // Refresh pointers - GC may have moved vectors
-            pat_data = vector_data_ptr(pattern);
-            unsigned *inp_data = vector_data_ptr(input);
-            bindings = syntax_match(pat_data[i], inp_data[i], literals,
-                                    bindings, ellipsis_id);
-            if (bindings == TOK_ERROR) {
-                gc_unprotect(4);
-                return TOK_ERROR;
-            }
-        }
-        gc_unprotect(4);
-        return bindings;
-    }
-
-    // List pattern
-    if (IS_PAIR(pattern)) {
-        // Check for ellipsis in pattern: (pat ... rest)
-        if (IS_PAIR(cdr(pattern)) &&
-            syntax_is_ellipsis(cadr(pattern), ellipsis_id)) {
-            // Collect matches for elem_pattern (zero or more)
-            unsigned matches = 0, matches_tail = 0;
-            gc_protect(&matches);
-            gc_protect(&matches_tail);
-            while (IS_PAIR(input)) {
-                // Refresh pattern references - GC may have moved pattern
-                unsigned rest_pattern = cddr(pattern);
-                // Try to match remaining input against rest pattern
-                unsigned rest_input = input;
-                unsigned tentative = syntax_match(
-                    rest_pattern, rest_input, literals, bindings, ellipsis_id);
-                if (tentative != TOK_ERROR) {
-                    // Refresh elem_pattern - GC may have moved pattern
-                    unsigned elem_pattern = car(pattern);
-                    unsigned ellipsis_binding = 0;
-                    gc_protect(&ellipsis_binding);
-                    gc_protect(&tentative); // MUST protect before alloc - GC
-                                            // could happen!
-                    ellipsis_binding = alloc_cons(elem_pattern, matches);
-                    unsigned result = alloc_cons(ellipsis_binding, tentative);
-                    gc_unprotect(8);
-                    return result;
-                }
-
-                // Refresh elem_pattern - GC may have moved pattern
-                unsigned elem_pattern = car(pattern);
-                // Try to match one more element
-                unsigned car_input = car(input);
-                unsigned elem_bindings = syntax_match(elem_pattern, car_input,
-                                                      literals, 0, ellipsis_id);
-                if (elem_bindings == TOK_ERROR) {
-                    break;
-                }
-
-                // Add this match to the list
-                list_append(&matches, &matches_tail, car(input));
-                input = cdr(input);
-            }
-
-            // Try matching empty ellipsis
-            // Refresh pattern references - GC may have moved pattern
-            unsigned rest_pattern = cddr(pattern);
-            unsigned tentative = syntax_match(rest_pattern, input, literals,
-                                              bindings, ellipsis_id);
-            if (tentative != TOK_ERROR) {
-                // Refresh elem_pattern - GC may have moved pattern
-                unsigned elem_pattern = car(pattern);
-                unsigned ellipsis_binding = 0;
-                gc_protect(&ellipsis_binding);
-                gc_protect(
-                    &tentative); // MUST protect before alloc - GC could happen!
-                ellipsis_binding = alloc_cons(elem_pattern, matches);
-                unsigned result = alloc_cons(ellipsis_binding, tentative);
-                gc_unprotect(8);
-                return result;
-            }
-            gc_unprotect(6);
-            return TOK_ERROR;
-        }
-
-        // Match ordinary list spines iteratively.  A macro may legitimately
-        // have a very wide fixed-arity pattern, which must not require one C
-        // frame per argument.
-        for (;;) {
-            if (!IS_PAIR(input)) {
-                gc_unprotect(4);
-                return TOK_ERROR;
-            }
-
-            bindings = syntax_match(car(pattern), car(input), literals,
-                                    bindings, ellipsis_id);
-            if (bindings == TOK_ERROR) {
-                gc_unprotect(4);
-                return TOK_ERROR;
-            }
-
-            pattern = cdr(pattern);
-            input = cdr(input);
-            if (!IS_PAIR(pattern)) {
-                gc_unprotect(4);
-                return syntax_match(pattern, input, literals, bindings,
-                                    ellipsis_id);
-            }
-
-            // Let the existing ellipsis logic handle a tail that begins an
-            // ellipsis group, just as the former recursive cdr call did.
-            if (IS_PAIR(cdr(pattern)) &&
-                syntax_is_ellipsis(cadr(pattern), ellipsis_id)) {
-                gc_unprotect(4);
-                return syntax_match(pattern, input, literals, bindings,
-                                    ellipsis_id);
-            }
-        }
-    }
-
-    // Other patterns (numbers, strings, etc.) must match exactly
-    gc_unprotect(4);
-    if (!IS_CELL(pattern) || !IS_CELL(input))
-        return pattern == input ? bindings : TOK_ERROR;
-    if (CELL_TYPE(pattern) == CELL_TYPE(input) &&
-        CELL_ID(pattern) == CELL_ID(input))
-        return bindings;
-
-    return TOK_ERROR;
 }
 
 // ============================================================================

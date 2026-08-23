@@ -1729,7 +1729,7 @@ unsigned atom_from_string(const char *s)
 
         // Try parsing as integer first
         errno = 0;
-        int64_t ival = strtoll(s, &endptr, 0);
+        int64_t ival = strtoll(s, &endptr, 10);
         if ((size_t)(endptr - s) == n) {
             // Check for overflow - if so, parse as bignum
             if (errno == ERANGE || (ival == LLONG_MAX || ival == LLONG_MIN)) {
@@ -1846,11 +1846,21 @@ unsigned atom_from_string(const char *s)
         }
     not_rational:
 
-        // Try parsing as floating-point
+        // strtod also accepts C99 hex floats ("0x1p3"); not Scheme syntax.
         {
-            double dval = strtod(s, &endptr);
-            if ((size_t)(endptr - s) == n) {
-                return store_inexact(dval);
+            bool has_hex_float_marker = false;
+            for (size_t i = 0; i < n; i++) {
+                char ch = s[i];
+                if (ch == 'x' || ch == 'X' || ch == 'p' || ch == 'P') {
+                    has_hex_float_marker = true;
+                    break;
+                }
+            }
+            if (!has_hex_float_marker) {
+                double dval = strtod(s, &endptr);
+                if ((size_t)(endptr - s) == n) {
+                    return store_inexact(dval);
+                }
             }
         }
     }
@@ -2699,10 +2709,6 @@ unsigned collect(unsigned x)
         CELL_ID(xx) = CELL_ID(x);
         CELL_TYPE(x) = BT_BROKENHEART;
         CELL_CAR(x) = xx;
-        if (string_cell_is_view(xx)) {
-            string_view_data *view = (string_view_data *)CELL_PTR(xx);
-            view->parent = collect_to_old(view->parent);
-        }
         return xx;
     }
 
