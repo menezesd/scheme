@@ -185,7 +185,7 @@ static bool get_small_int(code_object *code, unsigned const_idx, int64_t *val)
     if (!IS_NUM(cell))
         return false;
     int64_t boxed = CELL_ID(cell);
-    if (boxed <= INT32_MIN || boxed >= INT32_MAX)
+    if (boxed < INT32_MIN || boxed > INT32_MAX)
         return false;
     *val = boxed;
     return true;
@@ -194,8 +194,7 @@ static bool get_small_int(code_object *code, unsigned const_idx, int64_t *val)
 // Helper: check if result fits in small integer range
 static bool fits_small_int(int64_t val)
 {
-    // Conservative: avoid overflow edge cases
-    return val > INT32_MIN && val < INT32_MAX;
+    return val >= INT32_MIN && val <= INT32_MAX;
 }
 
 // CSE pass: detect consecutive identical CONST/LOOKUP and use DUP

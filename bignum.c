@@ -879,18 +879,9 @@ bignum *bn_div(const bignum *a, const bignum *b, bignum **remainder)
         *remainder = NULL;
 
     if (bn_is_zero(b)) {
-        // Division by zero
-        bignum *quot = bn_new();
-        if (!quot)
-            return NULL;
-        if (remainder) {
-            *remainder = bn_new();
-            if (!*remainder) {
-                bn_free(quot);
-                return NULL;
-            }
-        }
-        return quot;
+        // Division by zero is an error; callers must pre-check. Returning
+        // a dummy zero quotient hid the failure from direct bn_div users.
+        return NULL;
     }
 
     int result_sign = (a->sign != b->sign);
@@ -1538,12 +1529,12 @@ bool bn_add_limb_ip_checked(bignum *a, limb_t b)
 
     if (a->sign) {
         // Negative number: compute out-of-place so failure can be reported.
-        bignum tmp;
-        tmp.limbs = &b;
-        tmp.len = 1;
-        tmp.cap = 1;
-        tmp.sign = 0;
-        bignum *sum = bn_add(a, &tmp);
+        // Avoid aliasing the stack parameter `b` directly (see bug #6).
+        bignum *operand = bn_from_uint((uint64_t)b);
+        if (!operand)
+            return false;
+        bignum *sum = bn_add(a, operand);
+        bn_free(operand);
         if (!sum)
             return false;
         if (!bn_ensure_cap(a, sum->len)) {

@@ -809,8 +809,10 @@ static void write_obj_fp_inner(unsigned s, bool with_quotes, FILE *fp)
     }
     case BT_STRING: {
         char *str = GET_STRING_PTR(s);
-        if (!string_is_registered(str))
+        if (!string_is_registered(str)) {
+            fprintf(fp, "[invalid-string]");
             break;
+        }
         if (with_quotes) {
             write_escaped_string(fp, str);
         } else {

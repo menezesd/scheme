@@ -1342,15 +1342,18 @@ static unsigned read_string_literal(void)
             case '\r': {
                 // R7RS line continuation:
                 // \<intraline ws>*<line ending><intraline ws>* reads as
-                // nothing, letting long string literals span lines
+                // nothing, letting long string literals span lines.
+                // A bare `\<space>` not followed by a line ending is an
+                // error (previously it was silently dropped with a warning).
                 int lc = c;
                 while (lc == ' ' || lc == '\t')
                     lc = reader_getchar();
                 if (lc != '\n' && lc != '\r') {
-                    show_warning("unknown escape sequence: \\ ");
+                    show_error("string literal: expected line ending after \\ intraline whitespace");
                     if (lc != EOF)
                         reader_ungetc(lc);
-                    continue;
+                    sb_free(&sb);
+                    return TOK_ERROR;
                 }
                 if (lc == '\r') {
                     int nx = reader_getchar();
@@ -1416,15 +1419,14 @@ static unsigned read_string_literal(void)
                     sb_free(&hex);
                     break;
                 }
-                show_warning("invalid hex escape");
-                // Keep the consumed digits directly: the pushback buffer
-                // holds only 16 characters, so ungetting a long run would
-                // silently drop input
-                sb_append(&sb, 'x');
-                for (size_t i = 0; i < hex.len; i++)
-                    sb_append(&sb, hex.data[i]);
+                // R7RS requires \xHEX; with a terminating ';'. The only
+                // legacy byte form allowed without ';' is exactly two hex
+                // digits. Anything else is an error rather than a silent
+                // literal "x"+digits.
                 sb_free(&hex);
-                continue;
+                show_error("invalid hex escape: \\x requires ';' or exactly two hex digits");
+                sb_free(&sb);
+                return TOK_ERROR;
             }
             default:
                 if (c >= '0' && c <= '7') {

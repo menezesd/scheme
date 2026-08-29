@@ -2232,6 +2232,31 @@ bool check_args(unsigned args, unsigned min, unsigned max, const char *name)
         return false;
     }
 
+    // Reject improper lists (e.g. (1 . 2)) — FORLIST walks would silently
+    // drop the dotted tail. `a` is the cdr after `len` pairs; if it is
+    // non-nil and not a pair the list is dotted. For the early-exit case
+    // (variadic where we stopped at `min`) an improper tail beyond `limit`
+    // would otherwise be hidden: walk the remainder when `a` is a pair.
+    if (a != 0 && !IS_PAIR(a)) {
+        show_error("%s: improper list", name);
+        return false;
+    }
+    if (IS_PAIR(a)) {
+        // Walk remainder to catch an improper/circular tail beyond the
+        // early-exit `limit` (e.g. variadic `(1 2 3 . 4)` with min=2).
+        if (pair_chain_is_circular(a)) {
+            show_error("%s: circular list", name);
+            return false;
+        }
+        unsigned rest = a;
+        while (IS_PAIR(rest))
+            rest = cdr(rest);
+        if (rest != 0) {
+            show_error("%s: improper list", name);
+            return false;
+        }
+    }
+
     // If max is bounded and we counted more than max, or there are still more
     if (max != (unsigned)-1 && (len > max || IS_PAIR(a))) {
         show_error("%s: too many arguments (expected at most %u)", name, max);

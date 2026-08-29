@@ -154,6 +154,8 @@ unsigned pattern_current_pos(compiled_pattern *pat)
 
 void pattern_patch(compiled_pattern *pat, unsigned pos, unsigned value)
 {
+    if (!pat || pos >= pat->code_len)
+        lisp_panic("pattern_patch: position out of bounds");
     pat->code[pos].operand = value;
 }
 

@@ -278,6 +278,10 @@ static void close_reader_stream(FILE *port)
 
 // True if bytes already sit in the FILE*'s stdio read buffer. poll() only
 // sees the underlying fd, so without this a port can report "not ready"
+// while read-char would return instantly from the buffer. The previous
+// version inspected FILE internals (_IO_read_ptr, _r) which is not
+// True if bytes already sit in the FILE*'s stdio read buffer. poll() only
+// sees the underlying fd, so without this a port can report "not ready"
 // while read-char would return instantly from the buffer.
 static bool file_has_buffered_input(FILE *fp)
 {
