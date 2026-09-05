@@ -2696,20 +2696,37 @@ static compile_result compile_if(unsigned expr, compile_ctx *cctx)
 // stack out during analysis.
 #define TRMC_MAX_SCAN_DEPTH 64
 
-// A primitive that cannot re-enter Scheme, and so cannot capture. Everything
-// foldable qualifies. cons and list are barred from folding only because they
-// allocate mutable cells, which is irrelevant here.
-static bool trmc_capture_free_primitive(int64_t prim_id)
+// A primitive with no side effects that cannot re-enter Scheme. Both modes
+// need this, for different reasons: HOLE because such a primitive cannot
+// capture a continuation, FOLD because deferring its application to the
+// return has to be invisible. Everything foldable qualifies; cons, list,
+// append and string-append are barred from constant folding only because
+// they allocate fresh mutable objects, which is irrelevant to both.
+static bool trmc_safe_primitive(int64_t prim_id)
 {
     if (is_foldable_primitive(prim_id))
         return true;
     switch (prim_id) {
     case PCONS:
     case PLIST:
+    case PAPPEND:
+    case PSTRAPP:
         return true;
     default:
         return false;
     }
+}
+
+// A TAILCALL hands the callee's value straight back to our caller, skipping
+// the return that finishes the accumulator. So inside a TRMC body a tail call
+// to anything but the loop itself has to be an ordinary call. That costs one
+// frame at the base case, which is not the frame-per-element the transform
+// exists to remove.
+static unsigned trmc_call_opcode(compile_ctx *cctx, bool tail)
+{
+    if (!tail)
+        return OP_CALL;
+    return cctx->trmc_mode != TRMC_MODE_NONE ? OP_CALL : OP_TAILCALL;
 }
 
 // True if evaluating expr cannot capture a continuation. Narrow on purpose:
@@ -2744,25 +2761,12 @@ static bool trmc_capture_free(unsigned expr, compile_ctx *cctx, int depth)
         return false;
     }
 
-    if (!IS_BUILTIN(binding) || !trmc_capture_free_primitive(CELL_ID(binding)))
+    if (!IS_BUILTIN(binding) || !trmc_safe_primitive(CELL_ID(binding)))
         return false;
     for (unsigned a = cdr(expr); IS_PAIR(a); a = cdr(a))
         if (!trmc_capture_free(car(a), cctx, depth + 1))
             return false;
     return true;
-}
-
-// (cons E (self a1..an)) - the shape TRMC rewrites. cons must still denote
-// the builtin here, the same shadowing check the foldable-primitive path
-// makes, because a user is allowed to rebind it.
-static bool trmc_is_cons_call(unsigned expr, compile_ctx *cctx)
-{
-    if (!IS_PAIR(expr) || !IS_ATOM(car(expr)))
-        return false;
-    unsigned fn = lookup_silent(CELL_ID(car(expr)), cctx->env);
-    if (fn == TOK_ERROR || !IS_BUILTIN(fn) || CELL_ID(fn) != PCONS)
-        return false;
-    return list_length(cdr(expr)) == 2;
 }
 
 // A tail call to the letrec-bound loop variable, at the arity the loop
@@ -2776,39 +2780,106 @@ static bool trmc_is_self_call(unsigned expr, compile_ctx *cctx)
     return list_length(cdr(expr)) == cctx->loop_arity;
 }
 
-// Walk the tail positions of expr. False if any of them is something TRMC
-// cannot handle; *found records that the (cons E (self ...)) site was seen.
-// if and begin are followed because they do not push an environment frame,
-// so env_depth stays 0 and the loop jump does not skip a POPENV. let does
-// push one, which is why it is not followed here.
-static bool trmc_scan_tail(unsigned expr, compile_ctx *cctx, bool *found,
-                           int depth)
+// Only these leave an addressable hole: cons ends in one open cdr, append is
+// a run of them. Every other operator has to be replayed at the return.
+static bool trmc_op_has_hole(int64_t op, unsigned argc)
+{
+    return (op == PCONS && argc == 2) || (op == PAPPEND && argc >= 2);
+}
+
+// A tail-position application of a safe primitive whose last argument is the
+// recursive call - the shape both modes rewrite. The operator must still
+// denote the builtin here, the same shadowing check the foldable-primitive
+// path makes, since a user is allowed to rebind cons or append.
+//
+// *operands is the whole argument list, whose last element is the call, and
+// *call is that call. n-ary is handled by folding the leading operands with
+// the operator itself before accumulating: these primitives already left-fold
+// their arguments, so (op a b X) is (op (op a b) X) by their own definition,
+// with no associativity assumed on top.
+static bool trmc_classify(unsigned expr, compile_ctx *cctx, unsigned *operands,
+                          unsigned *call, int64_t *op)
+{
+    if (!IS_PAIR(expr) || !IS_ATOM(car(expr)))
+        return false;
+    unsigned fn = lookup_silent(CELL_ID(car(expr)), cctx->env);
+    if (fn == TOK_ERROR || !IS_BUILTIN(fn))
+        return false;
+    int64_t prim = CELL_ID(fn);
+    if (!trmc_safe_primitive(prim))
+        return false;
+
+    unsigned args = cdr(expr);
+    if (list_length(args) < 2)
+        return false;
+    // cons is strictly binary; a longer call is an arity error, not a site.
+    if (prim == PCONS && list_length(args) != 2)
+        return false;
+
+    unsigned last = args;
+    while (IS_PAIR(cdr(last)))
+        last = cdr(last);
+    if (!trmc_is_self_call(car(last), cctx))
+        return false;
+
+    if (operands)
+        *operands = args;
+    if (call)
+        *call = car(last);
+    if (op)
+        *op = prim;
+    return true;
+}
+
+// What the scan learns about a body. capture_free is what separates the two
+// modes: it is only HOLE that needs it, and it has to hold for the whole body
+// rather than just the operands, because the base-case branch runs with the
+// accumulator live too.
+typedef struct {
+    bool found;        // saw at least one site
+    int64_t op;        // the operator every site uses
+    bool hole_ok;      // every site's operator leaves a hole
+    bool capture_free; // nothing anywhere in the body can capture
+} trmc_scan_state;
+
+// Walk the tail positions of expr, recording what the scan finds. False only
+// when the body cannot be transformed at all; anything that merely rules out
+// HOLE mode clears st->capture_free instead. if and begin are followed
+// because they push no environment frame, so env_depth stays 0 and the loop
+// jump does not skip a POPENV. let does push one, which is why it is not
+// followed here.
+static bool trmc_scan_tail(unsigned expr, compile_ctx *cctx,
+                           trmc_scan_state *st, int depth)
 {
     if (depth > TRMC_MAX_SCAN_DEPTH)
         return false;
 
-    if (trmc_is_cons_call(expr, cctx)) {
-        unsigned call = caddr(expr);
-        if (trmc_is_self_call(call, cctx)) {
-            if (!trmc_capture_free(cadr(expr), cctx, 0))
-                return false;
-            for (unsigned a = cdr(call); IS_PAIR(a); a = cdr(a))
-                if (!trmc_capture_free(car(a), cctx, 0))
-                    return false;
-            *found = true;
-            return true;
-        }
-        // An ordinary cons that happens to be last: it computes a value and
-        // falls into the return, which is fine as long as it cannot capture.
-        return trmc_capture_free(expr, cctx, 0);
+    unsigned operands = 0, call = 0;
+    int64_t op = 0;
+    if (trmc_classify(expr, cctx, &operands, &call, &op)) {
+        // One accumulator, so one operator: two different constructors in the
+        // same body would need two, and the return can only finish one.
+        if (st->found && st->op != op)
+            return false;
+        st->found = true;
+        st->op = op;
+        if (!trmc_op_has_hole(op, list_length(operands)))
+            st->hole_ok = false;
+        for (unsigned a = operands; IS_PAIR(cdr(a)); a = cdr(a))
+            if (!trmc_capture_free(car(a), cctx, 0))
+                st->capture_free = false;
+        for (unsigned a = cdr(call); IS_PAIR(a); a = cdr(a))
+            if (!trmc_capture_free(car(a), cctx, 0))
+                st->capture_free = false;
+        return true;
     }
 
     if (trmc_is_self_call(expr, cctx)) {
-        // A plain self tail call already compiles to a jump, which keeps the
-        // accumulator; it just does not append to it.
+        // A plain self tail call already compiles to a jump, which carries the
+        // accumulator along; it just does not add to it.
         for (unsigned a = cdr(expr); IS_PAIR(a); a = cdr(a))
             if (!trmc_capture_free(car(a), cctx, 0))
-                return false;
+                st->capture_free = false;
         return true;
     }
 
@@ -2820,13 +2891,12 @@ static bool trmc_scan_tail(unsigned expr, compile_ctx *cctx, bool *found,
                 unsigned len = list_length(rest);
                 if (len < 2 || len > 3)
                     return false;
-                // The test is not in tail position, the branches are.
+                // The test is not in tail position; the branches are.
                 if (!trmc_capture_free(car(rest), cctx, 0))
+                    st->capture_free = false;
+                if (!trmc_scan_tail(cadr(rest), cctx, st, depth + 1))
                     return false;
-                if (!trmc_scan_tail(cadr(rest), cctx, found, depth + 1))
-                    return false;
-                if (len == 3 &&
-                    !trmc_scan_tail(caddr(rest), cctx, found, depth + 1))
+                if (len == 3 && !trmc_scan_tail(caddr(rest), cctx, st, depth + 1))
                     return false;
                 return true;
             }
@@ -2836,43 +2906,53 @@ static bool trmc_scan_tail(unsigned expr, compile_ctx *cctx, bool *found,
                     return true;
                 while (IS_PAIR(cdr(e))) {
                     if (!trmc_capture_free(car(e), cctx, 0))
-                        return false;
+                        st->capture_free = false;
                     e = cdr(e);
                 }
-                return trmc_scan_tail(car(e), cctx, found, depth + 1);
+                return trmc_scan_tail(car(e), cctx, st, depth + 1);
             }
         }
     }
 
-    // Anything else in tail position - the base case, typically - just has to
-    // produce a value without capturing.
-    return trmc_capture_free(expr, cctx, 0);
+    // Any other tail position - the base case, typically. FOLD mode does not
+    // care what it is, since its accumulator is never mutated and so is never
+    // reachable from a continuation captured here.
+    if (!trmc_capture_free(expr, cctx, 0))
+        st->capture_free = false;
+    return true;
 }
 
 // Decided for the whole body before it is compiled, so TRMC_INIT can be
-// emitted ahead of the loop entry point.
-static bool trmc_body_qualifies(unsigned body, compile_ctx *cctx)
+// emitted ahead of the loop entry point. Returns the mode, and the operator
+// to use in FOLD mode.
+static unsigned char trmc_body_qualifies(unsigned body, compile_ctx *cctx,
+                                         int64_t *op_out)
 {
     // Stack locals only: the accumulator lives at bp + trmc_slot, and bp is
     // only per-invocation for functions whose parameters are stack locals.
     // An environment-frame call leaves bp pointing at the caller's window.
     if (!cctx->code->use_locals || cctx->loop_var_id < 0 ||
         cctx->loop_arity == 0 || cctx->loop_arity > 16)
-        return false;
+        return TRMC_MODE_NONE;
 
     unsigned e = body;
     if (!IS_PAIR(e))
-        return false;
+        return TRMC_MODE_NONE;
+
+    trmc_scan_state st = {false, 0, true, true};
     while (IS_PAIR(cdr(e))) {
         if (!trmc_capture_free(car(e), cctx, 0))
-            return false;
+            st.capture_free = false;
         e = cdr(e);
     }
+    if (!trmc_scan_tail(car(e), cctx, &st, 0) || !st.found)
+        return TRMC_MODE_NONE;
 
-    bool found = false;
-    if (!trmc_scan_tail(car(e), cctx, &found, 0))
-        return false;
-    return found;
+    if (op_out)
+        *op_out = st.op;
+    // HOLE where it is available - one pass and one cell per element against
+    // FOLD's two and two - and FOLD everywhere else.
+    return (st.hole_ok && st.capture_free) ? TRMC_MODE_HOLE : TRMC_MODE_FOLD;
 }
 
 // A TAILCALL anywhere in a TRMC body would hand back the callee's value
@@ -3018,11 +3098,15 @@ static compile_result compile_lambda(unsigned expr, compile_ctx *cctx)
     // Tail recursion modulo cons. Decided before the body is compiled, since
     // TRMC_INIT has to sit ahead of the loop entry point.
     unsigned body_start = lambda_cctx->code->code_len;
-    if (trmc_body_qualifies(body, lambda_cctx)) {
-        lambda_cctx->trmc_enabled = true;
+    int64_t trmc_op = 0;
+    unsigned char trmc_mode = trmc_body_qualifies(body, lambda_cctx, &trmc_op);
+    if (trmc_mode != TRMC_MODE_NONE) {
+        lambda_cctx->trmc_mode = trmc_mode;
         lambda_cctx->trmc_slot = (unsigned)lambda_cctx->num_locals;
-        lambda_cctx->code->trmc = true;
+        lambda_cctx->trmc_op = (unsigned)trmc_op;
+        lambda_cctx->code->trmc_mode = trmc_mode;
         lambda_cctx->code->trmc_slot = lambda_cctx->trmc_slot;
+        lambda_cctx->code->trmc_op = (unsigned)trmc_op;
         emit(lambda_cctx, OP_TRMC_INIT);
     }
     // Self tail calls jump here, not to ip 0: re-running TRMC_INIT would
@@ -3033,13 +3117,15 @@ static compile_result compile_lambda(unsigned expr, compile_ctx *cctx)
     // Compile body
     compile_begin(body, lambda_cctx);
 
-    if (lambda_cctx->trmc_enabled &&
+    if (lambda_cctx->trmc_mode != TRMC_MODE_NONE &&
         trmc_code_has_tailcall(lambda_cctx->code, body_start)) {
-        // See trmc_code_has_tailcall: the pre-pass and the emitted code
-        // disagreed. Throw the body away and compile it again plainly.
+        // See trmc_code_has_tailcall. trmc_call_opcode should have kept every
+        // tail call in this body out of TAILCALL form, so reaching here means
+        // some path emitted one anyway. Throw the body away and compile it
+        // again plainly rather than return a truncated result.
         lambda_cctx->code->code_len = body_start;
-        lambda_cctx->trmc_enabled = false;
-        lambda_cctx->code->trmc = false;
+        lambda_cctx->trmc_mode = TRMC_MODE_NONE;
+        lambda_cctx->code->trmc_mode = TRMC_MODE_NONE;
         lambda_cctx->loop_start = body_start;
         compile_begin(body, lambda_cctx);
     }
@@ -3925,7 +4011,7 @@ static compile_result compile_cond(unsigned expr, compile_ctx *cctx)
                 compile_expr_internal(receiver_expr, cctx);
                 cctx->tail_position = tail;
                 gc_unprotect(1);
-                emit2(cctx, tail ? OP_TAILCALL : OP_CALL, 1);
+                emit2(cctx, trmc_call_opcode(cctx, tail), 1);
             } else if (conseq) {
                 compile_begin(conseq, cctx);
             } else {
@@ -3968,7 +4054,7 @@ static compile_result compile_cond(unsigned expr, compile_ctx *cctx)
             gc_unprotect(1);
             // Stack has: test-value receiver
             // CALL pops fn first, then args - already in correct order
-            emit2(cctx, tail ? OP_TAILCALL : OP_CALL, 1);
+            emit2(cctx, trmc_call_opcode(cctx, tail), 1);
         } else if (conseq) {
             // Normal consequent - compile expressions
             compile_begin(conseq, cctx);
@@ -4167,16 +4253,43 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
     // the arguments, so the list is built forwards in constant frame space.
     // This has to come before primitive inlining, which would otherwise
     // compile the cons and leave the recursive call under it.
-    if (cctx->trmc_enabled && cctx->tail_position && cctx->env_depth == 0 &&
-        trmc_is_cons_call(expr, cctx) &&
-        trmc_is_self_call(caddr(expr), cctx)) {
+    unsigned trmc_operands = 0, trmc_call = 0;
+    int64_t trmc_op = 0;
+    if (cctx->trmc_mode != TRMC_MODE_NONE && cctx->tail_position &&
+        cctx->env_depth == 0 &&
+        trmc_classify(expr, cctx, &trmc_operands, &trmc_call, &trmc_op) &&
+        (unsigned)trmc_op == cctx->trmc_op) {
         cctx->tail_position = false;
-        compile_expr_internal(cadr(expr), cctx);
+        if (cctx->trmc_mode == TRMC_MODE_HOLE) {
+            // Add each argument to the chain as it is evaluated. Every one of
+            // these opcodes pops what it consumed, so the operand stack is
+            // back at the loop's baseline before the next argument and before
+            // the call's own arguments. HOLE only ever sees cons or append,
+            // and splicing append's arguments one at a time avoids copying
+            // the prefix twice, which combining them first would.
+            unsigned accumulate =
+                (trmc_op == PCONS) ? OP_TRMC_APPEND : OP_TRMC_SPLICE;
+            for (unsigned a = trmc_operands; IS_PAIR(cdr(a)); a = cdr(a)) {
+                compile_expr_internal(car(a), cctx);
+                emit(cctx, accumulate);
+            }
+        } else {
+            unsigned operand_count = 0;
+            for (unsigned a = trmc_operands; IS_PAIR(cdr(a)); a = cdr(a)) {
+                compile_expr_internal(car(a), cctx);
+                operand_count++;
+            }
+            if (operand_count > 1) {
+                // (op a b (self ...)) is (op (op a b) (self ...)) by the
+                // primitive's own left-to-right folding, so collapse the
+                // leading arguments with the operator and stack one value.
+                // Nothing here assumes associativity beyond that.
+                emit3(cctx, OP_PRIM, (unsigned)trmc_op, operand_count);
+            }
+            emit(cctx, OP_TRMC_PUSH);
+        }
         cctx->tail_position = true;
-        // TRMC_APPEND pops the element it just pushed, so the operand stack
-        // is back at the loop's baseline before the arguments are evaluated.
-        emit(cctx, OP_TRMC_APPEND);
-        emit_self_call_loop(cdr(caddr(expr)), cctx);
+        emit_self_call_loop(cdr(trmc_call), cctx);
         return dynamic_result();
     }
 
@@ -4914,11 +5027,7 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
     compile_expr_internal(fn_expr, cctx);
 
     // Emit call
-    if (tail) {
-        emit2(cctx, OP_TAILCALL, argc);
-    } else {
-        emit2(cctx, OP_CALL, argc);
-    }
+    emit2(cctx, trmc_call_opcode(cctx, tail), argc);
 
     return dynamic_result();
 }

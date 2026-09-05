@@ -2347,6 +2347,46 @@ void list_append(unsigned *head, unsigned *tail, unsigned elem)
     }
 }
 
+// Copy the spine of `list` onto an accumulator whose last cdr is still open,
+// the way append copies all but its last argument. False (with the error
+// already reported) if `list` is improper: append rejects a dotted argument
+// in any but the final position, and so must this.
+bool list_append_copy(unsigned *head, unsigned *tail, unsigned list,
+                      const char *name)
+{
+    GC_PROTECT_GUARD;
+    gc_protect(head);
+    gc_protect(tail);
+    gc_protect(&list);
+    unsigned cursor = list;
+    gc_protect(&cursor);
+
+    while (cursor) {
+        if (!IS_PAIR(cursor)) {
+            show_error("%s: improper list", name);
+            return false;
+        }
+        unsigned cell;
+        {
+            unsigned elem = car(cursor);
+            GC_PROTECT_GUARD;
+            gc_protect(&elem);
+            cell = alloc();
+            CELL_TYPE(cell) = BT_CONS;
+            CELL_CAR(cell) = elem; // elem is up to date after any collection
+            CELL_CDR(cell) = 0;
+        }
+        if (!*head) {
+            *head = *tail = cell;
+        } else {
+            cell_set_cdr(*tail, cell);
+            *tail = cell;
+        }
+        cursor = cdr(cursor);
+    }
+    return true;
+}
+
 void *checked_malloc_array(unsigned count, size_t elem_size)
 {
     size_t size;

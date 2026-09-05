@@ -899,6 +899,8 @@ static const char *opcode_names[] = {
     [OP_NUMEQ_INT_JUMPIFNOT] = "NUMEQ_INT_JUMPIFNOT",
     [OP_TRMC_INIT] = "TRMC_INIT",
     [OP_TRMC_APPEND] = "TRMC_APPEND",
+    [OP_TRMC_SPLICE] = "TRMC_SPLICE",
+    [OP_TRMC_PUSH] = "TRMC_PUSH",
     [OP_ERROR_RETURN] = "ERROR_RETURN",
 };
 

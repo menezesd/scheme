@@ -1671,13 +1671,35 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
         }
 
         case OP_TRMC_INIT: {
-            // Two accumulator slots, head then tail, sitting just above the
-            // parameters. They live on the operand stack rather than in
-            // vm_state so the collectors root them for free (the whole stack
-            // is traced) and so an inner activation of the same function gets
-            // its own pair - a vm_state field would be shared between them.
+            // The accumulator sits just above the parameters, on the operand
+            // stack rather than in vm_state: the collectors trace the whole
+            // stack, so the slots are rooted for free, and being per-frame
+            // each activation of the function gets its own - a vm_state field
+            // would be shared between an outer and an inner one.
+            // HOLE needs head and tail, FOLD needs only the pending list.
             vm_push(vm, 0);
-            vm_push(vm, 0);
+            if (vm->code->trmc_mode == TRMC_MODE_HOLE)
+                vm_push(vm, 0);
+            break;
+        }
+
+        case OP_TRMC_PUSH: {
+            // FOLD mode. Prepending allocates but mutates nothing, so a
+            // continuation captured anywhere in the body restores its own
+            // accumulator value and rebuilds independently. That is the whole
+            // reason this mode needs no restriction on the body.
+            unsigned v = vm_pop(vm);
+            if (vm->error)
+                break;
+            unsigned slot;
+            if (!vm_local_index(vm, vm->code->trmc_slot, &slot))
+                break;
+            // alloc_cons can collect; v and the accumulator both have to
+            // survive it. The slot is on the traced stack, v is not any more.
+            GC_GUARD;
+            gc_protect(&v);
+            unsigned cell = alloc_cons(v, vm->stack[slot]);
+            vm->stack[slot] = cell;
             break;
         }
 
@@ -1701,10 +1723,35 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             break;
         }
 
+        case OP_TRMC_SPLICE: {
+            // The append case. append copies every argument but the last, so
+            // splicing a copy of this one onto the accumulator is the same
+            // work the untransformed call would do - just done outermost
+            // first, into a chain whose end stays open for the recursion's
+            // result. That is also why the left fold is not quadratic here:
+            // nothing is recopied on the next iteration.
+            unsigned v = vm_pop(vm);
+            if (vm->error)
+                break;
+            unsigned base, tail_idx;
+            if (!vm_local_index(vm, vm->code->trmc_slot, &base) ||
+                !vm_local_index(vm, vm->code->trmc_slot + 1, &tail_idx))
+                break;
+            unsigned head = vm->stack[base];
+            unsigned tail = vm->stack[tail_idx];
+            bool ok = list_append_copy(&head, &tail, v, "append");
+            vm->stack[base] = head;
+            vm->stack[tail_idx] = tail;
+            if (!ok)
+                VM_ERROR(vm, ctx.last_error[0] ? ctx.last_error
+                                               : "append: improper list");
+            break;
+        }
+
         case OP_RETURN_LOCALS: {
             vm->ip++; // skip operand
             unsigned val = vm_pop(vm);
-            if (vm->code->trmc) {
+            if (vm->code->trmc_mode == TRMC_MODE_HOLE) {
                 // Close the chain: the value this return produces fills the
                 // hole at the end of the accumulator. An empty accumulator
                 // means the function never appended, so the value stands.
@@ -1717,6 +1764,44 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                     cell_set_cdr(tail, val);
                     val = vm->stack[base];
                 }
+            } else if (vm->code->trmc_mode == TRMC_MODE_FOLD) {
+                // Replay the pending operations. The accumulator holds them
+                // innermost-first, which is the order the untransformed
+                // function would have applied them in as the recursion
+                // unwound - so this is the same sequence of calls on the same
+                // values, not a reassociation.
+                unsigned acc_slot;
+                if (!vm_local_index(vm, vm->code->trmc_slot, &acc_slot))
+                    break;
+                unsigned fold_op = vm->code->trmc_op;
+                // Both the running result and the cursor live on the operand
+                // stack, because applying the primitive can collect and the
+                // stack is what the collectors trace. Reusing the
+                // accumulator's own slot as the cursor keeps it rooted too.
+                unsigned result_slot = vm->sp;
+                vm_push(vm, val);
+                while (!vm->error && vm->stack[acc_slot]) {
+                    unsigned cell = vm->stack[acc_slot];
+                    vm_push(vm, car(cell));
+                    vm_push(vm, vm->stack[result_slot]);
+                    if (vm->error)
+                        break;
+                    unsigned res =
+                        apply_primitive_argv(fold_op, 2,
+                                             &vm->stack[vm->sp - 2]);
+                    vm->sp -= 2;
+                    if (res == TOK_ERROR) {
+                        VM_ERROR(vm, ctx.last_error[0] ? ctx.last_error
+                                                       : "trmc: fold failed");
+                        break;
+                    }
+                    vm->stack[result_slot] = res;
+                    vm->stack[acc_slot] = cdr(vm->stack[acc_slot]);
+                }
+                if (vm->error)
+                    break;
+                val = vm->stack[result_slot];
+                vm->sp = result_slot;
             }
             if (vm->fp == 0) {
                 vm->sp = vm->bp;

@@ -6235,14 +6235,45 @@ static bool code_tree_has_opcode(const code_object *code, unsigned op)
     return false;
 }
 
-static bool code_tree_has_trmc_flag(const code_object *code)
+// The transformed body itself, not the enclosing lambda: the outer lambda's
+// own call into the loop is an ordinary tail call and stays one.
+static const code_object *code_tree_find_trmc(const code_object *code)
+{
+    if (!code)
+        return NULL;
+    if (code->trmc_mode != TRMC_MODE_NONE)
+        return code;
+    for (unsigned i = 0; i < code->children_len; i++) {
+        const code_object *found = code_tree_find_trmc(code->children[i]);
+        if (found)
+            return found;
+    }
+    return NULL;
+}
+
+static bool code_has_opcode(const code_object *code, unsigned op)
 {
     if (!code)
         return false;
-    if (code->trmc)
+    for (unsigned ip = 0; ip < code->code_len;) {
+        unsigned size = instruction_size(code->code[ip]);
+        if (size == 0 || size > code->code_len - ip)
+            return false;
+        if (code->code[ip] == op)
+            return true;
+        ip += size;
+    }
+    return false;
+}
+
+static bool code_tree_has_trmc_mode(const code_object *code, unsigned mode)
+{
+    if (!code)
+        return false;
+    if (code->trmc_mode == mode)
         return true;
     for (unsigned i = 0; i < code->children_len; i++) {
-        if (code_tree_has_trmc_flag(code->children[i]))
+        if (code_tree_has_trmc_mode(code->children[i], mode))
             return true;
     }
     return false;
@@ -6288,7 +6319,9 @@ TEST(trmc_transforms_cons_over_a_self_tail_call)
     ASSERT(code != NULL);
     ASSERT(code_tree_has_opcode(code, OP_TRMC_INIT));
     ASSERT(code_tree_has_opcode(code, OP_TRMC_APPEND));
-    ASSERT(code_tree_has_trmc_flag(code));
+    ASSERT(code_tree_has_trmc_mode(code, TRMC_MODE_HOLE));
+    // A capture-free body takes the cheaper mode, not the general one.
+    ASSERT(!code_tree_has_opcode(code, OP_TRMC_PUSH));
     PASS();
 }
 
@@ -6304,13 +6337,14 @@ TEST(trmc_loop_jump_clears_the_accumulator_init)
     PASS();
 }
 
-TEST(trmc_declines_when_the_element_calls_a_general_procedure)
+TEST(trmc_uses_fold_mode_when_the_element_can_capture)
 {
     unsigned env = default_environment();
     GC_GUARD;
     gc_protect(&env);
-    // f is an ordinary procedure, so it might capture a continuation; the
-    // half-built list would then be reachable from a second invocation.
+    // f is an ordinary procedure, so it might capture a continuation, and a
+    // mutated chain would be reachable from a second invocation. FOLD mode
+    // never mutates, so it takes this body where HOLE cannot.
     code_object *code = trmc_compile(
         "(define trmc-walk (lambda (n f)"
         "  (letrec ((loop (lambda (k)"
@@ -6318,18 +6352,19 @@ TEST(trmc_declines_when_the_element_calls_a_general_procedure)
         "    (loop n))))",
         env);
     ASSERT(code != NULL);
+    ASSERT(code_tree_has_trmc_mode(code, TRMC_MODE_FOLD));
+    ASSERT(code_tree_has_opcode(code, OP_TRMC_PUSH));
     ASSERT(!code_tree_has_opcode(code, OP_TRMC_APPEND));
-    ASSERT(!code_tree_has_trmc_flag(code));
     PASS();
 }
 
-TEST(trmc_declines_when_the_base_case_calls_a_general_procedure)
+TEST(trmc_uses_fold_mode_when_the_base_case_can_capture)
 {
     unsigned env = default_environment();
     GC_GUARD;
     gc_protect(&env);
-    // The base case runs with the accumulator live, so a capture there is
-    // just as dangerous as one in the element expression.
+    // The base case runs with the accumulator live, so a capture there rules
+    // out HOLE just as much as one in the element expression does.
     code_object *code = trmc_compile(
         "(define trmc-base (lambda (n f)"
         "  (letrec ((loop (lambda (k)"
@@ -6337,6 +6372,7 @@ TEST(trmc_declines_when_the_base_case_calls_a_general_procedure)
         "    (loop n))))",
         env);
     ASSERT(code != NULL);
+    ASSERT(code_tree_has_trmc_mode(code, TRMC_MODE_FOLD));
     ASSERT(!code_tree_has_opcode(code, OP_TRMC_APPEND));
     PASS();
 }
@@ -6358,13 +6394,15 @@ TEST(trmc_declines_when_cons_is_rebound)
     PASS();
 }
 
-TEST(trmc_declines_on_a_tail_call_to_another_procedure)
+TEST(trmc_demotes_a_foreign_tail_call_to_an_ordinary_call)
 {
     unsigned env = default_environment();
     GC_GUARD;
     gc_protect(&env);
-    // A TAILCALL returns the callee's value directly, without running the
-    // return that closes the chain.
+    // A TAILCALL would hand back the callee's value without running the
+    // return that finishes the accumulator, so inside a TRMC body it becomes
+    // an ordinary CALL - one extra frame at the base case, which is not the
+    // frame-per-element the transform removes.
     code_object *code = trmc_compile(
         "(define trmc-other (lambda (n g)"
         "  (letrec ((loop (lambda (k)"
@@ -6372,7 +6410,11 @@ TEST(trmc_declines_on_a_tail_call_to_another_procedure)
         "    (loop n))))",
         env);
     ASSERT(code != NULL);
-    ASSERT(!code_tree_has_opcode(code, OP_TRMC_APPEND));
+    const code_object *body = code_tree_find_trmc(code);
+    ASSERT(body != NULL);
+    ASSERT(body->trmc_mode == TRMC_MODE_FOLD);
+    ASSERT(!code_has_opcode(body, OP_TAILCALL));
+    ASSERT(code_has_opcode(body, OP_CALL));
     PASS();
 }
 
@@ -6388,7 +6430,136 @@ TEST(trmc_declines_for_a_top_level_define)
         "  (if (= n 0) '() (cons n (trmc-global (- n 1))))))",
         env);
     ASSERT(code != NULL);
+    ASSERT(code_tree_has_trmc_mode(code, TRMC_MODE_NONE));
+    ASSERT(!code_tree_has_opcode(code, OP_TRMC_INIT));
+    PASS();
+}
+
+TEST(trmc_folds_string_append)
+{
+    unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
+    // A string has no patchable tail, so there is no hole to leave open;
+    // string-append can only be replayed at the return. That turns the
+    // quadratic left fold into one pass over the pieces.
+    code_object *code = trmc_compile(
+        "(define trmc-spell (lambda (n s)"
+        "  (letrec ((loop (lambda (k)"
+        "    (if (= k 0) \"\" (string-append s (loop (- k 1)))))))"
+        "    (loop n))))",
+        env);
+    ASSERT(code != NULL);
+    ASSERT(code_tree_has_trmc_mode(code, TRMC_MODE_FOLD));
+    ASSERT(code_tree_has_opcode(code, OP_TRMC_PUSH));
+    ASSERT(compiled_eval_string(
+               "(define trmc-spell (lambda (n s)"
+               "  (letrec ((loop (lambda (k)"
+               "    (if (= k 0) \"\" (string-append s (loop (- k 1)))))))"
+               "    (loop n))))",
+               env) != TOK_ERROR);
+    unsigned len = compiled_eval_string("(string-length (trmc-spell 50000 \"ab\"))",
+                                        env);
+    ASSERT(is_int(len, 100000));
+    PASS();
+}
+
+TEST(trmc_fold_mode_leaves_an_earlier_result_alone)
+{
+    unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
+    // FOLD's accumulator is built by prepending, which allocates but never
+    // mutates, so re-entering a continuation captured in the loop rebuilds
+    // from that continuation's own accumulator value. The list the first run
+    // returned must be untouched - the property HOLE mode cannot offer, and
+    // the reason FOLD needs no restriction on the body.
+    ASSERT(compiled_eval_string("(define trmc-k #f)", env) != TOK_ERROR);
+    ASSERT(compiled_eval_string("(define trmc-saved #f)", env) != TOK_ERROR);
+    ASSERT(compiled_eval_string("(define (trmc-id x) x)", env) != TOK_ERROR);
+    ASSERT(compiled_eval_string(
+               "(define trmc-cap (lambda (n)"
+               "  (letrec ((loop (lambda (j)"
+               "    (if (= j 0) '()"
+               "        (cons (trmc-id (call-with-current-continuation"
+               "                        (lambda (c)"
+               "                          (if (= j 1) (set! trmc-k c)) j)))"
+               "              (loop (- j 1)))))))"
+               "    (loop n))))",
+               env) != TOK_ERROR);
+    unsigned out = compiled_eval_string(
+        "(call-with-current-continuation"
+        "  (lambda (return)"
+        "    (let ((lst (trmc-cap 3)))"
+        "      (if (not trmc-saved)"
+        "          (begin (set! trmc-saved lst)"
+        "                 (let ((c trmc-k)) (set! trmc-k #f) (c 99))))"
+        "      (return (cons trmc-saved lst)))))",
+        env);
+    ASSERT(out != TOK_ERROR && IS_PAIR(out));
+    unsigned first = car(out), second = cdr(out);
+    // first is (3 2 1), second is (3 2 99)
+    ASSERT(is_int(car(first), 3));
+    ASSERT(is_int(car(cdr(cdr(first))), 1));
+    ASSERT(is_int(car(cdr(cdr(second))), 99));
+    PASS();
+}
+
+TEST(trmc_transforms_append_over_a_self_tail_call)
+{
+    unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
+    code_object *code = trmc_compile(
+        "(define trmc-spans (lambda (n)"
+        "  (letrec ((loop (lambda (k)"
+        "    (if (= k 0) '() (append (list k k) (loop (- k 1)))))))"
+        "    (loop n))))",
+        env);
+    ASSERT(code != NULL);
+    ASSERT(code_tree_has_opcode(code, OP_TRMC_SPLICE));
+    // The element opcode belongs to the cons shape, not this one.
     ASSERT(!code_tree_has_opcode(code, OP_TRMC_APPEND));
+    PASS();
+}
+
+TEST(trmc_append_shares_its_final_argument)
+{
+    unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
+    // R7RS: append copies every argument but the last, which it shares. The
+    // transform has to preserve that - the base case value is spliced in by
+    // reference, not copied.
+    ASSERT(compiled_eval_string("(define trmc-shared-tail '(9 9))", env) !=
+           TOK_ERROR);
+    ASSERT(compiled_eval_string(
+               "(define trmc-shared (lambda (n)"
+               "  (letrec ((loop (lambda (k)"
+               "    (if (= k 0) trmc-shared-tail"
+               "        (append (list k) (loop (- k 1)))))))"
+               "    (loop n))))",
+               env) != TOK_ERROR);
+    unsigned shared = compiled_eval_string(
+        "(eq? (cdr (cdr (cdr (trmc-shared 3)))) trmc-shared-tail)", env);
+    ASSERT(shared == ctx.atom_true);
+    PASS();
+}
+
+TEST(trmc_append_rejects_an_improper_operand)
+{
+    unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
+    // A dotted argument in any but the final position is an error for
+    // append, and stays one after the transform.
+    ASSERT(compiled_eval_string(
+               "(define trmc-improper (lambda (n)"
+               "  (letrec ((loop (lambda (k)"
+               "    (if (= k 0) '() (append '(1 . 2) (loop (- k 1)))))))"
+               "    (loop n))))",
+               env) != TOK_ERROR);
+    ASSERT(compiled_eval_string("(trmc-improper 2)", env) == TOK_ERROR);
     PASS();
 }
 
@@ -6440,6 +6611,37 @@ TEST(trmc_handles_empty_single_and_non_list_base_cases)
     unsigned dtail = cdr(cdr(dotted));
     ASSERT(CELL_TYPE(dtail) == BT_ATOM);
     ASSERT_STR_EQ(ctx.atom_table[CELL_ID(dtail)], "end");
+    PASS();
+}
+
+TEST(trmc_fold_mode_runs_beyond_the_frame_ceiling)
+{
+    unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
+    // FOLD mode has to clear the ceiling too, and its return does real work
+    // per level rather than one set-cdr!, so the replay is what is under test
+    // here as much as the loop.
+    ASSERT(compiled_eval_string("(define (trmc-scale x) (* x 10))", env) !=
+           TOK_ERROR);
+    ASSERT(compiled_eval_string(
+               "(define trmc-walk (lambda (n)"
+               "  (letrec ((loop (lambda (k)"
+               "    (if (= k 0) '() (cons (trmc-scale k) (loop (- k 1)))))))"
+               "    (loop n))))",
+               env) != TOK_ERROR);
+    unsigned len = compiled_eval_string("(length (trmc-walk 2000000))", env);
+    ASSERT(is_int(len, 2000000));
+
+    // Arithmetic, where the accumulator holds numbers rather than list cells.
+    ASSERT(compiled_eval_string(
+               "(define trmc-total (lambda (n)"
+               "  (letrec ((loop (lambda (k)"
+               "    (if (= k 0) 0 (+ k (loop (- k 1)))))))"
+               "    (loop n))))",
+               env) != TOK_ERROR);
+    unsigned sum = compiled_eval_string("(trmc-total 2000000)", env);
+    ASSERT(is_int(sum, 2000001000000LL));
     PASS();
 }
 
@@ -6799,13 +7001,19 @@ int main(void)
     // Tail recursion modulo cons
     RUN_TEST(trmc_transforms_cons_over_a_self_tail_call);
     RUN_TEST(trmc_loop_jump_clears_the_accumulator_init);
-    RUN_TEST(trmc_declines_when_the_element_calls_a_general_procedure);
-    RUN_TEST(trmc_declines_when_the_base_case_calls_a_general_procedure);
+    RUN_TEST(trmc_uses_fold_mode_when_the_element_can_capture);
+    RUN_TEST(trmc_uses_fold_mode_when_the_base_case_can_capture);
     RUN_TEST(trmc_declines_when_cons_is_rebound);
-    RUN_TEST(trmc_declines_on_a_tail_call_to_another_procedure);
+    RUN_TEST(trmc_demotes_a_foreign_tail_call_to_an_ordinary_call);
     RUN_TEST(trmc_declines_for_a_top_level_define);
+    RUN_TEST(trmc_folds_string_append);
+    RUN_TEST(trmc_fold_mode_leaves_an_earlier_result_alone);
+    RUN_TEST(trmc_transforms_append_over_a_self_tail_call);
+    RUN_TEST(trmc_append_shares_its_final_argument);
+    RUN_TEST(trmc_append_rejects_an_improper_operand);
     RUN_TEST(trmc_result_matches_the_untransformed_function);
     RUN_TEST(trmc_handles_empty_single_and_non_list_base_cases);
+    RUN_TEST(trmc_fold_mode_runs_beyond_the_frame_ceiling);
     RUN_TEST(trmc_builds_beyond_the_frame_ceiling);
 
     TEST_SUMMARY("evaluator");

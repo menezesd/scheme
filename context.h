@@ -376,6 +376,8 @@ static inline unsigned list_last(unsigned lst)
 
 // Append element to list being built (modifies head/tail pointers)
 void list_append(unsigned *head, unsigned *tail, unsigned elem);
+bool list_append_copy(unsigned *head, unsigned *tail, unsigned list,
+                      const char *name);
 
 // Overflow-checked array allocation helpers.
 void *checked_malloc_array(unsigned count, size_t elem_size);

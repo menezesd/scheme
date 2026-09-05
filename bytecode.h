@@ -206,13 +206,26 @@ enum opcode {
     OP_LT_INT_JUMPIFNOT,  // Fixnum compare+branch
     OP_NUMEQ_INT_JUMPIFNOT,
 
-    // Tail recursion modulo cons. A function whose only recursive call sits
-    // inside a (cons E (self ...)) in tail position is compiled as a loop that
-    // builds the list forwards and mutates the last cell's cdr, instead of
-    // holding one frame per element. TRMC_INIT reserves the accumulator; the
-    // chain's open tail is closed by RETURN_LOCALS under code->trmc.
-    OP_TRMC_INIT,   // push head=() and tail=() as two stack locals
-    OP_TRMC_APPEND, // pop v; cell = (v . ()); link it in; tail = cell
+    // Tail recursion modulo a constructor. A function whose recursive call
+    // sits inside one - (cons E (self ...)), (append E (self ...)) - needs a
+    // frame per level to hold the pending operation. Both modes below turn it
+    // into a loop; TRMC_INIT reserves the accumulator and RETURN_LOCALS
+    // finishes it, under code->trmc_mode.
+    //
+    // HOLE mode builds the result forwards in one pass, mutating the last
+    // cell's cdr, which is what map in stdlib.scm does by hand. It is the
+    // cheaper mode and the restricted one: the half-built structure must stay
+    // unobservable, so the body has to be capture-free.
+    //
+    // FOLD mode stacks the pending operands functionally and replays them at
+    // the return. It costs a second pass and one cell per level more, and in
+    // exchange it is unrestricted: prepending never mutates, so a re-entered
+    // continuation just rebuilds from its own accumulator value, and for a
+    // pure operator nothing about the evaluation order changes at all.
+    OP_TRMC_INIT,   // reserve the accumulator (2 slots for HOLE, 1 for FOLD)
+    OP_TRMC_APPEND, // HOLE: pop v; cell = (v . ()); link it in; tail = cell
+    OP_TRMC_SPLICE, // HOLE: pop list; copy its spine onto the accumulator
+    OP_TRMC_PUSH,   // FOLD: pop v; acc = (v . acc), allocating but not mutating
 
     // Marker for exception-handler return frames (never emitted by the
     // compiler; see vm_signal_error). Firing it signals the R7RS
@@ -221,6 +234,11 @@ enum opcode {
 
     OP_COUNT // Number of opcodes (must be last)
 };
+
+// TRMC accumulator strategies; see the OP_TRMC_* opcodes for the trade-off.
+#define TRMC_MODE_NONE 0
+#define TRMC_MODE_HOLE 1 // one pass, mutates an open cdr, capture-free bodies
+#define TRMC_MODE_FOLD 2 // two passes, purely functional, any body
 
 // ============================================================================
 // Code Object
@@ -252,12 +270,13 @@ typedef struct code_object {
     unsigned rest_idx; // Index of rest parameter (if has_rest)
     bool use_locals;   // True if params are stack locals (not in env)
 
-    // Tail recursion modulo cons. Set by the compiler when the body was
-    // compiled with a TRMC accumulator, which RETURN_LOCALS has to close.
-    // A flag read by the existing return rather than a separate return
-    // opcode, so no other site that ends a tail position has to know.
-    bool trmc;          // True if this body carries a TRMC accumulator
-    unsigned trmc_slot; // Local slot of head; tail is trmc_slot + 1
+    // Tail recursion modulo a constructor. Read by RETURN_LOCALS, which has
+    // to finish the accumulator - a flag on the existing return rather than
+    // a separate return opcode, so no other site that ends a tail position
+    // has to know this exists.
+    unsigned char trmc_mode; // TRMC_MODE_*, 0 when the body has no accumulator
+    unsigned trmc_slot;      // First accumulator slot (HOLE also uses +1)
+    unsigned trmc_op;        // TRMC_MODE_FOLD: the primitive to fold with
 
     // Source info for debugging
     const char *name;     // Function name (if known)
@@ -436,10 +455,12 @@ typedef struct compile_ctx {
                                 // TRMC_INIT sits before the body and must not
                                 // be re-run on each iteration.
 
-    // Tail recursion modulo cons, decided for the whole body before it is
-    // compiled (see trmc_body_qualifies) so TRMC_INIT can be emitted first.
-    bool trmc_enabled;          // (cons E (self ...)) compiles to append+loop
-    unsigned trmc_slot;         // Local slot of head; tail is trmc_slot + 1
+    // Tail recursion modulo a constructor, decided for the whole body before
+    // it is compiled (see trmc_body_qualifies) so TRMC_INIT can be emitted
+    // ahead of the loop entry point.
+    unsigned char trmc_mode;    // TRMC_MODE_*, 0 when not transforming
+    unsigned trmc_slot;         // First accumulator slot
+    unsigned trmc_op;           // FOLD mode: the primitive to fold with
 
     unsigned env_depth;         // Number of PUSHENV frames since lambda entry
     unsigned macro_expansion_depth; // Guard against recursive expansion

@@ -1502,6 +1502,113 @@ b")
 (test "the first result is not mutated by the second run" '(3 2 1)
     (car trmc-reentry))
 
+(test-section "Tail recursion modulo append")
+;; append already copies every argument but the last and shares that one,
+;; which is the accumulator's shape exactly. Splicing the copies outermost
+;; first does the same total work; a left fold over append would recopy the
+;; whole prefix each iteration and be quadratic.
+(define (trmc-spans n)
+  (let loop ((k n))
+    (if (= k 0) '() (append (list k k) (loop (- k 1))))))
+(test "append-modulo builds in order" '(3 3 2 2 1 1) (trmc-spans 3))
+(test "1M elements from 500k appends" 1000000 (length (trmc-spans 500000)))
+(test "empty operands contribute nothing" '(6 4 2)
+    (let loop ((k 6))
+      (if (= k 0) '() (append (if (even? k) (list k) '()) (loop (- k 1))))))
+(test "n-ary append splices operands left to right" '(3 -3 2 -2 1 -1 end)
+    (let loop ((k 3))
+      (if (= k 0) '(end)
+          (append (list k) (list (- k)) (loop (- k 1))))))
+
+;; The last argument is shared, not copied - the one place append's identity
+;; is observable through eq?.
+(define trmc-shared-tail '(9 9))
+(define (trmc-shared n)
+  (let loop ((k n))
+    (if (= k 0) trmc-shared-tail (append (list k) (loop (- k 1))))))
+(test "the base case value is shared, not copied" #t
+    (eq? (list-tail (trmc-shared 3) 3) trmc-shared-tail))
+(test "append-modulo result is otherwise correct" '(3 2 1 9 9)
+    (trmc-shared 3))
+(test "an improper operand is still an error" 'err
+    (guard (e (#t 'err))
+      (let loop ((k 2)) (if (= k 0) '() (append '(1 . 2) (loop (- k 1)))))))
+
+(test-section "Tail recursion modulo a general operator")
+;; Where there is no hole to mutate - string-append, arithmetic - or where the
+;; body could capture a continuation, the pending operations are stacked
+;; functionally and replayed at the return instead. Prepending never mutates,
+;; so this mode needs no restriction on the body; and for a pure operator
+;; nothing about the evaluation order changes, since the operands were already
+;; evaluated outermost-first and the operator still applies innermost-first.
+
+;; Depths here are modest on purpose. This file runs in both engines, and the
+;; CPS interpreter has no such transform - it really does recurse, at about
+;; 17s per 200k levels. That the transform clears the VM's frame ceiling is
+;; asserted in test_eval, which is VM-only and can afford the depth.
+
+;; The element is a general call, which the mutating mode cannot accept.
+(define (trmc-scale x) (* x 10))
+(define (trmc-walk n)
+  (let loop ((k n))
+    (if (= k 0) '() (cons (trmc-scale k) (loop (- k 1))))))
+(test "general element expression" '(50 40 30 20 10) (trmc-walk 5))
+(test "100k elements with a general element" 100000 (length (trmc-walk 100000)))
+
+;; string-append: quadratic as a left fold, one pass as a replay.
+(define (trmc-spell n)
+  (let loop ((k n))
+    (if (= k 0) "" (string-append (number->string k) "," (loop (- k 1))))))
+(test "string-append modulo" "5,4,3,2,1," (trmc-spell 5))
+(test "50k string-append levels" 288894
+    (string-length (trmc-spell 50000)))
+
+;; Arithmetic over exact integers.
+(define (trmc-total n)
+  (let loop ((k n))
+    (if (= k 0) 0 (+ k (loop (- k 1))))))
+(test "sum of 1..10" 55 (trmc-total 10))
+(test "sum of 1..100000" 5000050000 (trmc-total 100000))
+
+;; Subtraction is not associative, and does not have to be: the replay applies
+;; the operator innermost-first, exactly as the recursion would have.
+(define (trmc-alt n)
+  (let loop ((k n))
+    (if (= k 0) 0 (- k (loop (- k 1))))))
+(test "non-associative operator keeps its nesting" 3 (trmc-alt 5))
+(test "non-associative operator, deep" 50000 (trmc-alt 100000))
+
+;; A tail call to another procedure becomes an ordinary call inside a
+;; transformed body, so the return that replays the operations still runs.
+(define (trmc-fin) '(done))
+(define (trmc-calls n)
+  (let loop ((k n))
+    (if (= k 0) (trmc-fin) (cons k (loop (- k 1))))))
+(test "foreign tail call in the base case" '(3 2 1 done) (trmc-calls 3))
+
+;; The property the mutating mode cannot offer: re-entering a continuation
+;; captured in the loop rebuilds from that continuation's own accumulator and
+;; leaves the first result alone.
+(define trmc-fk #f)
+(define trmc-fsaved #f)
+(define (trmc-fcap n)
+  (let loop ((j n))
+    (if (= j 0)
+        '()
+        (cons (trmc-scale (call-with-current-continuation
+                           (lambda (c) (if (= j 1) (set! trmc-fk c)) j)))
+              (loop (- j 1))))))
+(define trmc-freentry
+  (call-with-current-continuation
+   (lambda (return)
+     (let ((lst (trmc-fcap 3)))
+       (if (not trmc-fsaved)
+           (begin (set! trmc-fsaved lst)
+                  (let ((c trmc-fk)) (set! trmc-fk #f) (c 99))))
+       (return (list trmc-fsaved lst))))))
+(test "re-entry rebuilds independently" '(30 20 990) (cadr trmc-freentry))
+(test "the first result is untouched" '(30 20 10) (car trmc-freentry))
+
 (test-section "Macro expansion guard is a depth, not a total")
 ;; The CPS interpreter's expansion guard used to be a cumulative cap: any
 ;; single top-level form that expanded more than 1000 macro uses in total

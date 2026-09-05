@@ -126,6 +126,29 @@
 (check "trmc element expression allocates too" '((3) (2) (1))
        (let loop ((k 3)) (if (= k 0) '() (cons (list k) (loop (- k 1))))))
 
+;; The append shape copies a spine per iteration, so TRMC_SPLICE allocates
+;; several cells per element rather than one - more chances for a collection
+;; to land mid-copy, with the accumulator half-linked.
+(check "trmc append splices under forced collections" '(3 3 2 2 1 1)
+       (let loop ((k 3)) (if (= k 0) '() (append (list k k) (loop (- k 1))))))
+(check "trmc append length under forced collections" 40
+       (length (let loop ((k 20))
+                 (if (= k 0) '() (append (list k k) (loop (- k 1)))))))
+
+;; The functional accumulator allocates a cell per level while building and
+;; then applies the operator once per level at the return, so a forced
+;; collection lands on both halves. The cursor walking it during the replay is
+;; the accumulator's own stack slot, which is what makes it survive.
+(check "trmc fold rebuilds a list under forced collections" '(30 20 10)
+       (let ((scale (lambda (x) (* x 10))))
+         (let loop ((k 3))
+           (if (= k 0) '() (cons (scale k) (loop (- k 1)))))))
+(check "trmc fold string-append under forced collections" "3,2,1,"
+       (let loop ((k 3))
+         (if (= k 0) "" (string-append (number->string k) "," (loop (- k 1))))))
+(check "trmc fold arithmetic under forced collections" 210
+       (let loop ((k 20)) (if (= k 0) 0 (+ k (loop (- k 1))))))
+
 (newline)
 (display "GC stress tests: ")
 (display (if (= failures 0) "all passed" "FAILURES"))
