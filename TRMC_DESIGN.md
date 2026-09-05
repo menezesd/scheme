@@ -1,6 +1,79 @@
-# Tail Recursion Modulo Cons — design
+# Tail Recursion Modulo Cons — design and status
 
-Status: design only, nothing implemented. Read this before starting.
+Status: implemented, in two modes. This file records what was built and what
+the design got wrong; the sections below are the original plan, annotated.
+
+## What exists
+
+`(op E1..Ek (self a1..an))` in tail position compiles to a loop instead of a
+frame per level, for any `op` that is a pure primitive. Two strategies:
+
+**HOLE** — one pass, mutating an open cdr, as the original plan describes.
+Applies to `cons` and to `append` (which already copies every argument but the
+last and shares that one, so a run of copied spines ending in an open cdr is
+exactly its shape). Requires the body to be capture-free, for the call/cc
+reason below.
+
+**FOLD** — the pending operands are stacked by prepending and replayed at the
+return. Costs a second pass and one cell per level more. In exchange it is
+unrestricted, and that turned out to matter more than the original plan
+assumed:
+
+- It is not a reassociation and does not need one. In `(op E (self ...))` the
+  operand is evaluated before the recursive call either way, and the replay
+  runs innermost-first, which is the order the recursion would have applied
+  them in as it unwound. Same calls, same values, same sequence; only the
+  timing moves. So `(- k (loop ...))` transforms correctly despite subtraction
+  being about as non-associative as it gets, and float `+` raises none of the
+  questions it would for an accumulator that folds left.
+- Prepending allocates but never mutates, so a continuation captured anywhere
+  in the body restores its own accumulator value and rebuilds from it. The
+  first run's result is untouched. That is precisely the hazard HOLE has to
+  exclude, so FOLD needs no capture-free requirement at all.
+
+`(cons (f x) (walk (cdr xs)))` — the shape the plan singled out as excluded —
+therefore compiles. HOLE is preferred where it applies because one pass and
+one cell per element beats two and two.
+
+## What the plan got wrong
+
+**Top-level `define` was never eligible.** The plan's own example,
+`(define (build n) ...)`, does not qualify: the loop optimization is armed by
+`compile_letrec`, and a global can be redefined between iterations, so its
+self-call cannot legally become a jump. The shape that works is a named `let`,
+which reaches `letrec` through the stdlib's own `let` macro. The C
+`compile_named_let` never arms the loop optimization either, so `test_eval` —
+which runs without the stdlib — has to spell the `letrec` out.
+
+**Stage 2 was not about `env_depth`.** Following `cond` needed nothing but
+walking it, since `cond` pushes no frame. `let` does push one, and
+`emit_self_call_loop` now unwinds pending frames before the jump — but with
+the stdlib loaded, `let` is a macro that expands to `((lambda (d) ...) val)`,
+so the real blocker is elsewhere: `captured_by_inner_lambda` counts a
+reference from inside that lambda as a capture even though it is inlined and
+never becomes a closure, which costs the function its stack locals, which TRMC
+needs for the accumulator's address. Teaching that walk about
+immediately-applied lambdas is the actual stage 2, and it has to match the
+inliner's acceptance conditions exactly.
+
+**`max`, `min`, `gcd`, `lcm` get nothing.** They are stdlib procedures, not
+primitives, so they are ordinary calls. That is the right answer, but it means
+the arithmetic coverage is whatever the primitive table happens to hold.
+
+## Still open
+
+- The `captured_by_inner_lambda` change above, which is what makes `let`
+  bodies work under the stdlib.
+- More than one operator per body: the return can only finish one
+  accumulator, so a body mixing `cons` and `append` sites transforms only the
+  first operator's and leaves the rest as ordinary recursion (correct, just
+  not optimized).
+- Vectors, which would need a different accumulator and are probably not worth
+  it.
+
+---
+
+# Original design
 
 ## The problem
 

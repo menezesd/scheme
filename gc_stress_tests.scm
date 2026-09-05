@@ -149,6 +149,16 @@
 (check "trmc fold arithmetic under forced collections" 210
        (let loop ((k 20)) (if (= k 0) 0 (+ k (loop (- k 1))))))
 
+;; The same accumulator reached through cond and through a let frame - the
+;; let case also unwinds an environment frame on every iteration, so a
+;; collection can land between the unwind and the jump.
+(check "trmc under cond with forced collections" '(4 3 2 1)
+       (let loop ((k 4))
+         (cond ((= k 0) '()) (else (cons k (loop (- k 1)))))))
+(check "trmc under a let frame with forced collections" '(8 6 4 2)
+       (let loop ((k 4))
+         (if (= k 0) '() (let ((d (* k 2))) (cons d (loop (- k 1)))))))
+
 (newline)
 (display "GC stress tests: ")
 (display (if (= failures 0) "all passed" "FAILURES"))

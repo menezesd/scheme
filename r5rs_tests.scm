@@ -1609,6 +1609,36 @@ b")
 (test "re-entry rebuilds independently" '(30 20 990) (cadr trmc-freentry))
 (test "the first result is untouched" '(30 20 10) (car trmc-freentry))
 
+(test-section "TRMC under cond, and/or and let")
+;; cond pushes no environment frame, so its clause bodies sit at the same
+;; depth as an if's branches.
+(define (trmc-cond n)
+  (let loop ((k n))
+    (cond ((= k 0) '())
+          (else (cons k (loop (- k 1)))))))
+(test "cond clause bodies" '(3 2 1) (trmc-cond 3))
+(test "cond, past the frame ceiling" 1200000 (length (trmc-cond 1200000)))
+(test "cond with several clauses" '(3 -2 1)
+    (let loop ((k 3))
+      (cond ((= k 0) '())
+            ((even? k) (cons (- k) (loop (- k 1))))
+            (else (cons k (loop (- k 1)))))))
+
+;; Only the last operand of and/or is in tail position.
+(test "and contributes its last operand" '(2 1)
+    (let loop ((k 2)) (and #t (if (= k 0) '() (cons k (loop (- k 1)))))))
+(test "or short-circuits to the accumulator's tail" '(2 1 . #f)
+    (let loop ((k 2)) (or (if (= k 0) #f (cons k (loop (- k 1)))) #f)))
+
+;; A let frame has to come off before the loop jump; leaking one per
+;; iteration would exhaust the environment long before this finishes.
+(define (trmc-let n)
+  (let loop ((k n))
+    (if (= k 0) '()
+        (let ((d (* k 2))) (cons d (loop (- k 1)))))))
+(test "let inside the loop body" '(6 4 2) (trmc-let 3))
+(test "let inside the loop body, deep" 200000 (length (trmc-let 200000)))
+
 (test-section "Macro expansion guard is a depth, not a total")
 ;; The CPS interpreter's expansion guard used to be a cumulative cap: any
 ;; single top-level form that expanded more than 1000 macro uses in total
