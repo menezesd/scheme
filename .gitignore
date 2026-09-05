@@ -21,6 +21,13 @@ test_unicode_case
 # Debug symbol bundles (macOS)
 *.dSYM/
 
+# clang static analyzer output
+*.plist
+
+# Python bytecode caches (tools/)
+__pycache__/
+*.pyc
+
 # Downloaded Unicode source files
 .unicode/
 

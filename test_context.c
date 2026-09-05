@@ -3241,6 +3241,8 @@ TEST(mk_primop_test)
 TEST(default_environment_has_primitives)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
 
     // Look up '+' primitive
     unsigned plus = atom_from_string("+");

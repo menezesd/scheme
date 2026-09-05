@@ -1172,22 +1172,34 @@ unsigned environment_with_imports(unsigned source, unsigned specs)
     unsigned target = 0;
     gc_protect(&result);
     gc_protect(&target);
-    for (unsigned env = source; IS_PAIR(env); env = cdr(env)) {
-        unsigned frame = car(env);
+    // The walk below calls defvar, which allocates. Under a minor collection
+    // that was harmless by accident: source is the pristine stdlib
+    // environment, whose cells live in the old generation and do not move.
+    // A major collection moves everything, so every cursor into source has
+    // to be rooted or the vars/vals walk desynchronises after the first
+    // defvar and the length check at the bottom reports mismatched bindings.
+    unsigned env = 0, frame = 0, vars = 0, vals = 0, var = 0;
+    gc_protect(&env);
+    gc_protect(&frame);
+    gc_protect(&vars);
+    gc_protect(&vals);
+    gc_protect(&var);
+    for (env = source; IS_PAIR(env); env = cdr(env)) {
+        frame = car(env);
         if (!IS_PAIR(frame) || !env_binding_list_acyclic(car(frame))) {
             show_error("environment: invalid source environment");
             gc_unprotect(4);
             return TOK_ERROR;
         }
-        unsigned vars = car(frame);
-        unsigned vals = cdr(frame);
+        vars = car(frame);
+        vals = cdr(frame);
         if (!proper_finite_list(vars) || !proper_finite_list(vals)) {
             show_error("environment: invalid source bindings");
             gc_unprotect(4);
             return TOK_ERROR;
         }
         while (IS_PAIR(vars) && IS_PAIR(vals)) {
-            unsigned var = car(vars);
+            var = car(vars);
             if (IS_ATOM(var)) {
                 const char *name = valid_atom_name(var);
                 if (!name) {

@@ -1312,6 +1312,25 @@ b")
      (string-append (symbol->string (string->symbol "+inf.0")) "-sym")))
 (test "infinity literal" #t (> +inf.0 0))
 
+(test-section "Macro expansion guard is a depth, not a total")
+;; The CPS interpreter's expansion guard used to be a cumulative cap: any
+;; single top-level form that expanded more than 1000 macro uses in total
+;; failed with "macro expansion exceeded maximum depth", even with no nesting
+;; at all. eval in a loop is the natural trigger.
+(define-syntax guard-probe-macro
+  (syntax-rules () ((_ x) (let ((tmp x)) (+ tmp 1)))))
+(test "1500 evals of a macro call in one form" 1500
+    (let ((env (interaction-environment)))
+      (let loop ((i 0) (acc 0))
+        (if (= i 1500)
+            acc
+            (loop (+ i 1) (+ acc (- (eval '(guard-probe-macro 0) env) 0)))))))
+;; ...while a genuinely infinite expansion must still be caught, not hang.
+(define-syntax runaway-probe-macro
+  (syntax-rules () ((_) (runaway-probe-macro))))
+(test "infinite macro expansion is still caught" 'caught
+    (guard (e (#t 'caught)) (runaway-probe-macro)))
+
 ;;; ============================================================================
 ;;; Summary
 ;;; ============================================================================

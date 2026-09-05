@@ -824,12 +824,6 @@ static inline int32_t FIXNUM_VALUE(unsigned v)
 // Argument Checking Macros
 // ============================================================================
 
-#define REQUIRE_ARGS(args, min, max, name)                                     \
-    do {                                                                       \
-        if (!check_args(args, min, max, name))                                 \
-            return TOK_ERROR;                                                  \
-    } while (0)
-
 #define REQUIRE_TYPE(val, expected_type, name)                                 \
     do {                                                                       \
         if (CELL_TYPE(val) != expected_type) {                                 \

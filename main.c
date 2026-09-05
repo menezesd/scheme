@@ -30,6 +30,14 @@ static int eval_depth = 0;
 // Evaluate expression (interpreter or bytecode depending on mode)
 static unsigned eval_expr(unsigned expr, unsigned env)
 {
+    // Both parameters are by-value copies, so a caller's gc_protect (or the
+    // alloc root in main) does not cover them. compile_toplevel and vm_run
+    // both allocate, and env is still used afterwards for the error-boundary
+    // setvar calls, so root them for the whole function.
+    GC_GUARD;
+    gc_protect(&expr);
+    gc_protect(&env);
+
     unsigned result;
     if (use_bytecode) {
         code_object *code = compile_toplevel(expr, env);
@@ -89,12 +97,15 @@ static void restore_reader_context(const char *filename)
 // Evaluate a batch of expressions as a begin form
 static unsigned eval_batch(unsigned exprs, unsigned env)
 {
+    // env must be rooted before the allocations below, not just exprs.
+    GC_GUARD;
+    gc_protect(&env);
+
     if (!exprs)
         return 0;
     if (!cdr(exprs))
         return eval_expr(car(exprs), env);
 
-    GC_GUARD;
     gc_protect(&exprs);
     unsigned begin_atom = alloc();
     CELL_TYPE(begin_atom) = BT_ATOM;
@@ -108,6 +119,8 @@ static unsigned eval_batch(unsigned exprs, unsigned env)
 static bool eval_pending_batch(unsigned *batch, unsigned *batch_tail,
                                unsigned env, bool warn_on_error)
 {
+    GC_GUARD;
+    gc_protect(&env);
     if (!*batch)
         return true;
     unsigned result = eval_batch(*batch, env);
@@ -129,9 +142,15 @@ static bool load_from_port(FILE *f, unsigned *env, bool warn_on_error,
     reader_set_filename(filename);
     reader_reset_position();
 
-    // Evaluate expressions as they are read, batching consecutive
-    // non-macro expressions for call/cc support.  Streaming avoids retaining
-    // the entire input file in the heap and keeps the GC root set bounded.
+    // Consecutive non-macro expressions are batched into one begin form so a
+    // continuation captured in an earlier form can still be resumed from a
+    // later one. A define-syntax forces the batch out first, since the macro
+    // has to exist before anything after it is compiled.
+    //
+    // A batch that is still pending when reading stops - at a syntax error as
+    // much as at EOF - has to be evaluated anyway. Dropping it would mean a
+    // typo near the end of a file silently skipped every form since the last
+    // define-syntax, while the forms before that define-syntax still ran.
     unsigned batch = 0, batch_tail = 0;
     gc_protect(&batch);
     gc_protect(&batch_tail);
@@ -139,6 +158,7 @@ static bool load_from_port(FILE *f, unsigned *env, bool warn_on_error,
     for (;;) {
         unsigned expr = read_obj_port(f);
         if (expr == TOK_ERROR) {
+            eval_pending_batch(&batch, &batch_tail, *env, warn_on_error);
             restore_reader_context(old_filename);
             return false;
         }
@@ -146,6 +166,7 @@ static bool load_from_port(FILE *f, unsigned *env, bool warn_on_error,
             break;
         if (expr == TOK_CLOSE || expr == TOK_DOT) {
             show_error("unexpected reader token at top level");
+            eval_pending_batch(&batch, &batch_tail, *env, warn_on_error);
             restore_reader_context(old_filename);
             return false;
         }

@@ -31,7 +31,7 @@ UBSAN_OBJS = $(SRCS:.c=.ubsan.o)
 UBSAN_CFLAGS = $(DEBUG_CFLAGS) -fsanitize=undefined
 UBSAN_LDFLAGS = $(LDFLAGS) -fsanitize=undefined
 
-.PHONY: all clean distclean debug sanitize ubsan test test-interpreter test-c test-prop test-r5rs test-stress test-sanitize test-ubsan test-repl-exit test-diff test-all unicode-tables
+.PHONY: all clean distclean debug sanitize ubsan test test-interpreter test-c test-prop test-r5rs test-stress test-sanitize test-ubsan test-repl-exit test-diff test-gcstress test-all unicode-tables
 
 all: $(TARGET)
 
@@ -164,31 +164,33 @@ INTERP_OBJS = context.o reader.o writer.o env.o primitive_table.o feature_table.
 test-c: $(TEST_BINS)
 	@for t in $(TEST_BINS); do ./$$t || exit 1; done
 
-test_bignum: test_bignum.c bignum.o
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+# test_framework.h defines the assertion macros every test binary uses, so a
+# change to it has to relink them all.
+test_bignum: test_bignum.c bignum.o test_framework.h
+	$(CC) $(CFLAGS) -o $@ test_bignum.c bignum.o $(LDFLAGS)
 
-test_bignum_ubsan: test_bignum.c bignum.ubsan.o
-	$(CC) $(UBSAN_CFLAGS) -o $@ $^ $(UBSAN_LDFLAGS)
+test_bignum_ubsan: test_bignum.c bignum.ubsan.o test_framework.h
+	$(CC) $(UBSAN_CFLAGS) -o $@ test_bignum.c bignum.ubsan.o $(UBSAN_LDFLAGS)
 
-test_reader: test_reader.c $(INTERP_OBJS)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+test_reader: test_reader.c $(INTERP_OBJS) test_framework.h
+	$(CC) $(CFLAGS) -o $@ test_reader.c $(INTERP_OBJS) $(LDFLAGS)
 
-test_context: test_context.c $(INTERP_OBJS)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+test_context: test_context.c $(INTERP_OBJS) test_framework.h
+	$(CC) $(CFLAGS) -o $@ test_context.c $(INTERP_OBJS) $(LDFLAGS)
 
-test_macros: test_macros.c $(INTERP_OBJS)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+test_macros: test_macros.c $(INTERP_OBJS) test_framework.h
+	$(CC) $(CFLAGS) -o $@ test_macros.c $(INTERP_OBJS) $(LDFLAGS)
 
-test_eval: test_eval.c $(INTERP_OBJS)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+test_eval: test_eval.c $(INTERP_OBJS) test_framework.h
+	$(CC) $(CFLAGS) -o $@ test_eval.c $(INTERP_OBJS) $(LDFLAGS)
 
-test_pattern: test_pattern.c $(INTERP_OBJS)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+test_pattern: test_pattern.c $(INTERP_OBJS) test_framework.h
+	$(CC) $(CFLAGS) -o $@ test_pattern.c $(INTERP_OBJS) $(LDFLAGS)
 
-test_unicode_norm: test_unicode_norm.c $(INTERP_OBJS) unicode_norm_test_data.h
+test_unicode_norm: test_unicode_norm.c $(INTERP_OBJS) unicode_norm_test_data.h test_framework.h
 	$(CC) $(CFLAGS) -o $@ test_unicode_norm.c $(INTERP_OBJS) $(LDFLAGS)
 
-test_unicode_case: test_unicode_case.c $(INTERP_OBJS) unicode_case_test_data.h
+test_unicode_case: test_unicode_case.c $(INTERP_OBJS) unicode_case_test_data.h test_framework.h
 	$(CC) $(CFLAGS) -o $@ test_unicode_case.c $(INTERP_OBJS) $(LDFLAGS)
 
 # Run property tests
@@ -239,14 +241,45 @@ test-repl-exit: $(TARGET)
 test-diff: $(TARGET)
 	@python3 tools/run_mit_differential.py
 
+# Force a collection every N allocations while loading the stdlib and running
+# a small workload, in both engines. Major intervals start at 200, not lower:
+# a full semispace copy is expensive, and the CPS interpreter allocates far
+# more per step than the VM, so MAJOR=17 there ran for the better part of an
+# hour. MAJOR=200 still lands hundreds of full collections across the workload.
+# Success is the workload's own verdict line plus a zero exit - not the absence
+# of "error:" in the output, which some cases print deliberately (an unbound
+# name evaluated inside a guard) before catching it. This is the only way rooting bugs show up
+# reliably: at the default cadence a collection lands during the stdlib load
+# roughly never, so a cell held across one survives by luck. Several intervals,
+# because each one lands collections at different points.
+test-gcstress: $(TARGET)
+	@for spec in "VESPER_GC_STRESS=1" "VESPER_GC_STRESS=17" \
+	             "VESPER_GC_STRESS=200" "VESPER_GC_STRESS=2000" \
+	             "VESPER_GC_STRESS_MAJOR=200" "VESPER_GC_STRESS_MAJOR=2000"; do \
+		for mode in "" "--interpreter"; do \
+			printf "gcstress %-26s %-14s " "$$spec" "$${mode:-vm}"; \
+			if env $$spec ./$(TARGET) $$mode gc_stress_tests.scm \
+			     > /tmp/vesper-gcstress.$$$$ 2>&1 && \
+			   grep -q "GC stress tests: all passed" /tmp/vesper-gcstress.$$$$; then \
+				echo "ok"; \
+			else \
+				echo "FAILED"; cat /tmp/vesper-gcstress.$$$$; \
+				rm -f /tmp/vesper-gcstress.$$$$; exit 1; \
+			fi; \
+			rm -f /tmp/vesper-gcstress.$$$$; \
+		done; \
+	done
+
 # Run all tests, including the UBSan-only smoke path that works on macOS
 # systems where ASan can hang before main.
-test-all: test test-interpreter test-c test-prop test-r5rs test-stress test-ubsan test-repl-exit
+test-all: test test-interpreter test-c test-prop test-r5rs test-stress test-ubsan test-repl-exit test-diff test-gcstress
 
 clean:
 	rm -f $(OBJS) $(DEBUG_OBJS) $(SAN_OBJS) $(UBSAN_OBJS) $(TARGET) \
 	      $(DEBUG_TARGET) $(SAN_TARGET) $(UBSAN_TARGET) $(TEST_BINS) \
 	      test_bignum_ubsan
+	rm -f *.plist
+	rm -rf tools/__pycache__
 
 # Format code (requires clang-format)
 format:

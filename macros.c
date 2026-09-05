@@ -3219,12 +3219,14 @@ unsigned syntax_expand(unsigned tmpl, unsigned bindings, unsigned mark,
         }
         // Check for ellipsis: (tmpl ... rest)
         if (IS_PAIR(cdr(tmpl)) && syntax_is_ellipsis(cadr(tmpl), ellipsis_id)) {
-            unsigned elem_tmpl = car(tmpl);
-            unsigned rest_tmpl = cddr(tmpl);
-
-            // Collect ALL ellipsis-bound variables in the template
+            // Collect ALL ellipsis-bound variables in the template.
+            // car(tmpl)/cddr(tmpl) are deliberately not hoisted above this
+            // call: it allocates, so a collection inside it moves them, and
+            // tmpl is the only one of the three that is rooted. Re-read them
+            // afterwards - the same refresh the vector branch below already
+            // does.
             unsigned ellipsis_vars =
-                collect_ellipsis_vars(elem_tmpl, bindings, 0);
+                collect_ellipsis_vars(car(tmpl), bindings, 0);
             gc_protect(&ellipsis_vars);
 
             // Find iteration count from first variable's values
@@ -3238,6 +3240,8 @@ unsigned syntax_expand(unsigned tmpl, unsigned bindings, unsigned mark,
             unsigned result = 0, result_tail = 0;
             gc_protect(&result);
             gc_protect(&result_tail);
+            unsigned elem_tmpl = car(tmpl);
+            unsigned rest_tmpl = cddr(tmpl);
             gc_protect(&elem_tmpl);
             gc_protect(&rest_tmpl);
 

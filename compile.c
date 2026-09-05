@@ -351,16 +351,23 @@ static compile_ctx *cctx_new(compile_ctx *parent, unsigned env)
     // Inherit known_lambdas from parent (they're still in scope)
     cctx->known_lambdas = parent ? parent->known_lambdas : 0;
     cctx->macro_expansion_depth = parent ? parent->macro_expansion_depth : 0;
-    // Protect env and known_lambdas so they're updated if GC runs
+    // Protect env, known_lambdas and loop_params so they're updated if GC
+    // runs. loop_params matters as much as the other two: compile_lambda
+    // copies it into the nested context for the loop optimization, and
+    // compile_call later walks it to decide which parameters a self tail call
+    // should SET. Compiling a lambda body allocates freely, so a stale
+    // loop_params yields SETs against the wrong symbols and the "loop" never
+    // advances - an infinite loop rather than a wrong answer.
     gc_protect(&cctx->env);
     gc_protect(&cctx->known_lambdas);
+    gc_protect(&cctx->loop_params);
     return cctx;
 }
 
 static void cctx_free(compile_ctx *cctx)
 {
-    // Unprotect env and known_lambdas that were protected in cctx_new
-    gc_unprotect(2);
+    // Unprotect env, known_lambdas and loop_params from cctx_new
+    gc_unprotect(3);
     // Note: code is transferred out, not freed here
     free(cctx);
 }
@@ -1025,7 +1032,12 @@ static unsigned rename_template_vars_lambda(unsigned tmpl, unsigned rename_map)
     unsigned params = cadr(tmpl);
     unsigned body = cddr(tmpl);
 
+    // tmpl is returned as-is when nothing below it changed, and everything
+    // below it allocates, so tmpl needs rooting as much as its parts do.
+    // Returning a stale index here hands the caller a cell that has since
+    // been reused - which silently corrupts the stored macro template.
     GC_GUARD;
+    gc_protect(&tmpl);
     gc_protect(&keyword);
     gc_protect(&params);
     gc_protect(&body);
@@ -1052,7 +1064,10 @@ static unsigned rename_template_vars_let(unsigned tmpl, unsigned rename_map,
     unsigned binding_list = cadr(tmpl);
     unsigned body = cddr(tmpl);
 
+    // Same as rename_template_vars_lambda: several paths return tmpl
+    // unchanged after allocating.
     GC_GUARD;
+    gc_protect(&tmpl);
     gc_protect(&keyword);
     gc_protect(&binding_list);
     gc_protect(&body);
@@ -1138,7 +1153,10 @@ static unsigned rename_template_vars_named_let(unsigned tmpl,
     unsigned binding_list = caddr(tmpl);
     unsigned body = cdddr(tmpl);
 
+    // Same as rename_template_vars_lambda: several paths return tmpl
+    // unchanged after allocating.
     GC_GUARD;
+    gc_protect(&tmpl);
     gc_protect(&keyword);
     gc_protect(&name);
     gc_protect(&binding_list);
@@ -1230,6 +1248,13 @@ static unsigned rename_template_vars(unsigned tmpl, unsigned rename_map)
             return tmpl;
         if (IS_ATOM(car(tmpl)) && CELL_ID(car(tmpl)) == ctx.kw_quasiquote &&
             IS_PAIR(cdr(tmpl)) && !head_is_alias) {
+            // rename_template_vars_quasiquote allocates, and car(tmpl) /
+            // cddr(tmpl) are read after it returns, so tmpl has to survive
+            // the call. GC_GUARD releases these on every exit, replacing the
+            // manual unprotect below.
+            GC_GUARD;
+            gc_protect(&tmpl);
+            gc_protect(&rename_map);
             unsigned new_body =
                 rename_template_vars_quasiquote(cadr(tmpl), rename_map, 1);
             if (new_body == TOK_ERROR)
@@ -1237,9 +1262,7 @@ static unsigned rename_template_vars(unsigned tmpl, unsigned rename_map)
             gc_protect(&new_body);
             unsigned result_tail = alloc_cons(new_body, cddr(tmpl));
             gc_protect(&result_tail);
-            unsigned result = alloc_cons(car(tmpl), result_tail);
-            gc_unprotect(2);
-            return result;
+            return alloc_cons(car(tmpl), result_tail);
         }
         if (IS_ATOM(car(tmpl)) && CELL_ID(car(tmpl)) == ctx.kw_lambda &&
             IS_PAIR(cdr(tmpl)) && IS_PAIR(cddr(tmpl)) && !head_is_alias) {
@@ -1379,6 +1402,13 @@ static unsigned rename_template_vars_shadowed_heads(unsigned tmpl,
             return tmpl;
         if (IS_ATOM(car(tmpl)) && CELL_ID(car(tmpl)) == ctx.kw_quasiquote &&
             IS_PAIR(cdr(tmpl)) && !quasiquote_shadowed && !head_is_alias) {
+            // rename_template_vars_quasiquote allocates, and car(tmpl) /
+            // cddr(tmpl) are read after it returns, so tmpl has to survive
+            // the call. GC_GUARD releases these on every exit, replacing the
+            // manual unprotect below.
+            GC_GUARD;
+            gc_protect(&tmpl);
+            gc_protect(&rename_map);
             unsigned new_body =
                 rename_template_vars_quasiquote(cadr(tmpl), rename_map, 1);
             if (new_body == TOK_ERROR)
@@ -1386,9 +1416,7 @@ static unsigned rename_template_vars_shadowed_heads(unsigned tmpl,
             gc_protect(&new_body);
             unsigned result_tail = alloc_cons(new_body, cddr(tmpl));
             gc_protect(&result_tail);
-            unsigned result = alloc_cons(car(tmpl), result_tail);
-            gc_unprotect(2);
-            return result;
+            return alloc_cons(car(tmpl), result_tail);
         }
 
         unsigned original = tmpl;
@@ -1619,7 +1647,13 @@ static bool compile_macro_binding(unsigned mac, unsigned expr,
     }
 
     if (cctx->macro_expansion_depth >= MAX_COMPILE_MACRO_EXPANSION_DEPTH) {
-        show_error("macro expansion exceeded maximum depth");
+        // Deliberately silent here: emit_syntax_error defers the error to the
+        // point where this code actually runs. A macro that recurses only in
+        // a branch guarded by a runtime test (say (if (= n 0) 'done (m 0)))
+        // cannot be expanded statically to a fixed point, but the program is
+        // still correct as long as the capped branch is never reached.
+        // Reporting at compile time would print an error for a program that
+        // then runs fine and exits 0.
         *result =
             emit_syntax_error(cctx, "macro expansion exceeded maximum depth");
         return true;
@@ -1715,6 +1749,10 @@ static bool collect_syntax_free_vars(compile_ctx *cctx, unsigned rules,
     gc_protect(&rename_map);
     gc_protect(&gensym_bindings);
     gc_protect(&gensym_const_bindings);
+    // literals is a by-value cell parameter that stays live across every
+    // iteration below, and collect_pattern_vars/collect_template_free_vars
+    // both allocate.
+    gc_protect(&literals);
 
     unsigned r = rules;
     gc_protect(&r);
@@ -1752,7 +1790,11 @@ static bool collect_syntax_free_vars(compile_ctx *cctx, unsigned rules,
             unsigned val = lookup_silent(var_id, cctx->env);
             if (val != TOK_ERROR) {
                 extern unsigned gensym_counter;
-                char name[20];
+                // "##gensym##" is 10 chars and %u is up to 10 digits, so 21
+                // bytes are needed. At 20 the name would silently truncate
+                // once the counter passes 1e9 and two distinct gensyms could
+                // then collide, which defeats the whole point of a gensym.
+                char name[32];
                 snprintf(name, sizeof(name), "##gensym##%u",
                          gensym_counter++);
                 unsigned gensym_atom = atom_from_string(name);
@@ -1920,13 +1962,22 @@ static void extend_env_with_syntax_gensyms(compile_ctx *cctx,
                                            unsigned gensym_bindings,
                                            unsigned gensym_const_bindings)
 {
+    // defvar conses a new binding onto the frame, so it can collect. Both
+    // lists arrive as by-value copies that no caller's gc_protect covers, and
+    // the cursor walking them has to survive each iteration's allocation -
+    // otherwise the second lap reads cdr() out of a reclaimed cell.
     GC_GUARD;
     gc_protect(&cctx->env);
-    for (unsigned gb = gensym_const_bindings; gb; gb = cdr(gb)) {
+    gc_protect(&gensym_bindings);
+    gc_protect(&gensym_const_bindings);
+
+    unsigned gb = 0;
+    gc_protect(&gb);
+    for (gb = gensym_const_bindings; gb; gb = cdr(gb)) {
         unsigned entry = car(gb);
         defvar(car(entry), cdr(entry), cctx->env);
     }
-    for (unsigned gb = gensym_bindings; gb; gb = cdr(gb)) {
+    for (gb = gensym_bindings; gb; gb = cdr(gb)) {
         unsigned entry = car(gb);
         unsigned gensym_atom = car(entry);
         // Placeholder value - the real value is only known at runtime;
@@ -2227,7 +2278,9 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
                             if (val != TOK_ERROR) {
                                 // Create gensym
                                 extern unsigned gensym_counter;
-                                char name[20];
+                                // See the note on the other gensym site: 20
+                                // bytes truncates past a billion gensyms.
+                                char name[32];
                                 snprintf(name, sizeof(name), "##gensym##%u",
                                          gensym_counter++);
                                 unsigned gensym_atom = atom_from_string(name);

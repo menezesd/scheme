@@ -34,6 +34,30 @@ make test-diff # Compare semantic probes, in both engines, against MIT Scheme (r
 make clean    # Remove build artifacts
 ```
 
+### Debugging aids
+
+`VESPER_GC_STRESS=N` forces a minor collection every N allocations instead of
+waiting for the 256K-cell nursery to fill. A reference that was never rooted
+otherwise survives almost every run and fails only when a collection happens
+to land on the wrong allocation, which makes rooting bugs look like flaky,
+layout-dependent failures. Small values are slow but deterministic:
+
+```bash
+VESPER_GC_STRESS=1000 ./vesper myprogram.scm
+```
+
+`VESPER_GC_STRESS_MAJOR=N` does the same for full collections. Minor GC only
+touches the nursery, so on its own it barely exercises the semispace flip,
+promotion, or the card-table scan for old-to-young pointers.
+
+`make test-gcstress` runs a small workload at several intervals in both
+engines, and is part of `make test-all`.
+
+Building with `-DVESPER_GC_TRAP_FREE_CELLS` additionally aborts the moment a
+reclaimed cell is dereferenced, which points at the stale read rather than the
+corruption it causes later. It is compile-time because `car`/`cdr` are the
+hottest functions in the interpreter.
+
 On some Apple Clang/macOS combinations, ASan can hang before `main` while the
 sanitizer runtime initializes shadow memory. `make test-sanitize` reports that
 case as a bounded skip; `make test-ubsan` still provides runtime undefined

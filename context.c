@@ -485,6 +485,7 @@ bool bytevec_is_registered(const bytevec_data *bytevec)
 void init_heap(void)
 {
     setlocale(LC_CTYPE, "");
+    init_gc_stress();
     // Allocate cons cells heap (includes nursery space at end of first
     // semispace)
     size_t heap_size = 2 * SEMISPACE_SIZE * sizeof(cons_cell);
@@ -552,6 +553,90 @@ unsigned minor_gc(unsigned root);
 void set_alloc_gc_root(unsigned *root)
 {
     alloc_gc_root = root;
+}
+
+// GC stress: force a minor collection every N allocations.
+//
+// A collection normally only happens when the nursery (256K cells) fills, so
+// a reference that was never rooted survives almost every run and fails only
+// when a collection lands on exactly the wrong allocation. That makes rooting
+// bugs look like flaky, layout-dependent test failures. Setting
+// VESPER_GC_STRESS=N collects every N allocations instead, which turns them
+// into deterministic ones. N=1 is the most aggressive and the slowest.
+static unsigned gc_stress_interval = 0; // 0 disables the whole mechanism
+static unsigned gc_stress_countdown = 0;
+
+// VESPER_GC_STRESS_MAJOR=N does the same for full collections. Minor GC only
+// ever touches the nursery, so on its own it leaves the semispace flip,
+// promotion and the code-object constant walk barely exercised - which is
+// where a different set of rooting bugs would live.
+static unsigned gc_stress_major_interval = 0;
+static unsigned gc_stress_major_countdown = 0;
+
+#ifdef VESPER_GC_TRAP_FREE_CELLS
+void gc_report_free_cell_access(unsigned id, const char *accessor)
+{
+    fprintf(stderr,
+            "GC TRAP: %s() on reclaimed cell %u - a cell index was held "
+            "across a collection without being rooted\n",
+            accessor, id);
+    abort();
+}
+#endif
+
+static unsigned read_stress_interval(const char *name)
+{
+    const char *setting = getenv(name);
+    if (!setting || !*setting)
+        return 0;
+    long value = strtol(setting, NULL, 10);
+    if (value <= 0)
+        return 0;
+    return (value > INT_MAX) ? (unsigned)INT_MAX : (unsigned)value;
+}
+
+void init_gc_stress(void)
+{
+    gc_stress_interval = read_stress_interval("VESPER_GC_STRESS");
+    gc_stress_countdown = gc_stress_interval;
+    gc_stress_major_interval = read_stress_interval("VESPER_GC_STRESS_MAJOR");
+    gc_stress_major_countdown = gc_stress_major_interval;
+}
+
+// Only stress once there is an allocation root to collect from. Startup interns
+// primitives before main.c calls set_alloc_gc_root, and a collection there
+// would have nothing to trace from and would discard the environment being
+// built. The real collector never runs that early either - that phase
+// allocates far less than a nursery.
+static inline bool gc_stress_armed(void)
+{
+    return alloc_gc_root && *alloc_gc_root;
+}
+
+// Returns true if a stress collection is due. Kept tiny so the disabled case
+// is a single predictable branch on the allocation hot path.
+static inline bool gc_stress_due(void)
+{
+    if (!gc_stress_interval)
+        return false;
+    if (!gc_stress_armed())
+        return false;
+    if (--gc_stress_countdown)
+        return false;
+    gc_stress_countdown = gc_stress_interval;
+    return true;
+}
+
+static inline bool gc_stress_major_due(void)
+{
+    if (!gc_stress_major_interval)
+        return false;
+    if (!gc_stress_armed())
+        return false;
+    if (--gc_stress_major_countdown)
+        return false;
+    gc_stress_major_countdown = gc_stress_major_interval;
+    return true;
 }
 
 // Shadow stack for GC roots - protects local C variables during allocation
@@ -645,6 +730,23 @@ void trigger_gc(void)
     }
 }
 
+// After a minor collection, the old generation may be close to full: every
+// nursery survivor was just promoted into it, and only a major collection
+// reclaims it. The nursery-full trigger has always run this check; the stress
+// hooks did not, so a minor collection every N allocations promoted almost
+// everything (at that cadence nearly all of it is still live) and old gen
+// filled monotonically until minor_gc panicked with "old generation full".
+// One helper, called from both paths, so they cannot drift apart.
+static void maybe_major_after_minor(void)
+{
+    unsigned old_gen_used = ctx.hptr - ctx.mmin;
+    unsigned old_gen_size = ctx.nursery_start - ctx.mmin;
+    if (old_gen_used > old_gen_size * 8 / 10 && alloc_gc_root &&
+        *alloc_gc_root) {
+        *alloc_gc_root = gc(*alloc_gc_root);
+    }
+}
+
 unsigned alloc(void)
 {
     // Check if generational GC is disabled (no card table)
@@ -699,6 +801,21 @@ unsigned alloc(void)
     unsigned nursery_end =
         (ctx.mmin < SEMISPACE_SIZE) ? SEMISPACE_SIZE : 2 * SEMISPACE_SIZE;
 
+    // Under stress, collect on schedule rather than waiting for the nursery
+    // to fill. in_gc_mode is already excluded above, so this cannot recurse.
+    // The major check comes first: a full collection subsumes a minor one, and
+    // running both back to back would only waste time.
+    if (gc_stress_major_due()) {
+        *alloc_gc_root = gc(*alloc_gc_root);
+        nursery_end =
+            (ctx.mmin < SEMISPACE_SIZE) ? SEMISPACE_SIZE : 2 * SEMISPACE_SIZE;
+    } else if (gc_stress_due()) {
+        *alloc_gc_root = minor_gc(*alloc_gc_root);
+        maybe_major_after_minor();
+        nursery_end =
+            (ctx.mmin < SEMISPACE_SIZE) ? SEMISPACE_SIZE : 2 * SEMISPACE_SIZE;
+    }
+
     // Check if nursery is full
     if (ctx.nursery_ptr >= nursery_end) {
         // Nursery full - run minor GC to promote survivors
@@ -709,12 +826,7 @@ unsigned alloc(void)
         }
 
         // Check if old gen is getting full (> 80%) - trigger major GC
-        unsigned old_gen_used = ctx.hptr - ctx.mmin;
-        unsigned old_gen_size = ctx.nursery_start - ctx.mmin;
-        if (old_gen_used > old_gen_size * 8 / 10 && alloc_gc_root &&
-            *alloc_gc_root) {
-            *alloc_gc_root = gc(*alloc_gc_root);
-        }
+        maybe_major_after_minor();
 
         // After GC, nursery should be reset
         nursery_end =
@@ -2213,59 +2325,6 @@ bool cond_clauses_valid(unsigned clauses, const char *name, unsigned env)
     return true;
 }
 
-bool check_args(unsigned args, unsigned min, unsigned max, const char *name)
-{
-    // Early-exit optimization: only count as many args as needed to decide.
-    // For variadic (max=-1), stop after min. For fixed-arity, stop after max+1.
-    unsigned limit = (max == (unsigned)-1) ? min : max + 1;
-    unsigned len = 0;
-    unsigned a = args;
-
-    while (IS_PAIR(a) && len < limit) {
-        len++;
-        a = cdr(a);
-    }
-
-    if (len < min) {
-        show_error("%s: too few arguments (expected %u, got %u)", name, min,
-                   len);
-        return false;
-    }
-
-    // Reject improper lists (e.g. (1 . 2)) — FORLIST walks would silently
-    // drop the dotted tail. `a` is the cdr after `len` pairs; if it is
-    // non-nil and not a pair the list is dotted. For the early-exit case
-    // (variadic where we stopped at `min`) an improper tail beyond `limit`
-    // would otherwise be hidden: walk the remainder when `a` is a pair.
-    if (a != 0 && !IS_PAIR(a)) {
-        show_error("%s: improper list", name);
-        return false;
-    }
-    if (IS_PAIR(a)) {
-        // Walk remainder to catch an improper/circular tail beyond the
-        // early-exit `limit` (e.g. variadic `(1 2 3 . 4)` with min=2).
-        if (pair_chain_is_circular(a)) {
-            show_error("%s: circular list", name);
-            return false;
-        }
-        unsigned rest = a;
-        while (IS_PAIR(rest))
-            rest = cdr(rest);
-        if (rest != 0) {
-            show_error("%s: improper list", name);
-            return false;
-        }
-    }
-
-    // If max is bounded and we counted more than max, or there are still more
-    if (max != (unsigned)-1 && (len > max || IS_PAIR(a))) {
-        show_error("%s: too many arguments (expected at most %u)", name, max);
-        return false;
-    }
-
-    return true;
-}
-
 void list_append(unsigned *head, unsigned *tail, unsigned elem)
 {
     // Protect in-progress list roots and elem; alloc() can trigger GC.
@@ -2805,6 +2864,36 @@ unsigned collect(unsigned x)
     }
 }
 
+
+// Forward every registered string port's retained source string.
+//
+// A string input port keeps its source as a cell reference inside a malloc'd
+// string_port, not inside the port cell itself. The collectors only forward it
+// while copying the port cell, and the card table's dirty scan does not cover
+// port cells at all, so two cases were left stale:
+//
+//   * open-input-string fills in source_string and only then allocates the
+//     port cell with make_pointer_cell. A collection during that allocation
+//     moves the source while no cell yet refers to the port, so nothing
+//     forwards the reference.
+//   * an old-generation port whose source still lives in the nursery is never
+//     visited by a minor collection.
+//
+// Walking the registry covers both: registration is exactly the set of live
+// string_port structs, and it does not depend on the port having a cell yet.
+static void update_all_string_port_sources(unsigned (*collector)(unsigned))
+{
+    for (size_t i = 0; i < string_port_registry.bucket_count; i++) {
+        for (ptr_registry_node *node = string_port_registry.buckets[i]; node;
+             node = node->next) {
+            string_port *sp = (string_port *)node->ptr;
+            if (!sp || sp->source_string == ctx.atom_false)
+                continue;
+            sp->source_string = collector(sp->source_string);
+        }
+    }
+}
+
 unsigned gc(unsigned root)
 {
     ctx.major_gc_count++;
@@ -2860,6 +2949,7 @@ unsigned gc(unsigned root)
     // CAR/CDR are recursively processed
     gc_update_all_code_objects();
     gc_update_all_patterns();
+    update_all_string_port_sources(collect);
 
     while (scan != ctx.hptr) {
         enum lisp_type t = CELL_TYPE(scan);
@@ -3157,6 +3247,7 @@ unsigned minor_gc(unsigned root)
     // Update code object constants - they may point to nursery cells.
     minor_gc_update_all_code_objects();
     minor_gc_update_all_patterns();
+    update_all_string_port_sources(collect_to_old);
 
     // Scan dirty cards in old generation for nursery pointers
     // Skip if generational GC is disabled (no card table)
@@ -3234,9 +3325,15 @@ unsigned minor_gc(unsigned root)
 
     // Free external data for unreachable nursery cells. Promoted cells were
     // rewritten as BT_BROKENHEART, so they are skipped here.
-    unsigned nursery_end =
-        (ctx.mmin < SEMISPACE_SIZE) ? SEMISPACE_SIZE : 2 * SEMISPACE_SIZE;
-    for (unsigned i = ctx.nursery_start; i < nursery_end; i++) {
+    //
+    // Only the cells allocated this cycle need visiting: everything from
+    // nursery_ptr up to the nursery end is still BT_FREE from the previous
+    // reset and holds no external data. When the nursery is full (the normal
+    // trigger) the two bounds coincide, so this changes nothing there - but a
+    // collection forced early, by gc-flip or VESPER_GC_STRESS, used to scan
+    // all 256K cells to reclaim a few hundred. Under stress in the CPS
+    // interpreter that scan was ~80% of the process's time.
+    for (unsigned i = ctx.nursery_start; i < ctx.nursery_ptr; i++) {
         free_external_cell_data(i);
         CELL_TYPE(i) = BT_FREE;
     }

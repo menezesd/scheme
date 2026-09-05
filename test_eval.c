@@ -28,6 +28,13 @@ void set_alloc_gc_root(unsigned *root);
 // Helper: evaluate a string and return the result
 static unsigned eval_string(const char *src, unsigned env)
 {
+    // env arrives by value, so the caller's gc_protect does not cover this
+    // copy. read_obj() below allocates and can therefore collect, which would
+    // leave this copy pointing at a cell that has since been reused. Root it
+    // before reading, not after.
+    GC_GUARD;
+    gc_protect(&env);
+
     // Set up input from string
     FILE *old_stdin = stdin;
     FILE *f = fmemopen((void *)src, strlen(src), "r");
@@ -48,6 +55,10 @@ static unsigned eval_string(const char *src, unsigned env)
 
 static unsigned compiled_eval_string(const char *src, unsigned env)
 {
+    // Same by-value hazard as eval_string: root env before read_obj().
+    GC_GUARD;
+    gc_protect(&env);
+
     FILE *old_stdin = stdin;
     FILE *f = fmemopen((void *)src, strlen(src), "r");
     if (!f) {
@@ -63,9 +74,7 @@ static unsigned compiled_eval_string(const char *src, unsigned env)
     if (expr == TOK_ERROR)
         return TOK_ERROR;
 
-    GC_GUARD;
     gc_protect(&expr);
-    gc_protect(&env);
     code_object *code = compile_toplevel(expr, env);
     vm_state vm;
     vm_init(&vm);
@@ -195,6 +204,8 @@ static int is_stat_entry(unsigned entry, const char *name)
 TEST(eval_integer)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("42", env);
     ASSERT(is_int(result, 42));
     PASS();
@@ -203,6 +214,8 @@ TEST(eval_integer)
 TEST(eval_direct_fixnum_expression)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_obj(MAKE_FIXNUM(42), env);
     ASSERT_EQ(result, MAKE_FIXNUM(42));
     PASS();
@@ -211,6 +224,8 @@ TEST(eval_direct_fixnum_expression)
 TEST(compiled_direct_fixnum_expression)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned expr = MAKE_FIXNUM(42);
     code_object *code = compile_toplevel(expr, env);
     ASSERT(code != NULL);
@@ -226,6 +241,8 @@ TEST(compiled_direct_fixnum_expression)
 TEST(compiled_booleans_are_self_evaluating)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string("#t", env);
     ASSERT(result == ctx.atom_true);
     result = compiled_eval_string("#f", env);
@@ -236,6 +253,8 @@ TEST(compiled_booleans_are_self_evaluating)
 TEST(eval_negative_integer)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("-17", env);
     ASSERT(is_int(result, -17));
     PASS();
@@ -244,6 +263,8 @@ TEST(eval_negative_integer)
 TEST(eval_true)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("#t", env);
     ASSERT(result == ctx.atom_true);
     PASS();
@@ -252,6 +273,8 @@ TEST(eval_true)
 TEST(eval_false)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("#f", env);
     ASSERT(result == ctx.atom_false);
     PASS();
@@ -260,6 +283,8 @@ TEST(eval_false)
 TEST(eval_rejects_boolean_binding_names)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     ASSERT(eval_string("(let ((#t 1)) #t)", env) == TOK_ERROR);
     ASSERT(eval_string("(let ((#f 1)) #f)", env) == TOK_ERROR);
     ASSERT(eval_string("((lambda (#t) #t) 1)", env) == TOK_ERROR);
@@ -271,6 +296,8 @@ TEST(eval_rejects_boolean_binding_names)
 TEST(compiled_rejects_boolean_binding_names)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     ASSERT(compiled_eval_string("(let ((#t 1)) #t)", env) == TOK_ERROR);
     ASSERT(compiled_eval_string("(let ((#f 1)) #f)", env) == TOK_ERROR);
     ASSERT(compiled_eval_string("((lambda (#t) #t) 1)", env) == TOK_ERROR);
@@ -282,6 +309,8 @@ TEST(compiled_rejects_boolean_binding_names)
 TEST(eval_quote)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("'(1 2 3)", env);
     ASSERT(IS_PAIR(result));
     ASSERT(is_int(car(result), 1));
@@ -295,6 +324,8 @@ TEST(eval_quote)
 TEST(eval_add)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(+ 1 2 3)", env);
     ASSERT(is_int(result, 6));
     PASS();
@@ -303,6 +334,8 @@ TEST(eval_add)
 TEST(eval_add_rationals)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(+ 1/2 1/3)", env);
     ASSERT(CELL_TYPE(result) == BT_RATIONAL);
     ASSERT(is_int(CELL_CAR(result), 5));
@@ -313,6 +346,8 @@ TEST(eval_add_rationals)
 TEST(eval_subtract)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(- 10 3 2)", env);
     ASSERT(is_int(result, 5));
     PASS();
@@ -321,6 +356,8 @@ TEST(eval_subtract)
 TEST(eval_subtract_rationals)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(- 1/2 1/3)", env);
     ASSERT(CELL_TYPE(result) == BT_RATIONAL);
     ASSERT(is_int(CELL_CAR(result), 1));
@@ -331,6 +368,8 @@ TEST(eval_subtract_rationals)
 TEST(eval_multiply)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(* 2 3 4)", env);
     ASSERT(is_int(result, 24));
     PASS();
@@ -339,6 +378,8 @@ TEST(eval_multiply)
 TEST(eval_multiply_exact_complex)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string(
         "(* (make-rectangular 1 1) (make-rectangular 1 1))", env);
     ASSERT(CELL_TYPE(result) == BT_COMPLEX);
@@ -350,6 +391,8 @@ TEST(eval_multiply_exact_complex)
 TEST(eval_divide)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(/ 20 4)", env);
     ASSERT(is_int(result, 5));
     PASS();
@@ -358,6 +401,8 @@ TEST(eval_divide)
 TEST(eval_divide_exact_complex)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string(
         "(/ (make-rectangular 1 1) (make-rectangular 1 -1))", env);
     ASSERT(CELL_TYPE(result) == BT_COMPLEX);
@@ -369,6 +414,8 @@ TEST(eval_divide_exact_complex)
 TEST(eval_reciprocal_exact_complex)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(/ (make-rectangular 1 1))", env);
     ASSERT(CELL_TYPE(result) == BT_COMPLEX);
     ASSERT(CELL_TYPE(CELL_CAR(result)) == BT_RATIONAL);
@@ -387,6 +434,8 @@ TEST(eval_reciprocal_exact_complex)
 TEST(eval_exact_rational_comparison_preserves_precision)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     ASSERT(eval_string("(= 9007199254740993/2 9007199254740992/2)", env) ==
            ctx.atom_false);
     ASSERT(eval_string("(> 9007199254740993/2 9007199254740992/2)", env) ==
@@ -399,6 +448,8 @@ TEST(eval_exact_rational_comparison_preserves_precision)
 TEST(eval_ordered_comparison_rejects_complex)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     ASSERT(eval_string("(< (make-rectangular 1 1) 2)", env) == TOK_ERROR);
     ASSERT(eval_string("(> 2 (make-rectangular 1 1))", env) == TOK_ERROR);
     PASS();
@@ -407,6 +458,8 @@ TEST(eval_ordered_comparison_rejects_complex)
 TEST(eval_eq_true)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(= 5 5)", env);
     ASSERT(is_bool(result, 1));
     PASS();
@@ -415,6 +468,8 @@ TEST(eval_eq_true)
 TEST(eval_eq_false)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(= 5 6)", env);
     ASSERT(is_bool(result, 0));
     PASS();
@@ -423,6 +478,8 @@ TEST(eval_eq_false)
 TEST(eval_lt_true)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(< 3 5)", env);
     ASSERT(is_bool(result, 1));
     PASS();
@@ -431,6 +488,8 @@ TEST(eval_lt_true)
 TEST(eval_lt_false)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(< 5 3)", env);
     ASSERT(is_bool(result, 0));
     PASS();
@@ -443,6 +502,8 @@ TEST(eval_lt_false)
 TEST(eval_if_true)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(if #t 1 2)", env);
     ASSERT(is_int(result, 1));
     PASS();
@@ -451,6 +512,8 @@ TEST(eval_if_true)
 TEST(eval_if_false)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(if #f 1 2)", env);
     ASSERT(is_int(result, 2));
     PASS();
@@ -459,6 +522,8 @@ TEST(eval_if_false)
 TEST(eval_cond_first)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(cond (#t 42) (#f 99))", env);
     ASSERT(is_int(result, 42));
     PASS();
@@ -467,6 +532,8 @@ TEST(eval_cond_first)
 TEST(eval_cond_else)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(cond (#f 1) (else 2))", env);
     ASSERT(is_int(result, 2));
 
@@ -498,6 +565,8 @@ TEST(cond_expand_rejects_recursive_requirement)
 {
     const char *src = "(cond-expand (#0=(and #0#) 1) (else 2))";
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     ASSERT(is_int(eval_string(src, env), 2));
     ASSERT(is_int(compiled_eval_string(src, env), 2));
     PASS();
@@ -510,6 +579,8 @@ TEST(cond_expand_rejects_recursive_requirement)
 TEST(eval_lambda_call)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("((lambda (x) (+ x 1)) 5)", env);
     ASSERT(is_int(result, 6));
     PASS();
@@ -518,6 +589,8 @@ TEST(eval_lambda_call)
 TEST(eval_lambda_closure)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result =
         eval_string("(((lambda (x) (lambda (y) (+ x y))) 10) 5)", env);
     ASSERT(is_int(result, 15));
@@ -527,6 +600,8 @@ TEST(eval_lambda_closure)
 TEST(eval_lambda_rest_param)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result =
         eval_string("((lambda (x . rest) (length rest)) 1 2 3 4)", env);
     ASSERT(is_int(result, 3));
@@ -536,6 +611,8 @@ TEST(eval_lambda_rest_param)
 TEST(eval_lambda_rejects_wrong_arity)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     ASSERT(eval_string("((lambda (x) x))", env) == TOK_ERROR);
     ASSERT(eval_string("((lambda (x) x) 1 2)", env) == TOK_ERROR);
     ASSERT(eval_string("((lambda (x y . rest) rest) 1)", env) == TOK_ERROR);
@@ -547,6 +624,8 @@ TEST(eval_lambda_rejects_wrong_arity)
 TEST(eval_rejects_malformed_lambda)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     ASSERT(eval_string("(lambda . 1)", env) == TOK_ERROR);
     ASSERT(eval_string("(lambda (x . 1) x)", env) == TOK_ERROR);
     ASSERT(eval_string("(lambda (x))", env) == TOK_ERROR);
@@ -558,6 +637,8 @@ TEST(eval_rejects_malformed_lambda)
 TEST(eval_rejects_malformed_special_forms)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     ASSERT(eval_string("(quote)", env) == TOK_ERROR);
     ASSERT(eval_string("(quote a b)", env) == TOK_ERROR);
     ASSERT(eval_string("(if #t)", env) == TOK_ERROR);
@@ -712,6 +793,8 @@ TEST(eval_rejects_malformed_special_forms)
 TEST(eval_load_rejects_non_string)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     ASSERT(eval_string("(load 1)", env) == TOK_ERROR);
     PASS();
 }
@@ -719,6 +802,8 @@ TEST(eval_load_rejects_non_string)
 TEST(compiled_load_rejects_non_string)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     ASSERT(compiled_eval_string("(load 1)", env) == TOK_ERROR);
     PASS();
 }
@@ -735,6 +820,8 @@ TEST(eval_load_reads_file_with_port_reader)
     fclose(f);
 
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result =
         eval_string("(load \"/tmp/vesper-load-port-reader-test.scm\")", env);
     remove(path);
@@ -751,6 +838,8 @@ TEST(eval_load_rejects_reader_token_sentinel)
     fclose(f);
 
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result =
         eval_string("(load \"/tmp/vesper-load-reader-token-test.scm\")", env);
     remove(path);
@@ -765,6 +854,8 @@ TEST(eval_load_rejects_reader_token_sentinel)
 TEST(eval_define_variable)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     eval_string("(define x 42)", env);
     unsigned result = eval_string("x", env);
     ASSERT(is_int(result, 42));
@@ -784,6 +875,8 @@ TEST(cps_define_continuation_propagates_invalid_environment)
 TEST(eval_define_function)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     eval_string("(define (square x) (* x x))", env);
     unsigned result = eval_string("(square 7)", env);
     ASSERT(is_int(result, 49));
@@ -793,6 +886,8 @@ TEST(eval_define_function)
 TEST(eval_define_recursive)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     eval_string("(define (fact n) (if (< n 2) 1 (* n (fact (- n 1)))))", env);
     unsigned result = eval_string("(fact 5)", env);
     ASSERT(is_int(result, 120));
@@ -806,6 +901,8 @@ TEST(eval_define_recursive)
 TEST(eval_let_simple)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(let ((x 1) (y 2)) (+ x y))", env);
     ASSERT(is_int(result, 3));
     PASS();
@@ -814,6 +911,8 @@ TEST(eval_let_simple)
 TEST(eval_named_let)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string(
         "(let loop ((n 5) (acc 1)) "
         "  (if (= n 0) acc (loop (- n 1) (* acc n))))",
@@ -838,6 +937,8 @@ TEST(eval_named_let)
 TEST(compiled_named_let)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string(
         "(let loop ((n 5) (acc 1)) "
         "  (if (= n 0) acc (loop (- n 1) (* acc n))))",
@@ -863,6 +964,8 @@ TEST(compiled_named_let)
 TEST(eval_let_accepts_quoted_cyclic_data)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result =
         eval_string("(let ((x '#0=(1 . #0#))) (list? x))", env);
     ASSERT(result == ctx.atom_false);
@@ -872,6 +975,8 @@ TEST(eval_let_accepts_quoted_cyclic_data)
 TEST(compiled_let_accepts_quoted_cyclic_data)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result =
         compiled_eval_string("(let ((x '#0=(1 . #0#))) (list? x))", env);
     ASSERT(result == ctx.atom_false);
@@ -881,6 +986,8 @@ TEST(compiled_let_accepts_quoted_cyclic_data)
 TEST(eval_let_nested)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(let ((x 1)) (let ((y 2)) (+ x y)))", env);
     ASSERT(is_int(result, 3));
     PASS();
@@ -889,6 +996,8 @@ TEST(eval_let_nested)
 TEST(eval_empty_let_forms_do_not_leak_internal_defines)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string(
         "(let () (define eval-empty-let-leak 1) eval-empty-let-leak)",
         env);
@@ -907,6 +1016,8 @@ TEST(eval_empty_let_forms_do_not_leak_internal_defines)
 TEST(compiled_empty_let_forms_do_not_leak_internal_defines)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string(
         "(let () (define compiled-empty-let-leak 1) "
         "compiled-empty-let-leak)",
@@ -929,6 +1040,8 @@ TEST(compiled_empty_let_forms_do_not_leak_internal_defines)
 TEST(eval_empty_syntax_binding_forms_splice_internal_defines)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string(
         "(let-syntax () "
         "  (define eval-empty-let-syntax-def 1) "
@@ -981,6 +1094,8 @@ TEST(eval_empty_syntax_binding_forms_splice_internal_defines)
 TEST(compiled_empty_syntax_binding_forms_splice_internal_defines)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string(
         "(let-syntax () "
         "  (define compiled-empty-let-syntax-def 1) "
@@ -1035,6 +1150,8 @@ TEST(compiled_empty_syntax_binding_forms_splice_internal_defines)
 TEST(eval_letstar)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(let* ((x 1) (y (+ x 1))) (+ x y))", env);
     ASSERT(is_int(result, 3));
     result = eval_string("(let* ((x 1) (x (+ x 1))) x)", env);
@@ -1047,6 +1164,8 @@ TEST(eval_letstar)
 TEST(eval_letrec)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string(
         "(letrec ((even? (lambda (n) (if (= n 0) #t (odd? (- n 1))))) "
         "         (odd? (lambda (n) (if (= n 0) #f (even? (- n 1)))))) "
@@ -1063,6 +1182,8 @@ TEST(eval_letrec)
 TEST(eval_and_all_true)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(and #t #t #t)", env);
     ASSERT(is_bool(result, 1));
     PASS();
@@ -1071,6 +1192,8 @@ TEST(eval_and_all_true)
 TEST(eval_and_one_false)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(and #t #f #t)", env);
     ASSERT(is_bool(result, 0));
     PASS();
@@ -1079,6 +1202,8 @@ TEST(eval_and_one_false)
 TEST(eval_or_all_false)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(or #f #f #f)", env);
     ASSERT(is_bool(result, 0));
     PASS();
@@ -1087,6 +1212,8 @@ TEST(eval_or_all_false)
 TEST(eval_or_one_true)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(or #f #t #f)", env);
     ASSERT(is_bool(result, 1));
     PASS();
@@ -1099,6 +1226,8 @@ TEST(eval_or_one_true)
 TEST(eval_begin_sequence)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(begin 1 2 3)", env);
     ASSERT(is_int(result, 3));
     PASS();
@@ -1107,6 +1236,8 @@ TEST(eval_begin_sequence)
 TEST(eval_begin_side_effects)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     eval_string("(define x 0)", env);
     unsigned result = eval_string("(begin (set! x 1) (set! x 2) x)", env);
     ASSERT(is_int(result, 2));
@@ -1120,6 +1251,8 @@ TEST(eval_begin_side_effects)
 TEST(eval_callcc_simple)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(call/cc (lambda (k) (k 42)))", env);
     ASSERT(is_int(result, 42));
     PASS();
@@ -1128,6 +1261,8 @@ TEST(eval_callcc_simple)
 TEST(eval_callcc_escape)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result =
         eval_string("(+ 1 (call/cc (lambda (k) (+ 10 (k 5)))))", env);
     ASSERT(is_int(result, 6));
@@ -1137,6 +1272,8 @@ TEST(eval_callcc_escape)
 TEST(eval_callcc_accepts_callcc)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(call/cc call/cc)", env);
     ASSERT(IS_CONT(result));
     PASS();
@@ -1145,6 +1282,8 @@ TEST(eval_callcc_accepts_callcc)
 TEST(eval_callcc_result_is_procedure)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(procedure? (call/cc call/cc))", env);
     ASSERT(is_bool(result, 1));
     PASS();
@@ -1153,6 +1292,8 @@ TEST(eval_callcc_result_is_procedure)
 TEST(compiled_callcc_simple)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string("(call/cc (lambda (k) (k 42)))", env);
     ASSERT(is_int(result, 42));
     PASS();
@@ -1161,6 +1302,8 @@ TEST(compiled_callcc_simple)
 TEST(compiled_callcc_escape)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result =
         compiled_eval_string("(+ 1 (call/cc (lambda (k) (+ 10 (k 5)))))", env);
     ASSERT(is_int(result, 6));
@@ -1170,6 +1313,8 @@ TEST(compiled_callcc_escape)
 TEST(compiled_callcc_accepts_callcc)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string("(call/cc call/cc)", env);
     ASSERT(IS_CELL(result) && CELL_TYPE(result) == BT_VMCONT);
     PASS();
@@ -1178,6 +1323,8 @@ TEST(compiled_callcc_accepts_callcc)
 TEST(compiled_callcc_result_is_procedure)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result =
         compiled_eval_string("(procedure? (call/cc call/cc))", env);
     ASSERT(is_bool(result, 1));
@@ -1187,6 +1334,8 @@ TEST(compiled_callcc_result_is_procedure)
 TEST(compiled_callcc_rejects_wrong_arity)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     ASSERT(compiled_eval_string("(call/cc)", env) == TOK_ERROR);
     ASSERT(compiled_eval_string("(call/cc (lambda (k) k) 1)", env) ==
            TOK_ERROR);
@@ -1196,6 +1345,8 @@ TEST(compiled_callcc_rejects_wrong_arity)
 TEST(eval_call_with_values_accepts_zero_values)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string(
         "(call-with-values (lambda () (values)) (lambda () 42))",
         env);
@@ -1206,6 +1357,8 @@ TEST(eval_call_with_values_accepts_zero_values)
 TEST(eval_call_with_values_zero_values_to_list)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string(
         "(call-with-values (lambda () (values)) list)",
         env);
@@ -1216,6 +1369,8 @@ TEST(eval_call_with_values_zero_values_to_list)
 TEST(eval_callcc_accepts_multiple_values)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string(
         "(call-with-values (lambda () (call/cc (lambda (k) (k 1 2)))) list)",
         env);
@@ -1229,6 +1384,8 @@ TEST(eval_callcc_accepts_multiple_values)
 TEST(eval_callcc_accepts_zero_values)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string(
         "(call-with-values (lambda () (call/cc (lambda (k) (k)))) list)",
         env);
@@ -1243,6 +1400,8 @@ TEST(eval_callcc_accepts_zero_values)
 TEST(gc_shadow_stack_balanced)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     int initial = get_shadow_stack_top();
 
     // Evaluate some expressions that use gc_protect/gc_unprotect
@@ -1259,6 +1418,8 @@ TEST(gc_shadow_stack_balanced)
 TEST(gc_shadow_stack_lambda)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     int initial = get_shadow_stack_top();
 
     eval_string("(lambda (x) x)", env);
@@ -1271,6 +1432,8 @@ TEST(gc_shadow_stack_lambda)
 TEST(gc_shadow_stack_macro_expansion)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     eval_string("(define-syntax swap! "
                 "  (syntax-rules () "
                 "    ((_ a b) (let ((tmp a)) (set! a b) (set! b tmp)))))",
@@ -1287,6 +1450,8 @@ TEST(gc_shadow_stack_macro_expansion)
 TEST(gc_shadow_stack_letrec)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     int initial = get_shadow_stack_top();
 
     eval_string(
@@ -1301,6 +1466,8 @@ TEST(gc_shadow_stack_letrec)
 TEST(gc_preserves_closures)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
 
     // Create a closure (using gc-aware eval)
     eval_string_gc("(define add-n (lambda (n) (lambda (x) (+ n x))))", &env);
@@ -1318,6 +1485,8 @@ TEST(gc_preserves_closures)
 TEST(gc_preserves_continuations)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
 
     // Store a continuation (using gc-aware eval)
     eval_string_gc("(define saved #f)", &env);
@@ -1335,6 +1504,8 @@ TEST(gc_preserves_continuations)
 TEST(cps_primitive_error_roots_environment_across_gc)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string_gc(
         "(append (iota 100000) '(2 . 3) '())",
         &env);
@@ -1345,6 +1516,8 @@ TEST(cps_primitive_error_roots_environment_across_gc)
 TEST(letstar_binding_cell_survives_gc)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string_gc(
         "(let ((junk (make-vector 200000 0))) "
         "  (let* ((x 1) (y 42)) y))",
@@ -1356,6 +1529,8 @@ TEST(letstar_binding_cell_survives_gc)
 TEST(gc_preserves_current_input_string_port)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string_gc(
         "(begin "
         "  (set-current-input-port! (open-input-string \"ab\")) "
@@ -1371,6 +1546,8 @@ TEST(gc_preserves_current_input_string_port)
 TEST(eval_read_string_port_preserves_unread_delimiter)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string(
         "(let ((p (open-input-string \"1)\"))) "
         "  (and (= (read p) 1) "
@@ -1388,6 +1565,8 @@ TEST(textual_port_operations_use_utf8_character_boundaries)
         "       (char=? (read-char p) (integer->char 955)) "
         "       (string=? (read-string 1 p) \"x\")))";
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     ASSERT(is_bool(eval_string(src, env), 1));
     ASSERT(is_bool(compiled_eval_string(src, env), 1));
 
@@ -1411,6 +1590,8 @@ TEST(eval_read_file_port_preserves_unread_delimiter)
     fclose(f);
 
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string(
         "(let ((p (open-input-file \"/tmp/vesper-read-delimiter-test.scm\"))) "
         "  (let ((ok (and (= (read p) 1) "
@@ -1440,6 +1621,8 @@ TEST(file_textual_port_operations_peek_utf8_without_consuming)
         "                 (= (read p) 1)))) "
         "    (close-input-port p) ok))";
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     ASSERT(is_bool(eval_string(src, env), 1));
     ASSERT(is_bool(compiled_eval_string(src, env), 1));
     remove(path);
@@ -1458,6 +1641,8 @@ TEST(read_line_rejects_invalid_utf8_file_content)
         "(read-line (open-input-file "
         "\"/tmp/vesper-read-line-invalid-utf8-test.scm\"))";
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     ASSERT(eval_string(src, env) == TOK_ERROR);
     ASSERT(compiled_eval_string(src, env) == TOK_ERROR);
 
@@ -1474,6 +1659,8 @@ TEST(read_line_rejects_invalid_utf8_file_content)
 TEST(string_operations_reject_null_character)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     ASSERT(eval_string("(string #\\null)", env) == TOK_ERROR);
     ASSERT(compiled_eval_string("(string #\\null)", env) == TOK_ERROR);
     ASSERT(eval_string("(list->string (list #\\null))", env) == TOK_ERROR);
@@ -1500,6 +1687,8 @@ TEST(string_operations_reject_null_character)
 TEST(eval_read_rejects_reader_token_sentinels)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     ASSERT(eval_string("(read (open-input-string \")\"))", env) == TOK_ERROR);
     ASSERT(eval_string("(read (open-input-string \".\"))", env) == TOK_ERROR);
     PASS();
@@ -1508,6 +1697,8 @@ TEST(eval_read_rejects_reader_token_sentinels)
 TEST(compiled_read_rejects_reader_token_sentinels)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     ASSERT(compiled_eval_string("(read (open-input-string \")\"))", env) ==
            TOK_ERROR);
     ASSERT(compiled_eval_string("(read (open-input-string \".\"))", env) ==
@@ -1524,6 +1715,8 @@ TEST(eval_read_bytevector_preserves_unread_delimiter)
     fclose(f);
 
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string(
         "(let ((p (open-binary-input-file "
         "          \"/tmp/vesper-read-bytevector-delimiter-test.bin\"))) "
@@ -1558,6 +1751,8 @@ TEST(read_bytevector_into_preserves_unread_delimiter)
         "         (= (bytevector-u8-ref bv 0) 41) "
         "         (= (bytevector-u8-ref bv 1) 65))))";
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     ASSERT(is_bool(eval_string(src, env), 1));
     ASSERT(is_bool(compiled_eval_string(src, env), 1));
     remove(path);
@@ -1567,6 +1762,8 @@ TEST(read_bytevector_into_preserves_unread_delimiter)
 TEST(gc_preserves_current_output_string_port)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string_gc(
         "(begin "
         "  (set-current-output-port! (open-output-string)) "
@@ -1587,6 +1784,8 @@ TEST(write_string_uses_utf8_character_indices)
         "  (write-string \"λx\" p 1 2) "
         "  (get-output-string p))";
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string(src, env);
     ASSERT(IS_STRING(result));
     ASSERT_STR_EQ(GET_STRING_PTR(result), "x");
@@ -1604,6 +1803,8 @@ TEST(write_char_encodes_utf8_scalars)
         "  (write-char (integer->char 955) p) "
         "  (get-output-string p))";
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string(src, env);
     ASSERT(IS_STRING(result));
     ASSERT_STR_EQ(GET_STRING_PTR(result), "λ");
@@ -1631,6 +1832,8 @@ TEST(write_char_encodes_utf8_scalars)
 TEST(eval_newline_rejects_closed_current_output_port)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string_gc(
         "(let ((p (open-output-string))) "
         "  (set-current-output-port! p) "
@@ -1646,6 +1849,8 @@ TEST(eval_newline_rejects_closed_current_output_port)
 TEST(eval_flush_rejects_closed_output_port)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string(
         "(let ((p (open-output-string))) "
         "  (close-output-port p) "
@@ -1658,6 +1863,8 @@ TEST(eval_flush_rejects_closed_output_port)
 TEST(eval_io_rejects_nil_port_argument)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     ASSERT(eval_string("(display \"x\" '())", env) == TOK_ERROR);
     ASSERT(eval_string("(write \"x\" '())", env) == TOK_ERROR);
     ASSERT(eval_string("(newline '())", env) == TOK_ERROR);
@@ -1673,6 +1880,8 @@ TEST(eval_io_rejects_nil_port_argument)
 TEST(eval_close_port_rejects_wrong_direction)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result =
         eval_string("(close-input-port (open-output-string))", env);
     ASSERT(result == TOK_ERROR);
@@ -1685,6 +1894,8 @@ TEST(eval_close_port_rejects_wrong_direction)
 TEST(eval_set_current_port_rejects_closed_port)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string(
         "(let ((p (open-output-string))) "
         "  (close-output-port p) "
@@ -1708,6 +1919,8 @@ TEST(eval_set_current_port_rejects_closed_port)
 TEST(eval_write_to_string_escapes_strings)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result =
         eval_string("(write-to-string \"a\\\"b\\\\c\\n\\t\\r\")", env);
     ASSERT(IS_STRING(result));
@@ -1749,6 +1962,8 @@ TEST(write_simple_rejects_cyclic_data)
     free(output);
 
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     ASSERT(eval_string("(let ((p (open-output-string))) "
                        "(write-simple '#0=(x . #0#) p))",
                        env) == TOK_ERROR);
@@ -1761,6 +1976,8 @@ TEST(write_simple_rejects_cyclic_data)
 TEST(compiled_write_to_string_hides_bytecode_closure)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result =
         compiled_eval_string("(write-to-string (lambda (x) x))", env);
     ASSERT(IS_STRING(result));
@@ -1777,6 +1994,8 @@ TEST(eval_open_output_file_append_argument_is_truthy)
     fclose(f);
 
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result =
         eval_string("(let ((p (open-output-file "
                     "\"/tmp/vesper-open-output-append-test.txt\" 'append))) "
@@ -1806,6 +2025,8 @@ TEST(eval_open_output_file_false_argument_truncates)
     fclose(f);
 
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result =
         eval_string("(let ((p (open-output-file "
                     "\"/tmp/vesper-open-output-truncate-test.txt\" #f))) "
@@ -1829,6 +2050,8 @@ TEST(eval_open_output_file_false_argument_truncates)
 TEST(gc_preserves_labeled_string)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result =
         eval_string_gc("(let ((s '#1=\"abc\")) (gc-flip) (string-length s))",
                        &env);
@@ -1839,6 +2062,8 @@ TEST(gc_preserves_labeled_string)
 TEST(gc_preserves_labeled_vector)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result =
         eval_string_gc("(let ((v '#1=#(10 20))) (gc-flip) (vector-ref v 1))",
                        &env);
@@ -1853,6 +2078,8 @@ TEST(gc_preserves_labeled_vector)
 TEST(eval_apply_simple)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(apply + '(1 2 3))", env);
     ASSERT(is_int(result, 6));
     PASS();
@@ -1861,6 +2088,8 @@ TEST(eval_apply_simple)
 TEST(eval_apply_lambda)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(apply (lambda (x y) (+ x y)) '(3 4))", env);
     ASSERT(is_int(result, 7));
     PASS();
@@ -1869,6 +2098,8 @@ TEST(eval_apply_lambda)
 TEST(eval_rejects_improper_application)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(+ . 1)", env);
     ASSERT(result == TOK_ERROR);
     PASS();
@@ -1877,6 +2108,8 @@ TEST(eval_rejects_improper_application)
 TEST(eval_special_form_keywords_respect_lexical_bindings)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string(
         "(equal? "
         "  (list "
@@ -1906,6 +2139,8 @@ TEST(eval_special_form_keywords_respect_lexical_bindings)
 TEST(eval_quasiquote_unquotes_vector_element)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(vector-ref `#(a ,(+ 1 2)) 1)", env);
     ASSERT(is_int(result, 3));
     PASS();
@@ -1914,6 +2149,8 @@ TEST(eval_quasiquote_unquotes_vector_element)
 TEST(eval_quasiquote_respects_shadowed_keywords)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string(
         "(equal? (let ((unquote 10)) `(a (unquote 1))) "
         "        '(a (unquote 1)))",
@@ -1936,6 +2173,8 @@ TEST(eval_quasiquote_respects_shadowed_keywords)
 TEST(eval_quasiquote_rejects_top_level_splicing)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("`(unquote-splicing)", env);
     ASSERT(result == TOK_ERROR);
     PASS();
@@ -1944,6 +2183,8 @@ TEST(eval_quasiquote_rejects_top_level_splicing)
 TEST(eval_quasiquote_splicing_preserves_dotted_tail)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string(
         "(equal? `(a ,@(list 1 2) . tail) '(a 1 2 . tail))", env);
     ASSERT(result == ctx.atom_true);
@@ -1953,6 +2194,8 @@ TEST(eval_quasiquote_splicing_preserves_dotted_tail)
 TEST(eval_quasiquote_rejects_improper_splice_value)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("`(,@(cons 1 2) x)", env);
     ASSERT(result == TOK_ERROR);
     PASS();
@@ -1961,6 +2204,8 @@ TEST(eval_quasiquote_rejects_improper_splice_value)
 TEST(eval_quasiquote_rejects_circular_splice_value)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(let ((x (cons 1 '()))) "
                                   "  (set-cdr! x x) "
                                   "  `(,@x))",
@@ -1972,6 +2217,8 @@ TEST(eval_quasiquote_rejects_circular_splice_value)
 TEST(eval_quasiquote_rejects_circular_template)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     ASSERT(eval_string("`#1=(a . #1#)", env) == TOK_ERROR);
     ASSERT(eval_string("`#1=#(#1#)", env) == TOK_ERROR);
     PASS();
@@ -1980,6 +2227,8 @@ TEST(eval_quasiquote_rejects_circular_template)
 TEST(eval_syntax_rules_rejects_circular_pattern_and_template)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     ASSERT(eval_string(
                "(begin "
                "  (define-syntax m "
@@ -2004,6 +2253,8 @@ TEST(eval_syntax_rules_rejects_circular_pattern_and_template)
 TEST(eval_syntax_rules_rejects_circular_invocation)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     ASSERT(eval_string(
                "(begin "
                "  (define-syntax m (syntax-rules () ((m x) x))) "
@@ -2015,6 +2266,8 @@ TEST(eval_syntax_rules_rejects_circular_invocation)
 TEST(eval_quasiquote_rejects_malformed_subforms)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     ASSERT(eval_string("`(unquote)", env) == TOK_ERROR);
     ASSERT(eval_string("`(unquote 1 2)", env) == TOK_ERROR);
     ASSERT(eval_string("`(unquote-splicing)", env) == TOK_ERROR);
@@ -2041,6 +2294,8 @@ TEST(eval_quasiquote_rejects_malformed_subforms)
 TEST(eval_quasiquote_allows_data_in_unquote_expression)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string(
         "(equal? `(a ,(quote (unquote 1 2))) "
         "        '(a (unquote 1 2)))",
@@ -2062,6 +2317,8 @@ TEST(eval_quasiquote_allows_data_in_unquote_expression)
 TEST(eval_cons)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(cons 1 2)", env);
     ASSERT(IS_PAIR(result));
     ASSERT(is_int(car(result), 1));
@@ -2072,6 +2329,8 @@ TEST(eval_cons)
 TEST(eval_car_cdr)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned r1 = eval_string("(car '(1 2 3))", env);
     ASSERT(is_int(r1, 1));
     unsigned r2 = eval_string("(cdr '(1 2 3))", env);
@@ -2083,6 +2342,8 @@ TEST(eval_car_cdr)
 TEST(eval_length)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(length '(1 2 3 4 5))", env);
     ASSERT(is_int(result, 5));
     PASS();
@@ -2091,6 +2352,8 @@ TEST(eval_length)
 TEST(eval_rejects_circular_list_operations)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     ASSERT(eval_string("(let ((x (cons 1 '()))) "
                        "  (set-cdr! x x) "
                        "  (length x))",
@@ -2125,6 +2388,8 @@ TEST(eval_rejects_circular_list_operations)
 TEST(eval_equal_handles_cycles)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(let ((x (cons 1 '())) "
                                   "      (y (cons 1 '()))) "
                                   "  (set-cdr! x x) "
@@ -2154,6 +2419,8 @@ TEST(eval_equal_handles_cycles)
 TEST(eval_hash_table_handles_cyclic_equal_keys)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string(
         "(let ((h (make-hash-table)) "
         "      (x (cons 1 '())) "
@@ -2180,6 +2447,8 @@ TEST(eval_hash_table_handles_cyclic_equal_keys)
 TEST(hash_table_enumeration_survives_gc_rehash)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     const char *source =
         "(let ((h (make-strong-eq-hash-table))) "
         "  (let loop ((i 0)) "
@@ -2198,6 +2467,8 @@ TEST(hash_table_enumeration_survives_gc_rehash)
 TEST(eval_append)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(length (append '(1 2) '(3 4 5)))", env);
     ASSERT(is_int(result, 5));
     PASS();
@@ -2206,6 +2477,8 @@ TEST(eval_append)
 TEST(eval_gc_stats_shape)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(gc-stats)", env);
     ASSERT(CELL_TYPE(result) == BT_CONS);
     ASSERT(is_stat_entry(car(result), "minor-gc"));
@@ -2218,6 +2491,11 @@ TEST(eval_gc_stats_shape)
     result = cdr(result);
     ASSERT(CELL_TYPE(result) == BT_CONS);
     ASSERT(is_stat_entry(car(result), "nursery"));
+    result = cdr(result);
+    // Interned-symbol count: atom-table slots are never reclaimed, so this
+    // is the direct measure of per-expansion gensym leakage.
+    ASSERT(CELL_TYPE(result) == BT_CONS);
+    ASSERT(is_stat_entry(car(result), "atoms"));
     ASSERT(cdr(result) == 0);
     PASS();
 }
@@ -2225,6 +2503,8 @@ TEST(eval_gc_stats_shape)
 TEST(eval_string_to_symbol_preserves_numeric_text)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result =
         eval_string("(symbol? (string->symbol \"123\"))", env);
     ASSERT(is_bool(result, 1));
@@ -2234,6 +2514,8 @@ TEST(eval_string_to_symbol_preserves_numeric_text)
 TEST(eval_environment_rejects_non_integer_version)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(scheme-report-environment \"5\")", env);
     ASSERT(result == TOK_ERROR);
 
@@ -2245,6 +2527,8 @@ TEST(eval_environment_rejects_non_integer_version)
 TEST(eval_null_environment_booleans_are_self_evaluating)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned null_env = eval_string("(null-environment 5)", env);
     ASSERT(null_env != TOK_ERROR);
 
@@ -2263,6 +2547,8 @@ TEST(eval_null_environment_booleans_are_self_evaluating)
 TEST(eval_bytevector_rejects_out_of_range_constructor)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(bytevector 256)", env);
     ASSERT(result == TOK_ERROR);
     PASS();
@@ -2271,6 +2557,8 @@ TEST(eval_bytevector_rejects_out_of_range_constructor)
 TEST(eval_exit_rejects_out_of_range_code)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     ASSERT(eval_string("(exit 9223372036854775807)", env) == TOK_ERROR);
     ASSERT(eval_string("(emergency-exit 9223372036854775807)", env) ==
            TOK_ERROR);
@@ -2280,6 +2568,8 @@ TEST(eval_exit_rejects_out_of_range_code)
 TEST(compiled_exit_rejects_out_of_range_code)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     ASSERT(compiled_eval_string("(exit 9223372036854775807)", env) ==
            TOK_ERROR);
     ASSERT(compiled_eval_string("(emergency-exit 9223372036854775807)", env) ==
@@ -2290,6 +2580,8 @@ TEST(compiled_exit_rejects_out_of_range_code)
 TEST(eval_make_bytevector_rejects_out_of_range_fill)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(make-bytevector 3 -1)", env);
     ASSERT(result == TOK_ERROR);
     PASS();
@@ -2298,6 +2590,8 @@ TEST(eval_make_bytevector_rejects_out_of_range_fill)
 TEST(eval_bytevector_set_rejects_out_of_range)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result =
         eval_string("(let ((bv (make-bytevector 1))) "
                     "(bytevector-u8-set! bv 0 300))",
@@ -2315,6 +2609,8 @@ TEST(eval_read_bytevector_zero_returns_empty)
     fclose(f);
 
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result =
         eval_string("(let ((p (open-binary-input-file "
                     "\"/tmp/vesper-read-bytevector-zero-test.bin\"))) "
@@ -2336,6 +2632,8 @@ TEST(eval_read_bytevector_rejects_large_count)
     fclose(f);
 
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result =
         eval_string("(let ((p (open-binary-input-file "
                     "\"/tmp/vesper-read-bytevector-large-test.bin\"))) "
@@ -2355,6 +2653,8 @@ TEST(eval_read_bytevector_rejects_closed_port)
     fclose(f);
 
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result =
         eval_string("(let ((p (open-binary-input-file "
                     "\"/tmp/vesper-read-bytevector-closed-test.bin\"))) "
@@ -2375,6 +2675,8 @@ TEST(eval_read_bytevector_zero_rejects_closed_port)
     fclose(f);
 
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result =
         eval_string("(let ((p (open-binary-input-file "
                     "\"/tmp/vesper-read-bytevector-zero-closed-test.bin\"))) "
@@ -2395,6 +2697,8 @@ TEST(eval_char_ready_file_port)
     fclose(f);
 
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result =
         eval_string("(let ((p (open-input-file "
                     "\"/tmp/vesper-char-ready-test.txt\"))) "
@@ -2410,6 +2714,8 @@ TEST(eval_char_ready_file_port)
 TEST(eval_abs_int64_min)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(abs -9223372036854775808)", env);
     ASSERT(CELL_TYPE(result) == BT_BIGNUM);
     char *s = bn_to_string(get_bignum(result), 10);
@@ -2421,6 +2727,8 @@ TEST(eval_abs_int64_min)
 TEST(eval_abs_negative_rational)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(abs -1/2)", env);
     ASSERT(CELL_TYPE(result) == BT_RATIONAL);
     ASSERT(is_int(CELL_CAR(result), 1));
@@ -2431,6 +2739,8 @@ TEST(eval_abs_negative_rational)
 TEST(eval_negate_rational)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(- 1/2)", env);
     ASSERT(CELL_TYPE(result) == BT_RATIONAL);
     ASSERT(is_int(CELL_CAR(result), -1));
@@ -2441,6 +2751,8 @@ TEST(eval_negate_rational)
 TEST(eval_quotient_int64_min_by_negative_one)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(quotient -9223372036854775808 -1)", env);
     ASSERT(CELL_TYPE(result) == BT_BIGNUM);
     char *s = bn_to_string(get_bignum(result), 10);
@@ -2452,6 +2764,8 @@ TEST(eval_quotient_int64_min_by_negative_one)
 TEST(eval_remainder_int64_min_by_negative_one)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(remainder -9223372036854775808 -1)", env);
     ASSERT(is_int(result, 0));
     PASS();
@@ -2460,6 +2774,8 @@ TEST(eval_remainder_int64_min_by_negative_one)
 TEST(eval_modulo_int64_min_by_negative_one)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(modulo -9223372036854775808 -1)", env);
     ASSERT(is_int(result, 0));
     PASS();
@@ -2468,6 +2784,8 @@ TEST(eval_modulo_int64_min_by_negative_one)
 TEST(eval_inexact_to_exact_int64_min)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(inexact->exact -9.223372036854776e18)", env);
     ASSERT(is_int(result, INT64_MIN));
     PASS();
@@ -2476,6 +2794,8 @@ TEST(eval_inexact_to_exact_int64_min)
 TEST(eval_inexact_to_exact_positive_int64_boundary)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(inexact->exact 9.223372036854776e18)", env);
     ASSERT(CELL_TYPE(result) == BT_BIGNUM);
     char *s = bn_to_string(get_bignum(result), 10);
@@ -2487,6 +2807,8 @@ TEST(eval_inexact_to_exact_positive_int64_boundary)
 TEST(eval_number_to_string_int64_min_radix)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result =
         eval_string("(number->string -9223372036854775808 16)", env);
     ASSERT(CELL_TYPE(result) == BT_STRING);
@@ -2497,6 +2819,8 @@ TEST(eval_number_to_string_int64_min_radix)
 TEST(eval_number_to_string_exact_non_int64)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
 
     unsigned big = eval_string("(number->string 9223372036854775808)", env);
     ASSERT(CELL_TYPE(big) == BT_STRING);
@@ -2533,6 +2857,8 @@ TEST(eval_number_to_string_exact_non_int64)
 TEST(eval_radix_rejects_out_of_range_values)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     ASSERT(eval_string("(number->string 10 9223372036854775807)", env) ==
            TOK_ERROR);
     ASSERT(eval_string("(string->number \"10\" 9223372036854775807)", env) ==
@@ -2543,6 +2869,8 @@ TEST(eval_radix_rejects_out_of_range_values)
 TEST(compiled_radix_rejects_out_of_range_values)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     ASSERT(compiled_eval_string("(number->string 10 9223372036854775807)",
                                 env) == TOK_ERROR);
     ASSERT(compiled_eval_string("(string->number \"10\" 9223372036854775807)",
@@ -2553,6 +2881,8 @@ TEST(compiled_radix_rejects_out_of_range_values)
 TEST(eval_arithmetic_shift_negative_left)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(arithmetic-shift -1 1)", env);
     ASSERT(is_int(result, -2));
     PASS();
@@ -2561,6 +2891,8 @@ TEST(eval_arithmetic_shift_negative_left)
 TEST(eval_arithmetic_shift_int64_min_count)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result =
         eval_string("(arithmetic-shift -8 -9223372036854775808)", env);
     ASSERT(is_int(result, -1));
@@ -2570,6 +2902,8 @@ TEST(eval_arithmetic_shift_int64_min_count)
 TEST(eval_arithmetic_shift_large_left_promotes)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(arithmetic-shift 1 63)", env);
     ASSERT(CELL_TYPE(result) == BT_BIGNUM);
     char *s = bn_to_string(get_bignum(result), 10);
@@ -2581,6 +2915,8 @@ TEST(eval_arithmetic_shift_large_left_promotes)
 TEST(eval_arithmetic_shift_overflow_left_promotes)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(arithmetic-shift 2 62)", env);
     ASSERT(CELL_TYPE(result) == BT_BIGNUM);
     char *s = bn_to_string(get_bignum(result), 10);
@@ -2592,6 +2928,8 @@ TEST(eval_arithmetic_shift_overflow_left_promotes)
 TEST(eval_arithmetic_shift_negative_large_left_promotes)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(arithmetic-shift -1 63)", env);
     ASSERT(is_int(result, INT64_MIN));
     PASS();
@@ -2600,6 +2938,8 @@ TEST(eval_arithmetic_shift_negative_large_left_promotes)
 TEST(eval_rationalize_rejects_large_inexact)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(rationalize 1e100 0.0)", env);
     ASSERT(result == TOK_ERROR);
     PASS();
@@ -2608,6 +2948,8 @@ TEST(eval_rationalize_rejects_large_inexact)
 TEST(eval_floor_preserves_bignum)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(floor 9223372036854775808)", env);
     ASSERT(CELL_TYPE(result) == BT_BIGNUM);
     char *s = bn_to_string(get_bignum(result), 10);
@@ -2619,6 +2961,8 @@ TEST(eval_floor_preserves_bignum)
 TEST(eval_magnitude_preserves_rational)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(magnitude -1/2)", env);
     ASSERT(CELL_TYPE(result) == BT_RATIONAL);
     ASSERT(is_int(CELL_CAR(result), 1));
@@ -2629,6 +2973,8 @@ TEST(eval_magnitude_preserves_rational)
 TEST(eval_magnitude_preserves_bignum)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(magnitude -9223372036854775809)", env);
     ASSERT(CELL_TYPE(result) == BT_BIGNUM);
     char *s = bn_to_string(get_bignum(result), 10);
@@ -2684,6 +3030,8 @@ TEST(eval_complex_division_scales_finite_components)
 TEST(eval_sqrt_preserves_exact_bignum_squares)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string(
         "(number->string "
         " (sqrt 100000000000000000000000000000000000000))",
@@ -2710,6 +3058,8 @@ TEST(eval_sqrt_preserves_exact_bignum_squares)
 TEST(eval_sqrt_preserves_exact_very_large_bignum_squares)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string(
         "(let ((x (expt 10 4000))) (= (sqrt x) (expt 10 2000)))", env);
     ASSERT(is_bool(result, 1));
@@ -2726,6 +3076,8 @@ TEST(eval_exact_to_inexact_huge_bignum_overflows_to_infinity)
         "(let ((x (exact->inexact (expt 2 2000)))) "
         "  (and (infinite? x) (not (nan? x))))";
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     ASSERT(is_bool(eval_string(src, env), 1));
     ASSERT(is_bool(compiled_eval_string(src, env), 1));
     PASS();
@@ -2739,6 +3091,8 @@ TEST(eval_exact_to_inexact_huge_rational_stays_finite)
         "       (d (exact->inexact r))) "
         "  (and (not (infinite? d)) (not (nan? d)) (= d 1.0)))";
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     ASSERT(is_bool(eval_string(src, env), 1));
     ASSERT(is_bool(compiled_eval_string(src, env), 1));
     PASS();
@@ -2747,6 +3101,8 @@ TEST(eval_exact_to_inexact_huge_rational_stays_finite)
 TEST(eval_string_to_number_radix_bignum)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(string->number \"8000000000000000\" 16)", env);
     ASSERT(CELL_TYPE(result) == BT_BIGNUM);
     char *s = bn_to_string(get_bignum(result), 10);
@@ -2758,6 +3114,8 @@ TEST(eval_string_to_number_radix_bignum)
 TEST(eval_string_to_number_radix_rejects_invalid)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(string->number \"12abc\" 10)", env);
     ASSERT(result == ctx.atom_false);
     PASS();
@@ -2766,6 +3124,8 @@ TEST(eval_string_to_number_radix_rejects_invalid)
 TEST(eval_integer_to_char_rejects_surrogates)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     ASSERT(eval_string("(integer->char #xd800)", env) == TOK_ERROR);
     ASSERT(eval_string("(integer->char #xdfff)", env) == TOK_ERROR);
     PASS();
@@ -2774,6 +3134,8 @@ TEST(eval_integer_to_char_rejects_surrogates)
 TEST(compiled_integer_to_char_rejects_surrogates)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     ASSERT(compiled_eval_string("(integer->char #xd800)", env) == TOK_ERROR);
     ASSERT(compiled_eval_string("(integer->char #xdfff)", env) == TOK_ERROR);
     PASS();
@@ -2782,6 +3144,8 @@ TEST(compiled_integer_to_char_rejects_surrogates)
 TEST(eval_complex_reader_accepts_implicit_imaginary_unit)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string(
         "(and (= (real-part 1+i) 1) "
         "     (= (imag-part 1+i) 1) "
@@ -2797,6 +3161,8 @@ TEST(eval_complex_reader_accepts_implicit_imaginary_unit)
 TEST(eval_complex_reader_preserves_exact_components)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string(
         "(and (exact? 1+2i) "
         "     (= (real-part 1+2i) 1) "
@@ -2815,6 +3181,8 @@ TEST(eval_complex_reader_preserves_exact_components)
 TEST(eval_complex_reader_rejects_nested_imaginary_suffix)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string(
         "(and (not (number? '1+2ii)) "
         "     (not (number? '2ii)) "
@@ -2830,6 +3198,8 @@ TEST(eval_complex_reader_rejects_nested_imaginary_suffix)
 TEST(eval_integer_rejects_infinity)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string("(integer? 1e999)", env);
     ASSERT(result == ctx.atom_false);
     PASS();
@@ -2838,6 +3208,8 @@ TEST(eval_integer_rejects_infinity)
 TEST(eval_rational_accessors_reject_infinity)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     ASSERT(eval_string("(numerator 1e999)", env) == TOK_ERROR);
     ASSERT(eval_string("(denominator 1e999)", env) == TOK_ERROR);
     ASSERT(compiled_eval_string("(numerator 1e999)", env) == TOK_ERROR);
@@ -2848,6 +3220,8 @@ TEST(eval_rational_accessors_reject_infinity)
 TEST(compiled_integer_predicate_matches_eval)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     ASSERT(eval_string("(integer? 1.0)", env) == ctx.atom_true);
     ASSERT(compiled_eval_string("(integer? 1.0)", env) == ctx.atom_true);
     ASSERT(eval_string("(integer? 1.5)", env) == ctx.atom_false);
@@ -2858,15 +3232,25 @@ TEST(compiled_integer_predicate_matches_eval)
 
 TEST(eval_exact_rejects_non_numbers)
 {
+    // R7RS 6.2.6 defines exact?/inexact? over numbers, so a non-number is a
+    // type error rather than a #f answer. exact-integer? and friends are
+    // genuine type predicates and stay total - see below.
     unsigned env = default_environment();
-    ASSERT(eval_string("(exact? '())", env) == ctx.atom_false);
-    ASSERT(eval_string("(exact? 'foo)", env) == ctx.atom_false);
+    GC_GUARD;
+    gc_protect(&env);
+    ASSERT(eval_string("(exact? '())", env) == TOK_ERROR);
+    ASSERT(eval_string("(exact? 'foo)", env) == TOK_ERROR);
+    ASSERT(eval_string("(inexact? 'foo)", env) == TOK_ERROR);
+    ASSERT(eval_string("(exact? 1/2)", env) == ctx.atom_true);
+    ASSERT(eval_string("(inexact? 1.0)", env) == ctx.atom_true);
     PASS();
 }
 
 TEST(eval_numtower_rejects_non_numbers)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     ASSERT(eval_string("(real-part 'foo)", env) == TOK_ERROR);
     ASSERT(eval_string("(imag-part 'foo)", env) == TOK_ERROR);
     ASSERT(eval_string("(magnitude 'foo)", env) == TOK_ERROR);
@@ -2876,15 +3260,19 @@ TEST(eval_numtower_rejects_non_numbers)
     ASSERT(eval_string("(make-rectangular 'foo 0)", env) == TOK_ERROR);
     ASSERT(eval_string("(make-polar 'foo 0)", env) == TOK_ERROR);
     ASSERT(eval_string("(rationalize 'foo 1)", env) == TOK_ERROR);
-    ASSERT(eval_string("(finite? 'foo)", env) == ctx.atom_false);
-    ASSERT(eval_string("(infinite? 'foo)", env) == ctx.atom_false);
-    ASSERT(eval_string("(nan? 'foo)", env) == ctx.atom_false);
+    ASSERT(eval_string("(finite? 'foo)", env) == TOK_ERROR);
+    ASSERT(eval_string("(infinite? 'foo)", env) == TOK_ERROR);
+    ASSERT(eval_string("(nan? 'foo)", env) == TOK_ERROR);
+    ASSERT(eval_string("(finite? 1)", env) == ctx.atom_true);
+    ASSERT(eval_string("(nan? (/ 0. 0.))", env) == ctx.atom_true);
     PASS();
 }
 
 TEST(eval_exact_tiny_complex_imag_part_is_not_zero)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string(
         "(= (imag-part (make-rectangular 1 (/ 1 (expt 10 400)))) 0)",
         env);
@@ -2916,6 +3304,8 @@ TEST(eval_exact_tiny_complex_imag_part_is_not_zero)
 TEST(eval_math_rejects_non_numbers)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     ASSERT(eval_string("(asin 'foo)", env) == TOK_ERROR);
     ASSERT(eval_string("(acos 'foo)", env) == TOK_ERROR);
     ASSERT(eval_string("(sqrt 'foo)", env) == TOK_ERROR);
@@ -2938,6 +3328,8 @@ TEST(eval_math_rejects_non_numbers)
 TEST(compiled_div_fixnum_boundary)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result =
         compiled_eval_string("(let ((x -1073741824)) (/ x -1))", env);
     ASSERT(is_int(result, 1073741824));
@@ -2947,6 +3339,8 @@ TEST(compiled_div_fixnum_boundary)
 TEST(compiled_constant_folding_releases_gc_roots)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     for (int i = 0; i < 600; i++) {
         unsigned result = compiled_eval_string("(+ 1 2)", env);
         ASSERT(is_int(result, 3));
@@ -2957,6 +3351,8 @@ TEST(compiled_constant_folding_releases_gc_roots)
 TEST(compiled_number_predicate_constant_folds)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned expr = read_expr_from_string("(number? 1)");
     ASSERT(expr != TOK_ERROR);
 
@@ -2979,6 +3375,8 @@ TEST(compiled_number_predicate_constant_folds)
 TEST(compiled_lookup_add1_int64_max)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     eval_string("(define x 9223372036854775807)", env);
     unsigned result = compiled_eval_string("(+ x 1)", env);
     ASSERT(CELL_TYPE(result) == BT_BIGNUM);
@@ -2991,6 +3389,8 @@ TEST(compiled_lookup_add1_int64_max)
 TEST(compiled_lookup_sub1_int64_min)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     eval_string("(define x -9223372036854775808)", env);
     unsigned result = compiled_eval_string("(- x 1)", env);
     ASSERT(CELL_TYPE(result) == BT_BIGNUM);
@@ -3003,6 +3403,8 @@ TEST(compiled_lookup_sub1_int64_min)
 TEST(compiled_div_int64_min_by_negative_one)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     eval_string("(define x -9223372036854775808)", env);
     eval_string("(define y -1)", env);
     unsigned result = compiled_eval_string("(/ x y)", env);
@@ -3016,6 +3418,8 @@ TEST(compiled_div_int64_min_by_negative_one)
 TEST(compiled_modulo_int64_min_by_negative_one)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     eval_string("(define x -9223372036854775808)", env);
     eval_string("(define y -1)", env);
     unsigned result = compiled_eval_string("(modulo x y)", env);
@@ -3076,6 +3480,8 @@ TEST(compiled_macro_pattern_roots_survive_rational_gc)
 TEST(compiled_letrec_tail_call_many_args)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string(
         "(letrec ((loop (lambda (a b c d e f g h i j k l m n o p q count) "
         "(if (= count 0) "
@@ -3090,6 +3496,8 @@ TEST(compiled_letrec_tail_call_many_args)
 TEST(compiled_let_forms_preserve_enclosing_tail_context)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string(
         "(let ((x 0)) "
         "  (let ((ignore (let ((y 1)) (set! x 1)))) x) "
@@ -3109,6 +3517,8 @@ TEST(compiled_let_forms_preserve_enclosing_tail_context)
 TEST(compiled_cond_arrow_preserves_tail_context)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned expr = read_expr_from_string(
         "(lambda (receiver g) "
         "  (cond (1 => (g)) "
@@ -3128,6 +3538,8 @@ TEST(compiled_cond_arrow_preserves_tail_context)
 TEST(compiled_string_to_list_allocates_fresh_result)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string(
         "(let ((f (lambda () (string->list \"ab\")))) "
         "  (let ((x (f)) (y (f))) "
@@ -3141,6 +3553,8 @@ TEST(compiled_string_to_list_allocates_fresh_result)
 TEST(compiled_begin_preserves_unbound_lookup_error)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string(
         "(begin definitely-unbound-variable 1)",
         env);
@@ -3151,6 +3565,8 @@ TEST(compiled_begin_preserves_unbound_lookup_error)
 TEST(compiled_multiply_by_zero_preserves_side_effects)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string(
         "(let ((x 0)) "
         "  (* (begin (set! x 1) 2) 0) "
@@ -3163,6 +3579,8 @@ TEST(compiled_multiply_by_zero_preserves_side_effects)
 TEST(compiled_multiply_by_one_preserves_type_error)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string("(* \"x\" 1)", env);
     ASSERT(result == TOK_ERROR);
     PASS();
@@ -3171,6 +3589,8 @@ TEST(compiled_multiply_by_one_preserves_type_error)
 TEST(compiled_divide_by_one_preserves_type_error)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string("(/ \"x\" 1)", env);
     ASSERT(result == TOK_ERROR);
     PASS();
@@ -3179,6 +3599,8 @@ TEST(compiled_divide_by_one_preserves_type_error)
 TEST(compiled_double_not_returns_boolean)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string(
         "(let ((x 42)) (not (not x)))",
         env);
@@ -3189,6 +3611,8 @@ TEST(compiled_double_not_returns_boolean)
 TEST(compiled_add1_sub1_preserves_type_error)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string("(- (+ \"x\" 1) 1)", env);
     ASSERT(result == TOK_ERROR);
     PASS();
@@ -3197,6 +3621,8 @@ TEST(compiled_add1_sub1_preserves_type_error)
 TEST(compiled_lookup_add1_sub1_halt_on_type_error)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     ASSERT(compiled_eval_string("(define fused-add1-error \"x\")", env) !=
            TOK_ERROR);
     ASSERT(compiled_eval_string(
@@ -3212,6 +3638,8 @@ TEST(compiled_lookup_add1_sub1_halt_on_type_error)
 TEST(compiled_add1_sub1_support_non_integer_numbers)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned inexact = compiled_eval_string("(let ((x 0)) (+ 1 (exp x)))", env);
     ASSERT(IS_INEXACT(inexact));
     ASSERT(to_double(inexact) == 2.0);
@@ -3242,6 +3670,8 @@ TEST(compiled_add1_sub1_support_non_integer_numbers)
 TEST(compiled_zerop_preserves_type_error)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string("(= \"x\" 0)", env);
     ASSERT(result == TOK_ERROR);
     PASS();
@@ -3250,6 +3680,8 @@ TEST(compiled_zerop_preserves_type_error)
 TEST(compiled_if_numeq_preserves_type_error)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string("(if (= \"x\" 1) 2 3)", env);
     ASSERT(result == TOK_ERROR);
     PASS();
@@ -3258,6 +3690,8 @@ TEST(compiled_if_numeq_preserves_type_error)
 TEST(compiled_if_less_than_preserves_type_error)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string("(if (< \"x\" 1) 2 3)", env);
     ASSERT(result == TOK_ERROR);
     PASS();
@@ -3266,6 +3700,8 @@ TEST(compiled_if_less_than_preserves_type_error)
 TEST(compiled_if_other_comparisons_preserve_type_error)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     ASSERT(compiled_eval_string("(if (> \"x\" 1) 2 3)", env) == TOK_ERROR);
     ASSERT(compiled_eval_string("(if (<= \"x\" 1) 2 3)", env) == TOK_ERROR);
     ASSERT(compiled_eval_string("(if (>= \"x\" 1) 2 3)", env) == TOK_ERROR);
@@ -3275,6 +3711,8 @@ TEST(compiled_if_other_comparisons_preserve_type_error)
 TEST(compiled_if_constant_branches_preserve_test_effects)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string(
         "(let ((x 0)) "
         "  (and (if (begin (set! x 1) #t) 5 5) x))",
@@ -3286,6 +3724,8 @@ TEST(compiled_if_constant_branches_preserve_test_effects)
 TEST(compiled_and_late_constant_false_preserves_prior_effects)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string(
         "(let ((x 0)) "
         "  (and (begin (set! x 1) #t) #f (set! x 2)) "
@@ -3298,6 +3738,8 @@ TEST(compiled_and_late_constant_false_preserves_prior_effects)
 TEST(compiled_or_late_constant_true_preserves_prior_effects)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string(
         "(let ((x 0)) "
         "  (or (begin (set! x 1) #f) 5 (set! x 2)) "
@@ -3310,6 +3752,8 @@ TEST(compiled_or_late_constant_true_preserves_prior_effects)
 TEST(compiled_append_boxes_improper_tail)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string("(cdr (append '(a) 1))", env);
     ASSERT(is_int(result, 1));
     PASS();
@@ -3318,6 +3762,8 @@ TEST(compiled_append_boxes_improper_tail)
 TEST(compiled_apply_rejects_non_list_final_argument)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string("(apply cons 1 2)", env);
     ASSERT(result == TOK_ERROR);
     PASS();
@@ -3326,6 +3772,8 @@ TEST(compiled_apply_rejects_non_list_final_argument)
 TEST(compiled_apply_rejects_improper_final_list)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string("(apply + '(1 . 2))", env);
     ASSERT(result == TOK_ERROR);
     PASS();
@@ -3334,6 +3782,8 @@ TEST(compiled_apply_rejects_improper_final_list)
 TEST(compiled_length_accepts_string)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string("(length \"abc\")", env);
     ASSERT(is_int(result, 3));
     result = compiled_eval_string("(length \"A\\x03bb;B\")", env);
@@ -3344,6 +3794,8 @@ TEST(compiled_length_accepts_string)
 TEST(compiled_length_accepts_vector)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string("(length '#(1 2 3 4))", env);
     ASSERT(is_int(result, 4));
     PASS();
@@ -3352,6 +3804,8 @@ TEST(compiled_length_accepts_vector)
 TEST(compiled_length_rejects_number)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string("(length 1)", env);
     ASSERT(result == TOK_ERROR);
     PASS();
@@ -3360,6 +3814,8 @@ TEST(compiled_length_rejects_number)
 TEST(compiled_listp_rejects_circular_list)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string(
         "(let ((x (cons 1 '()))) "
         "  (set-cdr! x x) "
@@ -3372,6 +3828,8 @@ TEST(compiled_listp_rejects_circular_list)
 TEST(compiled_rejects_circular_list_operations)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     ASSERT(compiled_eval_string("(let ((x (cons 1 '()))) "
                                 "  (set-cdr! x x) "
                                 "  (length x))",
@@ -3406,6 +3864,8 @@ TEST(compiled_rejects_circular_list_operations)
 TEST(compiled_equal_handles_cycles)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string("(let ((x (cons 1 '())) "
                                            "      (y (cons 1 '()))) "
                                            "  (set-cdr! x x) "
@@ -3435,6 +3895,8 @@ TEST(compiled_equal_handles_cycles)
 TEST(compiled_hash_table_handles_cyclic_equal_keys)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string(
         "(let ((h (make-hash-table)) "
         "      (x (cons 1 '())) "
@@ -3461,6 +3923,8 @@ TEST(compiled_hash_table_handles_cyclic_equal_keys)
 TEST(compiled_vector_ref_rejects_non_vector)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string("(vector-ref 1 0)", env);
     ASSERT(result == TOK_ERROR);
     PASS();
@@ -3469,6 +3933,8 @@ TEST(compiled_vector_ref_rejects_non_vector)
 TEST(compiled_call_rejects_fixnum_operator)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string("(1 2)", env);
     ASSERT(result == TOK_ERROR);
     PASS();
@@ -3477,6 +3943,8 @@ TEST(compiled_call_rejects_fixnum_operator)
 TEST(compiled_rejects_improper_application)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string("(+ . 1)", env);
     ASSERT(result == TOK_ERROR);
     PASS();
@@ -3485,6 +3953,8 @@ TEST(compiled_rejects_improper_application)
 TEST(compiled_special_form_keywords_respect_lexical_bindings)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string(
         "(equal? "
         "  (list "
@@ -3514,6 +3984,8 @@ TEST(compiled_special_form_keywords_respect_lexical_bindings)
 TEST(compiled_lambda_optimizations_respect_syntax_binding)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     const char *program =
         "(let-syntax ((lambda (syntax-rules () "
         "                       ((lambda formals body ...) "
@@ -3538,6 +4010,8 @@ TEST(compiled_lambda_optimizations_respect_syntax_binding)
 TEST(eval_macro_expansion_rejects_recursive_expansion)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     ASSERT(eval_string(
                "(begin "
                "  (define-syntax loop "
@@ -3569,6 +4043,8 @@ TEST(eval_macro_expansion_rejects_recursive_expansion)
 TEST(compiled_rejects_malformed_lambda)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     ASSERT(compiled_eval_string("(lambda . 1)", env) == TOK_ERROR);
     ASSERT(compiled_eval_string("(lambda (x . 1) x)", env) == TOK_ERROR);
     ASSERT(compiled_eval_string("(lambda (x))", env) == TOK_ERROR);
@@ -3580,6 +4056,8 @@ TEST(compiled_rejects_malformed_lambda)
 TEST(compiled_lambda_rejects_wrong_arity)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     ASSERT(compiled_eval_string("((lambda (x) x))", env) == TOK_ERROR);
     ASSERT(compiled_eval_string("((lambda (x) x) 1 2)", env) == TOK_ERROR);
     ASSERT(compiled_eval_string("((lambda (x y . rest) rest) 1)", env) ==
@@ -3592,6 +4070,8 @@ TEST(compiled_lambda_rejects_wrong_arity)
 TEST(compiled_let_lambda_handles_dotted_formals_in_self_reference_check)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string(
         "(let ((f (lambda (x . rest) x))) (f 1 2 3))", env);
     ASSERT(is_int(result, 1));
@@ -3607,6 +4087,8 @@ TEST(compiled_let_lambda_handles_dotted_formals_in_self_reference_check)
 TEST(compiled_rejects_malformed_special_forms)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     ASSERT(compiled_eval_string("(quote)", env) == TOK_ERROR);
     ASSERT(compiled_eval_string("(quote a b)", env) == TOK_ERROR);
     ASSERT(compiled_eval_string("(if #t)", env) == TOK_ERROR);
@@ -3780,6 +4262,8 @@ TEST(compiled_rejects_malformed_special_forms)
 TEST(compiled_quasiquote_unquotes_vector_element)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string("(vector-ref `#(a ,(+ 1 2)) 1)", env);
     ASSERT(is_int(result, 3));
     PASS();
@@ -3788,6 +4272,8 @@ TEST(compiled_quasiquote_unquotes_vector_element)
 TEST(compiled_quasiquote_respects_shadowed_keywords)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string(
         "(equal? (let ((unquote 10)) `(a (unquote 1))) "
         "        '(a (unquote 1)))",
@@ -3810,6 +4296,8 @@ TEST(compiled_quasiquote_respects_shadowed_keywords)
 TEST(compiled_quasiquote_rejects_top_level_splicing)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string("`(unquote-splicing)", env);
     ASSERT(result == TOK_ERROR);
     PASS();
@@ -3818,6 +4306,8 @@ TEST(compiled_quasiquote_rejects_top_level_splicing)
 TEST(compiled_quasiquote_splicing_preserves_dotted_tail)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string(
         "(equal? `(a ,@(list 1 2) . tail) '(a 1 2 . tail))", env);
     ASSERT(result == ctx.atom_true);
@@ -3827,6 +4317,8 @@ TEST(compiled_quasiquote_splicing_preserves_dotted_tail)
 TEST(compiled_quasiquote_rejects_improper_splice_value)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string("`(,@(cons 1 2) x)", env);
     ASSERT(result == TOK_ERROR);
     PASS();
@@ -3835,6 +4327,8 @@ TEST(compiled_quasiquote_rejects_improper_splice_value)
 TEST(compiled_quasiquote_rejects_circular_splice_value)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string("(let ((x (cons 1 '()))) "
                                            "  (set-cdr! x x) "
                                            "  `(,@x))",
@@ -3846,6 +4340,8 @@ TEST(compiled_quasiquote_rejects_circular_splice_value)
 TEST(compiled_quasiquote_rejects_circular_template)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     ASSERT(compiled_eval_string("`#1=(a . #1#)", env) == TOK_ERROR);
     ASSERT(compiled_eval_string("`#1=#(#1#)", env) == TOK_ERROR);
     PASS();
@@ -3854,6 +4350,8 @@ TEST(compiled_quasiquote_rejects_circular_template)
 TEST(compiled_syntax_rules_rejects_circular_pattern_and_template)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     ASSERT(compiled_eval_string(
                "(begin "
                "  (define-syntax m "
@@ -3878,6 +4376,8 @@ TEST(compiled_syntax_rules_rejects_circular_pattern_and_template)
 TEST(compiled_syntax_rules_rejects_circular_invocation)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     ASSERT(compiled_eval_string(
                "(begin "
                "  (define-syntax m (syntax-rules () ((m x) x))) "
@@ -3889,6 +4389,8 @@ TEST(compiled_syntax_rules_rejects_circular_invocation)
 TEST(compiled_legacy_macro_rejects_circular_invocation)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     ASSERT(eval_string("(define-macro (m . args) 1)", env) != TOK_ERROR);
     ASSERT(compiled_eval_string("#1=(m . #1#)", env) == TOK_ERROR);
     PASS();
@@ -3897,6 +4399,8 @@ TEST(compiled_legacy_macro_rejects_circular_invocation)
 TEST(compiled_quasiquote_rejects_malformed_subforms)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     ASSERT(compiled_eval_string("`(unquote)", env) == TOK_ERROR);
     ASSERT(compiled_eval_string("`(unquote 1 2)", env) == TOK_ERROR);
     ASSERT(compiled_eval_string("`(unquote-splicing)", env) == TOK_ERROR);
@@ -3924,6 +4428,8 @@ TEST(compiled_quasiquote_rejects_malformed_subforms)
 TEST(compiled_quasiquote_allows_data_in_unquote_expression)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string(
         "(equal? `(a ,(quote (unquote 1 2))) "
         "        '(a (unquote 1 2)))",
@@ -3941,6 +4447,8 @@ TEST(compiled_quasiquote_allows_data_in_unquote_expression)
 TEST(compiled_local_set_returns_assigned_value)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string(
         "(begin "
         "  (define local-set-result (lambda (x) (set! x 2))) "
@@ -3953,6 +4461,8 @@ TEST(compiled_local_set_returns_assigned_value)
 TEST(compiled_call_with_values_accepts_zero_values)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string(
         "(call-with-values (lambda () (values)) (lambda () 42))",
         env);
@@ -3963,6 +4473,8 @@ TEST(compiled_call_with_values_accepts_zero_values)
 TEST(compiled_call_with_values_zero_values_to_list)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string(
         "(call-with-values (lambda () (values)) list)",
         env);
@@ -3973,6 +4485,8 @@ TEST(compiled_call_with_values_zero_values_to_list)
 TEST(compiled_callcc_accepts_multiple_values)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string(
         "(call-with-values (lambda () (call/cc (lambda (k) (k 1 2)))) list)",
         env);
@@ -3986,6 +4500,8 @@ TEST(compiled_callcc_accepts_multiple_values)
 TEST(compiled_callcc_accepts_zero_values)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string(
         "(call-with-values (lambda () (call/cc (lambda (k) (k)))) list)",
         env);
@@ -3996,6 +4512,8 @@ TEST(compiled_callcc_accepts_zero_values)
 TEST(compiled_call_with_values_rejects_non_producer)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string("(call-with-values '() list)", env);
     ASSERT(result == TOK_ERROR);
     PASS();
@@ -4004,6 +4522,8 @@ TEST(compiled_call_with_values_rejects_non_producer)
 TEST(compiled_define_syntax_preserves_custom_ellipsis)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string(
         "(define-syntax foo "
         "  (syntax-rules ::: () "
@@ -4019,6 +4539,8 @@ TEST(compiled_define_syntax_preserves_custom_ellipsis)
 TEST(compiled_begin_define_syntax_is_visible_to_later_forms)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string(
         "(begin "
         "  (define-syntax a (syntax-rules () ((a) (b)))) "
@@ -4183,6 +4705,8 @@ TEST(compiled_begin_define_syntax_is_visible_to_later_forms)
 TEST(compiled_let_syntax_preserves_custom_ellipsis)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string(
         "(let-syntax "
         "    ((foo (syntax-rules ::: () "
@@ -4196,6 +4720,8 @@ TEST(compiled_let_syntax_preserves_custom_ellipsis)
 TEST(eval_syntax_rules_respects_shadowed_ellipsis)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string(
         "(let ((... 2)) "
         "  (let-syntax "
@@ -4212,6 +4738,8 @@ TEST(eval_syntax_rules_respects_shadowed_ellipsis)
 TEST(compiled_syntax_rules_respects_shadowed_ellipsis)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string(
         "(let ((... 2)) "
         "  (let-syntax "
@@ -4228,6 +4756,8 @@ TEST(compiled_syntax_rules_respects_shadowed_ellipsis)
 TEST(eval_macro_hygiene_preserves_quoted_introduced_names)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string(
         "(let-syntax "
         "    ((m (syntax-rules () "
@@ -4252,6 +4782,8 @@ TEST(eval_macro_hygiene_preserves_quoted_introduced_names)
 TEST(compiled_macro_hygiene_preserves_quoted_introduced_names)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string(
         "(let-syntax "
         "    ((m (syntax-rules () "
@@ -4276,6 +4808,8 @@ TEST(compiled_macro_hygiene_preserves_quoted_introduced_names)
 TEST(eval_macro_hygiene_prevents_use_site_capture)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     ASSERT(eval_string(
                "(let-syntax ((m (syntax-rules () ((m) x)))) "
                "  (let ((x 1)) (m)))",
@@ -4308,6 +4842,8 @@ TEST(eval_macro_hygiene_prevents_use_site_capture)
 TEST(compiled_macro_hygiene_prevents_use_site_capture)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     ASSERT(compiled_eval_string(
                "(let-syntax ((m (syntax-rules () ((m) x)))) "
                "  (let ((x 1)) (m)))",
@@ -4340,6 +4876,8 @@ TEST(compiled_macro_hygiene_prevents_use_site_capture)
 TEST(eval_macro_hygiene_respects_shadowed_quote_in_templates)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string(
         "(equal? "
         "  (let ((x 1)) "
@@ -4393,6 +4931,8 @@ TEST(eval_macro_hygiene_respects_shadowed_quote_in_templates)
 TEST(compiled_macro_hygiene_respects_shadowed_quote_in_templates)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string(
         "(equal? "
         "  (let ((x 1)) "
@@ -4446,6 +4986,8 @@ TEST(compiled_macro_hygiene_respects_shadowed_quote_in_templates)
 TEST(eval_macro_hygiene_preserves_definition_site_keyword_bindings)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string(
         "(equal? "
         "  (let ((if list) (x 1)) "
@@ -4521,6 +5063,8 @@ TEST(eval_macro_hygiene_preserves_definition_site_keyword_bindings)
 TEST(compiled_macro_hygiene_preserves_definition_site_keyword_bindings)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string(
         "(equal? "
         "  (let ((if list) (x 1)) "
@@ -4596,6 +5140,8 @@ TEST(compiled_macro_hygiene_preserves_definition_site_keyword_bindings)
 TEST(eval_syntax_rules_unwraps_pattern_vars_in_quoted_templates)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string(
         "(let-syntax ((m (syntax-rules () "
         "                  ((m x) (quote (a . x)))))) "
@@ -4623,6 +5169,8 @@ TEST(eval_syntax_rules_unwraps_pattern_vars_in_quoted_templates)
 TEST(compiled_syntax_rules_unwraps_pattern_vars_in_quoted_templates)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string(
         "(let-syntax ((m (syntax-rules () "
         "                  ((m x) (quote (a . x)))))) "
@@ -4650,6 +5198,8 @@ TEST(compiled_syntax_rules_unwraps_pattern_vars_in_quoted_templates)
 TEST(eval_macro_hygiene_preserves_quasiquote_data)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string(
         "(equal? "
         "  (let-syntax "
@@ -4668,6 +5218,8 @@ TEST(eval_macro_hygiene_preserves_quasiquote_data)
 TEST(compiled_macro_hygiene_preserves_quasiquote_data)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string(
         "(equal? "
         "  (let-syntax "
@@ -4686,6 +5238,8 @@ TEST(compiled_macro_hygiene_preserves_quasiquote_data)
 TEST(eval_syntax_rules_literals_compare_lexical_bindings)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string(
         "(list "
         "  (let-syntax "
@@ -4718,6 +5272,8 @@ TEST(eval_syntax_rules_literals_compare_lexical_bindings)
 TEST(compiled_syntax_rules_literals_compare_lexical_bindings)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string(
         "(list "
         "  (let-syntax "
@@ -4750,6 +5306,8 @@ TEST(compiled_syntax_rules_literals_compare_lexical_bindings)
 TEST(eval_syntax_rules_underscore_literal_is_not_wildcard)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string(
         "(equal? "
         "  (list "
@@ -4773,6 +5331,8 @@ TEST(eval_syntax_rules_underscore_literal_is_not_wildcard)
 TEST(compiled_syntax_rules_underscore_literal_is_not_wildcard)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string(
         "(equal? "
         "  (list "
@@ -4796,6 +5356,8 @@ TEST(compiled_syntax_rules_underscore_literal_is_not_wildcard)
 TEST(eval_syntax_rules_treats_booleans_as_literals)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string(
         "(equal? "
         "  (let-syntax "
@@ -4826,6 +5388,8 @@ TEST(eval_syntax_rules_treats_booleans_as_literals)
 TEST(compiled_syntax_rules_treats_booleans_as_literals)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string(
         "(equal? "
         "  (let-syntax "
@@ -4856,6 +5420,8 @@ TEST(compiled_syntax_rules_treats_booleans_as_literals)
 TEST(eval_syntax_rules_ellipsis_allows_tail_patterns)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string(
         "(let-syntax "
         "    ((m (syntax-rules () "
@@ -4885,6 +5451,8 @@ TEST(eval_syntax_rules_ellipsis_allows_tail_patterns)
 TEST(eval_syntax_rules_vector_template_repeats_compound_elements)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string(
         "(let ((v (let-syntax "
         "             ((m (syntax-rules () "
@@ -4933,6 +5501,8 @@ TEST(eval_syntax_rules_vector_template_repeats_compound_elements)
 TEST(compiled_syntax_rules_ellipsis_allows_tail_patterns)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string(
         "(let-syntax "
         "    ((m (syntax-rules () "
@@ -4977,6 +5547,8 @@ TEST(compiled_syntax_rules_ellipsis_allows_tail_patterns)
 TEST(compiled_syntax_rules_vector_template_repeats_compound_elements)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string(
         "(let ((v (let-syntax "
         "             ((m (syntax-rules () "
@@ -5160,6 +5732,8 @@ TEST(syntax_rules_matches_large_flat_pattern_without_stack_overflow)
 TEST(eval_macro_set_target_is_referentially_transparent)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string(
         "(let ((x 0)) "
         "  (list "
@@ -5191,6 +5765,8 @@ TEST(eval_macro_set_target_is_referentially_transparent)
 TEST(compiled_macro_set_target_is_referentially_transparent)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string(
         "(let ((x 0)) "
         "  (list "
@@ -5222,6 +5798,8 @@ TEST(compiled_macro_set_target_is_referentially_transparent)
 TEST(eval_macro_hygiene_renames_nested_syntax_rules_templates)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string(
         "(let ((x 0)) "
         "  (let-syntax "
@@ -5275,6 +5853,8 @@ TEST(eval_macro_hygiene_renames_nested_syntax_rules_templates)
 TEST(compiled_macro_hygiene_renames_nested_syntax_rules_templates)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string(
         "(let ((x 0)) "
         "  (let-syntax "
@@ -5370,6 +5950,8 @@ TEST(compiled_macro_hygiene_renames_nested_syntax_rules_templates)
 TEST(eval_macro_define_target_is_hygienic)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = eval_string(
         "(let ((x 0)) "
         "  (let-syntax "
@@ -5439,6 +6021,8 @@ TEST(eval_macro_define_target_is_hygienic)
 TEST(compiled_macro_define_target_is_hygienic)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned result = compiled_eval_string(
         "(let ((x 0)) "
         "  (let-syntax "
@@ -5508,6 +6092,8 @@ TEST(compiled_macro_define_target_is_hygienic)
 TEST(compiled_macro_thunk_captures_stack_local)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     unsigned define_result =
         eval_string("(define (%call-thunk thunk) (thunk))", env);
     ASSERT(define_result != TOK_ERROR);
@@ -5526,6 +6112,8 @@ TEST(compiled_macro_thunk_captures_stack_local)
 TEST(compiled_binding_initializer_closures_capture_stack_locals)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     ASSERT(is_int(
         compiled_eval_string(
             "(begin "
@@ -5571,6 +6159,8 @@ TEST(compiled_binding_initializer_closures_capture_stack_locals)
 TEST(eval_calls_bytecode_closure_with_stack_locals)
 {
     unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
     FILE *old_stdin = stdin;
     const char *src =
         "(define bytecode-local-set (lambda (x) (set! x 2)))";

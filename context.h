@@ -49,13 +49,35 @@ typedef struct string_view_data {
 // Cell Accessors
 // ============================================================================
 
+// Build with -DVESPER_GC_TRAP_FREE_CELLS to abort the moment a reclaimed cell
+// is dereferenced. minor_gc marks every unreachable nursery cell BT_FREE, so
+// reading car/cdr of one means something held a cell index across a collection
+// without rooting it; trapping here reports the stale read rather than the
+// corruption it causes several steps later. Pair it with VESPER_GC_STRESS.
+// Compile-time rather than a runtime flag because car/cdr are the hottest
+// functions in the interpreter and this must cost nothing in a normal build.
+// Note it only catches dereferences - a stale value read as an atom id or a
+// vector handle slips past it.
+#ifdef VESPER_GC_TRAP_FREE_CELLS
+void gc_report_free_cell_access(unsigned id, const char *accessor);
+#define VESPER_CHECK_FREE_CELL(id, what)                                       \
+    do {                                                                       \
+        if (CELL_TYPE(id) == BT_FREE)                                          \
+            gc_report_free_cell_access((id), (what));                          \
+    } while (0)
+#else
+#define VESPER_CHECK_FREE_CELL(id, what) ((void)0)
+#endif
+
 static inline unsigned car(unsigned id)
 {
+    VESPER_CHECK_FREE_CELL(id, "car");
     return ctx.cons_cells[id].car;
 }
 
 static inline unsigned cdr(unsigned id)
 {
+    VESPER_CHECK_FREE_CELL(id, "cdr");
     return ctx.cons_cells[id].cdr;
 }
 
@@ -351,7 +373,6 @@ static inline unsigned list_last(unsigned lst)
 }
 
 // Check argument count
-bool check_args(unsigned args, unsigned min, unsigned max, const char *name);
 
 // Append element to list being built (modifies head/tail pointers)
 void list_append(unsigned *head, unsigned *tail, unsigned elem);
@@ -435,6 +456,9 @@ unsigned maybe_gc(unsigned root, int threshold_percent);
 
 // Set GC root for automatic collection during alloc
 void set_alloc_gc_root(unsigned *root);
+
+// Enable VESPER_GC_STRESS=N (collect every N allocations). Called by init_heap.
+void init_gc_stress(void);
 
 // Trigger GC using the registered alloc root (for escape commands)
 void trigger_gc(void);

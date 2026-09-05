@@ -447,7 +447,15 @@ static unsigned qq_transform(unsigned x, unsigned env, int depth)
         return TOK_ERROR;
     gc_protect(&result);
 
-    for (unsigned r = rev_elems; r; r = cdr(r)) {
+    // rev_elems is rooted, but the cursor walking it was a by-value copy
+    // that nothing updated. Each iteration allocates (the recursive
+    // transform and the cons/append call), so after a collection r pointed
+    // at the old location of a cell that had moved - and its cdr was
+    // whatever now lived there. Under GC stress the output contained
+    // reclaimed cells spliced in as elements.
+    unsigned r = 0;
+    gc_protect(&r);
+    for (r = rev_elems; r; r = cdr(r)) {
         unsigned elem = car(r);
         gc_protect(&elem);
         if (depth == 1 && IS_PAIR(elem) &&
@@ -697,6 +705,18 @@ static void apply_cont_step(void)
     unsigned data = cont_data(k);
     unsigned env = cont_env(k);
     unsigned next = cont_next(k);
+
+    // The macro-expansion guard counts expansions but, being trampolined,
+    // has no C-stack unwind to decrement on. Without a reset it was a
+    // cumulative cap: any top-level form that expanded more than 1000 macro
+    // uses in total - eval in a loop, say - failed with "exceeded maximum
+    // depth" even though nothing was nested. A runaway macro is the one case
+    // where expansion follows expansion with no other continuation ever
+    // applied (CONT_MACRO_EXPAND re-dispatches the result straight back into
+    // apply_syntax), so applying any *other* continuation is proof of
+    // progress and the right moment to restart the count.
+    if (type != CONT_MACRO_EXPAND)
+        eval_reset_macro_expansion_depth();
 
     // Dispatch via function pointer table
     if (type < CONT_COUNT && cont_handlers[type]) {

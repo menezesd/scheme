@@ -1801,9 +1801,16 @@ static unsigned make_gc_stats_list(void)
     gc_protect(&heap_used);
     unsigned nursery_used = store(ctx.nursery_ptr - ctx.nursery_start);
     gc_protect(&nursery_used);
+    // Interned symbols. Atom-table slots are never reclaimed (ids are stable
+    // references throughout the heap), so this only ever grows; a workload
+    // that mints a gensym per macro expansion shows up here long before it
+    // hits the table's hard limit.
+    unsigned atoms = store(ctx.atom_count);
+    gc_protect(&atoms);
     unsigned result = 0;
     gc_protect(&result);
 
+    prepend_stat_entry(&result, "atoms", atoms);
     prepend_stat_entry(&result, "nursery", nursery_used);
     prepend_stat_entry(&result, "old-gen", heap_used);
     prepend_stat_entry(&result, "major-gc", major);
