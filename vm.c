@@ -1915,6 +1915,30 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             break;
         }
 
+        case OP_TAILCALL_TRMC: {
+            // A tail call from inside a TRMC body. While the accumulator is
+            // empty this function's return would hand the value straight
+            // back, so a real tail call is exactly equivalent - and R7RS
+            // requires one, which a plain demotion to OP_CALL would break
+            // unboundedly for a mutual recursion cycling through here.
+            // Once something is pending the value has to come back to be
+            // folded in, which is the same reason (cons x (f y)) was never a
+            // tail call to begin with.
+            unsigned argc = vm->code->code[vm->ip++];
+            unsigned fn = vm_pop(vm);
+            if (vm->error)
+                break;
+            bool empty = false;
+            unsigned slot = vm->bp + vm->code->trmc_slot;
+            unsigned last = (vm->code->trmc_mode == TRMC_MODE_HOLE)
+                                ? slot + 1
+                                : slot;
+            if (last >= slot && last < vm->sp)
+                empty = (vm->stack[last] == 0);
+            vm_apply(vm, fn, argc, empty);
+            break;
+        }
+
         case OP_RETURN: {
             unsigned val = vm_pop(vm);
             if (vm->fp == 0) {

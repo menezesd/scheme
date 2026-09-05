@@ -2766,16 +2766,20 @@ static bool trmc_safe_primitive(int64_t prim_id)
     }
 }
 
-// A TAILCALL hands the callee's value straight back to our caller, skipping
-// the return that finishes the accumulator. So inside a TRMC body a tail call
-// to anything but the loop itself has to be an ordinary call. That costs one
-// frame at the base case, which is not the frame-per-element the transform
-// exists to remove.
+// A plain TAILCALL hands the callee's value straight back to our caller,
+// skipping the return that finishes the accumulator. Demoting it to an
+// ordinary call is not good enough either: that breaks proper tail calls,
+// and unboundedly, not by one frame - a mutual recursion whose cycle passes
+// through this body would grow the stack once per round trip. So inside a
+// TRMC body a tail call becomes TAILCALL_TRMC, which decides at runtime on
+// the one condition that matters: with the accumulator still empty the
+// return would pass the value through untouched, so a real tail call is
+// equivalent and R7RS requires it.
 static unsigned trmc_call_opcode(compile_ctx *cctx, bool tail)
 {
     if (!tail)
         return OP_CALL;
-    return cctx->trmc_mode != TRMC_MODE_NONE ? OP_CALL : OP_TAILCALL;
+    return cctx->trmc_mode != TRMC_MODE_NONE ? OP_TAILCALL_TRMC : OP_TAILCALL;
 }
 
 // True if evaluating expr cannot capture a continuation. Narrow on purpose:

@@ -79,6 +79,7 @@ unsigned instruction_size(unsigned op)
     case OP_CLOSURE:
     case OP_CALL:
     case OP_TAILCALL:
+    case OP_TAILCALL_TRMC:
     case OP_JUMP:
     case OP_JUMPIF:
     case OP_JUMPIFNOT:
@@ -901,6 +902,7 @@ static const char *opcode_names[] = {
     [OP_TRMC_APPEND] = "TRMC_APPEND",
     [OP_TRMC_SPLICE] = "TRMC_SPLICE",
     [OP_TRMC_PUSH] = "TRMC_PUSH",
+    [OP_TAILCALL_TRMC] = "TAILCALL_TRMC",
     [OP_ERROR_RETURN] = "ERROR_RETURN",
 };
 
@@ -1005,6 +1007,7 @@ void disassemble(code_object *code, const char *name)
             break;
         case OP_CALL:
         case OP_TAILCALL:
+        case OP_TAILCALL_TRMC:
         case OP_VALUES:
         case OP_LETREC_MARK:
         case OP_RETURN_LOCALS:

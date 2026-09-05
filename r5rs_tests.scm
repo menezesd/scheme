@@ -1703,6 +1703,28 @@ b")
     (go 3)))
 (test "letrec is unaffected" 9 (idef-letrec 9))
 
+(test-section "Proper tail calls survive the TRMC transform")
+;; trmc-tc-a qualifies for the transform, and its base case tail-calls
+;; trmc-tc-b, which tail-calls back. R7RS requires the cycle to run in
+;; constant space. Compiling that call as an ordinary call would grow the
+;; stack once per round trip, not by the one frame it looks like.
+(define (trmc-tc-b n) (if (= n 0) 'done (trmc-tc-a (- n 1))))
+(define (trmc-tc-a n)
+  (let loop ((k 0))
+    (if (= k 0) (trmc-tc-b n) (cons k (loop (- k 1))))))
+(test "3M-deep mutual recursion through a transformed body" 'done
+    (trmc-tc-a 3000000))
+
+;; With something already accumulated the value has to come back to be
+;; folded in, so the result still has to be right.
+(define (trmc-tc-c n)
+  (let loop ((k n))
+    (if (= k 0) (trmc-tc-tail) (cons k (loop (- k 1))))))
+(define (trmc-tc-tail) '(end))
+(test "a pending accumulator still folds the callee's value in" '(3 2 1 end)
+    (trmc-tc-c 3))
+(test "and deeply" 200001 (length (trmc-tc-c 200000)))
+
 (test-section "Macro expansion guard is a depth, not a total")
 ;; The CPS interpreter's expansion guard used to be a cumulative cap: any
 ;; single top-level form that expanded more than 1000 macro uses in total

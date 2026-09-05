@@ -226,6 +226,11 @@ enum opcode {
     OP_TRMC_APPEND, // HOLE: pop v; cell = (v . ()); link it in; tail = cell
     OP_TRMC_SPLICE, // HOLE: pop list; copy its spine onto the accumulator
     OP_TRMC_PUSH,   // FOLD: pop v; acc = (v . acc), allocating but not mutating
+    // A tail call from inside a TRMC body. Tail calls for real while the
+    // accumulator is still empty, since the return would then pass the value
+    // through untouched; keeps the frame once something is pending, which is
+    // exactly when the untransformed program was not tail-calling either.
+    OP_TAILCALL_TRMC, // TAILCALL_TRMC argc
 
     // Marker for exception-handler return frames (never emitted by the
     // compiler; see vm_signal_error). Firing it signals the R7RS

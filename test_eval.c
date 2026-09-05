@@ -6400,15 +6400,16 @@ TEST(trmc_declines_when_cons_is_rebound)
     PASS();
 }
 
-TEST(trmc_demotes_a_foreign_tail_call_to_an_ordinary_call)
+TEST(trmc_makes_a_foreign_tail_call_accumulator_conditional)
 {
     unsigned env = default_environment();
     GC_GUARD;
     gc_protect(&env);
-    // A TAILCALL would hand back the callee's value without running the
-    // return that finishes the accumulator, so inside a TRMC body it becomes
-    // an ordinary CALL - one extra frame at the base case, which is not the
-    // frame-per-element the transform removes.
+    // A plain TAILCALL would hand back the callee's value without running the
+    // return that finishes the accumulator. Demoting it to OP_CALL is not
+    // right either - that breaks proper tail calls - so it becomes
+    // TAILCALL_TRMC, which tail-calls for real while the accumulator is
+    // empty.
     code_object *code = trmc_compile(
         "(define trmc-other (lambda (n g)"
         "  (letrec ((loop (lambda (k)"
@@ -6420,7 +6421,7 @@ TEST(trmc_demotes_a_foreign_tail_call_to_an_ordinary_call)
     ASSERT(body != NULL);
     ASSERT(body->trmc_mode == TRMC_MODE_FOLD);
     ASSERT(!code_has_opcode(body, OP_TAILCALL));
-    ASSERT(code_has_opcode(body, OP_CALL));
+    ASSERT(code_has_opcode(body, OP_TAILCALL_TRMC));
     PASS();
 }
 
@@ -7075,7 +7076,7 @@ int main(void)
     RUN_TEST(trmc_uses_fold_mode_when_the_element_can_capture);
     RUN_TEST(trmc_uses_fold_mode_when_the_base_case_can_capture);
     RUN_TEST(trmc_declines_when_cons_is_rebound);
-    RUN_TEST(trmc_demotes_a_foreign_tail_call_to_an_ordinary_call);
+    RUN_TEST(trmc_makes_a_foreign_tail_call_accumulator_conditional);
     RUN_TEST(trmc_declines_for_a_top_level_define);
     RUN_TEST(trmc_follows_cond_clauses);
     RUN_TEST(trmc_unwinds_let_frames_before_the_loop_jump);
