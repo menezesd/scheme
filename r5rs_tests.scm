@@ -1639,6 +1639,70 @@ b")
 (test "let inside the loop body" '(6 4 2) (trmc-let 3))
 (test "let inside the loop body, deep" 200000 (length (trmc-let 200000)))
 
+(test-section "Case-insensitive string comparison is n-ary")
+;; R7RS 6.7 gives these two-or-more arguments, like their case-sensitive
+;; siblings. stdlib redefined them as strictly binary, shadowing the C
+;; primitive that already handled the n-ary case with the same foldcase.
+(test "string-ci=? with three arguments" #t (string-ci=? "a" "A" "a"))
+(test "string-ci<? with three arguments" #t (string-ci<? "a" "B" "c"))
+(test "string-ci>? with three arguments" #t (string-ci>? "c" "B" "a"))
+(test "string-ci<=? with three arguments" #t (string-ci<=? "a" "A" "b"))
+(test "string-ci>=? with three arguments" #t (string-ci>=? "b" "B" "a"))
+(test "string-ci=? rejects a lone argument" 'err
+    (guard (e (#t 'err)) (string-ci=? "a")))
+(test "a non-matching argument still answers #f" #f (string-ci=? "a" "A" "b"))
+;; Folding stays full Unicode, not ASCII - all of these match MIT.
+(test "sharp s folds to ss" #t (string-ci=? "Stra\x00df;e" "STRASSE"))
+(test "final sigma folds with sigma" #t
+    (string-ci=? "\x3a3;\x38a;\x3a3;\x3a5;\x3a6;\x39f;\x3a3;"
+                 "\x3c3;\x3af;\x3c3;\x3c5;\x3c6;\x3bf;\x3c2;"))
+(test "dotted capital I does not fold to i" #f (string-ci=? "\x130;" "i"))
+
+(test-section "Internal defines are local and see their enclosing scope")
+;; Both of these were VM-only failures: with stack locals the function has no
+;; environment frame, so an internal define landed in the closure's
+;; environment - the global one for a top-level procedure. The CPS
+;; interpreter and MIT were always right.
+(define (trmc-idef-outer n)
+  (define (idef-inner x) (* x 2))
+  (idef-inner n))
+(test "internal define computes" 42 (trmc-idef-outer 21))
+(test "internal define does not escape its body" 'unbound
+    (guard (e (#t 'unbound)) (idef-inner 5)))
+
+(define (idef-capture n)
+  (define (helper x) (* x n))
+  (helper 2))
+(test "internal define sees an enclosing parameter" 42 (idef-capture 21))
+
+;; The same through the (define name (lambda ...)) spelling, which worked
+;; before only because the walk could see the lambda.
+(define (idef-lambda-form n)
+  (define helper (lambda (x) (* x n)))
+  (helper 2))
+(test "internal define written as a lambda" 42 (idef-lambda-form 21))
+
+;; Several internal defines, mutually recursive, all reading a parameter.
+(define (idef-mutual n)
+  (define (even-step k) (if (= k 0) n (odd-step (- k 1))))
+  (define (odd-step k) (if (= k 0) (- n) (even-step (- k 1))))
+  (even-step 4))
+(test "mutually recursive internal defines" 7 (idef-mutual 7))
+(test "neither escapes" 'unbound
+    (guard (e (#t 'unbound)) (even-step 1)))
+
+;; A body whose defines arrive inside a begin, which R7RS splices.
+(define (idef-in-begin n)
+  (begin (define (spliced x) (+ x n)))
+  (spliced 1))
+(test "internal define spliced from a begin" 43 (idef-in-begin 42))
+
+;; letrec still defines into its own frame, so it keeps stack locals.
+(define (idef-letrec n)
+  (letrec ((go (lambda (k) (if (= k 0) n (go (- k 1))))))
+    (go 3)))
+(test "letrec is unaffected" 9 (idef-letrec 9))
+
 (test-section "Macro expansion guard is a depth, not a total")
 ;; The CPS interpreter's expansion guard used to be a cumulative cap: any
 ;; single top-level form that expanded more than 1000 macro uses in total

@@ -163,6 +163,36 @@ static void register_known_lambda(compile_ctx *cctx, unsigned var,
 
 // Forward declaration
 static bool contains_reference(unsigned expr, int64_t var_id);
+static unsigned is_internal_define(unsigned expr, unsigned env);
+static bool is_keyword_shadowed(int64_t kw, unsigned env);
+
+// True if this body introduces internal defines - the same set
+// scan_internal_defines collects, without building the list.
+//
+// An internal define needs an environment frame to land in. compile_begin
+// extends the compile-time environment for one but emits no PUSHENV, so at
+// runtime the binding goes wherever the environment currently points - and a
+// stack-local function has no frame of its own, leaving the closure's
+// environment, which for a top-level procedure is the global one. Two bugs
+// followed: the name leaked out of the body, and the defined procedure could
+// not see the enclosing parameters, since those live in stack slots rather
+// than in any environment. (letrec is fine either way: it pushes its own
+// frame before defining into it.)
+static bool body_defines_internally(unsigned body, unsigned env)
+{
+    for (unsigned e = body; IS_PAIR(e); e = cdr(e)) {
+        unsigned expr = car(e);
+        if (is_internal_define(expr, env))
+            return true;
+        if (IS_PAIR(expr) && IS_KEYWORD(car(expr), ctx.kw_begin) &&
+            !is_keyword_shadowed(ctx.kw_begin, env)) {
+            for (unsigned b = cdr(expr); IS_PAIR(b); b = cdr(b))
+                if (is_internal_define(car(b), env))
+                    return true;
+        }
+    }
+    return false;
+}
 
 // Check if var_id is captured by an inner closure. Since this runs on
 // unexpanded source, we must check let/let*/letrec too (they expand
@@ -3211,7 +3241,10 @@ static compile_result compile_lambda(unsigned expr, compile_ctx *cctx)
     // Stack locals: keep params on VM stack for direct access (LOCAL_GET)
     // instead of in environment frames. Only for fixed-arity functions where
     // no parameter is captured by an inner closure.
-    if (!has_rest && arity > 0 && arity <= 8) {
+    // A body with internal defines needs an environment frame for them; see
+    // body_defines_internally.
+    if (!has_rest && arity > 0 && arity <= 8 &&
+        !body_defines_internally(body, lambda_env)) {
         bool can_use_locals = true;
         unsigned slot = 0;
         for (unsigned p = params; p && IS_PAIR(p); p = cdr(p), slot++) {

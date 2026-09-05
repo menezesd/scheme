@@ -4133,21 +4133,6 @@
 (define string-in-nfd? string-normalized-nfd?)
 (define string-in-nfc? string-normalized-nfc?)
 
-(define (string-ci=? a b)
-  (string=? (string-foldcase a) (string-foldcase b)))
-
-(define (string-ci<? a b)
-  (string<? (string-foldcase a) (string-foldcase b)))
-
-(define (string-ci>? a b)
-  (string>? (string-foldcase a) (string-foldcase b)))
-
-(define (string-ci<=? a b)
-  (string<=? (string-foldcase a) (string-foldcase b)))
-
-(define (string-ci>=? a b)
-  (string>=? (string-foldcase a) (string-foldcase b)))
-
 ;; string-prefix? - check if s starts with prefix
 (define (string-prefix? prefix s)
   (let ((plen (string-length prefix))
