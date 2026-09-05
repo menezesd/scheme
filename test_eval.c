@@ -6189,6 +6189,274 @@ TEST(eval_calls_bytecode_closure_with_stack_locals)
 }
 
 // ============================================================================
+// Tail recursion modulo cons
+// ============================================================================
+// Result-only tests would pass for the wrong reason: a body that was never
+// transformed still computes the right list, just with a frame per element.
+// These look at what was emitted instead.
+
+static code_object *trmc_compile(const char *src, unsigned env)
+{
+    GC_GUARD;
+    gc_protect(&env);
+    FILE *old_stdin = stdin;
+    FILE *f = fmemopen((void *)src, strlen(src), "r");
+    if (!f)
+        return NULL;
+    stdin = f;
+    reader_reset_labels();
+    unsigned expr = read_obj();
+    fclose(f);
+    stdin = old_stdin;
+    if (expr == TOK_ERROR)
+        return NULL;
+    gc_protect(&expr);
+    return compile_toplevel(expr, env);
+}
+
+// Walks the code object and everything nested under it; the transformed body
+// is a child of the toplevel code, not the toplevel code itself.
+static bool code_tree_has_opcode(const code_object *code, unsigned op)
+{
+    if (!code)
+        return false;
+    for (unsigned ip = 0; ip < code->code_len;) {
+        unsigned size = instruction_size(code->code[ip]);
+        if (size == 0 || size > code->code_len - ip)
+            break;
+        if (code->code[ip] == op)
+            return true;
+        ip += size;
+    }
+    for (unsigned i = 0; i < code->children_len; i++) {
+        if (code_tree_has_opcode(code->children[i], op))
+            return true;
+    }
+    return false;
+}
+
+static bool code_tree_has_trmc_flag(const code_object *code)
+{
+    if (!code)
+        return false;
+    if (code->trmc)
+        return true;
+    for (unsigned i = 0; i < code->children_len; i++) {
+        if (code_tree_has_trmc_flag(code->children[i]))
+            return true;
+    }
+    return false;
+}
+
+// The loop jump must clear TRMC_INIT. Targeting ip 0 would re-run it and
+// discard the accumulator on every iteration.
+static bool code_tree_jump_targets_zero(const code_object *code)
+{
+    if (!code)
+        return false;
+    for (unsigned ip = 0; ip < code->code_len;) {
+        unsigned size = instruction_size(code->code[ip]);
+        if (size == 0 || size > code->code_len - ip)
+            break;
+        if (code->code[ip] == OP_JUMP && code->code[ip + 1] == 0)
+            return true;
+        ip += size;
+    }
+    for (unsigned i = 0; i < code->children_len; i++) {
+        if (code_tree_jump_targets_zero(code->children[i]))
+            return true;
+    }
+    return false;
+}
+
+// letrec, not named let: the loop optimization these tests depend on is set
+// up by compile_letrec, and the C named-let path never arms it. In a full
+// interpreter the stdlib's own let macro expands a named let into exactly
+// this letrec, but test_eval runs without the stdlib.
+#define TRMC_BUILD                                                             \
+    "(define trmc-build (lambda (n)"                                           \
+    "  (letrec ((loop (lambda (k)"                                             \
+    "    (if (= k 0) '() (cons k (loop (- k 1)))))))"                          \
+    "    (loop n))))"
+
+TEST(trmc_transforms_cons_over_a_self_tail_call)
+{
+    unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
+    code_object *code = trmc_compile(TRMC_BUILD, env);
+    ASSERT(code != NULL);
+    ASSERT(code_tree_has_opcode(code, OP_TRMC_INIT));
+    ASSERT(code_tree_has_opcode(code, OP_TRMC_APPEND));
+    ASSERT(code_tree_has_trmc_flag(code));
+    PASS();
+}
+
+TEST(trmc_loop_jump_clears_the_accumulator_init)
+{
+    unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
+    code_object *code = trmc_compile(TRMC_BUILD, env);
+    ASSERT(code != NULL);
+    ASSERT(code_tree_has_opcode(code, OP_TRMC_INIT));
+    ASSERT(!code_tree_jump_targets_zero(code));
+    PASS();
+}
+
+TEST(trmc_declines_when_the_element_calls_a_general_procedure)
+{
+    unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
+    // f is an ordinary procedure, so it might capture a continuation; the
+    // half-built list would then be reachable from a second invocation.
+    code_object *code = trmc_compile(
+        "(define trmc-walk (lambda (n f)"
+        "  (letrec ((loop (lambda (k)"
+        "    (if (= k 0) '() (cons (f k) (loop (- k 1)))))))"
+        "    (loop n))))",
+        env);
+    ASSERT(code != NULL);
+    ASSERT(!code_tree_has_opcode(code, OP_TRMC_APPEND));
+    ASSERT(!code_tree_has_trmc_flag(code));
+    PASS();
+}
+
+TEST(trmc_declines_when_the_base_case_calls_a_general_procedure)
+{
+    unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
+    // The base case runs with the accumulator live, so a capture there is
+    // just as dangerous as one in the element expression.
+    code_object *code = trmc_compile(
+        "(define trmc-base (lambda (n f)"
+        "  (letrec ((loop (lambda (k)"
+        "    (if (= k 0) (f 0) (cons k (loop (- k 1)))))))"
+        "    (loop n))))",
+        env);
+    ASSERT(code != NULL);
+    ASSERT(!code_tree_has_opcode(code, OP_TRMC_APPEND));
+    PASS();
+}
+
+TEST(trmc_declines_when_cons_is_rebound)
+{
+    unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
+    // A user may rebind cons; the transform is only valid for the builtin.
+    code_object *code = trmc_compile(
+        "(define trmc-shadowed (lambda (n cons)"
+        "  (letrec ((loop (lambda (k)"
+        "    (if (= k 0) '() (cons k (loop (- k 1)))))))"
+        "    (loop n))))",
+        env);
+    ASSERT(code != NULL);
+    ASSERT(!code_tree_has_opcode(code, OP_TRMC_APPEND));
+    PASS();
+}
+
+TEST(trmc_declines_on_a_tail_call_to_another_procedure)
+{
+    unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
+    // A TAILCALL returns the callee's value directly, without running the
+    // return that closes the chain.
+    code_object *code = trmc_compile(
+        "(define trmc-other (lambda (n g)"
+        "  (letrec ((loop (lambda (k)"
+        "    (if (= k 0) (g) (cons k (loop (- k 1)))))))"
+        "    (loop n))))",
+        env);
+    ASSERT(code != NULL);
+    ASSERT(!code_tree_has_opcode(code, OP_TRMC_APPEND));
+    PASS();
+}
+
+TEST(trmc_declines_for_a_top_level_define)
+{
+    unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
+    // A global can be redefined between iterations, so its self-call cannot
+    // become a jump - which is also what makes it ineligible for TRMC.
+    code_object *code = trmc_compile(
+        "(define trmc-global (lambda (n)"
+        "  (if (= n 0) '() (cons n (trmc-global (- n 1))))))",
+        env);
+    ASSERT(code != NULL);
+    ASSERT(!code_tree_has_opcode(code, OP_TRMC_APPEND));
+    PASS();
+}
+
+TEST(trmc_result_matches_the_untransformed_function)
+{
+    unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
+    ASSERT(compiled_eval_string(TRMC_BUILD, env) != TOK_ERROR);
+    // Same shape with a rebound cons, which declines the transform.
+    ASSERT(compiled_eval_string(
+               "(define trmc-plain (lambda (n mycons)"
+               "  (letrec ((loop (lambda (k)"
+               "    (if (= k 0) '() (mycons k (loop (- k 1)))))))"
+               "    (loop n))))",
+               env) != TOK_ERROR);
+    unsigned same = compiled_eval_string(
+        "(let loop ((i 0))"
+        "  (if (> i 40) #t"
+        "      (if (equal? (trmc-build i) (trmc-plain i cons))"
+        "          (loop (+ i 1)) #f)))",
+        env);
+    ASSERT(same == ctx.atom_true);
+    PASS();
+}
+
+TEST(trmc_handles_empty_single_and_non_list_base_cases)
+{
+    unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
+    ASSERT(compiled_eval_string(TRMC_BUILD, env) != TOK_ERROR);
+    ASSERT(compiled_eval_string("(trmc-build 0)", env) == 0);
+    unsigned one = compiled_eval_string("(trmc-build 1)", env);
+    ASSERT(IS_PAIR(one) && is_int(car(one), 1) && cdr(one) == 0);
+
+    // A base case that is not a list leaves a dotted tail, which the return
+    // has to splice in unchanged.
+    ASSERT(compiled_eval_string(
+               "(define trmc-dotted (lambda (n)"
+               "  (letrec ((loop (lambda (k)"
+               "    (if (= k 0) 'end (cons k (loop (- k 1)))))))"
+               "    (loop n))))",
+               env) != TOK_ERROR);
+    unsigned dotted = compiled_eval_string("(trmc-dotted 2)", env);
+    ASSERT(IS_PAIR(dotted));
+    ASSERT(is_int(car(dotted), 2));
+    ASSERT(IS_PAIR(cdr(dotted)) && is_int(car(cdr(dotted)), 1));
+    unsigned dtail = cdr(cdr(dotted));
+    ASSERT(CELL_TYPE(dtail) == BT_ATOM);
+    ASSERT_STR_EQ(ctx.atom_table[CELL_ID(dtail)], "end");
+    PASS();
+}
+
+TEST(trmc_builds_beyond_the_frame_ceiling)
+{
+    unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
+    ASSERT(compiled_eval_string(TRMC_BUILD, env) != TOK_ERROR);
+    // Well past VM_MAX_FRAMES_SIZE: without the transform this is a stack
+    // overflow, not a slow success.
+    unsigned len = compiled_eval_string("(length (trmc-build 2000000))", env);
+    ASSERT(is_int(len, 2000000));
+    PASS();
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -6527,6 +6795,18 @@ int main(void)
     RUN_TEST(compiled_macro_thunk_captures_stack_local);
     RUN_TEST(compiled_binding_initializer_closures_capture_stack_locals);
     RUN_TEST(eval_calls_bytecode_closure_with_stack_locals);
+
+    // Tail recursion modulo cons
+    RUN_TEST(trmc_transforms_cons_over_a_self_tail_call);
+    RUN_TEST(trmc_loop_jump_clears_the_accumulator_init);
+    RUN_TEST(trmc_declines_when_the_element_calls_a_general_procedure);
+    RUN_TEST(trmc_declines_when_the_base_case_calls_a_general_procedure);
+    RUN_TEST(trmc_declines_when_cons_is_rebound);
+    RUN_TEST(trmc_declines_on_a_tail_call_to_another_procedure);
+    RUN_TEST(trmc_declines_for_a_top_level_define);
+    RUN_TEST(trmc_result_matches_the_untransformed_function);
+    RUN_TEST(trmc_handles_empty_single_and_non_list_base_cases);
+    RUN_TEST(trmc_builds_beyond_the_frame_ceiling);
 
     TEST_SUMMARY("evaluator");
 }

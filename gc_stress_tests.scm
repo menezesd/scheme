@@ -111,6 +111,21 @@
          (list (eval '(length (map (lambda (x) (+ x 1)) '(1 2))) r)
                (eval '(+ 1 2) r))))
 
+;; TRMC keeps its accumulator in two operand-stack slots rather than in
+;; vm_state, on the theory that the collectors already trace the whole stack.
+;; TRMC_APPEND allocates a cell per element, so at a forced collection per
+;; allocation every single iteration collects between reading the head/tail
+;; slots and writing them back. If that reasoning is wrong this is where it
+;; shows: a stale head returns a truncated or corrupted list.
+(check "trmc list length under forced collections" 200
+       (length (let loop ((k 200)) (if (= k 0) '() (cons k (loop (- k 1)))))))
+(check "trmc list contents under forced collections" '(4 3 2 1)
+       (let loop ((k 4)) (if (= k 0) '() (cons k (loop (- k 1))))))
+(check "trmc dotted tail survives collection" '(2 1 . end)
+       (let loop ((k 2)) (if (= k 0) 'end (cons k (loop (- k 1))))))
+(check "trmc element expression allocates too" '((3) (2) (1))
+       (let loop ((k 3)) (if (= k 0) '() (cons (list k) (loop (- k 1))))))
+
 (newline)
 (display "GC stress tests: ")
 (display (if (= failures 0) "all passed" "FAILURES"))

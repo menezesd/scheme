@@ -206,6 +206,14 @@ enum opcode {
     OP_LT_INT_JUMPIFNOT,  // Fixnum compare+branch
     OP_NUMEQ_INT_JUMPIFNOT,
 
+    // Tail recursion modulo cons. A function whose only recursive call sits
+    // inside a (cons E (self ...)) in tail position is compiled as a loop that
+    // builds the list forwards and mutates the last cell's cdr, instead of
+    // holding one frame per element. TRMC_INIT reserves the accumulator; the
+    // chain's open tail is closed by RETURN_LOCALS under code->trmc.
+    OP_TRMC_INIT,   // push head=() and tail=() as two stack locals
+    OP_TRMC_APPEND, // pop v; cell = (v . ()); link it in; tail = cell
+
     // Marker for exception-handler return frames (never emitted by the
     // compiler; see vm_signal_error). Firing it signals the R7RS
     // "handler returned from a non-continuable exception" error.
@@ -243,6 +251,13 @@ typedef struct code_object {
     bool has_rest;     // True if has rest parameter
     unsigned rest_idx; // Index of rest parameter (if has_rest)
     bool use_locals;   // True if params are stack locals (not in env)
+
+    // Tail recursion modulo cons. Set by the compiler when the body was
+    // compiled with a TRMC accumulator, which RETURN_LOCALS has to close.
+    // A flag read by the existing return rather than a separate return
+    // opcode, so no other site that ends a tail position has to know.
+    bool trmc;          // True if this body carries a TRMC accumulator
+    unsigned trmc_slot; // Local slot of head; tail is trmc_slot + 1
 
     // Source info for debugging
     const char *name;     // Function name (if known)
@@ -417,6 +432,15 @@ typedef struct compile_ctx {
     unsigned loop_arity;        // Number of fixed parameters
     bool loop_pending;          // Loop info set by letrec, awaiting pickup by
                                 // the binding's own lambda (not nested ones)
+    unsigned loop_start;        // ip the self-call JUMP targets. Not always 0:
+                                // TRMC_INIT sits before the body and must not
+                                // be re-run on each iteration.
+
+    // Tail recursion modulo cons, decided for the whole body before it is
+    // compiled (see trmc_body_qualifies) so TRMC_INIT can be emitted first.
+    bool trmc_enabled;          // (cons E (self ...)) compiles to append+loop
+    unsigned trmc_slot;         // Local slot of head; tail is trmc_slot + 1
+
     unsigned env_depth;         // Number of PUSHENV frames since lambda entry
     unsigned macro_expansion_depth; // Guard against recursive expansion
 } compile_ctx;

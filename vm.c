@@ -1670,9 +1670,54 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             break;
         }
 
+        case OP_TRMC_INIT: {
+            // Two accumulator slots, head then tail, sitting just above the
+            // parameters. They live on the operand stack rather than in
+            // vm_state so the collectors root them for free (the whole stack
+            // is traced) and so an inner activation of the same function gets
+            // its own pair - a vm_state field would be shared between them.
+            vm_push(vm, 0);
+            vm_push(vm, 0);
+            break;
+        }
+
+        case OP_TRMC_APPEND: {
+            unsigned v = vm_pop(vm);
+            if (vm->error)
+                break;
+            unsigned base, tail_idx;
+            if (!vm_local_index(vm, vm->code->trmc_slot, &base) ||
+                !vm_local_index(vm, vm->code->trmc_slot + 1, &tail_idx))
+                break;
+            // list_append allocates, so it roots head, tail and v itself.
+            // The stack slots still hold the pre-collection values while it
+            // runs; the collectors forward those in place, and the copies
+            // written back afterwards are the forwarded ones.
+            unsigned head = vm->stack[base];
+            unsigned tail = vm->stack[tail_idx];
+            list_append(&head, &tail, v);
+            vm->stack[base] = head;
+            vm->stack[tail_idx] = tail;
+            break;
+        }
+
         case OP_RETURN_LOCALS: {
             vm->ip++; // skip operand
             unsigned val = vm_pop(vm);
+            if (vm->code->trmc) {
+                // Close the chain: the value this return produces fills the
+                // hole at the end of the accumulator. An empty accumulator
+                // means the function never appended, so the value stands.
+                unsigned base, tail_idx;
+                if (!vm_local_index(vm, vm->code->trmc_slot, &base) ||
+                    !vm_local_index(vm, vm->code->trmc_slot + 1, &tail_idx))
+                    break;
+                unsigned tail = vm->stack[tail_idx];
+                if (tail) {
+                    cell_set_cdr(tail, val);
+                    val = vm->stack[base];
+                }
+            }
             if (vm->fp == 0) {
                 vm->sp = vm->bp;
                 vm_push(vm, val);

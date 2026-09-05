@@ -897,6 +897,9 @@ static const char *opcode_names[] = {
     [OP_MUL_INT] = "MUL_INT",
     [OP_LT_INT_JUMPIFNOT] = "LT_INT_JUMPIFNOT",
     [OP_NUMEQ_INT_JUMPIFNOT] = "NUMEQ_INT_JUMPIFNOT",
+    [OP_TRMC_INIT] = "TRMC_INIT",
+    [OP_TRMC_APPEND] = "TRMC_APPEND",
+    [OP_ERROR_RETURN] = "ERROR_RETURN",
 };
 
 static const char *disassemble_atom_name(unsigned atom_id)

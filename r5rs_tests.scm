@@ -1442,6 +1442,66 @@ b")
       (define (build n) (if (= n 0) '() (cons n (build (- n 1)))))
       (list-tail (build 100000) 99997)))
 
+(test-section "Tail recursion modulo cons")
+;; (cons E (self a ...)) in tail position compiles to a loop that builds the
+;; list forwards and mutates the last cell's cdr, so depth is bounded by
+;; memory rather than by VM frames.
+(define (trmc-build n)
+  (let loop ((k n))
+    (if (= k 0) '() (cons k (loop (- k 1))))))
+(test "1.2M elements, past the 1M frame ceiling" 1200000
+    (length (trmc-build 1200000)))
+(test "elements come out in order" '(5 4 3 2 1) (trmc-build 5))
+(test "empty result" '() (trmc-build 0))
+(test "single element" '(1) (trmc-build 1))
+(test "deep result has the right elements at the end" '(3 2 1)
+    (list-tail (trmc-build 100000) 99997))
+
+;; A base case that is not a list leaves a dotted tail, which the return
+;; splices in unchanged rather than treating as the end of a proper list.
+(define (trmc-dotted n)
+  (let loop ((k n))
+    (if (= k 0) 'end (cons k (loop (- k 1))))))
+(test "non-list base case becomes a dotted tail" '(2 1 . end) (trmc-dotted 2))
+(test "non-list base case with no elements" 'end (trmc-dotted 0))
+
+;; Same shape with cons rebound, which declines the transform: the two must
+;; agree everywhere, not just on the happy path.
+(define (trmc-plain n mycons)
+  (let loop ((k n))
+    (if (= k 0) '() (mycons k (loop (- k 1))))))
+(test "transformed and untransformed agree for 0..40" #t
+    (let loop ((i 0))
+      (if (> i 40)
+          #t
+          (if (equal? (trmc-build i) (trmc-plain i cons)) (loop (+ i 1)) #f))))
+
+;; The transform is only sound while the half-built list is unobservable.
+;; A capture in the element expression makes it observable, so the transform
+;; must decline - and the way to tell is that re-entering the continuation
+;; must not rewrite the list the first run already returned.
+(define trmc-k #f)
+(define trmc-saved #f)
+(define (trmc-cap n)
+  (let loop ((j n))
+    (if (= j 0)
+        '()
+        (cons (call-with-current-continuation
+               (lambda (c) (if (= j 1) (set! trmc-k c)) j))
+              (loop (- j 1))))))
+(define trmc-reentry
+  (call-with-current-continuation
+   (lambda (return)
+     (let ((lst (trmc-cap 3)))
+       (if (not trmc-saved)
+           (begin (set! trmc-saved lst)
+                  (let ((k trmc-k)) (set! trmc-k #f) (k 99))))
+       (return (list trmc-saved lst))))))
+(test "re-entering a captured continuation rebuilds the list" '(3 2 99)
+    (cadr trmc-reentry))
+(test "the first result is not mutated by the second run" '(3 2 1)
+    (car trmc-reentry))
+
 (test-section "Macro expansion guard is a depth, not a total")
 ;; The CPS interpreter's expansion guard used to be a cumulative cap: any
 ;; single top-level form that expanded more than 1000 macro uses in total
