@@ -2930,6 +2930,120 @@ static bool trmc_scan_tail(unsigned expr, compile_ctx *cctx,
                 }
                 return trmc_scan_tail(car(e), cctx, st, depth + 1);
             }
+            if (kw == ctx.kw_cond) {
+                // Like if, cond pushes no environment frame, so a site in a
+                // clause body is still at env_depth 0.
+                for (unsigned c = cdr(expr); IS_PAIR(c); c = cdr(c)) {
+                    unsigned clause = car(c);
+                    if (!IS_PAIR(clause))
+                        return false;
+                    unsigned test = car(clause);
+                    unsigned conseq = cdr(clause);
+                    bool is_else =
+                        IS_KEYWORD(test, ctx.kw_else) &&
+                        env_find_binding_cell(ctx.kw_else, cctx->env) == 0;
+                    if (!is_else && !trmc_capture_free(test, cctx, 0))
+                        st->capture_free = false;
+                    if (!IS_PAIR(conseq))
+                        continue; // (test): the test value is the result
+                    if (IS_KEYWORD(car(conseq), ctx.kw_arrow) &&
+                        env_find_binding_cell(ctx.kw_arrow, cctx->env) == 0) {
+                        // (test => receiver) applies the receiver, and a call
+                        // can capture whatever the receiver expression is.
+                        st->capture_free = false;
+                        continue;
+                    }
+                    unsigned e = conseq;
+                    while (IS_PAIR(cdr(e))) {
+                        if (!trmc_capture_free(car(e), cctx, 0))
+                            st->capture_free = false;
+                        e = cdr(e);
+                    }
+                    if (!trmc_scan_tail(car(e), cctx, st, depth + 1))
+                        return false;
+                }
+                return true;
+            }
+            if (kw == ctx.kw_lambda)
+                return true; // a lambda in tail position is just a value
+            if (kw == ctx.kw_let && IS_PAIR(cdr(expr)) &&
+                !IS_ATOM(cadr(expr))) {
+                // Plain let, not named let. The scan reads the body in the
+                // enclosing compile-time environment, so it cannot see that a
+                // binding here shadows something it resolved to a primitive -
+                // (let ((car f)) ...) would look capture-free and would not
+                // be. Rather than extend the environment during analysis,
+                // give up on HOLE for these bodies; FOLD has no such
+                // requirement and takes them unchanged.
+                st->capture_free = false;
+                for (unsigned b = cadr(expr); IS_PAIR(b); b = cdr(b))
+                    if (!IS_PAIR(car(b)))
+                        return false;
+                unsigned e = cddr(expr);
+                if (!IS_PAIR(e))
+                    return true;
+                while (IS_PAIR(cdr(e)))
+                    e = cdr(e);
+                return trmc_scan_tail(car(e), cctx, st, depth + 1);
+            }
+            if (kw == ctx.kw_and || kw == ctx.kw_or) {
+                // Only the last operand is in tail position - compile_and and
+                // compile_or both set tail_position = tail && is_last - so a
+                // site can only appear there.
+                unsigned e = cdr(expr);
+                if (!IS_PAIR(e))
+                    return true;
+                while (IS_PAIR(cdr(e))) {
+                    if (!trmc_capture_free(car(e), cctx, 0))
+                        st->capture_free = false;
+                    e = cdr(e);
+                }
+                return trmc_scan_tail(car(e), cctx, st, depth + 1);
+            }
+        }
+    }
+
+    // ((lambda (v ...) body) arg ...) in tail position - what the stdlib's own
+    // let macro expands to, and the shape compile_call inlines rather than
+    // building a closure for.
+    //
+    // Mostly latent as things stand: captured_by_inner_lambda counts a
+    // reference from inside this lambda as a capture, even though the lambda
+    // is about to be inlined and never becomes a closure, so any body that
+    // mentions a loop parameter under a let loses stack locals - and TRMC
+    // needs them for the accumulator's address. Teaching that walk about
+    // immediately-applied lambdas would make this live, and would want to
+    // match the inliner's acceptance conditions exactly, since disagreeing
+    // means a closure looking up a parameter that is not in the environment.
+    //
+    // Same caveat as a let besides: the scan reads the body without these
+    // bindings in scope, so it cannot tell that one shadows a name it
+    // resolved to a primitive. HOLE is given up; FOLD is unaffected.
+    if (IS_PAIR(expr) && IS_PAIR(car(expr)) && IS_ATOM(car(car(expr))) &&
+        CELL_ID(car(car(expr))) == ctx.kw_lambda &&
+        builtin_keyword_unbound(ctx.kw_lambda, cctx->env)) {
+        unsigned fn = car(expr);
+        unsigned params = IS_PAIR(cdr(fn)) ? cadr(fn) : 0;
+        unsigned fn_body = IS_PAIR(cdr(fn)) ? cddr(fn) : 0;
+        // Only the shape the inliner accepts: fixed arity, exact match.
+        unsigned param_count = 0;
+        bool ok = !IS_ATOM(params);
+        for (unsigned p = params; ok && p; p = IS_PAIR(p) ? cdr(p) : 0) {
+            if (IS_ATOM(p)) {
+                ok = false; // rest parameter
+                break;
+            }
+            param_count++;
+        }
+        if (ok && param_count == list_length(cdr(expr)) && IS_PAIR(fn_body)) {
+            st->capture_free = false;
+            for (unsigned a = cdr(expr); IS_PAIR(a); a = cdr(a))
+                if (!trmc_capture_free(car(a), cctx, 0))
+                    st->capture_free = false;
+            unsigned e = fn_body;
+            while (IS_PAIR(cdr(e)))
+                e = cdr(e);
+            return trmc_scan_tail(car(e), cctx, st, depth + 1);
         }
     }
 
@@ -4243,6 +4357,15 @@ static void emit_self_call_loop(unsigned args, compile_ctx *cctx)
             emit(cctx, OP_POP);
         }
     }
+    // The loop entry point expects the environment the lambda was entered
+    // with, so any frame a let pushed since then has to come off first -
+    // jumping straight past the POPENVs would leak one frame per iteration.
+    // cctx->env_depth is deliberately left alone: the enclosing form still
+    // emits its own POPENV for a fall-through path that this jump makes
+    // unreachable.
+    for (unsigned d = 0; d < cctx->env_depth; d++)
+        code_emit(cctx->code, OP_POPENV);
+
     // Back to the loop entry point, which is ip 0 only when nothing was
     // emitted ahead of the body (TRMC_INIT is).
     emit2(cctx, OP_JUMP, cctx->loop_start);
@@ -4274,8 +4397,11 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
     // compile the cons and leave the recursive call under it.
     unsigned trmc_operands = 0, trmc_call = 0;
     int64_t trmc_op = 0;
+    // No env_depth restriction here, unlike the plain loop optimization below:
+    // emit_self_call_loop unwinds the pending frames before jumping, and TRMC
+    // is limited to stack-local functions, so the SETs are LOCAL_SET_VOID and
+    // cannot be captured by a let frame that shadows a parameter name.
     if (cctx->trmc_mode != TRMC_MODE_NONE && cctx->tail_position &&
-        cctx->env_depth == 0 &&
         trmc_classify(expr, cctx, &trmc_operands, &trmc_call, &trmc_op) &&
         (unsigned)trmc_op == cctx->trmc_op) {
         cctx->tail_position = false;

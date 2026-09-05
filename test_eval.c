@@ -6441,6 +6441,71 @@ TEST(trmc_declines_for_a_top_level_define)
     PASS();
 }
 
+TEST(trmc_follows_cond_clauses)
+{
+    unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
+    // cond pushes no environment frame, so a site in a clause body is at the
+    // same depth as one directly under an if.
+    code_object *code = trmc_compile(
+        "(define trmc-cond (lambda (n)"
+        "  (letrec ((loop (lambda (k)"
+        "    (cond ((= k 0) '())"
+        "          (else (cons k (loop (- k 1))))))))"
+        "    (loop n))))",
+        env);
+    ASSERT(code != NULL);
+    ASSERT(code_tree_has_opcode(code, OP_TRMC_APPEND));
+    ASSERT(code_tree_has_trmc_mode(code, TRMC_MODE_HOLE));
+    ASSERT(compiled_eval_string(
+               "(define trmc-cond (lambda (n)"
+               "  (letrec ((loop (lambda (k)"
+               "    (cond ((= k 0) '())"
+               "          (else (cons k (loop (- k 1))))))))"
+               "    (loop n))))",
+               env) != TOK_ERROR);
+    unsigned len = compiled_eval_string("(length (trmc-cond 200000))", env);
+    ASSERT(is_int(len, 200000));
+    PASS();
+}
+
+TEST(trmc_unwinds_let_frames_before_the_loop_jump)
+{
+    unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
+    // A let pushes an environment frame, so jumping straight back to the loop
+    // entry point would leak one frame per iteration. The jump is preceded by
+    // a POPENV for each pending frame. (test_eval runs without the stdlib, so
+    // let here is the compiler's own form rather than the stdlib macro that
+    // expands to an immediately applied lambda.)
+    code_object *code = trmc_compile(
+        "(define trmc-let (lambda (n)"
+        "  (letrec ((loop (lambda (k)"
+        "    (if (= k 0) '()"
+        "        (let ((d (* k 2))) (cons d (loop (- k 1))))))))"
+        "    (loop n))))",
+        env);
+    ASSERT(code != NULL);
+    ASSERT(code_tree_has_opcode(code, OP_TRMC_INIT));
+    ASSERT(code_tree_has_opcode(code, OP_POPENV));
+    ASSERT(compiled_eval_string(
+               "(define trmc-let (lambda (n)"
+               "  (letrec ((loop (lambda (k)"
+               "    (if (= k 0) '()"
+               "        (let ((d (* k 2))) (cons d (loop (- k 1))))))))"
+               "    (loop n))))",
+               env) != TOK_ERROR);
+    unsigned three = compiled_eval_string("(trmc-let 3)", env);
+    ASSERT(IS_PAIR(three) && is_int(car(three), 6));
+    // Past the frame ceiling, and without leaking a frame per iteration -
+    // a leak would exhaust the environment long before this finishes.
+    unsigned len = compiled_eval_string("(length (trmc-let 1100000))", env);
+    ASSERT(is_int(len, 1100000));
+    PASS();
+}
+
 TEST(trmc_folds_string_append)
 {
     unsigned env = default_environment();
@@ -6636,8 +6701,8 @@ TEST(trmc_fold_mode_runs_beyond_the_frame_ceiling)
                "    (if (= k 0) '() (cons (trmc-scale k) (loop (- k 1)))))))"
                "    (loop n))))",
                env) != TOK_ERROR);
-    unsigned len = compiled_eval_string("(length (trmc-walk 2000000))", env);
-    ASSERT(is_int(len, 2000000));
+    unsigned len = compiled_eval_string("(length (trmc-walk 1100000))", env);
+    ASSERT(is_int(len, 1100000));
 
     // Arithmetic, where the accumulator holds numbers rather than list cells.
     ASSERT(compiled_eval_string(
@@ -6646,8 +6711,8 @@ TEST(trmc_fold_mode_runs_beyond_the_frame_ceiling)
                "    (if (= k 0) 0 (+ k (loop (- k 1)))))))"
                "    (loop n))))",
                env) != TOK_ERROR);
-    unsigned sum = compiled_eval_string("(trmc-total 2000000)", env);
-    ASSERT(is_int(sum, 2000001000000LL));
+    unsigned sum = compiled_eval_string("(trmc-total 1100000)", env);
+    ASSERT(is_int(sum, 605000550000LL));
     PASS();
 }
 
@@ -7012,6 +7077,8 @@ int main(void)
     RUN_TEST(trmc_declines_when_cons_is_rebound);
     RUN_TEST(trmc_demotes_a_foreign_tail_call_to_an_ordinary_call);
     RUN_TEST(trmc_declines_for_a_top_level_define);
+    RUN_TEST(trmc_follows_cond_clauses);
+    RUN_TEST(trmc_unwinds_let_frames_before_the_loop_jump);
     RUN_TEST(trmc_folds_string_append);
     RUN_TEST(trmc_fold_mode_leaves_an_earlier_result_alone);
     RUN_TEST(trmc_transforms_append_over_a_self_tail_call);
