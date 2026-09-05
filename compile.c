@@ -170,66 +170,85 @@ static bool contains_reference(unsigned expr, int64_t var_id);
 // actually escape will still disable locals. But it's safe and correct.
 static bool captured_by_inner_lambda(unsigned expr, int64_t var_id, unsigned env)
 {
-    if (!expr || !IS_PAIR(expr))
-        return false;
-    if (!IS_ATOM(car(expr)))
-        return captured_by_inner_lambda(car(expr), var_id, env) ||
-               captured_by_inner_lambda(cdr(expr), var_id, env);
+    // The spine is walked with this loop rather than by recursing on the cdr,
+    // which cost one C frame per list element: a lambda with a long flat body,
+    // or a macro that expands to one, overflowed the C stack here. Only the
+    // cars still recurse, so depth follows nesting rather than length.
+    for (;;) {
+        if (!expr || !IS_PAIR(expr))
+            return false;
+        if (!IS_ATOM(car(expr))) {
+            if (captured_by_inner_lambda(car(expr), var_id, env))
+                return true;
+            expr = cdr(expr);
+            continue;
+        }
 
-    int64_t kw = CELL_ID(car(expr));
-    if (kw == ctx.kw_quote && builtin_keyword_unbound(ctx.kw_quote, env))
-        return false;
-    // A nested lambda captures this variable if its body refers to the
-    // outer binding. Check the full lambda form so shadowing parameters are
-    // handled by contains_reference.
-    if (kw == ctx.kw_lambda && builtin_keyword_unbound(ctx.kw_lambda, env))
-        return contains_reference(expr, var_id);
-    // let/let*/letrec binding initializers may create closures over this
-    // variable, so scan the whole form for nested lambdas. Direct references
-    // do not count as captures because atoms return false above.
-    if ((kw == ctx.kw_let || kw == ctx.kw_letstar || kw == ctx.kw_letrec) &&
-        builtin_keyword_unbound(kw, env))
-        return captured_by_inner_lambda(cdr(expr), var_id, env);
-    unsigned binding = lookup_silent(kw, env);
-    if (binding != TOK_ERROR && IS_SYNTAX(binding))
-        return contains_reference(expr, var_id);
-    return captured_by_inner_lambda(car(expr), var_id, env) ||
-           captured_by_inner_lambda(cdr(expr), var_id, env);
+        int64_t kw = CELL_ID(car(expr));
+        if (kw == ctx.kw_quote && builtin_keyword_unbound(ctx.kw_quote, env))
+            return false;
+        // A nested lambda captures this variable if its body refers to the
+        // outer binding. Check the full lambda form so shadowing parameters
+        // are handled by contains_reference.
+        if (kw == ctx.kw_lambda && builtin_keyword_unbound(ctx.kw_lambda, env))
+            return contains_reference(expr, var_id);
+        // let/let*/letrec binding initializers may create closures over this
+        // variable, so scan the whole form for nested lambdas. Direct
+        // references do not count as captures because atoms return false
+        // above.
+        if ((kw == ctx.kw_let || kw == ctx.kw_letstar ||
+             kw == ctx.kw_letrec) &&
+            builtin_keyword_unbound(kw, env)) {
+            expr = cdr(expr);
+            continue;
+        }
+        unsigned binding = lookup_silent(kw, env);
+        if (binding != TOK_ERROR && IS_SYNTAX(binding))
+            return contains_reference(expr, var_id);
+        if (captured_by_inner_lambda(car(expr), var_id, env))
+            return true;
+        expr = cdr(expr);
+    }
 }
 
 // Check if expr contains a reference to var_id (for detecting self-reference)
 static bool contains_reference(unsigned expr, int64_t var_id)
 {
-    if (!expr)
-        return false;
-    if (IS_ATOM(expr))
-        return CELL_ID(expr) == var_id;
-    if (!IS_PAIR(expr))
-        return false;
+    // Spine iteratively, cars recursively, for the same reason as above.
+    for (;;) {
+        if (!expr)
+            return false;
+        if (IS_ATOM(expr))
+            return CELL_ID(expr) == var_id;
+        if (!IS_PAIR(expr))
+            return false;
 
-    // Check lambda - don't descend if var_id is shadowed by a parameter
-    if (IS_ATOM(car(expr)) && CELL_ID(car(expr)) == ctx.kw_lambda) {
-        unsigned params = cadr(expr);
-        // Check if var_id is in params
-        if (IS_ATOM(params) && CELL_ID(params) == var_id)
-            return false; // Shadowed by rest param
-        if (IS_PAIR(params)) {
-            for (unsigned p = params; p; p = IS_PAIR(p) ? cdr(p) : 0) {
-                if (IS_ATOM(p) && CELL_ID(p) == var_id)
-                    return false; // Shadowed by rest param
-                if (IS_PAIR(p) && IS_ATOM(car(p)) && CELL_ID(car(p)) == var_id)
-                    return false; // Shadowed by regular param
-                if (!IS_PAIR(p))
-                    break;
+        // Check lambda - don't descend if var_id is shadowed by a parameter
+        if (IS_ATOM(car(expr)) && CELL_ID(car(expr)) == ctx.kw_lambda) {
+            unsigned params = cadr(expr);
+            // Check if var_id is in params
+            if (IS_ATOM(params) && CELL_ID(params) == var_id)
+                return false; // Shadowed by rest param
+            if (IS_PAIR(params)) {
+                for (unsigned p = params; p; p = IS_PAIR(p) ? cdr(p) : 0) {
+                    if (IS_ATOM(p) && CELL_ID(p) == var_id)
+                        return false; // Shadowed by rest param
+                    if (IS_PAIR(p) && IS_ATOM(car(p)) &&
+                        CELL_ID(car(p)) == var_id)
+                        return false; // Shadowed by regular param
+                    if (!IS_PAIR(p))
+                        break;
+                }
             }
+            // Check body
+            expr = cddr(expr);
+            continue;
         }
-        // Check body
-        return contains_reference(cddr(expr), var_id);
-    }
 
-    // Recursively check car and cdr
-    return contains_reference(car(expr), var_id) ||
-           contains_reference(cdr(expr), var_id);
+        if (contains_reference(car(expr), var_id))
+            return true;
+        expr = cdr(expr);
+    }
 }
 
 // ============================================================================

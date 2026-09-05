@@ -638,8 +638,14 @@ static bool pattern_contains_var(unsigned pattern, unsigned var)
         return CELL_ID(pattern) == CELL_ID(var);
     }
     if (IS_PAIR(pattern)) {
-        return pattern_contains_var(car(pattern), var) ||
-               pattern_contains_var(cdr(pattern), var);
+        // Spine iteratively, cars recursively, the way pattern_binds_id below
+        // already does: recursing on the cdr cost a C frame per element.
+        while (IS_PAIR(pattern)) {
+            if (pattern_contains_var(car(pattern), var))
+                return true;
+            pattern = cdr(pattern);
+        }
+        return pattern_contains_var(pattern, var);
     }
     if (IS_VECTOR(pattern)) {
         unsigned len = vector_len(pattern);
@@ -811,22 +817,83 @@ static unsigned unwrap_protected(unsigned expr)
         if (IS_ATOM(head) && CELL_ID(head) == ctx.kw_syntax_rules) {
             return expr;
         }
-        // Recursively unwrap car and cdr
-        unsigned new_car = unwrap_protected(car(expr));
-        if (new_car == TOK_ERROR)
-            return TOK_ERROR;
-        gc_protect(&new_car);
-        unsigned new_cdr = unwrap_protected(cdr(expr));
-        if (new_cdr == TOK_ERROR)
-            return TOK_ERROR;
-        gc_protect(&new_cdr);
-        unsigned result;
-        if (new_car == car(expr) && new_cdr == cdr(expr))
-            result = expr;
-        else {
-            result = alloc_cons(new_car, new_cdr);
+        // Walk the spine iteratively, recursing only into the cars. Recursing
+        // on the cdr as well cost one C frame per list element, so a macro
+        // whose expansion is a long flat body - (begin e1 ... e100000), which
+        // is exactly what the large-flat-template tests build - ran the C
+        // stack out. Depth is now the expression's nesting, not its length.
+        //
+        // The result is shared with the input until something actually
+        // changes: most expansions unwrap nothing, and copying every one of
+        // them would be pure allocation. On the first change the identical
+        // prefix is copied and building continues from there.
+        unsigned out = 0, out_tail = 0, cursor = expr, tail = 0;
+        unsigned prefix = 0;
+        bool changed = false;
+        gc_protect(&out);
+        gc_protect(&out_tail);
+        gc_protect(&cursor);
+        gc_protect(&tail);
+
+        for (;;) {
+            // The spine ends at a non-pair - the empty list or a dotted tail -
+            // or at a cell that is itself a wrapper form. Either way, what the
+            // recursive call makes of it becomes the result's tail.
+            bool spine_end = !IS_PAIR(cursor);
+            if (!spine_end && IS_ATOM(car(cursor))) {
+                int64_t id = CELL_ID(car(cursor));
+                spine_end =
+                    (id == ctx.kw_protected || id == ctx.kw_syntax_rules);
+            }
+            if (spine_end) {
+                tail = unwrap_protected(cursor);
+                if (tail == TOK_ERROR)
+                    return TOK_ERROR;
+                if (tail != cursor && !changed) {
+                    // The change is in the tail, so the whole prefix is still
+                    // uncopied. (quote (a . x)) with x wrapped lands here.
+                    changed = true;
+                    unsigned p = expr;
+                    gc_protect(&p);
+                    for (unsigned i = 0; i < prefix; i++) {
+                        list_append(&out, &out_tail, car(p));
+                        p = cdr(p);
+                    }
+                    gc_unprotect(1);
+                }
+                break;
+            }
+
+            unsigned new_car = unwrap_protected(car(cursor));
+            if (new_car == TOK_ERROR)
+                return TOK_ERROR;
+            if (!changed && new_car == car(cursor)) {
+                prefix++;
+                cursor = cdr(cursor);
+                continue;
+            }
+            gc_protect(&new_car); // the prefix copy below allocates
+            if (!changed) {
+                changed = true;
+                unsigned p = expr;
+                gc_protect(&p);
+                for (unsigned i = 0; i < prefix; i++) {
+                    list_append(&out, &out_tail, car(p));
+                    p = cdr(p);
+                }
+                gc_unprotect(1);
+            }
+            list_append(&out, &out_tail, new_car);
+            gc_unprotect(1);
+            cursor = cdr(cursor);
         }
-        return result;
+
+        if (!changed)
+            return expr;
+        if (!out_tail)
+            return tail; // the spine ended before any element was kept
+        cell_set_cdr(out_tail, tail);
+        return out;
     }
 
     if (IS_VECTOR(expr)) {

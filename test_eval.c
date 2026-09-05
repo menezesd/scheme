@@ -173,7 +173,13 @@ static unsigned eval_string_gc(const char *src, unsigned *env_ptr)
 // Helper: check if result is an integer with given value
 static int is_int(unsigned x, int64_t val)
 {
-    if (CELL_TYPE(x) != BT_NUM)
+    // Small integers are tagged fixnums rather than heap cells, and CELL_TYPE
+    // on one indexes the heap about two billion cells out of bounds. The VM
+    // makes them for any arithmetic result that fits, so a number pulled out
+    // of a computed structure is routinely one of these.
+    if (IS_FIXNUM(x))
+        return FIXNUM_VALUE(x) == val;
+    if (!IS_CELL(x) || CELL_TYPE(x) != BT_NUM)
         return 0;
     return CELL_ID(x) == val;
 }

@@ -159,10 +159,18 @@ static inline unsigned syntax_pattern_var_count(unsigned pattern,
                    ? 1
                    : 0;
     if (IS_PAIR(pattern)) {
-        return syntax_pattern_var_count(car(pattern), literals, ellipsis_id,
-                                        id) +
-               syntax_pattern_var_count(cdr(pattern), literals, ellipsis_id,
-                                        id);
+        // Walk the spine, recursing only into the cars. Recursing on the cdr
+        // too cost a C frame per element, so a long flat pattern ran the
+        // stack out rather than being reported as a bad pattern.
+        unsigned count = 0;
+        for (unsigned p = pattern; IS_PAIR(p); p = cdr(p)) {
+            count += syntax_pattern_var_count(car(p), literals, ellipsis_id,
+                                              id);
+            if (!IS_PAIR(cdr(p)))
+                return count + syntax_pattern_var_count(cdr(p), literals,
+                                                        ellipsis_id, id);
+        }
+        return count;
     }
     if (IS_VECTOR(pattern)) {
         unsigned count = 0;
@@ -195,12 +203,18 @@ static inline bool syntax_pattern_vars_distinct_from(unsigned pattern,
         return true;
     }
     if (IS_PAIR(pattern)) {
-        return syntax_pattern_vars_distinct_from(car(pattern), whole_pattern,
-                                                 literals, ellipsis_id,
-                                                 context) &&
-               syntax_pattern_vars_distinct_from(cdr(pattern), whole_pattern,
-                                                 literals, ellipsis_id,
-                                                 context);
+        // Spine iteratively, cars recursively - see syntax_pattern_var_count.
+        for (unsigned p = pattern; IS_PAIR(p); p = cdr(p)) {
+            if (!syntax_pattern_vars_distinct_from(car(p), whole_pattern,
+                                                   literals, ellipsis_id,
+                                                   context))
+                return false;
+            if (!IS_PAIR(cdr(p)))
+                return syntax_pattern_vars_distinct_from(cdr(p), whole_pattern,
+                                                         literals, ellipsis_id,
+                                                         context);
+        }
+        return true;
     }
     if (IS_VECTOR(pattern)) {
         unsigned len = vector_len(pattern);
