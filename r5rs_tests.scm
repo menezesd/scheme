@@ -1426,6 +1426,22 @@ b")
        1e-9))
 (test "asin propagates NaN" #t (nan? (asin +nan.0)))
 
+(test-section "Non-tail recursion depth")
+;; The bytecode VM used to cap the call stack at 64K frames, which failed on
+;; an ordinary recursive list builder that the CPS interpreter handled fine.
+(test "100k-deep non-tail recursion" 100000
+    (let ()
+      (define (build n) (if (= n 0) '() (cons n (build (- n 1)))))
+      (length (build 100000))))
+(test "200k-deep non-tail recursion" 200000
+    (let ()
+      (define (build n) (if (= n 0) '() (cons n (build (- n 1)))))
+      (length (build 200000))))
+(test "deep recursion still returns the right elements" '(3 2 1)
+    (let ()
+      (define (build n) (if (= n 0) '() (cons n (build (- n 1)))))
+      (list-tail (build 100000) 99997)))
+
 (test-section "Macro expansion guard is a depth, not a total")
 ;; The CPS interpreter's expansion guard used to be a cumulative cap: any
 ;; single top-level form that expanded more than 1000 macro uses in total

@@ -340,8 +340,15 @@ bool is_vm_continuation_object(unsigned value);
 // VM State
 // ============================================================================
 
+// Ceilings, not preallocations: both arrays start small and grow on demand,
+// so these only bound runaway recursion. 64K frames used to cut off ordinary
+// non-tail recursion well before the value stack ran out - (build 100000) for
+// a plain recursive list builder already failed, while the CPS interpreter
+// and MIT both handle it - so the frame ceiling now matches the value stack's
+// and the two run out at roughly the same depth. At 24 bytes per frame the
+// frame array tops out around 24 MB.
 #define VM_MAX_STACK_SIZE (1024 * 1024)
-#define VM_MAX_FRAMES_SIZE (64 * 1024)
+#define VM_MAX_FRAMES_SIZE (1024 * 1024)
 
 /**
  * Virtual machine execution state.
