@@ -1312,6 +1312,120 @@ b")
      (string-append (symbol->string (string->symbol "+inf.0")) "-sym")))
 (test "infinity literal" #t (> +inf.0 0))
 
+(test-section "Inexactness contagion in min/max/gcd/lcm")
+;; R7RS 6.2.6: if any argument is inexact the result is inexact, even when
+;; the operand that wins the comparison (or survives a zero short-circuit)
+;; is the exact one.
+(test "min propagates inexactness" 1.0 (min 1 2.0))
+(test "max propagates inexactness" 2.0 (max 1.0 2))
+(test "min propagates from a later argument" 3.0 (min 5 3 4.0))
+(test "min keeps the smaller operand, coerced" 0.5 (min 1e300 1/2))
+(test "max over exact arguments stays exact" #t (exact? (max 1 2)))
+(test "min over exact arguments stays exact" #t (exact? (min 1 2)))
+(test "gcd propagates inexactness through its zero base case" 1.0 (gcd 0.0 1))
+(test "gcd propagates inexactness from either side" 1.0 (gcd 1 0.0))
+(test "gcd propagates inexactness generally" 2.0 (gcd 4.0 6))
+(test "gcd over exact arguments stays exact" #t (exact? (gcd 4 6)))
+(test "lcm propagates inexactness through its zero result" 0.0 (lcm 0.0 1))
+(test "lcm propagates inexactness generally" 12.0 (lcm 4.0 6))
+(test "lcm over exact arguments stays exact" #t (exact? (lcm 4 6)))
+(test "contagion survives downstream rounding" #f
+    (exact-integer? (round (max 1e-10 1.5 7/2))))
+
+(test-section "case with => clauses")
+;; R7RS 4.2.1 allows ((datum ...) => proc) and (else => proc).
+(test "case => applies the procedure to the key" '(a a)
+    (case 'a ((a) => (lambda (x) (list x x))) (else 'no)))
+(test "case else => applies to the key" '(z)
+    (case 'z ((a) 'no) (else => list)))
+(test "case => only fires on a match" 'other
+    (case 9 ((1) => list) (else 'other)))
+(test "case => among ordinary clauses" 'plain
+    (case 2 ((1) => list) ((2) 'plain) (else 'no)))
+(test "case with no match and no else is unspecified but does not error" #t
+    (begin (case 9 ((1) 'one)) #t))
+(test "case key is evaluated once" 1
+    (let ((n 0))
+      (case (begin (set! n (+ n 1)) 2) ((2) n) (else 'no))))
+
+(test-section "Handler returning from a non-continuable raise")
+;; R7RS 6.11: the secondary exception is raised in the dynamic environment of
+;; the handler, where the OUTER handler is installed - so it is catchable.
+(test "guard catches a handler that falls off the end" 'caught
+    (guard (e (#t 'caught))
+      (with-exception-handler (lambda (e) 'ret) (lambda () (raise 'x)))))
+(test "outer with-exception-handler sees the secondary exception" 'outer
+    (call/cc
+      (lambda (k)
+        (with-exception-handler
+          (lambda (e) (k 'outer))
+          (lambda ()
+            (with-exception-handler (lambda (e) 'ret)
+                                    (lambda () (raise 'x))))))))
+(test "the secondary exception is an error object" #t
+    (guard (e (#t (error-object? e)))
+      (with-exception-handler (lambda (e) 'ret) (lambda () (raise 'x)))))
+(test "a returning handler does not re-enter itself" 1
+    (let ((calls 0))
+      (guard (e (#t calls))
+        (with-exception-handler
+          (lambda (e) (set! calls (+ calls 1)) 'ret)
+          (lambda () (raise 'x))))))
+(test "raise-continuable still resumes with the handler value" 99
+    (with-exception-handler (lambda (e) 99) (lambda () (raise-continuable 'c))))
+(test "raise-continuable resumes mid-expression" 100
+    (with-exception-handler (lambda (e) 99)
+                            (lambda () (+ 1 (raise-continuable 'c)))))
+(test "a C-level error reaches an enclosing guard" 'caught-car
+    (guard (e (#t 'caught-car)) (car '())))
+(test "nested guard without a matching clause propagates outward" 'outer
+    (guard (e (#t 'outer))
+      (guard (e ((string? e) 'nope)) (raise 'sym))))
+
+(test-section "Exactness predicates reject non-numbers")
+;; R7RS 6.2.6 defines these over numbers; answering #f would disguise a type
+;; error as a plausible answer.
+(test "exact? on a symbol is an error" 'err
+    (guard (e (#t 'err)) (exact? 'a)))
+(test "inexact? on a string is an error" 'err
+    (guard (e (#t 'err)) (inexact? "s")))
+(test "nan? on a symbol is an error" 'err
+    (guard (e (#t 'err)) (nan? 'a)))
+(test "finite? on a symbol is an error" 'err
+    (guard (e (#t 'err)) (finite? 'a)))
+(test "infinite? on a symbol is an error" 'err
+    (guard (e (#t 'err)) (infinite? 'a)))
+(test "exact? still answers for numbers" #t (exact? 1/2))
+(test "inexact? still answers for numbers" #t (inexact? 1.0))
+(test "nan? still answers for numbers" #t (nan? (/ 0. 0.)))
+(test "finite? still answers for numbers" #t (finite? 1))
+(test "infinite? still answers for numbers" #t (infinite? (/ 1. 0.)))
+;; exact-integer?/exact-rational? are type predicates, not questions about a
+;; number, so they keep answering #f.
+(test "exact-integer? stays total" #f (exact-integer? 'a))
+(test "exact-rational? stays total" #f (exact-rational? 'a))
+
+(test-section "asin/acos outside [-1, 1]")
+;; sqrt, log and expt already return complex results rather than NaN; asin
+;; and acos now agree, and accept complex arguments like sin/cos/tan do.
+(test "asin 2 is complex, not NaN" #t (not (real? (asin 2))))
+(test "acos 2 is complex, not NaN" #t (not (real? (acos 2))))
+(test "asin round-trips through sin" #t
+    (< (magnitude (- (sin (asin 2)) 2)) 1e-9))
+(test "acos round-trips through cos" #t
+    (< (magnitude (- (cos (acos 2)) 2)) 1e-9))
+(test "asin -2 round-trips through sin" #t
+    (< (magnitude (- (sin (asin -2)) -2)) 1e-9))
+(test "asin real part matches MIT for x > 1" #t
+    (< (abs (- (real-part (asin 2)) 1.5707963267948966)) 1e-12))
+(test "asin stays real inside the domain" #t (real? (asin 0.5)))
+(test "acos stays real inside the domain" #t (real? (acos 0.5)))
+(test "asin of a complex argument round-trips" #t
+    (< (magnitude (- (sin (asin (make-rectangular 1 1)))
+                     (make-rectangular 1 1)))
+       1e-9))
+(test "asin propagates NaN" #t (nan? (asin +nan.0)))
+
 (test-section "Macro expansion guard is a depth, not a total")
 ;; The CPS interpreter's expansion guard used to be a cumulative cap: any
 ;; single top-level form that expanded more than 1000 macro uses in total

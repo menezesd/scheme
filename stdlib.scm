@@ -411,15 +411,15 @@
 ;;; ============================================================================
 
 (define (%require-bit-index who bit-num)
-  (if (not (and (exact? bit-num)
-                (integer? bit-num)
+  (if (not (and (integer? bit-num)
+                (exact? bit-num)
                 (>= bit-num 0)))
       (error (string-append who
                             ": expected a non-negative exact integer bit position")))
   bit-num)
 
 (define (%require-bit-integer who value)
-  (if (not (and (exact? value) (integer? value)))
+  (if (not (and (integer? value) (exact? value)))
       (error (string-append who ": expected an exact integer")))
   value)
 
@@ -971,7 +971,11 @@
 ;; unhandled errors propagate as TOK_ERROR to the C boundary, which restores
 ;; the baseline exception state (see eval_expr in main.c), so an interactive
 ;; REPL survives an unhandled error instead of losing the session.
-(define (*default-exception-handler* exn)
+;; Handlers take an optional second argument saying whether the raise was
+;; continuable. Every engine-side dispatch site (vm.c, eval.c) applies the
+;; handler to one argument, which means non-continuable; only
+;; raise-continuable passes the flag.
+(define (*default-exception-handler* exn . continuable)
   (display "Unhandled exception: ")
   (display exn)
   (newline)
@@ -989,10 +993,26 @@
 (define (with-exception-handler handler thunk)
   (let ((old-handler *current-exception-handler*))
     (letrec ((wrapped-handler
-               (lambda (obj)
+               (lambda (obj . continuable)
                  (dynamic-wind
                    (lambda () (set! *current-exception-handler* old-handler))
-                   (lambda () (handler obj))
+                   (lambda ()
+                     (let ((result (handler obj)))
+                       (if (and (pair? continuable) (car continuable))
+                           result
+                           ;; The handler returned from a non-continuable
+                           ;; raise. R7RS 6.11 raises a secondary exception
+                           ;; "in the same dynamic environment as the
+                           ;; handler" - i.e. right here, where old-handler
+                           ;; is installed - so an enclosing guard or
+                           ;; with-exception-handler can catch it. Raising
+                           ;; after the dynamic-wind has restored
+                           ;; wrapped-handler would instead re-enter the
+                           ;; handler that just returned.
+                           (raise (make-error-object
+                                   'error
+                                   "handler returned from non-continuable exception"
+                                   '())))))
                    (lambda () (set! *current-exception-handler* wrapped-handler))))))
       (dynamic-wind
         (lambda () (set! *current-exception-handler* wrapped-handler))
@@ -1000,14 +1020,16 @@
         (lambda () (set! *current-exception-handler* old-handler))))))
 
 ;; raise dispatches through raise-now (engine machinery) with a pinned
-;; return marker: a default-handler return IS the designed unhandled path
-;; (already reported), a user-handler return is the R7RS violation, and a
-;; handler that jumps to a continuation (guard) resumes normally.
+;; return marker. A wrapped handler never returns from a non-continuable
+;; raise (it raises the secondary exception above), so the marker now only
+;; fires for the default handler - the designed unhandled path, already
+;; reported - or for a bare procedure installed directly into
+;; *current-exception-handler*, which stays an engine-level error.
 (define (raise obj)
   (raise-now obj))
 
 (define (raise-continuable obj)
-  (*current-exception-handler* obj))
+  (*current-exception-handler* obj #t))
 
 (define (error message . irritants)
   (raise (make-error-object 'error message irritants)))
@@ -1041,10 +1063,23 @@
 ;;; ============================================================================
 
 ; case - multi-way branch
+; R7RS 4.2.1 allows both ((datum ...) result ...) and ((datum ...) => proc)
+; clause shapes, plus (else result ...) and (else => proc). The => clauses
+; must come first: otherwise (=> proc) matches result ... and expands to
+; (begin => proc), which fails with "undefined variable: =>".
 (define-syntax %case-dispatch
-  (syntax-rules (else)
+  (syntax-rules (else =>)
+    ((%case-dispatch key (else => proc))
+     (proc key))
     ((%case-dispatch key (else result ...))
      (begin result ...))
+    ((%case-dispatch key ((atoms ...) => proc))
+     (if (memv key '(atoms ...))
+         (proc key)))
+    ((%case-dispatch key ((atoms ...) => proc) clause ...)
+     (if (memv key '(atoms ...))
+         (proc key)
+         (%case-dispatch key clause ...)))
     ((%case-dispatch key ((atoms ...) result ...))
      (if (memv key '(atoms ...))
          (begin result ...)))
@@ -1126,12 +1161,12 @@
       (error (string-append who ": expected proper list"))))
 
 (define (%require-nonnegative-integer who k)
-  (if (and (exact? k) (integer? k) (>= k 0))
+  (if (and (integer? k) (exact? k) (>= k 0))
       k
       (error (string-append who ": expected nonnegative integer"))))
 
 (define (%require-exact-integer who k)
-  (if (and (exact? k) (integer? k))
+  (if (and (integer? k) (exact? k))
       k
       (error (string-append who ": expected exact integer"))))
 
@@ -1283,21 +1318,46 @@
 (define (odd? n) (not (= (remainder n 2) 0)))
 (define (even? n) (= (remainder n 2) 0))
 
+; R7RS 6.2.6: if any argument to min/max is inexact, the result is inexact,
+; even when the selected operand is the exact one. Selection and exactness
+; are decided separately - the operand that wins the comparison is kept as
+; is, then coerced once at the end if any argument was inexact.
+(define (%any-inexact? x rest)
+  (if (inexact? x)
+      #t
+      (if (null? rest)
+          #f
+          (%any-inexact? (car rest) (cdr rest)))))
+
+(define (%minmax-result value x rest)
+  (if (and (exact? value) (%any-inexact? x rest))
+      (exact->inexact value)
+      value))
+
 (define (max x . rest)
-  (if (null? rest)
-      x
-      (let ((m (apply max rest)))
-        (if (> x m) x m))))
+  (define (select x rest)
+    (if (null? rest)
+        x
+        (let ((m (select (car rest) (cdr rest))))
+          (if (> x m) x m))))
+  (%minmax-result (select x rest) x rest))
 
 (define (min x . rest)
-  (if (null? rest)
-      x
-      (let ((m (apply min rest)))
-        ; Use the reversed comparison so NaNs and signed zeros follow the
-        ; same operand-selection behavior as MIT/GNU Scheme: keep x unless
-        ; the accumulated minimum is strictly greater than it.
-        (if (> x m) m x))))
+  (define (select x rest)
+    (if (null? rest)
+        x
+        (let ((m (select (car rest) (cdr rest))))
+          ; Use the reversed comparison so NaNs and signed zeros follow the
+          ; same operand-selection behavior as MIT/GNU Scheme: keep x unless
+          ; the accumulated minimum is strictly greater than it.
+          (if (> x m) m x))))
+  (%minmax-result (select x rest) x rest))
 
+; Inexactness is contagious through gcd/lcm the same way it is through the
+; other numeric operators, including via the zero short-circuits: gcd2's base
+; case discards b, and lcm2's returns a fresh 0, so a zero operand would
+; otherwise silently drop the inexactness of the whole call. Track it across
+; the argument list and coerce once at the end.
 (define (gcd . args)
   (define (gcd2 a b)
     (if (= b 0)
@@ -1305,10 +1365,15 @@
         (gcd2 b (remainder a b))))
   (if (null? args)
       0
-      (let loop ((result (car args)) (rest (cdr args)))
+      (let loop ((result (car args))
+                 (rest (cdr args))
+                 (any-inexact? (inexact? (car args))))
         (if (null? rest)
-            (abs result)
-            (loop (gcd2 result (car rest)) (cdr rest))))))
+            (let ((g (abs result)))
+              (if (and any-inexact? (exact? g)) (exact->inexact g) g))
+            (loop (gcd2 result (car rest))
+                  (cdr rest)
+                  (or any-inexact? (inexact? (car rest))))))))
 
 (define (lcm . args)
   (define (lcm2 a b)
@@ -1317,10 +1382,15 @@
         (abs (quotient (* a b) (gcd a b)))))
   (if (null? args)
       1
-      (let loop ((result (car args)) (rest (cdr args)))
+      (let loop ((result (car args))
+                 (rest (cdr args))
+                 (any-inexact? (inexact? (car args))))
         (if (null? rest)
-            (abs result)
-            (loop (lcm2 result (car rest)) (cdr rest))))))
+            (let ((l (abs result)))
+              (if (and any-inexact? (exact? l)) (exact->inexact l) l))
+            (loop (lcm2 result (car rest))
+                  (cdr rest)
+                  (or any-inexact? (inexact? (car rest))))))))
 
 ;;; ============================================================================
 ;;; Higher-order functions
@@ -3209,10 +3279,10 @@
 (define (%char-set-range-well-formed? element)
   (and (pair? element)
        (not (pair? (cdr element)))
-       (exact? (car element))
        (integer? (car element))
-       (exact? (cdr element))
+       (exact? (car element))
        (integer? (cdr element))
+       (exact? (cdr element))
        (>= (car element) 0)
        (<= (car element) (cdr element))
        (<= (cdr element) %char-code-limit)))
@@ -3303,7 +3373,7 @@
 (define (%char-set-element-member? code element)
   (cond
     ((char? element) (= code (char->integer element)))
-    ((and (exact? element) (integer? element)
+    ((and (integer? element) (exact? element)
           (>= element 0) (< element %char-code-limit))
      (= code element))
     ((string? element)
@@ -3323,12 +3393,12 @@
   (cond
     ((char? element)
      (list (cons (char->integer element) (+ (char->integer element) 1))))
-    ((and (exact? element) (integer? element)
+    ((and (integer? element) (exact? element)
           (>= element 0) (< element %char-code-limit))
      (list (cons element (+ element 1))))
     ((and (pair? element) (not (pair? (cdr element))))
-     (if (and (exact? (car element)) (integer? (car element))
-              (exact? (cdr element)) (integer? (cdr element))
+     (if (and (integer? (car element)) (exact? (car element))
+              (integer? (cdr element)) (exact? (cdr element))
               (>= (car element) 0)
               (<= (car element) (cdr element))
               (<= (cdr element) %char-code-limit))
@@ -3384,7 +3454,7 @@
 
 (define (code-point-in-set? code set)
   (%require-char-set "code-point-in-set?" set)
-  (if (or (not (exact? code)) (not (integer? code))
+  (if (or (not (integer? code)) (not (exact? code))
           (< code 0) (>= code %char-code-limit))
       (error "code-point-in-set?: expected Unicode code point"))
   (if (eq? (vector-ref set 1) 'predicate)
@@ -3670,7 +3740,7 @@
       (error "char-set-hash: too many arguments"))
   (let ((bound (if (null? maybe-bound) #f (car maybe-bound))))
     (if (and bound
-             (or (not (exact? bound)) (not (integer? bound)) (<= bound 0)))
+             (or (not (integer? bound)) (not (exact? bound)) (<= bound 0)))
         (error "char-set-hash: expected positive exact integer bound"))
     (let ((hash (char-set-fold (lambda (char value)
                                  (modulo (+ (* value 33)
@@ -3836,8 +3906,8 @@
                                        out)))))))))
 
 (define (ucs-range->char-set lower upper . args)
-  (if (or (not (exact? lower)) (not (integer? lower)) (< lower 0)
-          (not (exact? upper)) (not (integer? upper)) (< upper lower))
+  (if (or (not (integer? lower)) (not (exact? lower)) (< lower 0)
+          (not (integer? upper)) (not (exact? upper)) (< upper lower))
       (error "ucs-range->char-set: invalid range"))
   (if (> (length args) 2)
       (error "ucs-range->char-set: too many arguments"))
@@ -4020,8 +4090,8 @@
         (error "read-string!: expected input port"))
     (if (not (textual-port? port))
         (error "read-string!: expected textual input port"))
-    (if (or (not (exact? start)) (not (integer? start)) (< start 0)
-            (not (exact? end)) (not (integer? end)) (< end start)
+    (if (or (not (integer? start)) (not (exact? start)) (< start 0)
+            (not (integer? end)) (not (exact? end)) (< end start)
             (> end (string-length string)))
         (error "read-string!: invalid string range"))
     (let loop ((index start))
@@ -5279,7 +5349,7 @@
   (if (> (length maybe-radix) 1)
       (error "char->digit: too many arguments"))
   (let ((radix (if (null? maybe-radix) 10 (car maybe-radix))))
-    (if (or (not (exact? radix)) (not (integer? radix))
+    (if (or (not (integer? radix)) (not (exact? radix))
             (< radix 2) (> radix 36))
         (error "char->digit: radix must be an exact integer in [2,36]"))
     (let ((unicode-digit (digit-value ch))
@@ -5301,10 +5371,10 @@
   (if (> (length maybe-radix) 1)
       (error "digit->char: too many arguments"))
   (let ((radix (if (null? maybe-radix) 10 (car maybe-radix))))
-    (if (or (not (exact? radix)) (not (integer? radix))
+    (if (or (not (integer? radix)) (not (exact? radix))
             (< radix 2) (> radix 36))
         (error "digit->char: radix must be an exact integer in [2,36]"))
-    (if (or (not (exact? digit)) (not (integer? digit))
+    (if (or (not (integer? digit)) (not (exact? digit))
             (< digit 0) (>= digit radix))
         (error "digit->char: digit out of range"))
     (integer->char
@@ -5353,7 +5423,7 @@
                          (char=? (string-ref name 0) #\X)))
                 (let ((code (string->number
                              (substring name 1 (string-length name)) 16)))
-                  (if (and code (exact? code) (integer? code))
+                  (if (and code (integer? code) (exact? code))
                       (integer->char code)
                       (error "name->char: invalid character name")))
                 (error "name->char: invalid character name"))))))

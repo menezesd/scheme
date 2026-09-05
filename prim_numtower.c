@@ -185,10 +185,16 @@ static const real_test_entry *find_real_test(unsigned prim_id)
     return NULL;
 }
 
-static unsigned numeric_real_test(unsigned x, real_test test)
+static unsigned numeric_real_test(unsigned x, real_test test,
+                                  const char *name)
 {
-    if (!is_numeric(x))
-        return ctx.atom_false;
+    // R7RS 6.2.6 defines finite?/infinite?/nan? over numbers only. Answering
+    // #f for a non-number would report "this symbol is not infinite", hiding
+    // the type error behind a plausible-looking answer.
+    if (!is_numeric(x)) {
+        show_error("%s: not a number", name);
+        return TOK_ERROR;
+    }
 
     if (IS_INEXACT(x)) {
         double d = to_double(x);
@@ -286,7 +292,7 @@ unsigned apply_numtower_primitive(unsigned prim_id, unsigned argc,
     const real_test_entry *real_test = find_real_test(prim_id);
     if (real_test) {
         REQUIRE_ARGC(argc, 1, 1, real_test->name);
-        return numeric_real_test(argv[0], real_test->test);
+        return numeric_real_test(argv[0], real_test->test, real_test->name);
     }
 
     switch (prim_id) {

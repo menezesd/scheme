@@ -180,16 +180,6 @@ static unsigned random_seed_value(unsigned x, const char *name)
     return x;
 }
 
-// Math function table for simple unary functions
-typedef struct {
-    unsigned id;
-    double (*func)(double);
-    const char *name;
-} math_func_entry;
-
-static const math_func_entry math_funcs[] = {
-    {PASIN, asin, "asin"}, {PACOS, acos, "acos"}, {0, NULL, NULL}};
-
 typedef enum {
     ROUND_FLOOR,
     ROUND_CEILING,
@@ -210,15 +200,6 @@ static const rounding_func_entry rounding_funcs[] = {
     {PROUND, ROUND_NEAREST, "round"},
     {0, 0, NULL}};
 
-static const math_func_entry *find_math_func(const math_func_entry *entries,
-                                             unsigned prim_id)
-{
-    for (const math_func_entry *entry = entries; entry->func; entry++) {
-        if (entry->id == prim_id)
-            return entry;
-    }
-    return NULL;
-}
 
 static const rounding_func_entry *find_rounding_func(unsigned prim_id)
 {
@@ -533,6 +514,61 @@ static void complex_tan_parts(double real, double imag, double *out_real,
     double denom = cos(2 * real) + cosh(2 * imag);
     *out_real = sin(2 * real) / denom;
     *out_imag = sinh(2 * imag) / denom;
+}
+
+// asin(z) = -i*ln(iz + sqrt(1 - z^2)), and acos(z) = pi/2 - asin(z).
+// Writing -i*ln(u) out in parts gives arg(u) - i*ln|u|.
+static void complex_asin_parts(double a, double b, double *out_real,
+                               double *out_imag)
+{
+    // 1 - z^2
+    double sq_real = 1.0 - (a * a - b * b);
+    double sq_imag = -2.0 * a * b;
+    double w_real, w_imag;
+    complex_sqrt_inexact(sq_real, sq_imag, &w_real, &w_imag);
+    // u = i*z + sqrt(1 - z^2)
+    double u_real = w_real - b;
+    double u_imag = w_imag + a;
+    *out_real = atan2(u_imag, u_real);
+    *out_imag = -log(hypot(u_real, u_imag));
+}
+
+static void complex_acos_parts(double a, double b, double *out_real,
+                               double *out_imag)
+{
+    double s_real, s_imag;
+    complex_asin_parts(a, b, &s_real, &s_imag);
+    *out_real = M_PI / 2.0 - s_real;
+    *out_imag = -s_imag;
+}
+
+// asin/acos outside [-1, 1] have complex values, and this numeric tower
+// already returns them from sqrt, log and expt rather than a NaN
+// (see log_value and sqrt_value). Complex arguments go the same way, which
+// also brings asin/acos in line with sin/cos/tan accepting them.
+static unsigned inverse_trig_value(unsigned x, bool is_asin, const char *name)
+{
+    if (!require_number(x, name))
+        return TOK_ERROR;
+
+    double real, imag;
+    if (IS_COMPLEX(x)) {
+        get_complex_parts(x, &real, &imag);
+    } else {
+        real = to_double(x);
+        imag = 0.0;
+        // In-domain reals (and NaN, which propagates) keep the libm result:
+        // it is more accurate near the branch points than the identity above.
+        if (isnan(real) || (real >= -1.0 && real <= 1.0))
+            return store_inexact(is_asin ? asin(real) : acos(real));
+    }
+
+    double out_real, out_imag;
+    if (is_asin)
+        complex_asin_parts(real, imag, &out_real, &out_imag);
+    else
+        complex_acos_parts(real, imag, &out_real, &out_imag);
+    return make_complex_inexact(out_real, out_imag);
 }
 
 static const unary_number_math_entry unary_number_math_funcs[] = {
@@ -956,12 +992,11 @@ static unsigned exact_rational_expt_result(bignum *num_power,
 unsigned apply_math_primitive(unsigned prim_id, unsigned argc,
                               unsigned *argv)
 {
-    const math_func_entry *math_func = find_math_func(math_funcs, prim_id);
-    if (math_func) {
-        REQUIRE_ARGC(argc, 1, 1, math_func->name);
-        if (!require_real(argv[0], math_func->name))
-            return TOK_ERROR;
-        return store_inexact(math_func->func(to_double(argv[0])));
+    if (prim_id == PASIN || prim_id == PACOS) {
+        bool is_asin = (prim_id == PASIN);
+        const char *name = is_asin ? "asin" : "acos";
+        REQUIRE_ARGC(argc, 1, 1, name);
+        return inverse_trig_value(argv[0], is_asin, name);
     }
 
     const rounding_func_entry *rounding_func = find_rounding_func(prim_id);

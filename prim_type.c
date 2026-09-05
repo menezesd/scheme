@@ -55,6 +55,11 @@ static bool proper_list_predicate(unsigned arg)
 typedef struct {
     unsigned id;
     bool (*predicate)(unsigned arg);
+    // Non-NULL for the exactness predicates, which R7RS 6.2.6 defines only
+    // over numbers: they answer a question about a number rather than
+    // testing membership in a type, so a non-number argument is a type
+    // error, not a #f answer. The name is the one reported in that error.
+    const char *number_only;
 } type_predicate_entry;
 
 static bool symbol_predicate(unsigned arg) { return IS_ATOM(arg); }
@@ -88,23 +93,23 @@ static bool boolean_predicate(unsigned arg)
 }
 
 static const type_predicate_entry type_predicates[] = {
-    {PSYMP, symbol_predicate},
-    {PNUMP, numeric_predicate},
-    {PINTEGERP, integer_predicate},
-    {PREALP, real_predicate},
-    {PEXACTP, exact_predicate},
-    {PINEXACTP, inexact_predicate},
-    {PCOMPLEXP, numeric_predicate},
-    {PRATIONALP, rational_predicate},
-    {PPROCP, procedure_predicate},
-    {PCONSP, pair_predicate},
-    {PNULLP, null_predicate},
-    {PSTRINGP, string_predicate},
-    {PCHARP, char_predicate},
-    {PVECTORP, vector_predicate},
-    {PBOOLP, boolean_predicate},
-    {PLISTP, proper_list_predicate},
-    {0, NULL},
+    {PSYMP, symbol_predicate, NULL},
+    {PNUMP, numeric_predicate, NULL},
+    {PINTEGERP, integer_predicate, NULL},
+    {PREALP, real_predicate, NULL},
+    {PEXACTP, exact_predicate, "exact?"},
+    {PINEXACTP, inexact_predicate, "inexact?"},
+    {PCOMPLEXP, numeric_predicate, NULL},
+    {PRATIONALP, rational_predicate, NULL},
+    {PPROCP, procedure_predicate, NULL},
+    {PCONSP, pair_predicate, NULL},
+    {PNULLP, null_predicate, NULL},
+    {PSTRINGP, string_predicate, NULL},
+    {PCHARP, char_predicate, NULL},
+    {PVECTORP, vector_predicate, NULL},
+    {PBOOLP, boolean_predicate, NULL},
+    {PLISTP, proper_list_predicate, NULL},
+    {0, NULL, NULL},
 };
 
 static const type_predicate_entry *find_type_predicate(unsigned prim_id)
@@ -122,5 +127,13 @@ unsigned apply_type_predicate(unsigned prim_id, unsigned argc,
 {
     REQUIRE_ARGC(argc, 1, 1, "type predicate");
     const type_predicate_entry *entry = find_type_predicate(prim_id);
-    return entry ? scheme_bool(entry->predicate(argv[0])) : TOK_ERROR;
+    if (!entry) {
+        show_error("type predicate: unknown primitive %u", prim_id);
+        return TOK_ERROR;
+    }
+    if (entry->number_only && !is_numeric(argv[0])) {
+        show_error("%s: not a number", entry->number_only);
+        return TOK_ERROR;
+    }
+    return scheme_bool(entry->predicate(argv[0]));
 }
