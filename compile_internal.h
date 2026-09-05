@@ -26,6 +26,12 @@ void code_register(code_object *code);
 // Get the size of an instruction (opcode + operands)
 unsigned instruction_size(unsigned op);
 
+// True for every opcode whose first operand is a jump target. Shared so that
+// the optimizer's jump fixup and the VM's bytecode verifier cannot disagree:
+// adding a branching opcode and teaching only one of them about it would
+// silently corrupt jump offsets.
+bool is_jump_opcode(unsigned op);
+
 // Peephole optimization with proper jump target fixup
 void peephole_optimize(code_object *code);
 

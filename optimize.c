@@ -26,7 +26,7 @@ static void *calloc_array_plus_one(unsigned count, size_t elem_size)
     return checked_calloc_array(count_plus_one, elem_size);
 }
 
-static bool is_jump_opcode(unsigned op)
+bool is_jump_opcode(unsigned op)
 {
     switch (op) {
     case OP_JUMP:
