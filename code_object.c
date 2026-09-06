@@ -33,8 +33,9 @@ code_object *code_object_registry = NULL;
 // since registration prepends. Measured at 2M calls: 9.7s for a procedure
 // defined early in stdlib.scm against 2.2s for one defined late.
 static code_object **code_set;
-static size_t code_set_cap;  // power of two, 0 until first use
-static size_t code_set_used;
+static size_t code_set_cap;      // power of two, 0 until first use
+static size_t code_set_used;     // live entries
+static size_t code_set_occupied; // live entries plus tombstones
 #define CODE_SET_TOMBSTONE ((code_object *)(uintptr_t)1)
 
 static size_t code_set_start(size_t cap, const code_object *code)
@@ -85,19 +86,27 @@ static bool code_set_grow(size_t want)
     free(code_set);
     code_set = table;
     code_set_cap = cap;
-    code_set_used = live; // rehashing drops the tombstones
+    code_set_used = live;
+    code_set_occupied = live; // rehashing drops the tombstones
     return true;
 }
 
 static void code_set_add(code_object *code)
 {
-    if (code_set_used + 1 > code_set_cap / 2) {
+    // Tombstones count here, not just live entries. A long session registers
+    // and sweeps code objects continuously; if only live entries were counted
+    // the table would never rehash, tombstones would fill every slot, and the
+    // lookup probe - which cannot stop at one - would spin forever looking for
+    // an empty slot that no longer exists.
+    if (code_set_occupied + 1 > code_set_cap / 2) {
         if (!code_set_grow(code_set_used + 1))
             return; // fall back to the list walk below
     }
     size_t i = code_set_slot_insert(code_set, code_set_cap, code);
     if (code_set[i] == code)
         return;
+    if (!code_set[i])
+        code_set_occupied++; // an empty slot, not a reused tombstone
     code_set[i] = code;
     code_set_used++;
 }

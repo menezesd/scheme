@@ -6316,6 +6316,39 @@ static bool code_tree_jump_targets_zero(const code_object *code)
     "    (if (= k 0) '() (cons k (loop (- k 1)))))))"                          \
     "    (loop n))))"
 
+TEST(code_object_registry_survives_heavy_churn)
+{
+    // Membership has to stay correct across repeated register/free cycles,
+    // which is how the registry is actually used - every compile makes code
+    // objects and the GC sweeps them. A wrong answer here is not an error but
+    // silent corruption: code_register skips an object it believes is already
+    // registered, so the GC never traces it.
+    //
+    // This does not reproduce the tombstone saturation that code_set_add
+    // guards against. Insertions reuse tombstones opportunistically, and I
+    // could not construct a workload that fills the table - the guard is
+    // there because open addressing with tombstones needs it, not because a
+    // failing case is on record.
+    for (unsigned round = 0; round < 200; round++) {
+        code_object *batch[64];
+        for (unsigned i = 0; i < 64; i++) {
+            batch[i] = code_new();
+            ASSERT(batch[i] != NULL);
+            code_emit(batch[i], OP_RETURN);
+            ASSERT(code_object_is_registered(batch[i]));
+        }
+        for (unsigned i = 0; i < 64; i++) {
+            ASSERT(code_object_is_registered(batch[i]));
+            code_free(batch[i]);
+        }
+    }
+    code_object *live = code_new();
+    ASSERT(live != NULL);
+    ASSERT(code_object_is_registered(live));
+    code_free(live);
+    PASS();
+}
+
 TEST(trmc_transforms_cons_over_a_self_tail_call)
 {
     unsigned env = default_environment();
@@ -7071,6 +7104,7 @@ int main(void)
     RUN_TEST(eval_calls_bytecode_closure_with_stack_locals);
 
     // Tail recursion modulo cons
+    RUN_TEST(code_object_registry_survives_heavy_churn);
     RUN_TEST(trmc_transforms_cons_over_a_self_tail_call);
     RUN_TEST(trmc_loop_jump_clears_the_accumulator_init);
     RUN_TEST(trmc_uses_fold_mode_when_the_element_can_capture);
