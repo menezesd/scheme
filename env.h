@@ -82,7 +82,6 @@ unsigned lookup_silent(int64_t var, unsigned env);
 void env_invalidate_cache(void);
 
 // Global inline cache epoch — bumped on define to invalidate bytecode ICs
-extern unsigned global_ic_epoch;
 
 // Bind parameters to arguments, supporting variadic (a b . rest) syntax
 unsigned bind_params(unsigned params, unsigned args);
@@ -103,5 +102,11 @@ unsigned environment_with_imports(unsigned source, unsigned specs);
 // Mark an environment root as immutable and query that marker.
 void mark_immutable_environment(unsigned env);
 bool environment_is_immutable(unsigned env);
+
+// GC support: the frame index holds cell indices, which move.
+void env_index_gc_update(unsigned (*collector)(unsigned));
+
+// Frame index lookup for the VM's inline cache; see env.c.
+bool env_frame_index_lookup(unsigned frame, int64_t var, unsigned *cell_out);
 
 #endif // ENV_H

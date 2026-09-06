@@ -287,9 +287,6 @@ typedef struct code_object {
     const char *name;     // Function name (if known)
     unsigned source_line; // Source line number
 
-    // Inline cache epoch (for invalidation on define)
-    unsigned ic_epoch;
-
     // GC integration: linked list of all code objects
     struct code_object *gc_next;
     bool gc_marked; // True if reachable during current GC

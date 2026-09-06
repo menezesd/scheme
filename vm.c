@@ -430,6 +430,20 @@ static inline unsigned ic_lookup(int64_t sym_id, unsigned env,
                 e = next;
         }
         if (cache_valid) {
+            // A large frame carries a side index, which answers in one probe
+            // instead of the offset walk below - and the walk is the whole
+            // cost for a global, since the frame holding a program's
+            // definitions runs to hundreds of bindings.
+            unsigned indexed_cell = 0;
+            if (env_frame_index_lookup(frame, sym_id, &indexed_cell)) {
+                unsigned value = 0;
+                if (indexed_cell && IS_PAIR(indexed_cell) &&
+                    vm_try_deref_binding_value(car(indexed_cell), &value))
+                    return value;
+                cache_valid = false;
+            }
+        }
+        if (cache_valid) {
             unsigned vars = car(frame);
             unsigned vals = cdr(frame);
             for (unsigned o = 0; o < cached_offset && vars; o++) {
@@ -463,6 +477,18 @@ static inline unsigned ic_lookup(int64_t sym_id, unsigned env,
         unsigned next = 0;
         if (!vm_try_env_frame(e, &frame, &next))
             return TOK_ERROR;
+        unsigned indexed_cell = 0;
+        if (env_frame_index_lookup(frame, sym_id, &indexed_cell)) {
+            unsigned value = 0;
+            if (indexed_cell && IS_PAIR(indexed_cell) &&
+                vm_try_deref_binding_value(car(indexed_cell), &value)) {
+                cache_slot[0] = depth;
+                cache_slot[1] = 0; // unused for an indexed frame
+                return value;
+            }
+            e = next;
+            continue;
+        }
         unsigned vars = car(frame);
         unsigned vals = cdr(frame);
         unsigned value = 0;

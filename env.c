@@ -27,6 +27,7 @@
  * The rest atom receives remaining arguments as a list.
  */
 
+#include <limits.h>
 #include "env.h"
 #include "context.h"
 #include "primitive_table.h"
@@ -40,42 +41,22 @@
 // ============================================================================
 // Lookup Cache
 // ============================================================================
-// 8-entry associative cache for variable lookups with move-to-front on hit.
-// Most code has high locality - the same variables are accessed repeatedly.
-// Move-to-front keeps hot entries at the front, approximating LRU eviction.
-
-#define LOOKUP_CACHE_SIZE 8
-
-typedef struct {
-    int64_t var;       // Variable atom ID (-1 = empty)
-    unsigned env;      // Environment where found
-    unsigned val_cell; // Cell containing the value (so mutations are visible)
-} lookup_cache_entry;
-
-static lookup_cache_entry lookup_cache[LOOKUP_CACHE_SIZE];
-
-// Global inline cache epoch for bytecode IC invalidation
-unsigned global_ic_epoch = 0;
-
 // Bumped whenever a cached binding-list acyclicity verdict could go stale:
 // on every defvar (which conses a new frame head) and after every GC (which
 // can recycle cell indices). See env_binding_list_acyclic.
 // Starts at 1 so that a zero-initialized cache slot never looks valid.
 static unsigned acyclic_epoch = 1;
 
-// Invalidate all cache entries
-static inline void invalidate_lookup_cache(void)
+static inline void bump_acyclic_epoch(void)
 {
-    for (int i = 0; i < LOOKUP_CACHE_SIZE; i++) {
-        lookup_cache[i].var = -1;
-    }
     acyclic_epoch++;
 }
 
-// Public function to invalidate cache (called after GC)
+// Called after a GC, which can recycle cell indices and so invalidate any
+// cached verdict about a binding list's shape.
 void env_invalidate_cache(void)
 {
-    invalidate_lookup_cache();
+    bump_acyclic_epoch();
 }
 
 static unsigned deref_binding_value(unsigned val)
@@ -281,6 +262,216 @@ bool env_binding_list_acyclic(unsigned vars)
     return result;
 }
 
+// ============================================================================
+// Frame index
+// ============================================================================
+//
+// Finding a name in a frame walks two parallel lists. That is fine for a call
+// frame holding three bindings and not fine for the frame a program
+// accumulates its definitions in, which after the stdlib holds around 950 -
+// and defvar prepends, so the earlier something was defined the deeper it
+// sits. Measured before this existed: a 2M-iteration loop calling a global
+// took 17.0s when that global was defined early in stdlib.scm and 3.1s when
+// defined late, against 0.17s for the same loop touching only primitives.
+//
+// So a large frame gets a side index from atom id to value cell, built on
+// demand the first time a lookup has to scan one. Atom ids are stable but not
+// dense - they run to about 960000 while a loaded stdlib interns only ~1400
+// symbols - so this is a small open-addressed table sized from the frame,
+// not an array indexed by id directly.
+//
+// Several frames are indexed at once because at least two large ones are live
+// during a load and alternate; with a single slot they evict each other on
+// every lookup, which measured 4x slower than no index at all.
+//
+// The tables hold cell indices, so the collectors forward them
+// (env_index_gc_update). A frame that becomes garbage while still indexed
+// keeps its bindings alive until its slot is reused - bounded by a few
+// frames, and normally these are the live environments anyway.
+
+#define ENV_INDEX_MIN_BINDINGS 64
+
+static bool env_frame_is_large(unsigned vars);
+static bool env_find_in_frame(int64_t var, unsigned vars, unsigned vals,
+                              unsigned *val_cell_out, unsigned *value_out);
+#define ENV_INDEX_FRAMES 4
+
+typedef struct {
+    unsigned frame; // frame this table describes; 0 when unused
+    unsigned mask;  // capacity - 1; capacity is a power of two
+    unsigned used;
+    int64_t *keys;    // atom id, or ENV_INDEX_EMPTY
+    unsigned *cells;  // value cell for that binding
+} env_frame_index;
+
+#define ENV_INDEX_EMPTY ((int64_t)-1)
+
+static env_frame_index env_indexes[ENV_INDEX_FRAMES];
+static unsigned env_index_next; // round-robin eviction
+
+static unsigned env_index_hash(int64_t id, unsigned mask)
+{
+    // Atom ids are scattered rather than sequential, so mix before masking.
+    uint64_t h = (uint64_t)id * 0x9E3779B97F4A7C15ull;
+    return (unsigned)(h >> 32) & mask;
+}
+
+static void env_index_release(env_frame_index *ix)
+{
+    free(ix->keys);
+    free(ix->cells);
+    ix->keys = NULL;
+    ix->cells = NULL;
+    ix->frame = 0;
+    ix->mask = 0;
+    ix->used = 0;
+}
+
+// Insert, keeping the first binding seen for a name: that is the one
+// env_find_in_frame's scan would have stopped at.
+static void env_index_insert(env_frame_index *ix, int64_t id, unsigned cell,
+                             bool overwrite)
+{
+    unsigned i = env_index_hash(id, ix->mask);
+    for (;;) {
+        if (ix->keys[i] == ENV_INDEX_EMPTY) {
+            ix->keys[i] = id;
+            ix->cells[i] = cell;
+            ix->used++;
+            return;
+        }
+        if (ix->keys[i] == id) {
+            if (overwrite)
+                ix->cells[i] = cell;
+            return;
+        }
+        i = (i + 1) & ix->mask;
+    }
+}
+
+static unsigned env_index_probe(const env_frame_index *ix, int64_t id)
+{
+    unsigned i = env_index_hash(id, ix->mask);
+    for (;;) {
+        if (ix->keys[i] == ENV_INDEX_EMPTY)
+            return 0;
+        if (ix->keys[i] == id)
+            return ix->cells[i];
+        i = (i + 1) & ix->mask;
+    }
+}
+
+static env_frame_index *env_index_for(unsigned frame)
+{
+    if (!frame)
+        return NULL;
+    for (unsigned i = 0; i < ENV_INDEX_FRAMES; i++) {
+        if (env_indexes[i].frame == frame)
+            return &env_indexes[i];
+    }
+    return NULL;
+}
+
+// Build a table for `frame`, taking over the next slot in rotation.
+static env_frame_index *env_index_build(unsigned frame)
+{
+    if (!IS_PAIR(frame))
+        return NULL;
+    unsigned vars = car(frame);
+    unsigned vals = cdr(frame);
+    if (!env_binding_list_acyclic(vars))
+        return NULL;
+
+    unsigned count = 0;
+    for (unsigned v = vars; IS_PAIR(v); v = cdr(v))
+        count++;
+    unsigned cap = 16;
+    while (cap < count * 2) {
+        if (cap > (1u << 24))
+            return NULL;
+        cap *= 2;
+    }
+
+    env_frame_index *ix = &env_indexes[env_index_next];
+    env_index_next = (env_index_next + 1) % ENV_INDEX_FRAMES;
+    env_index_release(ix);
+
+    ix->keys = malloc(cap * sizeof(int64_t));
+    ix->cells = malloc(cap * sizeof(unsigned));
+    if (!ix->keys || !ix->cells) {
+        env_index_release(ix);
+        return NULL;
+    }
+    for (unsigned i = 0; i < cap; i++)
+        ix->keys[i] = ENV_INDEX_EMPTY;
+    ix->mask = cap - 1;
+    ix->used = 0;
+
+    while (IS_PAIR(vars) && IS_PAIR(vals)) {
+        unsigned atom = car(vars);
+        if (!IS_ATOM(atom)) {
+            env_index_release(ix);
+            return NULL;
+        }
+        env_index_insert(ix, CELL_ID(atom), vals, false);
+        vars = cdr(vars);
+        vals = cdr(vals);
+    }
+    if (IS_ATOM(vars) && IS_PAIR(vals)) // dotted rest binding
+        env_index_insert(ix, CELL_ID(vars), vals, false);
+
+    ix->frame = frame;
+    return ix;
+}
+
+// Keep the index in step when a new binding is added to an indexed frame.
+static void env_index_note_define(unsigned frame, int64_t id, unsigned cell)
+{
+    env_frame_index *ix = env_index_for(frame);
+    if (!ix)
+        return;
+    // Built at about half load, so there is room to grow before probing
+    // degrades; past three quarters, drop the table and let the next lookup
+    // rebuild it at the right size.
+    if (ix->used + 1 > ((ix->mask + 1) / 4) * 3) {
+        env_index_release(ix);
+        return;
+    }
+    env_index_insert(ix, id, cell, true);
+}
+
+// For the VM's inline cache, which walks frames itself. True if `frame` is
+// indexed - in which case *cell_out is the binding cell, or 0 for a name the
+// frame does not bind, and the caller must not scan to double-check. False if
+// the frame is not worth indexing and the caller should scan as usual.
+bool env_frame_index_lookup(unsigned frame, int64_t var, unsigned *cell_out)
+{
+    env_frame_index *ix = env_index_for(frame);
+    if (!ix) {
+        if (!frame || !IS_PAIR(frame) || !env_frame_is_large(car(frame)))
+            return false;
+        ix = env_index_build(frame);
+        if (!ix)
+            return false;
+    }
+    *cell_out = env_index_probe(ix, var);
+    return true;
+}
+
+void env_index_gc_update(unsigned (*collector)(unsigned))
+{
+    for (unsigned i = 0; i < ENV_INDEX_FRAMES; i++) {
+        env_frame_index *ix = &env_indexes[i];
+        if (!ix->frame)
+            continue;
+        ix->frame = collector(ix->frame);
+        for (unsigned j = 0; j <= ix->mask; j++) {
+            if (ix->keys[j] != ENV_INDEX_EMPTY)
+                ix->cells[j] = collector(ix->cells[j]);
+        }
+    }
+}
+
 static bool env_find_in_frame(int64_t var, unsigned vars, unsigned vals,
                               unsigned *val_cell_out, unsigned *value_out)
 {
@@ -322,30 +513,43 @@ static bool env_find_in_frame(int64_t var, unsigned vars, unsigned vals,
     return false;
 }
 
-// ============================================================================
-// Environment Structure
-// ============================================================================
-//
-// Environments are represented as a list of frames, where each frame is a
-// cons cell of (vars . vals):
-//
-//   env = (frame1 . (frame2 . (frame3 . nil)))
-//
-// Each frame:
-//   frame = (vars . vals)
-//   vars  = list of variable atoms (or single atom for rest parameter)
-//   vals  = list of corresponding values (parallel structure to vars)
-//
-// Example: After (define x 1) (define y 2):
-//   env = (((x . (y . nil)) . (1 . (2 . nil))) . parent-env)
-//
-// Special case - rest parameter (lambda (a . rest) ...):
-//   vars = (a . rest-atom)  ; dotted list - rest is an atom, not a cons
-//   vals = (1 . (2 3 4))    ; rest parameter gets remaining args as list
-//
-// ============================================================================
-// Environment Operations
-// ============================================================================
+// Is this frame big enough to be worth indexing? Capped so the question costs
+// the same whether the answer is no or very much yes.
+static bool env_frame_is_large(unsigned vars)
+{
+    unsigned n = 0;
+    for (unsigned v = vars; IS_PAIR(v) && n < ENV_INDEX_MIN_BINDINGS;
+         v = cdr(v))
+        n++;
+    return n >= ENV_INDEX_MIN_BINDINGS;
+}
+
+// Frame lookup that consults the index, building one the first time a frame
+// turns out to be large - at the point where the linear scan would have been
+// paid for anyway.
+static bool env_find_in_frame_indexed(unsigned frame, int64_t var,
+                                      unsigned vars, unsigned vals,
+                                      unsigned *val_cell_out,
+                                      unsigned *value_out)
+{
+    env_frame_index *ix = env_index_for(frame);
+    if (!ix && frame && env_frame_is_large(vars))
+        ix = env_index_build(frame);
+
+    if (ix) {
+        // The table describes the whole frame, so a miss here is a real miss
+        // and there is nothing to gain from walking the list to confirm it.
+        unsigned cell = env_index_probe(ix, var);
+        if (!cell || !IS_PAIR(cell))
+            return false;
+        if (val_cell_out)
+            *val_cell_out = cell;
+        if (value_out && !try_deref_binding_value(car(cell), value_out))
+            return false;
+        return true;
+    }
+    return env_find_in_frame(var, vars, vals, val_cell_out, value_out);
+}
 
 unsigned empty_environment(void)
 {
@@ -375,8 +579,7 @@ unsigned defvar(unsigned var, unsigned aval, unsigned env)
     }
 
     // Invalidate lookup cache - new binding may shadow outer variables
-    invalidate_lookup_cache();
-    global_ic_epoch++;
+    bump_acyclic_epoch();
 
     int64_t vid = CELL_ID(var);
     unsigned vals = cdr(frame);
@@ -395,7 +598,7 @@ unsigned defvar(unsigned var, unsigned aval, unsigned env)
             }
             if (CELL_ID(vars) == vid) {
                 cell_set_car(vals, aval);
-                return var;
+                return var; // same cell, so the index still points at it
             } else {
                 break;
             }
@@ -407,7 +610,7 @@ unsigned defvar(unsigned var, unsigned aval, unsigned env)
         }
         if (CELL_ID(car(vars)) == vid) {
             cell_set_car(vals, aval);
-            return var;
+            return var; // same cell, so the index still points at it
         }
         vars = cdr(vars);
         vals = cdr(vals);
@@ -430,6 +633,10 @@ unsigned defvar(unsigned var, unsigned aval, unsigned env)
     }
     cell_set_car(frame, new_vars);
     cell_set_cdr(frame, new_vals);
+    // A new binding in the indexed frame has to reach the index, or the next
+    // lookup would report it missing - the index is treated as complete for
+    // the frame it describes.
+    env_index_note_define(frame, vid, new_vals);
     return var;
 }
 
@@ -457,7 +664,7 @@ unsigned env_find_binding_cell(int64_t var, unsigned env)
         unsigned vars = car(frame);
         unsigned vals = cdr(frame);
         unsigned val_cell = 0;
-        if (env_find_in_frame(var, vars, vals, &val_cell, NULL))
+        if (env_find_in_frame_indexed(frame, var, vars, vals, &val_cell, NULL))
             return val_cell;
         env = next;
     }
@@ -477,7 +684,8 @@ unsigned setvar(int64_t var, unsigned aval, unsigned env)
         unsigned vars = car(frame);
         unsigned vals = cdr(frame);
         unsigned val_cell = 0;
-        if (env_find_in_frame(var, vars, vals, &val_cell, NULL)) {
+        if (env_find_in_frame_indexed(frame, var, vars, vals, &val_cell,
+                                      NULL)) {
             if (environment_is_immutable(env)) {
                 show_error("set!: environment is immutable");
                 return TOK_ERROR;
@@ -496,56 +704,12 @@ unsigned setvar(int64_t var, unsigned aval, unsigned env)
     return TOK_ERROR;
 }
 
-// Move cache entry at index i to front (index 0), shifting others down
-static inline void cache_move_to_front(int i)
-{
-    if (i == 0)
-        return;
-    lookup_cache_entry tmp = lookup_cache[i];
-    for (int j = i; j > 0; j--) {
-        lookup_cache[j] = lookup_cache[j - 1];
-    }
-    lookup_cache[0] = tmp;
-}
-
-// Insert new entry at front, shifting others down (evicts last)
-static inline void cache_insert_front(int64_t var, unsigned env,
-                                      unsigned val_cell)
-{
-    for (int j = LOOKUP_CACHE_SIZE - 1; j > 0; j--) {
-        lookup_cache[j] = lookup_cache[j - 1];
-    }
-    lookup_cache[0].var = var;
-    lookup_cache[0].env = env;
-    lookup_cache[0].val_cell = val_cell;
-}
-
 // Internal lookup - returns TOK_ERROR if not found (no error message)
 static unsigned lookup_internal(int64_t var, unsigned env)
 {
-    // Check cache first - scan all entries for match
-    for (int i = 0; i < LOOKUP_CACHE_SIZE; i++) {
-        if (lookup_cache[i].var == var && lookup_cache[i].env == env) {
-            if (!IS_PAIR(lookup_cache[i].val_cell)) {
-                lookup_cache[i].var = -1;
-                break;
-            }
-            unsigned value = 0;
-            if (!try_deref_binding_value(car(lookup_cache[i].val_cell),
-                                         &value)) {
-                lookup_cache[i].var = -1;
-                break;
-            }
-            // Move to front on hit (LRU approximation)
-            cache_move_to_front(i);
-            return value;
-        }
-    }
-
     if (!env_chain_acyclic(env))
         return TOK_ERROR;
 
-    unsigned orig_env = env;
     while (env) {
         unsigned frame = 0;
         unsigned next = 0;
@@ -553,9 +717,9 @@ static unsigned lookup_internal(int64_t var, unsigned env)
             return TOK_ERROR;
         unsigned value = 0;
         unsigned val_cell = 0;
-        if (env_find_in_frame(var, car(frame), cdr(frame), &val_cell,
-                              &value)) {
-            cache_insert_front(var, orig_env, val_cell);
+        if (env_find_in_frame_indexed(frame, var, car(frame), cdr(frame),
+                                      &val_cell, &value)) {
+            (void)val_cell;
             return value;
         }
         env = next;

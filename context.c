@@ -2990,6 +2990,7 @@ unsigned gc(unsigned root)
     gc_update_all_code_objects();
     gc_update_all_patterns();
     update_all_string_port_sources(collect);
+    env_index_gc_update(collect);
 
     while (scan != ctx.hptr) {
         enum lisp_type t = CELL_TYPE(scan);
@@ -3288,6 +3289,7 @@ unsigned minor_gc(unsigned root)
     minor_gc_update_all_code_objects();
     minor_gc_update_all_patterns();
     update_all_string_port_sources(collect_to_old);
+    env_index_gc_update(collect_to_old);
 
     // Scan dirty cards in old generation for nursery pointers
     // Skip if generational GC is disabled (no card table)

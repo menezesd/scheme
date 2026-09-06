@@ -25,6 +25,94 @@
 // Global registry of all code objects for GC integration
 code_object *code_object_registry = NULL;
 
+// Membership set over the same objects. The list above is what the GC walks;
+// this answers "is this pointer a live code object" without walking it.
+// That question is asked on every call to a bytecode closure - it is how a
+// corrupt cell is stopped from being dereferenced as a code object - and as a
+// list walk it cost time proportional to how early the callee was defined,
+// since registration prepends. Measured at 2M calls: 9.7s for a procedure
+// defined early in stdlib.scm against 2.2s for one defined late.
+static code_object **code_set;
+static size_t code_set_cap;  // power of two, 0 until first use
+static size_t code_set_used;
+#define CODE_SET_TOMBSTONE ((code_object *)(uintptr_t)1)
+
+static size_t code_set_start(size_t cap, const code_object *code)
+{
+    uintptr_t v = (uintptr_t)code >> 4;
+    v *= 0x9E3779B97F4A7C15ull;
+    return (size_t)v & (cap - 1);
+}
+
+// Insert position: a tombstone is a fine place to land.
+static size_t code_set_slot_insert(code_object **table, size_t cap,
+                                   const code_object *code)
+{
+    size_t i = code_set_start(cap, code);
+    while (table[i] && table[i] != CODE_SET_TOMBSTONE && table[i] != code)
+        i = (i + 1) & (cap - 1);
+    return i;
+}
+
+// Lookup position: a tombstone must NOT stop the probe, or an entry inserted
+// after one was created becomes invisible - which reports a live code object
+// as unregistered and fails every call into it.
+static size_t code_set_slot_find(code_object **table, size_t cap,
+                                 const code_object *code)
+{
+    size_t i = code_set_start(cap, code);
+    while (table[i] && table[i] != code)
+        i = (i + 1) & (cap - 1);
+    return i;
+}
+
+static bool code_set_grow(size_t want)
+{
+    size_t cap = code_set_cap ? code_set_cap : 256;
+    while (cap < want * 2)
+        cap *= 2;
+    code_object **table = calloc(cap, sizeof(code_object *));
+    if (!table)
+        return false;
+    size_t live = 0;
+    for (size_t i = 0; i < code_set_cap; i++) {
+        code_object *c = code_set[i];
+        if (!c || c == CODE_SET_TOMBSTONE)
+            continue;
+        table[code_set_slot_insert(table, cap, c)] = c;
+        live++;
+    }
+    free(code_set);
+    code_set = table;
+    code_set_cap = cap;
+    code_set_used = live; // rehashing drops the tombstones
+    return true;
+}
+
+static void code_set_add(code_object *code)
+{
+    if (code_set_used + 1 > code_set_cap / 2) {
+        if (!code_set_grow(code_set_used + 1))
+            return; // fall back to the list walk below
+    }
+    size_t i = code_set_slot_insert(code_set, code_set_cap, code);
+    if (code_set[i] == code)
+        return;
+    code_set[i] = code;
+    code_set_used++;
+}
+
+static void code_set_remove(const code_object *code)
+{
+    if (!code_set_cap)
+        return;
+    size_t i = code_set_slot_find(code_set, code_set_cap, code);
+    if (code_set[i] == code) {
+        code_set[i] = CODE_SET_TOMBSTONE;
+        code_set_used--;
+    }
+}
+
 // Register a code object with the GC registry
 void code_register(code_object *code)
 {
@@ -32,6 +120,7 @@ void code_register(code_object *code)
         return;
     code->gc_next = code_object_registry;
     code_object_registry = code;
+    code_set_add(code);
 }
 
 static void code_unregister(code_object *code)
@@ -41,6 +130,7 @@ static void code_unregister(code_object *code)
         if (*prev == code) {
             *prev = code->gc_next;
             code->gc_next = NULL;
+            code_set_remove(code);
             return;
         }
         prev = &(*prev)->gc_next;
@@ -283,6 +373,11 @@ static void mark_code_object(code_object *code)
 
 bool code_object_is_registered(const code_object *needle)
 {
+    if (!needle)
+        return false;
+    if (code_set_cap)
+        return code_set[code_set_slot_find(code_set, code_set_cap, needle)] ==
+               needle;
     for (code_object *code = code_object_registry; code; code = code->gc_next) {
         if (code == needle)
             return true;
@@ -346,6 +441,11 @@ void gc_sweep_code_objects(void)
         if (!code->gc_marked) {
             // Unlink from registry
             *prev = code->gc_next;
+            // and from the membership set, or its address stays in there
+            // after the free. malloc reuses addresses, so the next code
+            // object allocated there would look already-registered, never be
+            // added to the registry, and never be traced by the GC.
+            code_set_remove(code);
             // Free the code object (but not children - they're in registry too)
             code_destroy_shallow(code);
         } else {
