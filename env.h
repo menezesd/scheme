@@ -103,6 +103,18 @@ unsigned environment_with_imports(unsigned source, unsigned specs);
 void mark_immutable_environment(unsigned env);
 bool environment_is_immutable(unsigned env);
 
+// The environment to consult for the exception machinery's state:
+// *current-exception-handler*, *default-exception-handler* and
+// *error-object-tag*. That state is dynamic, but it is stored in ordinary
+// variables of the environment the stdlib was loaded into, and
+// with-exception-handler is a stdlib closure that set!s them there. So
+// reading them from wherever the error happened is wrong whenever that is a
+// different environment: a scheme-report-environment clone carries its own
+// stale copies, an (environment ...) import set carries none. Returns the
+// interaction environment when there is one, else FALLBACK (the C test
+// harnesses run without main.c and bind what they need themselves).
+unsigned exception_state_env(unsigned fallback);
+
 // GC support: the frame index holds cell indices, which move.
 void env_index_gc_update(unsigned (*collector)(unsigned));
 

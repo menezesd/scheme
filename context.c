@@ -2970,6 +2970,7 @@ unsigned gc(unsigned root)
     ctx.current_output_cell = collect(ctx.current_output_cell);
     ctx.current_error_cell = collect(ctx.current_error_cell);
     ctx.r7rs_environment = collect(ctx.r7rs_environment);
+    ctx.global_environment = collect(ctx.global_environment);
     reader_update_datum_labels(collect);
 
     // Collect shadow stack entries - these are pointers to local C variables
@@ -3271,6 +3272,7 @@ unsigned minor_gc(unsigned root)
     ctx.current_output_cell = collect_to_old(ctx.current_output_cell);
     ctx.current_error_cell = collect_to_old(ctx.current_error_cell);
     ctx.r7rs_environment = collect_to_old(ctx.r7rs_environment);
+    ctx.global_environment = collect_to_old(ctx.global_environment);
     reader_update_datum_labels(collect_to_old);
 
     // Collect shadow stack entries

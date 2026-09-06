@@ -172,6 +172,11 @@ void mark_immutable_environment(unsigned env)
     cell_set_cdr(frame, new_vals);
 }
 
+unsigned exception_state_env(unsigned fallback)
+{
+    return ctx.global_environment ? ctx.global_environment : fallback;
+}
+
 bool env_chain_acyclic(unsigned env)
 {
     unsigned slow = env;

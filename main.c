@@ -408,6 +408,10 @@ int main(int argc, char **argv)
 
     // Set up automatic GC during allocation
     set_alloc_gc_root(&env);
+    // The exception machinery reads its state from here (see
+    // exception_state_env). Set before the stdlib loads so that an error
+    // raised during loading is dispatched the same way as one raised later.
+    ctx.global_environment = env;
 
     // Load standard library
     if (!load_stdlib(&env))

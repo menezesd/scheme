@@ -494,7 +494,7 @@ static void cps_signal_error(const char *msg, unsigned env, unsigned cont)
     if (!msg)
         msg = "unknown error";
     unsigned handler = lookup_silent(intern("*current-exception-handler*"),
-                                     env);
+                                     exception_state_env(env));
     if (handler == TOK_ERROR) {
         tramp_error();
         return;
@@ -513,94 +513,6 @@ static void cps_signal_error(const char *msg, unsigned env, unsigned cont)
     gc_protect(&args);
     unsigned err_cont = make_cont(CONT_ERR_RETURN, handler, env, cont);
     apply_function(handler, args, env, err_cont);
-}
-
-// Evaluate in a caller-supplied lexical environment without losing the
-// caller's dynamic exception machinery.  The R7RS `eval` environment controls
-// variable visibility, but it must not disconnect the evaluation from an
-// enclosing guard or with-exception-handler.  Keep the two handler bindings
-// in a short-lived frame layered over the supplied environment.
-static unsigned eval_env_with_exception_handlers(unsigned eval_env,
-                                                  unsigned caller_env)
-{
-    GC_GUARD;
-    unsigned current_name = 0;
-    unsigned default_name = 0;
-    unsigned error_tag_name = 0;
-    unsigned current_handler = 0;
-    unsigned default_handler = 0;
-    unsigned error_tag = 0;
-    unsigned vars_tail = 0;
-    unsigned vars = 0;
-    unsigned vars_tail2 = 0;
-    unsigned vals_tail = 0;
-    unsigned vals = 0;
-    unsigned vals_tail2 = 0;
-    unsigned frame = 0;
-    unsigned scoped_env = 0;
-    unsigned first_frame = 0;
-    unsigned outer = 0;
-
-    gc_protect(&first_frame);
-    gc_protect(&outer);
-    gc_protect(&eval_env);
-    gc_protect(&caller_env);
-    gc_protect(&current_name);
-    gc_protect(&default_name);
-    gc_protect(&error_tag_name);
-    gc_protect(&current_handler);
-    gc_protect(&default_handler);
-    gc_protect(&error_tag);
-    gc_protect(&vars_tail);
-    gc_protect(&vars);
-    gc_protect(&vars_tail2);
-    gc_protect(&vals_tail);
-    gc_protect(&vals);
-    gc_protect(&vals_tail2);
-    gc_protect(&frame);
-    gc_protect(&scoped_env);
-
-    current_name = atom_from_string("*current-exception-handler*");
-    default_name = atom_from_string("*default-exception-handler*");
-    error_tag_name = atom_from_string("*error-object-tag*");
-    current_handler = lookup_silent(CELL_ID(current_name), caller_env);
-    default_handler = lookup_silent(CELL_ID(default_name), caller_env);
-    error_tag = lookup_silent(CELL_ID(error_tag_name), caller_env);
-
-    if (current_handler == TOK_ERROR || default_handler == TOK_ERROR ||
-        error_tag == TOK_ERROR)
-        return TOK_ERROR;
-
-    vars_tail2 = alloc_cons(error_tag_name, 0);
-    vars_tail = alloc_cons(default_name, vars_tail2);
-    vars = alloc_cons(current_name, vars_tail);
-    vals_tail2 = alloc_cons(error_tag, 0);
-    vals_tail = alloc_cons(default_handler, vals_tail2);
-    vals = alloc_cons(current_handler, vals_tail);
-    frame = alloc_cons(vars, vals);
-
-    // Splice the handler frame in behind eval_env's own first frame rather
-    // than in front of it. defvar binds into whichever frame is first, and it
-    // mutates that frame's cons cell in place, so the eval'd expression has to
-    // start at the very frame eval_env starts at - otherwise a define lands in
-    // this temporary frame and is lost the moment eval returns, even though
-    // reads and set! (which walk the chain) appear to work.
-    //
-    // Immutability needs no separate handling for the same reason: both
-    // environments now begin at the same frame, which is the one
-    // environment_is_immutable reads.
-    if (!IS_PAIR(eval_env) || !IS_PAIR(car(eval_env))) {
-        // Not a frame list. Leave it to the evaluator to report.
-        scoped_env = alloc_cons(frame, eval_env);
-        if (environment_is_immutable(eval_env))
-            mark_immutable_environment(scoped_env);
-        return scoped_env;
-    }
-    first_frame = car(eval_env);
-    outer = cdr(eval_env);
-    scoped_env = alloc_cons(frame, outer);
-    scoped_env = alloc_cons(first_frame, scoped_env);
-    return scoped_env;
 }
 
 void cps_signal_current_error(unsigned env, unsigned cont)
@@ -861,7 +773,8 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
             }
             unsigned obj = car(args);
             unsigned handler = lookup_silent(
-                intern("*current-exception-handler*"), env);
+                intern("*current-exception-handler*"),
+                exception_state_env(env));
             if (handler == TOK_ERROR) {
                 cps_signal_current_error(env, cont);
                 return;
@@ -884,24 +797,15 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
                 cps_signal_current_error(env, cont);
                 return;
             }
-            unsigned expr = car(args);
-            unsigned eval_env = cadr(args);
-            GC_GUARD;
-            gc_protect(&expr);
-            gc_protect(&eval_env);
-            gc_protect(&env);
-            gc_protect(&cont);
-            unsigned scoped_env =
-                eval_env_with_exception_handlers(eval_env, env);
-            gc_protect(&scoped_env);
-            if (scoped_env == TOK_ERROR) {
-                show_error("eval: caller has no exception handlers");
-                cps_signal_current_error(env, cont);
-                return;
-            }
-            // Evaluate expression in the given lexical environment while
-            // retaining the caller's dynamic exception handlers.
-            tramp_eval(expr, scoped_env, cont);
+            // The expression is evaluated directly in the environment it
+            // was given. The caller's exception handlers stay in effect
+            // without any help from here: the exception machinery reads them
+            // from the interaction environment (exception_state_env), not
+            // from the environment of the code that raised. There used to be
+            // a frame holding copies of them consed in front of eval_env,
+            // and since define binds into the first frame, a definition made
+            // through eval landed in that frame and vanished with it.
+            tramp_eval(car(args), cadr(args), cont);
             return;
         }
 

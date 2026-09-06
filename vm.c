@@ -1022,7 +1022,7 @@ static bool vm_signal_error(vm_state *vm, const char *msg)
     if (!msg)
         msg = "unknown error";
     unsigned handler = lookup_silent(intern("*current-exception-handler*"),
-                                     vm->env);
+                                     exception_state_env(vm->env));
     if (handler == TOK_ERROR) {
         VM_ERROR(vm, msg);
         return false;
@@ -1065,7 +1065,7 @@ static void vm_handle_raise(vm_state *vm, unsigned argc, unsigned *argv)
     unsigned obj = argv[0];
     vm->sp -= argc;
     unsigned handler = lookup_silent(intern("*current-exception-handler*"),
-                                     vm->env);
+                                     exception_state_env(vm->env));
     if (handler == TOK_ERROR) {
         VM_ERROR(vm, "raise: no exception handler");
         return;
@@ -1083,6 +1083,52 @@ static void vm_handle_raise(vm_state *vm, unsigned argc, unsigned *argv)
     vm->ip = 0;
     vm_push(vm, obj);
     vm_apply(vm, handler, 1, false);
+}
+
+// eval runs the compiled expression in THIS VM. A frame is pushed so that
+// the unit's RETURN lands back here with its value on the stack, exactly as
+// a call would, and the dispatch loop simply continues into the new code.
+//
+// It used to hand the expression to main.c's eval callback, which compiled
+// it and ran it in a second vm_state on the C stack. Continuations do not
+// survive that boundary. One captured out here and invoked in there was
+// restored into the inner VM, which ran the rest of the program to
+// completion - and then vm_run returned normally into this handler, which
+// resumed the outer VM's stale state and ran the tail of the program a
+// second time. (guard (e ...) (eval ...)) is the everyday shape of that.
+// In the other direction, a continuation captured inside the eval'd code
+// and re-entered after eval had returned found its frames ending in the
+// inner VM's HALT. Run in place, both are ordinary frames of one VM.
+static void vm_handle_eval(vm_state *vm, unsigned argc, unsigned *argv)
+{
+    if (argc < 1 || argc > 2) {
+        vm->sp -= argc;
+        VM_ERROR(vm, "eval: expected 1 or 2 arguments");
+        return;
+    }
+    unsigned expr = argv[0];
+    unsigned eval_env = (argc == 2) ? argv[1] : vm->env;
+    vm->sp -= argc;
+    GC_GUARD;
+    gc_protect(&expr);
+    gc_protect(&eval_env);
+    code_object *code = compile_for_eval(expr, eval_env);
+    if (!code) {
+        VM_ERROR(vm, ctx.last_error[0] ? ctx.last_error
+                                       : "eval: compilation failed");
+        return;
+    }
+    if (!vm_code_is_well_formed(code)) {
+        VM_ERROR(vm, "eval: invalid bytecode");
+        return;
+    }
+    push_frame(vm, vm->code, vm->ip, vm->bp, vm->sp, vm->env);
+    if (vm->error)
+        return;
+    vm->code = code;
+    vm->ip = 0;
+    vm->bp = vm->sp;
+    vm->env = eval_env;
 }
 
 static bool vm_require_proper_list(vm_state *vm, unsigned list,
@@ -1266,6 +1312,25 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
 
         if (prim_id == PRAISENOW) {
             vm_handle_raise(vm, argc, argv);
+            return;
+        }
+
+        // eval and interaction-environment reach here when applied as
+        // first-class procedures - (apply eval ...), (map eval ...). The
+        // OP_PRIM fast path handles the direct call; apply_primitive_argv
+        // rejects both as "should be handled in apply_function".
+        if (prim_id == PEVAL) {
+            vm_handle_eval(vm, argc, argv);
+            return;
+        }
+
+        if (prim_id == PINTERACTIONENV) {
+            vm->sp -= argc;
+            if (argc != 0) {
+                VM_ERROR(vm, "interaction-environment: expected 0 arguments");
+                return;
+            }
+            vm_push(vm, vm->env);
             return;
         }
 
@@ -1993,7 +2058,8 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             // exception state. Any other handler returning from a
             // non-continuable exception is an R7RS error.
             unsigned dflt = lookup_silent(
-                intern("*default-exception-handler*"), vm->env);
+                intern("*default-exception-handler*"),
+                exception_state_env(vm->env));
             if (dflt != TOK_ERROR && vm->signal_handler == dflt) {
                 VM_ERROR_BREAK(vm, NULL);
             } else {
@@ -2201,26 +2267,8 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 break;
             }
 
-            // Special handling for eval - uses callback to main.c
             if (prim_id == PEVAL) {
-                if (argc < 1 || argc > 2) {
-                    vm->sp -= argc;
-                    VM_ERROR_BREAK(vm, "eval: expected 1 or 2 arguments");
-                }
-                unsigned expr = argv[0];
-                unsigned eval_env = (argc == 2) ? argv[1] : vm->env;
-                vm->sp -= argc;
-                GC_GUARD;
-                gc_protect(&expr);
-                gc_protect(&eval_env);
-                if (!ctx.eval_callback) {
-                    VM_ERROR_BREAK(vm, "eval: callback not set");
-                }
-                unsigned result = ctx.eval_callback(expr, eval_env);
-                if (result == TOK_ERROR) {
-                    VM_ERROR_BREAK(vm, "eval failed");
-                }
-                vm_push(vm, result);
+                vm_handle_eval(vm, argc, argv);
                 break;
             }
 

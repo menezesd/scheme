@@ -348,6 +348,12 @@ typedef struct {
     unsigned current_error_cell;  // Current error port cell (0 = use FILE*)
     // Immutable template used to construct isolated R7RS import environments.
     unsigned r7rs_environment;
+    // The interaction environment: where the standard library was loaded and
+    // therefore where its dynamic state lives. with-exception-handler is a
+    // stdlib closure, so its set! of *current-exception-handler* always lands
+    // here, whatever environment the code that raised was evaluated in. Zero
+    // until main.c has one (the C test harnesses never set it).
+    unsigned global_environment;
     FILE *transcript;             // NULL if not recording
     // Callbacks for VM special primitives (set by main.c)
     unsigned (*load_callback)(const char *filename,

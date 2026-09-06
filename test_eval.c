@@ -6316,6 +6316,58 @@ static bool code_tree_jump_targets_zero(const code_object *code)
     "    (if (= k 0) '() (cons k (loop (- k 1)))))))"                          \
     "    (loop n))))"
 
+TEST(vm_eval_runs_in_the_calling_vm)
+{
+    // eval used to compile its expression and run it in a second vm_state on
+    // the C stack, reached through main.c's eval callback. Continuations do
+    // not cross that boundary: one captured out here and invoked in there was
+    // restored into the inner VM, which ran the rest of the program and then
+    // returned normally into the outer VM's stale state, so the tail of the
+    // program ran twice. Running the expression in the calling VM makes both
+    // directions ordinary frames. (No stdlib here, so no guard; call/cc is
+    // engine-level, and eval no longer needs the callback at all - in this
+    // harness it used to fail with "eval: callback not set".)
+    unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
+
+    // Captured outside, invoked inside: the value lands in the right frame,
+    // 1 + 41 rather than a stale 1 + (1 + 41).
+    unsigned r = compiled_eval_string("(define eval-escape-k #f)", env);
+    ASSERT(r != TOK_ERROR);
+    r = compiled_eval_string(
+        "(+ 1 (call/cc (lambda (k) (set! eval-escape-k k)"
+        "  (eval '(eval-escape-k 41) (interaction-environment)))))",
+        env);
+    ASSERT(IS_NUM(r));
+    ASSERT_EQ(CELL_ID(r), 42);
+
+    // Captured inside, re-entered after eval has returned: its frames run
+    // back through the frame eval pushed instead of into an inner HALT.
+    r = compiled_eval_string(
+        "(begin (define eval-reentry-k #f) (define eval-reentry-n 0))", env);
+    ASSERT(r != TOK_ERROR);
+    r = compiled_eval_string(
+        "(begin"
+        "  (eval '(begin (call/cc (lambda (k) (set! eval-reentry-k k))) 'done)"
+        "        (interaction-environment))"
+        "  (set! eval-reentry-n (+ eval-reentry-n 1))"
+        "  (if (< eval-reentry-n 3) (eval-reentry-k #f))"
+        "  eval-reentry-n)",
+        env);
+    ASSERT(IS_NUM(r));
+    ASSERT_EQ(CELL_ID(r), 3);
+
+    // Applied as a first-class procedure it takes the same path; it used to
+    // fall through to apply_primitive_argv, which rejects it.
+    r = compiled_eval_string(
+        "(apply eval (cons '(+ 1 2) (cons (interaction-environment) '())))",
+        env);
+    ASSERT(IS_NUM(r));
+    ASSERT_EQ(CELL_ID(r), 3);
+    PASS();
+}
+
 TEST(code_object_registry_survives_heavy_churn)
 {
     // Membership has to stay correct across repeated register/free cycles,
@@ -7160,6 +7212,7 @@ int main(void)
     RUN_TEST(compiled_macro_thunk_captures_stack_local);
     RUN_TEST(compiled_binding_initializer_closures_capture_stack_locals);
     RUN_TEST(eval_calls_bytecode_closure_with_stack_locals);
+    RUN_TEST(vm_eval_runs_in_the_calling_vm);
 
     // Tail recursion modulo cons
     RUN_TEST(code_object_registry_survives_heavy_churn);

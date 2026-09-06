@@ -427,6 +427,62 @@
       (begin (eval '(set! eval-def-setme 9) (interaction-environment))
              eval-def-setme))
 
+;; eval must not disconnect the expression from the caller's dynamic context:
+;; neither its exception handlers nor its continuations.
+;;
+;; The VM used to run an eval'd expression in a second vm_state on the C
+;; stack. A continuation captured outside and invoked inside was restored
+;; into that inner VM, which ran the rest of the program - and then the inner
+;; run returned normally into the outer VM, which resumed its stale state and
+;; ran the tail of the program again. (guard (e ...) (eval ...)) did exactly
+;; that. Both engines also looked the current handler up lexically from the
+;; environment of the code that raised, so inside a scheme-report-environment
+;; clone they found the clone's stale copy, and inside an (environment ...)
+;; import set they found nothing at all.
+(test "guard around eval catches the error raised inside" 'caught
+      (guard (e (#t 'caught))
+        (eval '(car '()) (interaction-environment))))
+(test "error inside eval reaches an outer guard as itself" "car: not a pair"
+      (guard (e ((error-object? e) (error-object-message e)))
+        (eval '(car '()) (interaction-environment))))
+(test "guard around eval in an import environment" 'caught
+      (guard (e (#t 'caught))
+        (eval 'no-such-binding-anywhere (environment '(scheme base)))))
+(test "guard around eval in a report environment" 'caught
+      (guard (e (#t 'caught))
+        (eval '(car '()) (scheme-report-environment 5))))
+(test "handler installed inside eval in a report environment is current there"
+      'inner
+      (eval '(call-with-current-continuation
+               (lambda (k)
+                 (with-exception-handler
+                   (lambda (e) (k 'inner))
+                   (lambda () (car '())))))
+            (scheme-report-environment 5)))
+(define eval-escape-k #f)
+(test "continuation captured outside eval escapes from inside it" 42
+      (+ 1 (call-with-current-continuation
+             (lambda (k)
+               (set! eval-escape-k k)
+               (eval '(eval-escape-k 41) (interaction-environment))))))
+(define eval-reentry-k #f)
+(define eval-reentry-count 0)
+(test "continuation captured inside eval is re-entered after eval returned" 3
+      (begin
+        (eval '(begin (call-with-current-continuation
+                        (lambda (k) (set! eval-reentry-k k)))
+                      'done)
+              (interaction-environment))
+        (set! eval-reentry-count (+ eval-reentry-count 1))
+        (if (< eval-reentry-count 3)
+            (eval-reentry-k #f))
+        eval-reentry-count))
+(test "eval is a first-class procedure" 3
+      (apply eval (list '(+ 1 2) (interaction-environment))))
+(test "eval maps over expressions" '(2 6)
+      (map eval '((+ 1 1) (* 2 3))
+           (list (interaction-environment) (interaction-environment))))
+
 ;;; ============================================================================
 ;;; 6.6 Input and output
 ;;; ============================================================================

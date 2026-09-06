@@ -5562,7 +5562,8 @@ void compile_sequence(unsigned exprs, compile_ctx *cctx, bool tail)
     compile_begin(exprs, cctx);
 }
 
-code_object *compile_toplevel(unsigned expr, unsigned env)
+static code_object *compile_unit(unsigned expr, unsigned env,
+                                 unsigned terminator)
 {
     GC_GUARD;
     gc_protect(&expr);
@@ -5574,10 +5575,24 @@ code_object *compile_toplevel(unsigned expr, unsigned env)
     cctx->tail_position = false;
 
     compile_expr_internal(expr, cctx);
-    emit(cctx, OP_HALT);
+    emit(cctx, terminator);
 
     code_object *result = cctx->code;
     peephole_optimize(result);
     cctx_free(cctx);
     return result;
+}
+
+code_object *compile_toplevel(unsigned expr, unsigned env)
+{
+    return compile_unit(expr, env, OP_HALT);
+}
+
+// For eval inside a running VM. The VM pushes a frame and runs the unit in
+// place, so it ends in RETURN and hands its value back through that frame
+// like any call would. HALT would stop the VM with the caller's frames still
+// pending.
+code_object *compile_for_eval(unsigned expr, unsigned env)
+{
+    return compile_unit(expr, env, OP_RETURN);
 }

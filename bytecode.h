@@ -489,6 +489,8 @@ void code_patch(code_object *code, unsigned pos, unsigned val);
 
 // Compiler
 code_object *compile_toplevel(unsigned expr, unsigned env);
+// Same, ending in RETURN instead of HALT; see compile.c.
+code_object *compile_for_eval(unsigned expr, unsigned env);
 code_object *compile_expr(unsigned expr, compile_ctx *ctx);
 void compile_sequence(unsigned exprs, compile_ctx *ctx, bool tail);
 

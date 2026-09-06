@@ -2760,7 +2760,8 @@ static unsigned apply_transcript_primitive(unsigned prim_id, unsigned argc,
 unsigned make_error_object_c(const char *msg, unsigned env)
 {
     GC_GUARD;
-    unsigned tag = lookup_silent(intern("*error-object-tag*"), env);
+    unsigned tag = lookup_silent(intern("*error-object-tag*"),
+                                 exception_state_env(env));
     if (tag == TOK_ERROR)
         return TOK_ERROR;
     gc_protect(&tag);

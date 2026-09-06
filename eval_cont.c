@@ -659,7 +659,8 @@ void handle_cont_err_return(unsigned val, unsigned data, unsigned env,
 {
     (void)val;
     (void)next;
-    unsigned dflt = lookup_silent(intern("*default-exception-handler*"), env);
+    unsigned dflt = lookup_silent(intern("*default-exception-handler*"),
+                                  exception_state_env(env));
     if (dflt != TOK_ERROR && data == dflt) {
         tramp_error();
         return;
