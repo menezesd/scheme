@@ -182,7 +182,7 @@ static bool vm_instruction_starts_at(const code_object *code, unsigned target)
     return target == code->code_len;
 }
 
-static bool vm_code_is_well_formed(const code_object *code)
+static bool vm_code_is_well_formed(code_object *code)
 {
     // Code objects are GC-managed and their backing arrays are only valid
     // while the object remains registered.  Check the metadata before
@@ -195,6 +195,11 @@ static bool vm_code_is_well_formed(const code_object *code)
         (code->const_len != 0 && !code->constants) ||
         (code->children_len != 0 && !code->children))
         return false;
+    // The instruction walk below is the expensive part and only depends on
+    // the arrays, which do not change once compilation is done. Every routine
+    // that does change them clears this.
+    if (code->verified)
+        return true;
     for (unsigned i = 0; i < code->code_len;) {
         unsigned op = code->code[i];
         if (op >= OP_COUNT)
@@ -210,6 +215,7 @@ static bool vm_code_is_well_formed(const code_object *code)
         }
         i += size;
     }
+    code->verified = true;
     return true;
 }
 

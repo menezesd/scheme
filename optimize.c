@@ -392,6 +392,8 @@ static void cse_pass(code_object *code)
 // Peephole optimization with proper jump target fixup
 void peephole_optimize(code_object *code)
 {
+    if (code)
+        code->verified = false; // the instruction array is about to change
     if (!code || code->optimizing || code->code_len < 2 ||
         code->code_len > code->code_cap ||
         code->children_len > code->children_cap || !code->code ||

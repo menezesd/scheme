@@ -240,6 +240,8 @@ void code_free(code_object *code)
 
 void code_emit(code_object *code, unsigned instr)
 {
+    if (code)
+        code->verified = false;
     if (code->code_len >= code->code_cap) {
         unsigned new_cap =
             checked_grow_capacity(code->code_cap, sizeof(unsigned),
@@ -257,6 +259,8 @@ void code_emit(code_object *code, unsigned instr)
 
 unsigned code_add_const(code_object *code, unsigned val)
 {
+    if (code)
+        code->verified = false;
     // Check if constant already exists
     for (unsigned i = 0; i < code->const_len; i++) {
         if (code->constants[i] == val)
@@ -280,6 +284,8 @@ unsigned code_add_const(code_object *code, unsigned val)
 
 unsigned code_add_child(code_object *code, code_object *child)
 {
+    if (code)
+        code->verified = false;
     if (code->children_len >= code->children_cap) {
         unsigned new_cap =
             checked_grow_capacity(code->children_cap, sizeof(code_object *),
@@ -303,6 +309,8 @@ unsigned code_current_pos(code_object *code)
 
 void code_patch(code_object *code, unsigned pos, unsigned val)
 {
+    if (code)
+        code->verified = false;
     if (!code || pos >= code->code_len)
         lisp_panic("code_patch: position out of bounds");
     code->code[pos] = val;

@@ -289,6 +289,12 @@ typedef struct code_object {
 
     // GC integration: linked list of all code objects
     struct code_object *gc_next;
+    // Set once vm_code_is_well_formed has checked this object, cleared by
+    // every routine that changes it. The check walks the whole instruction
+    // array, and it runs on every call into the closure: for a procedure with
+    // a few hundred forms that measured 29us per call against 0.3us for a
+    // small one, on code that never executes.
+    bool verified;
     bool gc_marked; // True if reachable during current GC
     bool gc_pinned; // Never swept (internal singletons like the
                     // call-with-values finisher)
