@@ -538,7 +538,11 @@ static unsigned eval_env_with_exception_handlers(unsigned eval_env,
     unsigned vals_tail2 = 0;
     unsigned frame = 0;
     unsigned scoped_env = 0;
+    unsigned first_frame = 0;
+    unsigned outer = 0;
 
+    gc_protect(&first_frame);
+    gc_protect(&outer);
     gc_protect(&eval_env);
     gc_protect(&caller_env);
     gc_protect(&current_name);
@@ -574,9 +578,28 @@ static unsigned eval_env_with_exception_handlers(unsigned eval_env,
     vals_tail = alloc_cons(default_handler, vals_tail2);
     vals = alloc_cons(current_handler, vals_tail);
     frame = alloc_cons(vars, vals);
-    scoped_env = alloc_cons(frame, eval_env);
-    if (environment_is_immutable(eval_env))
-        mark_immutable_environment(scoped_env);
+
+    // Splice the handler frame in behind eval_env's own first frame rather
+    // than in front of it. defvar binds into whichever frame is first, and it
+    // mutates that frame's cons cell in place, so the eval'd expression has to
+    // start at the very frame eval_env starts at - otherwise a define lands in
+    // this temporary frame and is lost the moment eval returns, even though
+    // reads and set! (which walk the chain) appear to work.
+    //
+    // Immutability needs no separate handling for the same reason: both
+    // environments now begin at the same frame, which is the one
+    // environment_is_immutable reads.
+    if (!IS_PAIR(eval_env) || !IS_PAIR(car(eval_env))) {
+        // Not a frame list. Leave it to the evaluator to report.
+        scoped_env = alloc_cons(frame, eval_env);
+        if (environment_is_immutable(eval_env))
+            mark_immutable_environment(scoped_env);
+        return scoped_env;
+    }
+    first_frame = car(eval_env);
+    outer = cdr(eval_env);
+    scoped_env = alloc_cons(frame, outer);
+    scoped_env = alloc_cons(first_frame, scoped_env);
     return scoped_env;
 }
 

@@ -403,6 +403,30 @@
 ;; null-environment only has syntax, not procedures
 (test "eval lambda" 42 (eval '((lambda (x) x) 42) (null-environment 5)))
 
+;; A define evaluated in an environment has to persist in that environment.
+;; The interpreter used to evaluate the form in a temporary frame layered over
+;; the target environment to carry the caller's exception handlers, and define
+;; always binds into the first frame - so the binding landed in the wrapper and
+;; disappeared when eval returned. Reads and set! walk the whole chain, so only
+;; define was affected, and only in --interpreter mode.
+(define eval-def-existing 1)
+(define eval-def-setme 1)
+(test "eval define persists, read back through eval" 42
+      (begin (eval '(define eval-def-a 42) (interaction-environment))
+             (eval 'eval-def-a (interaction-environment))))
+(test "eval define persists, referenced directly" 43
+      (begin (eval '(define eval-def-b 43) (interaction-environment))
+             eval-def-b))
+(test "eval define of a procedure is callable" 15
+      (begin (eval '(define (eval-def-f x) (* x 3)) (interaction-environment))
+             (eval-def-f 5)))
+(test "eval define redefines an existing binding" 2
+      (begin (eval '(define eval-def-existing 2) (interaction-environment))
+             eval-def-existing))
+(test "eval set! still reaches the target environment" 9
+      (begin (eval '(set! eval-def-setme 9) (interaction-environment))
+             eval-def-setme))
+
 ;;; ============================================================================
 ;;; 6.6 Input and output
 ;;; ============================================================================
