@@ -36,6 +36,10 @@ static code_object **code_set;
 static size_t code_set_cap;      // power of two, 0 until first use
 static size_t code_set_used;     // live entries
 static size_t code_set_occupied; // live entries plus tombstones
+// Set when an allocation failure left a registered object out of the table.
+// While it is set the table is missing entries, so it cannot answer "no" -
+// lookups fall back to the registry list until a rebuild succeeds.
+static bool code_set_incomplete;
 #define CODE_SET_TOMBSTONE ((code_object *)(uintptr_t)1)
 
 static size_t code_set_start(size_t cap, const code_object *code)
@@ -67,27 +71,39 @@ static size_t code_set_slot_find(code_object **table, size_t cap,
     return i;
 }
 
-static bool code_set_grow(size_t want)
+static bool code_set_alloc_always_fails;
+
+void code_set_force_alloc_failure(bool fail)
 {
+    code_set_alloc_always_fails = fail;
+}
+
+// Rebuild the table from code_object_registry, not from the old table. The
+// list is the authoritative membership: code_register puts an object on it
+// before adding to the set, and code_unregister removes from both. Rebuilding
+// from the list is therefore identical in the ordinary case, and it is what
+// lets a table that lost entries to a failed allocation heal - rehashing the
+// old table would only carry the loss forward.
+static bool code_set_grow(void)
+{
+    size_t live = 0;
+    for (const code_object *c = code_object_registry; c; c = c->gc_next)
+        live++;
     size_t cap = code_set_cap ? code_set_cap : 256;
-    while (cap < want * 2)
+    while (cap < (live + 1) * 2)
         cap *= 2;
-    code_object **table = calloc(cap, sizeof(code_object *));
+    code_object **table =
+        code_set_alloc_always_fails ? NULL : calloc(cap, sizeof(code_object *));
     if (!table)
         return false;
-    size_t live = 0;
-    for (size_t i = 0; i < code_set_cap; i++) {
-        code_object *c = code_set[i];
-        if (!c || c == CODE_SET_TOMBSTONE)
-            continue;
+    for (code_object *c = code_object_registry; c; c = c->gc_next)
         table[code_set_slot_insert(table, cap, c)] = c;
-        live++;
-    }
     free(code_set);
     code_set = table;
     code_set_cap = cap;
     code_set_used = live;
     code_set_occupied = live; // rehashing drops the tombstones
+    code_set_incomplete = false;
     return true;
 }
 
@@ -98,9 +114,15 @@ static void code_set_add(code_object *code)
     // the table would never rehash, tombstones would fill every slot, and the
     // lookup probe - which cannot stop at one - would spin forever looking for
     // an empty slot that no longer exists.
-    if (code_set_occupied + 1 > code_set_cap / 2) {
-        if (!code_set_grow(code_set_used + 1))
-            return; // fall back to the list walk below
+    // A previous failure leaves entries missing, so keep retrying the rebuild
+    // until one succeeds; nothing else restores them.
+    if (code_set_incomplete || code_set_occupied + 1 > code_set_cap / 2) {
+        if (!code_set_grow()) {
+            // The caller has already put this object on the registry list, so
+            // it stays reachable, but the table no longer mirrors that list.
+            code_set_incomplete = true;
+            return;
+        }
     }
     size_t i = code_set_slot_insert(code_set, code_set_cap, code);
     if (code_set[i] == code)
@@ -392,7 +414,10 @@ bool code_object_is_registered(const code_object *needle)
 {
     if (!needle)
         return false;
-    if (code_set_cap)
+    // Only trust the table while it holds every registered object. A miss in
+    // an incomplete table is not an answer: it would report a live object as
+    // unregistered, and the GC would then sweep something still reachable.
+    if (code_set_cap && !code_set_incomplete)
         return code_set[code_set_slot_find(code_set, code_set_cap, needle)] ==
                needle;
     for (code_object *code = code_object_registry; code; code = code->gc_next) {

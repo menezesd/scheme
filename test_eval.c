@@ -6349,6 +6349,64 @@ TEST(code_object_registry_survives_heavy_churn)
     PASS();
 }
 
+TEST(code_object_stays_registered_when_the_index_cannot_grow)
+{
+    // The membership table is an index over code_object_registry, not the
+    // registry itself. If its rebuild allocation fails, entries go missing
+    // from the index while the objects are still registered and reachable.
+    // A miss then has to mean "ask the list", not "not registered" - the GC
+    // decides what to sweep through this predicate, so answering no about a
+    // live code object collects something still in use.
+    enum { N = 4000 };
+    static code_object *objs[N];
+    unsigned unregistered_while_incomplete = 0;
+
+    // Arm after startup so the table already exists; the interesting path is
+    // a populated index that loses entries, not the empty-table case.
+    code_set_force_alloc_failure(true);
+    unsigned made = 0;
+    for (unsigned i = 0; i < N; i++) {
+        objs[i] = code_new();
+        if (!objs[i])
+            break;
+        made++;
+        code_emit(objs[i], OP_RETURN);
+        if (!code_object_is_registered(objs[i]))
+            unregistered_while_incomplete++;
+    }
+
+    // Once the allocation can succeed again the next registration rebuilds
+    // the index from the registry list, recovering everything it dropped.
+    code_set_force_alloc_failure(false);
+    code_object *trigger = code_new();
+    unsigned missing_after_recovery = 0;
+    if (trigger) {
+        code_emit(trigger, OP_RETURN);
+        for (unsigned i = 0; i < made; i++) {
+            if (!code_object_is_registered(objs[i]))
+                missing_after_recovery++;
+        }
+    }
+
+    unsigned still_registered_after_free = 0;
+    for (unsigned i = 0; i < made; i++) {
+        code_free(objs[i]);
+        if (code_object_is_registered(objs[i]))
+            still_registered_after_free++;
+    }
+    if (trigger)
+        code_free(trigger);
+
+    // Assert only once the seam is disarmed: ASSERT returns from the test,
+    // and leaving it armed would break every test that follows.
+    ASSERT(made == N);
+    ASSERT(trigger != NULL);
+    ASSERT_EQ(0, unregistered_while_incomplete);
+    ASSERT_EQ(0, missing_after_recovery);
+    ASSERT_EQ(0, still_registered_after_free);
+    PASS();
+}
+
 TEST(trmc_transforms_cons_over_a_self_tail_call)
 {
     unsigned env = default_environment();
@@ -7105,6 +7163,7 @@ int main(void)
 
     // Tail recursion modulo cons
     RUN_TEST(code_object_registry_survives_heavy_churn);
+    RUN_TEST(code_object_stays_registered_when_the_index_cannot_grow);
     RUN_TEST(trmc_transforms_cons_over_a_self_tail_call);
     RUN_TEST(trmc_loop_jump_clears_the_accumulator_init);
     RUN_TEST(trmc_uses_fold_mode_when_the_element_can_capture);

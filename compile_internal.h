@@ -42,4 +42,9 @@ void peephole_optimize(code_object *code);
 // Collect code object constants during GC
 unsigned gc_collect_code(code_object *code);
 
+// Test seam: force the membership table's rebuild allocation to fail, so the
+// path where a registered object cannot be indexed is reachable without an
+// actual out-of-memory condition. Nothing in the runtime sets this.
+void code_set_force_alloc_failure(bool fail);
+
 #endif // COMPILE_INTERNAL_H
