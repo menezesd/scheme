@@ -99,7 +99,7 @@ enum cont_type {
     CONT_COND_TEST, // Evaluated condition; data = (conseq . rest-clauses), env,
                     // next
     CONT_COND_ARROW, // Evaluated receiver expr; data = test-value, env, next
-    CONT_LET_VALS, // Evaluating let values; data = (vars . (vals . (bindings .
+    CONT_LET_VALS, // Evaluating let values; data = (vars . (reversed-values . (bindings .
                    // body))), env, next
     CONT_LET_BODY, // Evaluating let body; data = remaining-body, new-env, next
     CONT_LETSTAR_VALS, // Evaluating let* values; data = (bindings . body), env,
@@ -237,6 +237,7 @@ typedef struct {
     size_t pos; // Read position (for input ports)
     size_t last_read_pos;
     size_t last_read_len;
+    size_t last_read_source_pos; // character position after the last read-char
     int last_read_char;
     bool last_read_valid;
     // For input ports opened on a Scheme string, retain the source cell so

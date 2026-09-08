@@ -102,6 +102,7 @@ unsigned environment_with_imports(unsigned source, unsigned specs);
 // Mark an environment root as immutable and query that marker.
 void mark_immutable_environment(unsigned env);
 bool environment_is_immutable(unsigned env);
+bool env_binding_is_immutable(int64_t var, unsigned env);
 
 // The environment to consult for the exception machinery's state:
 // *current-exception-handler*, *default-exception-handler* and

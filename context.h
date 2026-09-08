@@ -163,6 +163,11 @@ unsigned store_complex(unsigned real_part, unsigned imag_part);
 // Get numeric value as double (works for all numeric types)
 double to_double(unsigned x);
 
+// Approximate an exact integer as TOP * 2^(OMITTED_LIMBS * LIMB_BITS),
+// keeping its sign separate. Useful when scaling must precede conversion.
+bool exact_integer_top_double(unsigned value, double *top,
+                              size_t *omitted_limbs, bool *negative);
+
 // Check if a value is numeric
 bool is_numeric(unsigned x);
 

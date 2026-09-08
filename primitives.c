@@ -871,7 +871,6 @@ static unsigned string_ref_value(unsigned str, unsigned index,
 static unsigned string_set_value(unsigned str, unsigned index,
                                  unsigned value, const char *name)
 {
-    GC_GUARD;
     char *s = require_string_ptr(str, name);
     if (!s)
         return TOK_ERROR;
@@ -904,12 +903,18 @@ static unsigned string_set_value(unsigned str, unsigned index,
             show_error("%s: invalid string view", name);
             return TOK_ERROR;
         }
-        gc_protect(&root);
-        unsigned absolute_index = store(absolute);
-        unsigned result = string_set_value(root, absolute_index, value, name);
-        if (result != TOK_ERROR)
-            string_views_refresh(root);
-        return result;
+        // The codepoint and index are already validated C values. Continue
+        // on the root string directly; boxing an index and recursively
+        // calling this function could collect the unrooted character value.
+        if (string_cell_is_immutable(root)) {
+            show_error("%s: cannot modify immutable string", name);
+            return TOK_ERROR;
+        }
+        str = root;
+        idx = absolute;
+        s = require_string_ptr(str, name);
+        if (!s)
+            return TOK_ERROR;
     }
     char encoded[4];
     size_t encoded_len;

@@ -262,8 +262,9 @@ void code_free(code_object *code)
 
 void code_emit(code_object *code, unsigned instr)
 {
-    if (code)
-        code->verified = false;
+    if (!code)
+        lisp_panic("code_emit: null code object");
+    code->verified = false;
     if (code->code_len >= code->code_cap) {
         unsigned new_cap =
             checked_grow_capacity(code->code_cap, sizeof(unsigned),
@@ -281,8 +282,9 @@ void code_emit(code_object *code, unsigned instr)
 
 unsigned code_add_const(code_object *code, unsigned val)
 {
-    if (code)
-        code->verified = false;
+    if (!code)
+        lisp_panic("code_add_const: null code object");
+    code->verified = false;
     // Check if constant already exists
     for (unsigned i = 0; i < code->const_len; i++) {
         if (code->constants[i] == val)
@@ -306,8 +308,9 @@ unsigned code_add_const(code_object *code, unsigned val)
 
 unsigned code_add_child(code_object *code, code_object *child)
 {
-    if (code)
-        code->verified = false;
+    if (!code)
+        lisp_panic("code_add_child: null code object");
+    code->verified = false;
     if (code->children_len >= code->children_cap) {
         unsigned new_cap =
             checked_grow_capacity(code->children_cap, sizeof(code_object *),
@@ -412,7 +415,9 @@ static void mark_code_object(code_object *code)
 
 bool code_object_is_registered(const code_object *needle)
 {
-    if (!needle)
+    // Deleted slots are not objects. A malformed closure pointer equal to
+    // the marker must never compare as a successful membership-table hit.
+    if (!needle || needle == CODE_SET_TOMBSTONE)
         return false;
     // Only trust the table while it holds every registered object. A miss in
     // an incomplete table is not an answer: it would report a live object as

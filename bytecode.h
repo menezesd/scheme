@@ -136,9 +136,9 @@ enum opcode {
     OP_JUMPIFNOTZERO, // Jump if top is not zero: pop, if not zero jump
 
     // Letrec support for proper continuation behavior
-    OP_LETREC_MARK, // Mark letrec frame: LETREC_MARK n -> mark env frame as
-                    // letrec with n bindings
-    OP_LETREC_DONE, // End letrec init: clear letrec mark
+    OP_LETREC_MARK, // Mark letrec frame: LETREC_MARK n -> push env frame with
+                    // n bindings onto the active initialization stack
+    OP_LETREC_DONE, // End letrec init: pop the active letrec mark
 
     // Additional list accessors
     OP_CAAR,  // Inline caar: pop pair, push caar
@@ -218,19 +218,28 @@ enum opcode {
     // unobservable, so the body has to be capture-free.
     //
     // FOLD mode stacks the pending operands functionally and replays them at
-    // the return. It costs a second pass and one cell per level more, and in
+    // the return. Entries retain operands, operator symbols and environments; in
     // exchange it is unrestricted: prepending never mutates, so a re-entered
     // continuation just rebuilds from its own accumulator value, and for a
     // pure operator nothing about the evaluation order changes at all.
     OP_TRMC_INIT,   // reserve the accumulator (2 slots for HOLE, 1 for FOLD)
     OP_TRMC_APPEND, // HOLE: pop v; cell = (v . ()); link it in; tail = cell
     OP_TRMC_SPLICE, // HOLE: pop list; copy its spine onto the accumulator
-    OP_TRMC_PUSH,   // FOLD: pop v; acc = (v . acc), allocating but not mutating
+    OP_TRMC_PUSH,   // FOLD: symbol constant index; save operand and lexical env
     // A tail call from inside a TRMC body. Tail calls for real while the
     // accumulator is still empty, since the return would then pass the value
     // through untouched; keeps the frame once something is pending, which is
     // exactly when the untransformed program was not tail-calling either.
     OP_TAILCALL_TRMC, // TAILCALL_TRMC argc
+
+    // Guarded loop call: RECURSE target argc depth. Pop the actual callee;
+    // reuse locals and jump only when its code and captured environment match
+    // this activation. Otherwise perform a normal (TRMC-aware) tail call.
+    OP_RECURSE,
+
+    // target, symbol, expected primitive, argc, tail, cached depth/offset.
+    // Arguments remain intact until the binding is checked.
+    OP_GUARD_PRIMITIVE,
 
     // Marker for exception-handler return frames (never emitted by the
     // compiler; see vm_signal_error). Firing it signals the R7RS
@@ -281,7 +290,6 @@ typedef struct code_object {
     // has to know this exists.
     unsigned char trmc_mode; // TRMC_MODE_*, 0 when the body has no accumulator
     unsigned trmc_slot;      // First accumulator slot (HOLE also uses +1)
-    unsigned trmc_op;        // TRMC_MODE_FOLD: the primitive to fold with
 
     // Source info for debugging
     const char *name;     // Function name (if known)
@@ -352,6 +360,11 @@ typedef struct {
 // VM Continuation (for call/cc)
 // ============================================================================
 
+typedef struct {
+    unsigned frame; // Environment node whose CAR is the letrec binding frame
+    unsigned count; // Number of binding values to snapshot
+} vm_letrec_state;
+
 /**
  * Captured continuation structure.
  * Stored as a cell with type BT_VMCONT, id = pointer to this struct.
@@ -366,17 +379,26 @@ typedef struct {
     unsigned ip;       // Instruction pointer
     unsigned env;      // Current environment (cell index)
     unsigned bp;       // Base pointer for stack locals
+    unsigned signal_handler; // Exception handler active at capture time
 
-    // Letrec support: save/restore binding values for proper continuation behavior
-    unsigned *letrec_saved;    // Saved values of letrec bindings (NULL if none)
-    unsigned letrec_saved_len; // Number of saved values
-    unsigned letrec_frame;     // The frame that was being initialized
+    // Letrec support. Several initializations can be dynamically active when
+    // an initializer calls a procedure containing another letrec.
+    vm_letrec_state *letrecs;  // Active letrec initialization stack
+    unsigned letrec_depth;     // Number of active letrec states
+    unsigned *letrec_saved;    // Flattened saved binding values
+    unsigned letrec_saved_len; // Total number of saved binding values
 } vm_continuation;
 
 void vm_continuation_register(vm_continuation *cont);
 void vm_continuation_unregister(vm_continuation *cont);
 bool vm_continuation_is_registered(const vm_continuation *cont);
 bool is_vm_continuation_object(unsigned value);
+
+typedef enum {
+    VM_CONT_CALL_ERROR,
+    VM_CONT_CALL_RETURNED,
+    VM_CONT_CALL_TRANSFERRED,
+} vm_cont_call_status;
 
 // ============================================================================
 // VM State
@@ -413,12 +435,14 @@ typedef struct vm_state {
     unsigned bp;       // Base pointer for stack locals
 
     // Letrec initialization tracking
-    unsigned letrec_frame;   // Frame being initialized (0 if none)
-    unsigned letrec_count;   // Number of bindings in letrec
+    vm_letrec_state *letrecs; // Dynamically active initialization stack
+    unsigned letrec_depth;    // Number of active entries
+    unsigned letrec_cap;      // Allocated entries
 
     // Status
     bool running;          // True while VM is executing
     bool error;            // True if error occurred
+    bool cps_continuation_transfer; // CPS call restored this VM continuation
     const char *error_msg; // Error message (if error)
 
     // The exception handler dispatched by the most recent vm_signal_error
@@ -447,6 +471,7 @@ typedef struct compile_ctx {
     struct compile_ctx *parent; // Parent context (for nested lambdas)
     unsigned env;               // Compile-time environment (for macros)
     bool tail_position;         // True if compiling in tail position
+    bool immutable_base;       // All externally supplied frames are immutable
     unsigned known_lambdas;     // Alist of (var-id . lambda-expr) for inlining
     // Stack locals: map param symbol IDs to stack slots
     int num_locals;                // Number of stack locals (-1 = not using locals)
@@ -468,7 +493,6 @@ typedef struct compile_ctx {
     // ahead of the loop entry point.
     unsigned char trmc_mode;    // TRMC_MODE_*, 0 when not transforming
     unsigned trmc_slot;         // First accumulator slot
-    unsigned trmc_op;           // FOLD mode: the primitive to fold with
 
     unsigned env_depth;         // Number of PUSHENV frames since lambda entry
     unsigned macro_expansion_depth; // Guard against recursive expansion
@@ -499,6 +523,8 @@ void vm_init(vm_state *vm);
 void vm_free(vm_state *vm);
 unsigned vm_run(vm_state *vm, code_object *code, unsigned env);
 unsigned vm_call_closure(unsigned closure, unsigned args); // CPS interop
+vm_cont_call_status vm_call_continuation(unsigned continuation, unsigned args,
+                                         unsigned *result_out);
 void vm_push(vm_state *vm, unsigned val);
 unsigned vm_pop(vm_state *vm);
 

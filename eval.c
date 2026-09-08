@@ -816,8 +816,11 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
                 cps_signal_current_error(env, cont);
                 return;
             }
-            // Return the current environment
-            tramp_apply(env, cont);
+            // The interaction environment is the top-level environment, not
+            // a lexical frame around the call site.  In standalone harnesses
+            // ctx.global_environment is unset, so exception_state_env falls
+            // back to the current environment.
+            tramp_apply(exception_state_env(env), cont);
             return;
         }
 
@@ -996,6 +999,26 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
         gc_protect(&cont);
         unsigned value = values_from_list(args);
         tramp_apply(value, fn);
+        return;
+    }
+
+    if (IS_CELL(fn) && CELL_TYPE(fn) == BT_VMCONT) {
+        GC_GUARD;
+        gc_protect(&fn);
+        gc_protect(&args);
+        gc_protect(&env);
+        gc_protect(&cont);
+        unsigned result = 0;
+        vm_cont_call_status status = vm_call_continuation(fn, args, &result);
+        if (status == VM_CONT_CALL_ERROR) {
+            cps_signal_current_error(env, cont);
+            return;
+        }
+        // A continuation jump discards the CPS continuation at the call site.
+        // With an active VM, vm_apply will notice the transfer flag and resume
+        // the restored VM state; otherwise the temporary VM has already run
+        // that state to completion and its result is the evaluator's result.
+        tramp_done(status == VM_CONT_CALL_RETURNED ? result : 0);
         return;
     }
 

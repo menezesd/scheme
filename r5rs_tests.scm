@@ -483,6 +483,17 @@
       (map eval '((+ 1 1) (* 2 3))
            (list (interaction-environment) (interaction-environment))))
 
+;; interaction-environment denotes the top-level interaction environment, not
+;; the lexical environment of the call.  Returning the current VM/interpreter
+;; env leaked local bindings into eval.
+(define interaction-env-shadow 1)
+(test "interaction-environment ignores lexical bindings" 1
+      (let ((interaction-env-shadow 2))
+        (eval 'interaction-env-shadow (interaction-environment))))
+(test "first-class interaction-environment ignores lexical bindings" 1
+      (let ((interaction-env-shadow 2))
+        (eval 'interaction-env-shadow (apply interaction-environment '()))))
+
 ;;; ============================================================================
 ;;; 6.6 Input and output
 ;;; ============================================================================
@@ -1173,6 +1184,76 @@
              (h (lambda (n) (if (= n 0) 'h-done (f (- n 1))))))
       (list (f 0) (g 0) (h 0))))
 
+;; A continuation captured while an outer letrec is still being initialized
+;; must restore values already written into that outer frame. A nested letrec
+;; in a called procedure used to overwrite the VM's single active-letrec mark.
+(test "call/cc restores outer letrec init across nested letrec" '(1 20 3 2)
+    (let ((saved #f) (hits 0))
+      (letrec ((inner (lambda () (letrec ((z 7)) z)))
+               (run (lambda ()
+                      (letrec ((a 1)
+                               (b (begin
+                                    (inner)
+                                    (call/cc
+                                      (lambda (k) (set! saved k) 2))))
+                               (c 3))
+                        (set! hits (+ hits 1))
+                        (if (= hits 1)
+                            (begin (set! a 99) (saved 20))
+                            (list a b c hits))))))
+        (run))))
+
+;; Popping an ordinary lexical scope in a called procedure must likewise leave
+;; an outer letrec initialization active.
+(test "call/cc restores outer letrec init across nested lexical scope" '(1 20 2)
+    (let ((saved #f) (hits 0))
+      (letrec ((inner (lambda () (let ((z 7)) z)))
+               (run (lambda ()
+                      (letrec ((a 1)
+                               (b (begin
+                                    (inner)
+                                    (call/cc
+                                      (lambda (k) (set! saved k) 2)))))
+                        (set! hits (+ hits 1))
+                        (if (= hits 1)
+                            (begin (set! a 99) (saved 20))
+                            (list a b hits))))))
+        (run))))
+
+(test "call/cc restores two simultaneously active letrec initializers"
+      '(1 40 3 2)
+    (let ((saved #f) (hits 0))
+      (letrec ((a 1)
+               (b (letrec ((x 10)
+                           (y (call/cc
+                                (lambda (k) (set! saved k) 20))))
+                    (if (= y 20)
+                        (begin (set! x 77) (+ x y))
+                        (+ x y))))
+               (c 3))
+        (set! hits (+ hits 1))
+        (if (= hits 1)
+            (begin (set! a 99) (saved 30))
+            (list a b c hits)))))
+
+(test "multi-shot letrec continuation survives full GC" '(1 30 3 3)
+    (let ((saved #f) (hits 0))
+      (letrec ((a 1)
+               (b (begin
+                    (letrec ((z 7)) z)
+                    (call/cc (lambda (k) (set! saved k) 2))))
+               (c 3))
+        (set! hits (+ hits 1))
+        (cond ((= hits 1)
+               (set! a 99)
+               (gc-flip)
+               (saved 20))
+              ((= hits 2)
+               (set! a 88)
+               (gc-flip)
+               (saved 30))
+              (else (list a b c hits))))))
+
 (test-section "call-with-values continuations")
 (test "continuation escapes and resumes call-with-values" 5
     (let ((k #f))
@@ -1655,6 +1736,21 @@ b")
 (define (trmc-alt n)
   (let loop ((k n))
     (if (= k 0) 0 (- k (loop (- k 1))))))
+
+;; Do not rewrite an n-ary primitive by applying it to the leading operands
+;; before the recursive call.  That changes the operation itself for list and
+;; comparisons (and can change when mutable operands are observed for other
+;; primitives).
+(test "n-ary list in recursive position is not left-folded" '(a b z)
+    (letrec ((loop (lambda (k)
+                     (if (= k 0) 'z
+                         (list 'a 'b (loop (- k 1)))))))
+      (loop 1)))
+(test "n-ary comparison in recursive position is not left-folded" #t
+    (letrec ((loop (lambda (k)
+                     (if (= k 0) 3
+                         (< 1 2 (loop (- k 1)))))))
+      (loop 1)))
 (test "non-associative operator keeps its nesting" 3 (trmc-alt 5))
 (test "non-associative operator, deep" 50000 (trmc-alt 100000))
 

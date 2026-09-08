@@ -984,6 +984,19 @@ unsigned read_exact_decimal_number(const char *s, bool *handled)
     return normalize_rational_cells(num_cell, den_cell);
 }
 
+// Dispatch characters are bytes, not Unicode scalar values. Formatting EOF
+// or a non-ASCII byte with %c would create an invalid UTF-8 error message.
+static unsigned unknown_dispatch_syntax(const char *prefix, int c)
+{
+    if (c == EOF)
+        show_error("unexpected end of file after %s", prefix);
+    else if (c >= 0x20 && c <= 0x7e)
+        show_error("unknown # syntax: %s%c", prefix, c);
+    else
+        show_error("unknown # syntax: %s\\x%02x", prefix, (unsigned char)c);
+    return TOK_ERROR;
+}
+
 static unsigned read_prefixed_number(int prefix)
 {
     int base = 10;
@@ -993,8 +1006,7 @@ static unsigned read_prefixed_number(int prefix)
     if (prefix_radix(prefix, &base)) {
         have_radix = true;
     } else if (!prefix_exactness(prefix, &exactness)) {
-        show_error("unknown # syntax: #%c", prefix);
-        return TOK_ERROR;
+        return unknown_dispatch_syntax("#", prefix);
     }
 
     int c = reader_getchar();
@@ -1814,9 +1826,9 @@ unsigned read_token(void)
                         return cell;
                     }
                     reader_ungetc(c);
+                    return unknown_dispatch_syntax("#u8", c);
                 }
-                show_error("unknown # syntax: #u%c", c);
-                return TOK_ERROR;
+                return unknown_dispatch_syntax("#u", c);
             } else if (isdigit(c)) {
                 // Datum label: #n= or #n#
                 int label = c - '0';
@@ -1904,8 +1916,7 @@ unsigned read_token(void)
                     return TOK_ERROR;
                 }
             }
-            show_error("unknown # syntax: #%c", c);
-            return TOK_ERROR;
+            return unknown_dispatch_syntax("#", c);
         }
         case '"':
             return read_string_literal();

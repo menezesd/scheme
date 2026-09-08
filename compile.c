@@ -151,6 +151,9 @@ static unsigned lookup_known_lambda(int64_t var_id, unsigned known_lambdas,
 static void register_known_lambda(compile_ctx *cctx, unsigned var,
                                   unsigned val_expr)
 {
+    GC_GUARD;
+    gc_protect(&var);
+    gc_protect(&val_expr);
     unsigned depth_cell = store(compile_env_length(cctx->env));
     gc_protect(&depth_cell);
     unsigned vd = alloc_cons(val_expr, depth_cell);
@@ -379,6 +382,18 @@ static bool is_foldable_primitive(int64_t prim_id)
 // Compiler Context
 // ============================================================================
 
+static bool compile_base_is_immutable(unsigned env)
+{
+    if (!env_chain_acyclic(env))
+        return false;
+    while (IS_PAIR(env)) {
+        if (!environment_is_immutable(env))
+            return false;
+        env = cdr(env);
+    }
+    return env == 0;
+}
+
 static compile_ctx *cctx_new(compile_ctx *parent, unsigned env)
 {
     compile_ctx *cctx = checked_calloc_array(1, sizeof(compile_ctx));
@@ -394,6 +409,8 @@ static compile_ctx *cctx_new(compile_ctx *parent, unsigned env)
     }
     cctx->parent = parent;
     cctx->env = env;
+    cctx->immutable_base = parent ? parent->immutable_base
+                                  : compile_base_is_immutable(env);
     cctx->tail_position = false;
     cctx->loop_var_id = -1;
     cctx->num_locals = -1;
@@ -1136,7 +1153,9 @@ static unsigned rename_template_vars_let(unsigned tmpl, unsigned rename_map,
     gc_protect(&new_tail);
     bool changed = false;
 
-    for (unsigned bl = binding_list; IS_PAIR(bl); bl = cdr(bl)) {
+    unsigned bl = binding_list;
+    gc_protect(&bl);
+    for (; IS_PAIR(bl); bl = cdr(bl)) {
         unsigned binding = car(bl);
         if (!let_binding_has_value(binding)) {
             list_append(&new_bindings, &new_tail, binding);
@@ -1625,9 +1644,37 @@ static unsigned collect_pattern_vars(unsigned pattern, unsigned collected,
 
 // Emit bytecode to define gensyms created during macro expansion
 // This ensures gensyms from referential transparency are available at runtime
+// A gensym that names a transformer has to be visible to the compiler, not
+// only at runtime. The expansion compiled right after this may use it as a
+// macro keyword - a syntax-rules macro that recurses through its own name
+// (%case-dispatch, guard-aux, do-step) always does - and
+// compile_expr_internal classifies a form's head by looking it up in
+// cctx->env. The runtime DEFINE alone left that lookup empty, so the nested
+// use compiled as a procedure call of the transformer object and its clause
+// list as an argument expression: "not a procedure, got integer". Reached
+// whenever the template's reference has to be aliased, that is whenever the
+// name resolves differently at the use site than where the macro was
+// defined: a use site that shadows the inner macro's name, or an eval in a
+// scheme-report-environment clone. The define-syntax path binds its own
+// transformer into cctx->env the same way after emitting OP_DEFSYNTAX.
+static void bind_gensym_transformer_at_compile_time(compile_ctx *cctx,
+                                                    unsigned gensym,
+                                                    unsigned transformer)
+{
+    // The DEFINE already emitted reports an immutable frame at runtime;
+    // doing it again here would print the error twice.
+    if (environment_is_immutable(cctx->env))
+        return;
+    defvar(gensym, transformer, cctx->env);
+}
+
 static void emit_gensym_definitions(compile_ctx *cctx, unsigned bindings)
 {
-    for (unsigned b = bindings; b; b = cdr(b)) {
+    GC_GUARD;
+    gc_protect(&bindings);
+    unsigned b = bindings;
+    gc_protect(&b);
+    for (; b; b = cdr(b)) {
         unsigned entry = car(b);
         if (!IS_PAIR(entry) || !IS_ATOM(car(entry)))
             continue;
@@ -1645,6 +1692,8 @@ static void emit_gensym_definitions(compile_ctx *cctx, unsigned bindings)
             if (IS_SYNTAX(target_val) || IS_MACRO(target_val)) {
                 emit2(cctx, OP_CONST, code_add_const(cctx->code, target_val));
                 emit2(cctx, OP_DEFINE, gensym_id);
+                bind_gensym_transformer_at_compile_time(cctx, gensym,
+                                                        target_val);
                 continue;
             }
 
@@ -1654,6 +1703,8 @@ static void emit_gensym_definitions(compile_ctx *cctx, unsigned bindings)
                 emit2(cctx, OP_CONST,
                       code_add_const(cctx->code, resolved_target));
                 emit2(cctx, OP_DEFINE, gensym_id);
+                bind_gensym_transformer_at_compile_time(cctx, gensym,
+                                                        resolved_target);
                 continue;
             }
 
@@ -1677,6 +1728,8 @@ static void emit_gensym_definitions(compile_ctx *cctx, unsigned bindings)
 
         emit2(cctx, OP_CONST, code_add_const(cctx->code, target));
         emit2(cctx, OP_DEFINE, gensym_id);
+        if (IS_SYNTAX(target) || IS_MACRO(target))
+            bind_gensym_transformer_at_compile_time(cctx, gensym, target);
     }
 }
 
@@ -2814,7 +2867,8 @@ static bool trmc_capture_free(unsigned expr, compile_ctx *cctx, int depth)
         return false;
     }
 
-    if (!IS_BUILTIN(binding) || !trmc_safe_primitive(CELL_ID(binding)))
+    if (!IS_BUILTIN(binding) || !trmc_safe_primitive(CELL_ID(binding)) ||
+        !env_binding_is_immutable(kw, cctx->env))
         return false;
     for (unsigned a = cdr(expr); IS_PAIR(a); a = cdr(a))
         if (!trmc_capture_free(car(a), cctx, depth + 1))
@@ -2846,10 +2900,11 @@ static bool trmc_op_has_hole(int64_t op, unsigned argc)
 // path makes, since a user is allowed to rebind cons or append.
 //
 // *operands is the whole argument list, whose last element is the call, and
-// *call is that call. n-ary is handled by folding the leading operands with
-// the operator itself before accumulating: these primitives already left-fold
-// their arguments, so (op a b X) is (op (op a b) X) by their own definition,
-// with no associativity assumed on top.
+// *call is that call.  Restrict the transform to binary calls.  Collapsing the
+// leading operands of an n-ary call before the recursion is not generally
+// equivalent: (list a b X) is not (list (list a b) X), comparisons do not
+// left-fold through booleans, and even an associative primitive can observe a
+// mutable operand only after X has run in the source program.
 static bool trmc_classify(unsigned expr, compile_ctx *cctx, unsigned *operands,
                           unsigned *call, int64_t *op)
 {
@@ -2863,10 +2918,7 @@ static bool trmc_classify(unsigned expr, compile_ctx *cctx, unsigned *operands,
         return false;
 
     unsigned args = cdr(expr);
-    if (list_length(args) < 2)
-        return false;
-    // cons is strictly binary; a longer call is an arity error, not a site.
-    if (prim == PCONS && list_length(args) != 2)
+    if (list_length(args) != 2)
         return false;
 
     unsigned last = args;
@@ -2890,7 +2942,6 @@ static bool trmc_classify(unsigned expr, compile_ctx *cctx, unsigned *operands,
 // accumulator live too.
 typedef struct {
     bool found;        // saw at least one site
-    int64_t op;        // the operator every site uses
     bool hole_ok;      // every site's operator leaves a hole
     bool capture_free; // nothing anywhere in the body can capture
 } trmc_scan_state;
@@ -2910,13 +2961,11 @@ static bool trmc_scan_tail(unsigned expr, compile_ctx *cctx,
     unsigned operands = 0, call = 0;
     int64_t op = 0;
     if (trmc_classify(expr, cctx, &operands, &call, &op)) {
-        // One accumulator, so one operator: two different constructors in the
-        // same body would need two, and the return can only finish one.
-        if (st->found && st->op != op)
-            return false;
+        // Each FOLD entry records its own operator; HOLE sites all fill the
+        // same final cdr, so cons and append may share an accumulator too.
         st->found = true;
-        st->op = op;
-        if (!trmc_op_has_hole(op, list_length(operands)))
+        if (!trmc_op_has_hole(op, list_length(operands)) ||
+            !env_binding_is_immutable(CELL_ID(car(expr)), cctx->env))
             st->hole_ok = false;
         for (unsigned a = operands; IS_PAIR(cdr(a)); a = cdr(a))
             if (!trmc_capture_free(car(a), cctx, 0))
@@ -3092,8 +3141,7 @@ static bool trmc_scan_tail(unsigned expr, compile_ctx *cctx,
 // Decided for the whole body before it is compiled, so TRMC_INIT can be
 // emitted ahead of the loop entry point. Returns the mode, and the operator
 // to use in FOLD mode.
-static unsigned char trmc_body_qualifies(unsigned body, compile_ctx *cctx,
-                                         int64_t *op_out)
+static unsigned char trmc_body_qualifies(unsigned body, compile_ctx *cctx)
 {
     // Stack locals only: the accumulator lives at bp + trmc_slot, and bp is
     // only per-invocation for functions whose parameters are stack locals.
@@ -3106,7 +3154,7 @@ static unsigned char trmc_body_qualifies(unsigned body, compile_ctx *cctx,
     if (!IS_PAIR(e))
         return TRMC_MODE_NONE;
 
-    trmc_scan_state st = {false, 0, true, true};
+    trmc_scan_state st = {false, true, true};
     while (IS_PAIR(cdr(e))) {
         if (!trmc_capture_free(car(e), cctx, 0))
             st.capture_free = false;
@@ -3115,11 +3163,10 @@ static unsigned char trmc_body_qualifies(unsigned body, compile_ctx *cctx,
     if (!trmc_scan_tail(car(e), cctx, &st, 0) || !st.found)
         return TRMC_MODE_NONE;
 
-    if (op_out)
-        *op_out = st.op;
-    // HOLE where it is available - one pass and one cell per element against
-    // FOLD's two and two - and FOLD everywhere else.
-    return (st.hole_ok && st.capture_free) ? TRMC_MODE_HOLE : TRMC_MODE_FOLD;
+    // HOLE needs stable external bindings as well as a capture-free body.
+    // Mutable environments use deferred calls so later rebinding is visible.
+    return (cctx->immutable_base && st.hole_ok && st.capture_free)
+               ? TRMC_MODE_HOLE : TRMC_MODE_FOLD;
 }
 
 // A TAILCALL anywhere in a TRMC body would hand back the callee's value
@@ -3268,15 +3315,12 @@ static compile_result compile_lambda(unsigned expr, compile_ctx *cctx)
     // Tail recursion modulo cons. Decided before the body is compiled, since
     // TRMC_INIT has to sit ahead of the loop entry point.
     unsigned body_start = lambda_cctx->code->code_len;
-    int64_t trmc_op = 0;
-    unsigned char trmc_mode = trmc_body_qualifies(body, lambda_cctx, &trmc_op);
+    unsigned char trmc_mode = trmc_body_qualifies(body, lambda_cctx);
     if (trmc_mode != TRMC_MODE_NONE) {
         lambda_cctx->trmc_mode = trmc_mode;
         lambda_cctx->trmc_slot = (unsigned)lambda_cctx->num_locals;
-        lambda_cctx->trmc_op = (unsigned)trmc_op;
         lambda_cctx->code->trmc_mode = trmc_mode;
         lambda_cctx->code->trmc_slot = lambda_cctx->trmc_slot;
-        lambda_cctx->code->trmc_op = (unsigned)trmc_op;
         emit(lambda_cctx, OP_TRMC_INIT);
     }
     // Self tail calls jump here, not to ip 0: re-running TRMC_INIT would
@@ -3545,8 +3589,10 @@ static compile_result compile_named_let(unsigned expr, compile_ctx *cctx)
     gc_protect(&b);
     for (; b; b = cdr(b)) {
         unsigned binding = car(b);
+        gc_protect(&binding);
         list_append(&params, &params_tail, car(binding));
         list_append(&args, &args_tail, cadr(binding));
+        gc_unprotect(1);
     }
     gc_unprotect(1);
 
@@ -4351,61 +4397,120 @@ static compile_result compile_set(unsigned expr, compile_ctx *cctx)
     return dynamic_result();
 }
 
-// Function/primitive call with full constant folding
-// Argument evaluation, one SET per parameter, and the jump back to the loop
-// entry point: the tail shared by an ordinary self tail call and by the TRMC
-// site, which differ only in what precedes them.
-static void emit_self_call_loop(unsigned args, compile_ctx *cctx)
+// Evaluate a recursive call exactly like a general call (arguments, then
+// callee). Let the VM decide whether the binding still denotes this closure:
+// set! and lexical shadowing can change it even after compilation.
+static void emit_self_call_loop(unsigned fn, unsigned args, compile_ctx *cctx)
 {
-    // Compile all arguments first (before any SET)
+    GC_GUARD;
+    gc_protect(&fn);
+    gc_protect(&args);
     cctx->tail_position = false;
     unsigned a = args;
-    GC_GUARD;
     gc_protect(&a);
-    while (a) {
+    for (; a; a = cdr(a))
         compile_expr_internal(car(a), cctx);
-        a = cdr(a);
-    }
-    gc_unprotect(1);
+    compile_expr_internal(fn, cctx);
     cctx->tail_position = true;
 
-    // SET each parameter in reverse order (stack is LIFO)
-    // Use LOCAL_SET_VOID if params are stack locals
-    unsigned param_ids[16];
-    unsigned pi = 0;
-    for (unsigned p = cctx->loop_params; p && IS_PAIR(p) && pi < 16;
-         p = cdr(p)) {
-        param_ids[pi++] = CELL_ID(car(p));
+    if (cctx->code->use_locals) {
+        emit(cctx, OP_RECURSE);
+        code_emit(cctx->code, cctx->loop_start);
+        code_emit(cctx->code, cctx->loop_arity);
+        code_emit(cctx->code, cctx->env_depth);
+    } else {
+        // Environment parameters require fresh bindings at each call. The
+        // ordinary tail-call path already reuses the control frame.
+        emit2(cctx, trmc_call_opcode(cctx, true), cctx->loop_arity);
     }
-    for (int j = (int)pi - 1; j >= 0; j--) {
-        int local_slot = -1;
-        if (cctx->num_locals > 0) {
-            for (int k = 0; k < cctx->num_locals; k++) {
-                if (cctx->local_ids[k] == (int64_t)param_ids[j]) {
-                    local_slot = k;
-                    break;
-                }
-            }
-        }
-        if (local_slot >= 0) {
-            emit2(cctx, OP_LOCAL_SET_VOID, local_slot);
-        } else {
-            emit2(cctx, OP_SET, param_ids[j]);
-            emit(cctx, OP_POP);
-        }
-    }
-    // The loop entry point expects the environment the lambda was entered
-    // with, so any frame a let pushed since then has to come off first -
-    // jumping straight past the POPENVs would leak one frame per iteration.
-    // cctx->env_depth is deliberately left alone: the enclosing form still
-    // emits its own POPENV for a fall-through path that this jump makes
-    // unreachable.
-    for (unsigned d = 0; d < cctx->env_depth; d++)
-        code_emit(cctx->code, OP_POPENV);
+}
 
-    // Back to the loop entry point, which is ip 0 only when nothing was
-    // emitted ahead of the body (TRMC_INIT is).
-    emit2(cctx, OP_JUMP, cctx->loop_start);
+// Keep argument evaluation separate from opcode selection: a mutable binding
+// is checked only after all arguments have run, and fallback needs them intact.
+static void emit_primitive_operation(compile_ctx *cctx, int64_t prim, unsigned argc)
+{
+    if (argc == 1) {
+        switch (prim) {
+        case PCAR: emit(cctx, OP_CAR); return;
+        case PCDR: emit(cctx, OP_CDR); return;
+        case PNULLP: emit(cctx, OP_NULLP); return;
+        case PCONSP: emit(cctx, OP_PAIRP); return;
+        case PNOT: emit(cctx, OP_NOT); return;
+        case PLIST: emit(cctx, OP_LIST1); return;
+        case PSYMP: emit(cctx, OP_SYMBOLP); return;
+        case PNUMP: emit(cctx, OP_NUMBERP); return;
+        case PSTRINGP: emit(cctx, OP_STRINGP); return;
+        case PVECTORP: emit(cctx, OP_VECTORP); return;
+        case PBOOLP: emit(cctx, OP_BOOLEANP); return;
+        case PLISTP: emit(cctx, OP_LISTP); return;
+        case PINTEGERP: emit(cctx, OP_INTEGERP); return;
+        case PLENGTH: emit(cctx, OP_LENGTH); return;
+        case PREVERSE: emit(cctx, OP_REVERSE); return;
+        case PVECLEN: emit(cctx, OP_VECTORLEN); return;
+        case PABS: emit(cctx, OP_ABS); return;
+        case PCALLCC: emit(cctx, OP_CALLCC); return;
+        default: break;
+        }
+    }
+    if (argc == 2) {
+        switch (prim) {
+        case PCONS: emit(cctx, OP_CONS); return;
+        case PEQ: emit(cctx, OP_EQ); return;
+        case PPLUS: emit(cctx, OP_ADD); return;
+        case PMINUS: emit(cctx, OP_SUB); return;
+        case PTIMES: emit(cctx, OP_MUL); return;
+        case PDIV: emit(cctx, OP_DIV); return;
+        case PMOD: emit(cctx, OP_MOD); return;
+        case PLT: emit(cctx, OP_LT); return;
+        case PGT: emit(cctx, OP_GT); return;
+        case PLEQ: emit(cctx, OP_LE); return;
+        case PGEQ: emit(cctx, OP_GE); return;
+        case PEQUAL: emit(cctx, OP_NUMEQ); return;
+        case PSETCAR: emit(cctx, OP_SETCAR); return;
+        case PSETCDR: emit(cctx, OP_SETCDR); return;
+        case PLIST: emit(cctx, OP_LIST2); return;
+        case PAPPEND: emit(cctx, OP_APPEND); return;
+        case PVECREF: emit(cctx, OP_VECTORREF); return;
+        default: break;
+        }
+    }
+    if (argc == 3) {
+        switch (prim) {
+        case PLIST: emit(cctx, OP_LIST3); return;
+        case PVECSET: emit(cctx, OP_VECTORSET); return;
+        default: break;
+        }
+    }
+    emit3(cctx, OP_PRIM, prim, argc);
+}
+
+// Discard a known unit/zero operand only after the guard, so a replacement
+// procedure still receives the original argument list without reevaluation.
+static bool emit_unary_arithmetic(compile_ctx *cctx, int64_t prim,
+                                  compile_result *args, unsigned argc)
+{
+    if (argc != 2)
+        return false;
+    for (unsigned i = 0; i < 2; i++) {
+        if (!args[i].is_const || !IS_NUM(args[i].value))
+            continue;
+        int64_t value = CELL_ID(args[i].value);
+        unsigned op = OP_COUNT;
+        if (prim == PPLUS && (value == 1 || value == -1))
+            op = value == 1 ? OP_ADD1 : OP_SUB1;
+        else if (prim == PMINUS && i == 1 && (value == 1 || value == -1))
+            op = value == 1 ? OP_SUB1 : OP_ADD1;
+        else if (prim == PEQUAL && value == 0)
+            op = OP_ZEROP;
+        if (op != OP_COUNT) {
+            if (i == 0)
+                emit(cctx, OP_SWAP);
+            emit(cctx, OP_POP);
+            emit(cctx, op);
+            return true;
+        }
+    }
+    return false;
 }
 
 static compile_result compile_call(unsigned expr, compile_ctx *cctx)
@@ -4434,453 +4539,103 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
     // compile the cons and leave the recursive call under it.
     unsigned trmc_operands = 0, trmc_call = 0;
     int64_t trmc_op = 0;
-    // No env_depth restriction here, unlike the plain loop optimization below:
-    // emit_self_call_loop unwinds the pending frames before jumping, and TRMC
-    // is limited to stack-local functions, so the SETs are LOCAL_SET_VOID and
-    // cannot be captured by a let frame that shadows a parameter name.
+    // The guarded loop call unwinds pending environment frames only on its
+    // fast path, and updates the original parameter slots even when an inner
+    // let shadows their names.
     if (cctx->trmc_mode != TRMC_MODE_NONE && cctx->tail_position &&
-        trmc_classify(expr, cctx, &trmc_operands, &trmc_call, &trmc_op) &&
-        (unsigned)trmc_op == cctx->trmc_op) {
+        trmc_classify(expr, cctx, &trmc_operands, &trmc_call, &trmc_op)) {
+        gc_protect(&trmc_operands);
+        gc_protect(&trmc_call);
         cctx->tail_position = false;
-        if (cctx->trmc_mode == TRMC_MODE_HOLE) {
-            // Add each argument to the chain as it is evaluated. Every one of
-            // these opcodes pops what it consumed, so the operand stack is
-            // back at the loop's baseline before the next argument and before
-            // the call's own arguments. HOLE only ever sees cons or append,
-            // and splicing append's arguments one at a time avoids copying
-            // the prefix twice, which combining them first would.
-            unsigned accumulate =
-                (trmc_op == PCONS) ? OP_TRMC_APPEND : OP_TRMC_SPLICE;
-            for (unsigned a = trmc_operands; IS_PAIR(cdr(a)); a = cdr(a)) {
-                compile_expr_internal(car(a), cctx);
-                emit(cctx, accumulate);
-            }
-        } else {
-            unsigned operand_count = 0;
-            for (unsigned a = trmc_operands; IS_PAIR(cdr(a)); a = cdr(a)) {
-                compile_expr_internal(car(a), cctx);
-                operand_count++;
-            }
-            if (operand_count > 1) {
-                // (op a b (self ...)) is (op (op a b) (self ...)) by the
-                // primitive's own left-to-right folding, so collapse the
-                // leading arguments with the operator and stack one value.
-                // Nothing here assumes associativity beyond that.
-                emit3(cctx, OP_PRIM, (unsigned)trmc_op, operand_count);
-            }
-            emit(cctx, OP_TRMC_PUSH);
-        }
+        // Classification admits only (op E (self ...)). Evaluate E once;
+        // there are no leading n-ary operands to combine or traverse here.
+        compile_expr_internal(car(trmc_operands), cctx);
+        unsigned accumulate = OP_TRMC_PUSH;
+        if (cctx->trmc_mode == TRMC_MODE_HOLE)
+            accumulate = trmc_op == PCONS ? OP_TRMC_APPEND : OP_TRMC_SPLICE;
+        emit(cctx, accumulate);
+        if (accumulate == OP_TRMC_PUSH)
+            code_emit(cctx->code, code_add_const(cctx->code, fn_expr));
         cctx->tail_position = true;
-        emit_self_call_loop(cdr(trmc_call), cctx);
+        emit_self_call_loop(car(trmc_call), cdr(trmc_call), cctx);
         return dynamic_result();
     }
 
-    // Check for primitive inlining (silent lookup - ok if not found)
     if (IS_ATOM(fn_expr)) {
         unsigned fn = lookup_silent(CELL_ID(fn_expr), cctx->env);
         if (fn != TOK_ERROR && IS_BUILTIN(fn)) {
-            int64_t prim_id = CELL_ID(fn);
+            int64_t prim = CELL_ID(fn);
             unsigned argc = list_length(args);
-
-            // For foldable primitives, compile with constant tracking
-            if (is_foldable_primitive(prim_id)) {
-                unsigned saved_pos = cctx->code->code_len;
-                cctx->tail_position = false;
-
-                // Compile all arguments, tracking which are constant
-                compile_result arg_results[256] = {0};
-                unsigned i = 0;
-                unsigned protected_arg_count = 0;
-                bool all_const = true;
-
-                unsigned a = args;
-                gc_protect(&a);
-                while (a) {
-                    if (i >= 256) {
-                        all_const = false;
-                        compile_expr_internal(car(a), cctx);
-                        i++;
-                        a = cdr(a);
-                        continue;
-                    }
-                    arg_results[i] = compile_expr_internal(car(a), cctx);
-                    if (arg_results[i].is_const) {
-                        gc_protect(&arg_results[i].value);
-                        protected_arg_count++;
-                    }
-                    if (!arg_results[i].is_const)
-                        all_const = false;
-                    i++;
-                    a = cdr(a);
+            bool tail = cctx->tail_position;
+            bool immutable = cctx->immutable_base &&
+                env_binding_is_immutable(CELL_ID(fn_expr), cctx->env);
+            cctx->tail_position = false;
+            unsigned saved_pos = cctx->code->code_len;
+            compile_result results[256] = {0};
+            bool all_const = argc <= 256 && is_foldable_primitive(prim);
+            unsigned a = args, i = 0;
+            gc_protect(&a);
+            for (; a; a = cdr(a), i++) {
+                compile_result result = compile_expr_internal(car(a), cctx);
+                if (i < 256) {
+                    results[i] = result;
+                    if (result.is_const)
+                        gc_protect(&results[i].value);
                 }
-
-                if (all_const) {
-                    // Rewind bytecode - we don't need it
-                    cctx->code->code_len = saved_pos;
-
-                    // Build argument list from constant values
-                    unsigned arg_vals = 0;
-                    gc_protect(&arg_vals);
-                    for (unsigned j = 0; j < argc; j++) {
-                        arg_vals = alloc_cons(arg_results[argc - 1 - j].value,
-                                              arg_vals);
-                    }
-
-                    // Evaluate the primitive at compile time. A failure here
-                    // is not a user-visible error - the compiler simply
-                    // declines to fold - so the diagnostic is suppressed
-                    // while still being recorded in ctx.last_error. Saved and
-                    // restored rather than cleared, so a nested fold cannot
-                    // re-enable output for its enclosing one.
-                    bool saved_suppress = ctx.suppress_error_output;
-                    ctx.suppress_error_output = true;
-                    unsigned result = apply_primitive(prim_id, arg_vals);
-                    ctx.suppress_error_output = saved_suppress;
-                    gc_unprotect(1);
-                    gc_unprotect((int)protected_arg_count + 1);
-                    ctx.last_error[0] = '\0';
-                    if (result != TOK_ERROR) {
-                        // Success! Emit as constant
-                        emit2(cctx, OP_CONST,
-                              code_add_const(cctx->code, result));
-                        return const_result(result);
-                    }
-                    // If folding failed (e.g., division by zero), re-compile
-                    // normally
-                    a = args;
-                    gc_protect(&a);
-                    while (a) {
-                        compile_expr_internal(car(a), cctx);
-                        a = cdr(a);
-                    }
-                    gc_unprotect(1);
-                } else {
-                    gc_unprotect((int)protected_arg_count + 1);
-                }
-
-                // Arguments already compiled, emit the operation
-                // Check for specialized opcodes
-                if (argc == 1) {
-                    switch (prim_id) {
-                    case PCAR:
-                        emit(cctx, OP_CAR);
-                        return dynamic_result();
-                    case PCDR:
-                        emit(cctx, OP_CDR);
-                        return dynamic_result();
-                    case PNULLP:
-                        emit(cctx, OP_NULLP);
-                        return dynamic_result();
-                    case PCONSP:
-                        emit(cctx, OP_PAIRP);
-                        return dynamic_result();
-                    case PNOT:
-                        emit(cctx, OP_NOT);
-                        return dynamic_result();
-                    default:
-                        break;
-                    }
-                } else if (argc == 2) {
-                    if (prim_id == PCONS) {
-                        emit(cctx, OP_CONS);
-                        return dynamic_result();
-                    }
-                    if (prim_id == PEQ) {
-                        emit(cctx, OP_EQ);
-                        return dynamic_result();
-                    }
-
-                    // Check for unary arithmetic patterns: (+ x 1), (- x 1),
-                    // (= x 0)
-                    bool arg0_const = arg_results[0].is_const;
-                    bool arg1_const = arg_results[1].is_const;
-                    int64_t val0 =
-                        arg0_const && IS_NUM(arg_results[0].value)
-                            ? CELL_ID(arg_results[0].value)
-                            : -999;
-                    int64_t val1 =
-                        arg1_const && IS_NUM(arg_results[1].value)
-                            ? CELL_ID(arg_results[1].value)
-                            : -999;
-
-                    // (+ x 1) or (+ 1 x) -> ADD1
-                    // (+ x -1) or (+ -1 x) -> SUB1
-                    if (prim_id == PPLUS) {
-                        if (arg1_const && val1 == 1) {
-                            cctx->code->code_len = saved_pos;
-                            compile_expr_internal(car(args), cctx);
-                            emit(cctx, OP_ADD1);
-                            return dynamic_result();
-                        }
-                        if (arg0_const && val0 == 1) {
-                            cctx->code->code_len = saved_pos;
-                            compile_expr_internal(cadr(args), cctx);
-                            emit(cctx, OP_ADD1);
-                            return dynamic_result();
-                        }
-                        if (arg1_const && val1 == -1) {
-                            cctx->code->code_len = saved_pos;
-                            compile_expr_internal(car(args), cctx);
-                            emit(cctx, OP_SUB1);
-                            return dynamic_result();
-                        }
-                        if (arg0_const && val0 == -1) {
-                            cctx->code->code_len = saved_pos;
-                            compile_expr_internal(cadr(args), cctx);
-                            emit(cctx, OP_SUB1);
-                            return dynamic_result();
-                        }
-                    }
-
-                    // (- x 1) -> SUB1
-                    // (- x -1) -> ADD1
-                    if (prim_id == PMINUS) {
-                        if (arg1_const && val1 == 1) {
-                            cctx->code->code_len = saved_pos;
-                            compile_expr_internal(car(args), cctx);
-                            emit(cctx, OP_SUB1);
-                            return dynamic_result();
-                        }
-                        if (arg1_const && val1 == -1) {
-                            cctx->code->code_len = saved_pos;
-                            compile_expr_internal(car(args), cctx);
-                            emit(cctx, OP_ADD1);
-                            return dynamic_result();
-                        }
-                    }
-
-                    // (= x 0) or (= 0 x) -> ZEROP
-                    if (prim_id == PEQUAL) {
-                        if (arg1_const && val1 == 0) {
-                            cctx->code->code_len = saved_pos;
-                            compile_expr_internal(car(args), cctx);
-                            emit(cctx, OP_ZEROP);
-                            return dynamic_result();
-                        }
-                        if (arg0_const && val0 == 0) {
-                            cctx->code->code_len = saved_pos;
-                            compile_expr_internal(cadr(args), cctx);
-                            emit(cctx, OP_ZEROP);
-                            return dynamic_result();
-                        }
-                    }
-
-                }
-
-                // Emit specialized opcodes when constant folding didn't apply
-                if (argc == 2) {
-                    switch (prim_id) {
-                    case PPLUS: emit(cctx, OP_ADD); return dynamic_result();
-                    case PMINUS: emit(cctx, OP_SUB); return dynamic_result();
-                    case PTIMES: emit(cctx, OP_MUL); return dynamic_result();
-                    case PDIV: emit(cctx, OP_DIV); return dynamic_result();
-                    case PMOD: emit(cctx, OP_MOD); return dynamic_result();
-                    case PLT: emit(cctx, OP_LT); return dynamic_result();
-                    case PGT: emit(cctx, OP_GT); return dynamic_result();
-                    case PLEQ: emit(cctx, OP_LE); return dynamic_result();
-                    case PGEQ: emit(cctx, OP_GE); return dynamic_result();
-                    case PEQUAL: emit(cctx, OP_NUMEQ); return dynamic_result();
-                    case PCONS: emit(cctx, OP_CONS); return dynamic_result();
-                    case PEQ: emit(cctx, OP_EQ); return dynamic_result();
-                    default: break;
-                    }
-                }
-                emit3(cctx, OP_PRIM, prim_id, argc);
-                return dynamic_result();
+                if (!result.is_const)
+                    all_const = false;
             }
 
-            // Non-foldable primitive - compile normally
-            cctx->tail_position = false;
+            unsigned guard = 0;
+            if (!immutable) {
+                guard = cctx->code->code_len;
+                emit(cctx, OP_GUARD_PRIMITIVE);
+                code_emit(cctx->code, 0); // fallback resumes after the fast path
+                code_emit(cctx->code, CELL_ID(fn_expr));
+                code_emit(cctx->code, prim);
+                code_emit(cctx->code, argc);
+                code_emit(cctx->code, tail);
+                code_emit(cctx->code, 0xFFFFFFFF); // lookup cache
+                code_emit(cctx->code, 0xFFFFFFFF);
+            }
 
-            // call/cc captures the VM continuation, so it cannot go through the
-            // normal primitive call path.
-            if (prim_id == PCALLCC) {
-                unsigned a = args;
-                gc_protect(&a);
-                while (a) {
-                    compile_expr_internal(car(a), cctx);
-                    a = cdr(a);
+            bool folded = false;
+            unsigned constant = 0;
+            gc_protect(&constant);
+            if (all_const) {
+                unsigned values = 0;
+                gc_protect(&values);
+                for (unsigned j = argc; j > 0; j--)
+                    values = alloc_cons(results[j - 1].value, values);
+                bool suppress = ctx.suppress_error_output;
+                ctx.suppress_error_output = true;
+                constant = apply_primitive(prim, values);
+                ctx.suppress_error_output = suppress;
+                ctx.last_error[0] = '\0';
+                folded = constant != TOK_ERROR;
+                if (folded) {
+                    if (immutable)
+                        cctx->code->code_len = saved_pos;
+                    else
+                        for (unsigned j = 0; j < argc; j++)
+                            emit(cctx, OP_POP);
+                    emit2(cctx, OP_CONST, code_add_const(cctx->code, constant));
                 }
                 gc_unprotect(1);
-                if (argc == 1) {
-                    emit(cctx, OP_CALLCC);
-                } else {
-                    emit3(cctx, OP_PRIM, prim_id, argc);
-                }
-                return dynamic_result();
             }
-
-            if (argc == 1) {
-                compile_expr_internal(car(args), cctx);
-
-                switch (prim_id) {
-                case PCAR:
-                    emit(cctx, OP_CAR);
-                    return dynamic_result();
-                case PCDR:
-                    emit(cctx, OP_CDR);
-                    return dynamic_result();
-                case PNULLP:
-                    emit(cctx, OP_NULLP);
-                    return dynamic_result();
-                case PCONSP:
-                    emit(cctx, OP_PAIRP);
-                    return dynamic_result();
-                case PNOT:
-                    emit(cctx, OP_NOT);
-                    return dynamic_result();
-                case PLIST:
-                    emit(cctx, OP_LIST1);
-                    return dynamic_result();
-                // Type predicates
-                case PSYMP:
-                    emit(cctx, OP_SYMBOLP);
-                    return dynamic_result();
-                case PNUMP:
-                    emit(cctx, OP_NUMBERP);
-                    return dynamic_result();
-                case PSTRINGP:
-                    emit(cctx, OP_STRINGP);
-                    return dynamic_result();
-                case PVECTORP:
-                    emit(cctx, OP_VECTORP);
-                    return dynamic_result();
-                case PBOOLP:
-                    emit(cctx, OP_BOOLEANP);
-                    return dynamic_result();
-                case PLISTP:
-                    emit(cctx, OP_LISTP);
-                    return dynamic_result();
-                case PINTEGERP:
-                    emit(cctx, OP_INTEGERP);
-                    return dynamic_result();
-                // List operations
-                case PLENGTH:
-                    emit(cctx, OP_LENGTH);
-                    return dynamic_result();
-                case PREVERSE:
-                    emit(cctx, OP_REVERSE);
-                    return dynamic_result();
-                // Vector operations
-                case PVECLEN:
-                    emit(cctx, OP_VECTORLEN);
-                    return dynamic_result();
-                // Numeric operations
-                case PABS:
-                    emit(cctx, OP_ABS);
-                    return dynamic_result();
-                default:
-                    emit3(cctx, OP_PRIM, prim_id, 1);
-                    return dynamic_result();
-                }
-            }
-
-            if (argc == 2) {
-                compile_expr_internal(car(args), cctx);
-                compile_expr_internal(cadr(args), cctx);
-
-                switch (prim_id) {
-                case PCONS:
-                    emit(cctx, OP_CONS);
-                    return dynamic_result();
-                case PEQ:
-                    emit(cctx, OP_EQ);
-                    return dynamic_result();
-                case PPLUS:
-                    emit(cctx, OP_ADD);
-                    return dynamic_result();
-                case PMINUS:
-                    emit(cctx, OP_SUB);
-                    return dynamic_result();
-                case PTIMES:
-                    emit(cctx, OP_MUL);
-                    return dynamic_result();
-                case PDIV:
-                    emit(cctx, OP_DIV);
-                    return dynamic_result();
-                case PMOD:
-                    emit(cctx, OP_MOD);
-                    return dynamic_result();
-                case PLT:
-                    emit(cctx, OP_LT);
-                    return dynamic_result();
-                case PGT:
-                    emit(cctx, OP_GT);
-                    return dynamic_result();
-                case PLEQ:
-                    emit(cctx, OP_LE);
-                    return dynamic_result();
-                case PGEQ:
-                    emit(cctx, OP_GE);
-                    return dynamic_result();
-                case PEQUAL:
-                    emit(cctx, OP_NUMEQ);
-                    return dynamic_result();
-                case PSETCAR:
-                    emit(cctx, OP_SETCAR);
-                    return dynamic_result();
-                case PSETCDR:
-                    emit(cctx, OP_SETCDR);
-                    return dynamic_result();
-                case PLIST:
-                    emit(cctx, OP_LIST2);
-                    return dynamic_result();
-                // List operations
-                case PAPPEND:
-                    emit(cctx, OP_APPEND);
-                    return dynamic_result();
-                // Vector operations
-                case PVECREF:
-                    emit(cctx, OP_VECTORREF);
-                    return dynamic_result();
-                default:
-                    emit3(cctx, OP_PRIM, prim_id, 2);
-                    return dynamic_result();
-                }
-            }
-
-            if (argc == 3) {
-                if (prim_id == PLIST) {
-                    compile_expr_internal(car(args), cctx);
-                    compile_expr_internal(cadr(args), cctx);
-                    compile_expr_internal(caddr(args), cctx);
-                    emit(cctx, OP_LIST3);
-                    return dynamic_result();
-                }
-                if (prim_id == PVECSET) {
-                    compile_expr_internal(car(args), cctx);    // vector
-                    compile_expr_internal(cadr(args), cctx);   // index
-                    compile_expr_internal(caddr(args), cctx);  // value
-                    emit(cctx, OP_VECTORSET);
-                    return dynamic_result();
-                }
-            }
-
-            // Compile arguments for general case
-            unsigned a = args;
-            gc_protect(&a);
-            while (a) {
-                compile_expr_internal(car(a), cctx);
-                a = cdr(a);
-            }
-            gc_unprotect(1);
-
-            // Special handling for apply - use OP_PRIM to handle variable args
-            if (prim_id == PAPPLY) {
-                emit3(cctx, OP_PRIM, prim_id, argc);
-                return dynamic_result();
-            }
-
-            emit3(cctx, OP_PRIM, prim_id, argc);
-            return dynamic_result();
+            if (!folded && !emit_unary_arithmetic(cctx, prim, results, argc))
+                emit_primitive_operation(cctx, prim, argc);
+            if (!immutable)
+                cctx->code->code[guard + 1] = cctx->code->code_len;
+            return immutable && folded ? const_result(constant) : dynamic_result();
         }
     }
 
     // ========================================================================
     // Loop Optimization: recursive tail call to letrec-bound lambda
     // ========================================================================
-    // Compile as SET+JUMP(0) instead of TAILCALL, avoiding closure lookup,
-    // arg list building, and environment frame allocation.
+    // The VM reuses stack locals when the resolved callee still has this
+    // activation's code and environment, without allocating a call frame.
     if (IS_ATOM(fn_expr) && cctx->tail_position &&
         cctx->loop_var_id >= 0 &&
         CELL_ID(fn_expr) == cctx->loop_var_id &&
@@ -4889,7 +4644,7 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
         // because JUMP 0 would skip their POPENV instructions
         unsigned argc = list_length(args);
         if (argc == cctx->loop_arity && cctx->loop_arity <= 16) {
-            emit_self_call_loop(args, cctx);
+            emit_self_call_loop(fn_expr, args, cctx);
             return dynamic_result();
         }
     }
@@ -5099,8 +4854,9 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
 
                 // Add fixed params (only if lambda_params is a list)
                 if (IS_PAIR(lambda_params)) {
-                    for (unsigned p = lambda_params; p;
-                         p = IS_PAIR(p) ? cdr(p) : 0) {
+                    unsigned p = lambda_params;
+                    gc_protect(&p);
+                    for (; p; p = IS_PAIR(p) ? cdr(p) : 0) {
                         if (IS_ATOM(p))
                             break;
                         unsigned var = car(p);
@@ -5111,6 +4867,7 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
                         frame_vals = val;
                         gc_unprotect(1);
                     }
+                    gc_unprotect(1);
                 }
 
                 // Add rest param if present
@@ -5135,8 +4892,9 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
                 unsigned a = args;
                 gc_protect(&a);
                 if (IS_PAIR(lambda_params)) {
-                    for (unsigned p = lambda_params; p && a;
-                         p = IS_PAIR(p) ? cdr(p) : 0) {
+                    unsigned p = lambda_params;
+                    gc_protect(&p);
+                    for (; p && a; p = IS_PAIR(p) ? cdr(p) : 0) {
                         if (IS_ATOM(p))
                             break;
                         unsigned var = car(p);
@@ -5152,6 +4910,7 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
                         }
                         a = cdr(a);
                     }
+                    gc_unprotect(1);
                 }
                 gc_unprotect(1);
             }
@@ -5162,14 +4921,21 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
             if (saved_num_locals > 0)
                 memcpy(saved_local_ids, cctx->local_ids,
                        sizeof(int64_t) * saved_num_locals);
-            // Remove locals that are shadowed by IIFE params
-            if (cctx->num_locals > 0 && IS_PAIR(lambda_params)) {
-                for (unsigned p = lambda_params; p && IS_PAIR(p); p = cdr(p)) {
-                    int64_t pid = CELL_ID(car(p));
+            // Remove locals that are shadowed by IIFE params, including a
+            // rest parameter. Otherwise a reference to the rest binding can
+            // incorrectly compile as LOCAL_GET of an outer parameter.
+            if (cctx->num_locals > 0) {
+                unsigned p = lambda_params;
+                while (p) {
+                    unsigned param = IS_PAIR(p) ? car(p) : p;
+                    int64_t pid = CELL_ID(param);
                     for (int k = 0; k < cctx->num_locals; k++) {
                         if (cctx->local_ids[k] == pid)
                             cctx->local_ids[k] = -1; // disable this slot
                     }
+                    if (!IS_PAIR(p))
+                        break;
+                    p = cdr(p);
                 }
             }
             cctx->tail_position = tail;

@@ -23,6 +23,7 @@ static void close_string_port(unsigned port)
     sp->pos = 0;
     sp->last_read_pos = 0;
     sp->last_read_len = 0;
+    sp->last_read_source_pos = 0;
     sp->last_read_char = 0;
     sp->last_read_valid = false;
     sp->source_string = ctx.atom_false;

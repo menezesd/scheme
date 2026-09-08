@@ -144,29 +144,6 @@ static bool vm_integer_is_odd(vm_state *vm, unsigned n, const char *error_msg,
     return false;
 }
 
-static bool vm_is_jump_opcode(unsigned op)
-{
-    switch (op) {
-    case OP_JUMP:
-    case OP_JUMPIF:
-    case OP_JUMPIFNOT:
-    case OP_JUMPIFNULL:
-    case OP_JUMPIFNOTNULL:
-    case OP_JUMPIFZERO:
-    case OP_JUMPIFNOTZERO:
-    case OP_NUMEQ_JUMPIFNOT:
-    case OP_LT_JUMPIFNOT:
-    case OP_GT_JUMPIFNOT:
-    case OP_LE_JUMPIFNOT:
-    case OP_GE_JUMPIFNOT:
-    case OP_NUMEQ_INT_JUMPIFNOT:
-    case OP_LT_INT_JUMPIFNOT:
-        return true;
-    default:
-        return false;
-    }
-}
-
 static bool vm_instruction_starts_at(const code_object *code, unsigned target)
 {
     if (!code || target > code->code_len)
@@ -207,7 +184,7 @@ static bool vm_code_is_well_formed(code_object *code)
         unsigned size = instruction_size(op);
         if (size == 0 || size > code->code_len - i)
             return false;
-        if (vm_is_jump_opcode(op)) {
+        if (is_jump_opcode(op)) {
             unsigned target = code->code[i + 1];
             if (target > code->code_len ||
                 !vm_instruction_starts_at(code, target))
@@ -415,6 +392,20 @@ static bool vm_try_lookup_frame(int64_t sym_id, unsigned vars, unsigned vals,
     return false;
 }
 
+// Probe a frame through its side index when available; small lexical frames
+// use the same checked list walk as uncached lookup.
+static bool vm_lookup_in_frame(unsigned frame, int64_t symbol,
+                                unsigned *value, unsigned *offset)
+{
+    unsigned cell = 0;
+    if (env_frame_index_lookup(frame, symbol, &cell)) {
+        *offset = 0;
+        return cell && IS_PAIR(cell) &&
+               vm_try_deref_binding_value(car(cell), value);
+    }
+    return vm_try_lookup_frame(symbol, car(frame), cdr(frame), value, NULL, offset);
+}
+
 static inline unsigned ic_lookup(int64_t sym_id, unsigned env,
                                  unsigned *cache_slot)
 {
@@ -432,8 +423,17 @@ static inline unsigned ic_lookup(int64_t sym_id, unsigned env,
                 cache_valid = false;
                 break;
             }
-            if (d < cached_depth)
+            if (d < cached_depth) {
+                // A cached outer binding is valid only if no nearer frame
+                // has acquired a shadowing definition since the last call.
+                unsigned value = 0, offset = 0;
+                if (vm_lookup_in_frame(frame, sym_id, &value, &offset)) {
+                    cache_slot[0] = d;
+                    cache_slot[1] = offset;
+                    return value;
+                }
                 e = next;
+            }
         }
         if (cache_valid) {
             // A large frame carries a side index, which answers in one probe
@@ -483,25 +483,8 @@ static inline unsigned ic_lookup(int64_t sym_id, unsigned env,
         unsigned next = 0;
         if (!vm_try_env_frame(e, &frame, &next))
             return TOK_ERROR;
-        unsigned indexed_cell = 0;
-        if (env_frame_index_lookup(frame, sym_id, &indexed_cell)) {
-            unsigned value = 0;
-            if (indexed_cell && IS_PAIR(indexed_cell) &&
-                vm_try_deref_binding_value(car(indexed_cell), &value)) {
-                cache_slot[0] = depth;
-                cache_slot[1] = 0; // unused for an indexed frame
-                return value;
-            }
-            e = next;
-            continue;
-        }
-        unsigned vars = car(frame);
-        unsigned vals = cdr(frame);
-        unsigned value = 0;
-        unsigned val_cell = 0;
-        unsigned offset = 0;
-        if (vm_try_lookup_frame(sym_id, vars, vals, &value, &val_cell,
-                                &offset)) {
+        unsigned value = 0, offset = 0;
+        if (vm_lookup_in_frame(frame, sym_id, &value, &offset)) {
             cache_slot[0] = depth;
             cache_slot[1] = offset;
             return value;
@@ -515,6 +498,11 @@ static inline unsigned ic_lookup(int64_t sym_id, unsigned env,
 // When the VM is running, this points to the active VM state
 // so that GC can update VM roots
 static vm_state *active_vm = NULL;
+
+// Enter the dispatch loop using the execution state already stored in vm.
+// Unlike vm_run(), this does not reset code/ip/env/stack/frame state, so it
+// can resume a continuation after restore_continuation().
+static unsigned vm_dispatch(vm_state *vm);
 
 vm_state *get_active_vm(void)
 {
@@ -550,6 +538,7 @@ void vm_free(vm_state *vm)
 {
     free(vm->stack);
     free(vm->frames);
+    free(vm->letrecs);
     memset(vm, 0, sizeof(vm_state));
 }
 
@@ -578,6 +567,42 @@ static bool vm_resize_frames(vm_state *vm, unsigned new_cap,
     }
     vm->frames = new_frames;
     vm->frames_cap = new_cap;
+    return true;
+}
+
+static bool vm_resize_letrecs(vm_state *vm, unsigned new_cap,
+                              const char *error_msg)
+{
+    vm_letrec_state *new_letrecs =
+        checked_realloc_array(vm->letrecs, new_cap, sizeof(vm_letrec_state));
+    if (!new_letrecs) {
+        VM_ERROR(vm, error_msg);
+        return false;
+    }
+    vm->letrecs = new_letrecs;
+    vm->letrec_cap = new_cap;
+    return true;
+}
+
+static bool vm_push_letrec(vm_state *vm, unsigned frame, unsigned count)
+{
+    if (vm->letrec_depth >= vm->letrec_cap) {
+        if (vm->letrec_cap >= VM_MAX_STACK_SIZE) {
+            VM_ERROR(vm, "letrec initialization stack overflow");
+            return false;
+        }
+        unsigned new_cap = checked_grow_capacity(
+            vm->letrec_cap, sizeof(vm_letrec_state),
+            "letrec initialization capacity overflow");
+        if (new_cap > VM_MAX_STACK_SIZE)
+            new_cap = VM_MAX_STACK_SIZE;
+        if (!vm_resize_letrecs(vm, new_cap,
+                               "letrec initialization stack reallocation failed"))
+            return false;
+    }
+    vm->letrecs[vm->letrec_depth].frame = frame;
+    vm->letrecs[vm->letrec_depth].count = count;
+    vm->letrec_depth++;
     return true;
 }
 
@@ -762,16 +787,31 @@ static unsigned capture_continuation(vm_state *vm)
     LISP_ASSERT_MSG(vm->frames != NULL, "capture_continuation: null frames");
 
     // Calculate sizes for single allocation
-    unsigned letrec_count =
-        (vm->letrec_frame && vm->letrec_count > 0) ? vm->letrec_count : 0;
-    size_t stack_size, frames_size, letrec_size, total_size;
+    LISP_ASSERT_MSG(vm->letrec_depth <= VM_MAX_STACK_SIZE,
+                    "capture_continuation: letrec depth overflow");
+    LISP_ASSERT_MSG(vm->letrec_depth == 0 || vm->letrecs != NULL,
+                    "capture_continuation: missing letrec stack");
+    unsigned letrec_saved_count = 0;
+    for (unsigned i = 0; i < vm->letrec_depth; i++) {
+        LISP_ASSERT_MSG(vm->letrecs[i].count <=
+                            VM_MAX_STACK_SIZE - letrec_saved_count,
+                        "capture_continuation: letrec values overflow");
+        letrec_saved_count += vm->letrecs[i].count;
+    }
+
+    size_t stack_size, frames_size, letrec_states_size, letrec_values_size;
+    size_t total_size;
     LISP_ASSERT_MSG(checked_array_size(vm->sp, sizeof(unsigned), &stack_size),
                     "capture_continuation: stack size overflow");
     LISP_ASSERT_MSG(checked_array_size(vm->fp, sizeof(vm_frame), &frames_size),
                     "capture_continuation: frame size overflow");
-    LISP_ASSERT_MSG(checked_array_size(letrec_count, sizeof(unsigned),
-                                       &letrec_size),
-                    "capture_continuation: letrec size overflow");
+    LISP_ASSERT_MSG(checked_array_size(vm->letrec_depth,
+                                       sizeof(vm_letrec_state),
+                                       &letrec_states_size),
+                    "capture_continuation: letrec state size overflow");
+    LISP_ASSERT_MSG(checked_array_size(letrec_saved_count, sizeof(unsigned),
+                                       &letrec_values_size),
+                    "capture_continuation: letrec value size overflow");
 
     // vm_frame starts with a code_object* and needs pointer alignment, but
     // stack_size (a multiple of sizeof(unsigned) == 4) isn't necessarily a
@@ -788,7 +828,11 @@ static unsigned capture_continuation(vm_state *vm)
                     "capture_continuation: size overflow");
     LISP_ASSERT_MSG(checked_add_size(total_size, frames_size, &total_size),
                     "capture_continuation: size overflow");
-    LISP_ASSERT_MSG(checked_add_size(total_size, letrec_size, &total_size),
+    LISP_ASSERT_MSG(checked_add_size(total_size, letrec_states_size,
+                                     &total_size),
+                    "capture_continuation: size overflow");
+    LISP_ASSERT_MSG(checked_add_size(total_size, letrec_values_size,
+                                     &total_size),
                     "capture_continuation: size overflow");
 
     // Allocate the wrapper cell before copying VM roots. alloc() can trigger
@@ -805,6 +849,13 @@ static unsigned capture_continuation(vm_state *vm)
     cont->stack = (unsigned *)(block + sizeof(vm_continuation));
     cont->frames = (vm_frame *)(block + sizeof(vm_continuation) + stack_size +
                                 stack_padding);
+    char *letrec_base = (char *)cont->frames + frames_size;
+    cont->letrecs = vm->letrec_depth > 0
+                        ? (vm_letrec_state *)letrec_base
+                        : NULL;
+    cont->letrec_saved = letrec_saved_count > 0
+                             ? (unsigned *)(letrec_base + letrec_states_size)
+                             : NULL;
 
     // Copy stack
     cont->sp = vm->sp;
@@ -819,25 +870,27 @@ static unsigned capture_continuation(vm_state *vm)
     cont->ip = vm->ip;
     cont->env = vm->env;
     cont->bp = vm->bp;
+    cont->signal_handler = vm->signal_handler;
 
-    // Save letrec values if we're in letrec initialization
-    if (letrec_count > 0) {
-        cont->letrec_saved =
-            (unsigned *)(block + sizeof(vm_continuation) + stack_size +
-                         stack_padding + frames_size);
-        cont->letrec_saved_len = letrec_count;
-        cont->letrec_frame = vm->letrec_frame;
-
-        // Get the values list and save current values
-        unsigned frame = car(vm->letrec_frame);
+    // Save every active letrec frame and its current binding values. An outer
+    // initializer remains active while procedures called from it run.
+    cont->letrec_depth = vm->letrec_depth;
+    cont->letrec_saved_len = letrec_saved_count;
+    if (vm->letrec_depth > 0)
+        memcpy(cont->letrecs, vm->letrecs, letrec_states_size);
+    unsigned saved_index = 0;
+    for (unsigned i = 0; i < vm->letrec_depth; i++) {
+        unsigned letrec_frame = vm->letrecs[i].frame;
+        LISP_ASSERT_MSG(IS_PAIR(letrec_frame) && IS_PAIR(car(letrec_frame)),
+                        "capture_continuation: invalid letrec frame");
+        unsigned frame = car(letrec_frame);
         unsigned vals = cdr(frame);
-        for (unsigned i = 0; i < letrec_count && vals; i++, vals = cdr(vals)) {
-            cont->letrec_saved[i] = car(vals);
+        for (unsigned j = 0; j < vm->letrecs[i].count; j++) {
+            LISP_ASSERT_MSG(IS_PAIR(vals),
+                            "capture_continuation: truncated letrec values");
+            cont->letrec_saved[saved_index++] = car(vals);
+            vals = cdr(vals);
         }
-    } else {
-        cont->letrec_saved = NULL;
-        cont->letrec_saved_len = 0;
-        cont->letrec_frame = 0;
     }
 
     CELL_TYPE(cell) = BT_VMCONT;
@@ -894,6 +947,47 @@ static void restore_continuation(vm_state *vm, unsigned cont_cell,
         }
     }
 
+    if (cont->letrec_depth > VM_MAX_STACK_SIZE ||
+        (cont->letrec_depth > 0 && !cont->letrecs)) {
+        VM_ERROR(vm, "restore_continuation: invalid letrec stack");
+        return;
+    }
+    if (cont->letrec_saved_len > VM_MAX_STACK_SIZE ||
+        (cont->letrec_saved_len > 0 && !cont->letrec_saved)) {
+        VM_ERROR(vm, "restore_continuation: invalid letrec values");
+        return;
+    }
+
+    // Validate every active frame and every binding cell before making any
+    // Scheme-visible mutation. The flattened saved array must match the sum
+    // of the per-frame binding counts exactly.
+    unsigned expected_saved = 0;
+    for (unsigned i = 0; i < cont->letrec_depth; i++) {
+        vm_letrec_state *state = &cont->letrecs[i];
+        if (state->count > VM_MAX_STACK_SIZE - expected_saved) {
+            VM_ERROR(vm, "restore_continuation: invalid letrec values");
+            return;
+        }
+        expected_saved += state->count;
+        if (!state->frame || !IS_PAIR(state->frame) ||
+            !IS_PAIR(car(state->frame))) {
+            VM_ERROR(vm, "restore_continuation: invalid letrec frame");
+            return;
+        }
+        unsigned vals = cdr(car(state->frame));
+        for (unsigned j = 0; j < state->count; j++) {
+            if (!IS_PAIR(vals)) {
+                VM_ERROR(vm, "restore_continuation: invalid letrec values");
+                return;
+            }
+            vals = cdr(vals);
+        }
+    }
+    if (expected_saved != cont->letrec_saved_len) {
+        VM_ERROR(vm, "restore_continuation: invalid letrec values");
+        return;
+    }
+
     // Complete any fallible storage growth before restoring mutable letrec
     // bindings, so a failed restore has no partial semantic side effects.
     if (vm->stack_cap < cont->sp + 1) {
@@ -908,39 +1002,19 @@ static void restore_continuation(vm_state *vm, unsigned cont_cell,
                               "restore_continuation: frames realloc failed"))
             return;
     }
-
-    if (cont->letrec_saved_len > VM_MAX_STACK_SIZE ||
-        (cont->letrec_saved_len > 0 && !cont->letrec_saved)) {
-        VM_ERROR(vm, "restore_continuation: invalid letrec values");
-        return;
+    if (vm->letrec_cap < cont->letrec_depth) {
+        if (!vm_resize_letrecs(vm, cont->letrec_depth,
+                               "restore_continuation: letrec realloc failed"))
+            return;
     }
 
-    // Validate the whole binding list before modifying it.  A malformed
-    // continuation must not restore only a prefix of its saved letrec values.
-    if (cont->letrec_saved_len > 0) {
-        if (!cont->letrec_frame) {
-            VM_ERROR(vm, "restore_continuation: invalid letrec frame");
-            return;
-        }
-        if (!IS_PAIR(cont->letrec_frame) || !IS_PAIR(car(cont->letrec_frame))) {
-            VM_ERROR(vm, "restore_continuation: invalid letrec frame");
-            return;
-        }
-        unsigned frame = car(cont->letrec_frame);
-        unsigned vals = cdr(frame);
-        for (unsigned i = 0; i < cont->letrec_saved_len; i++) {
-            if (!IS_PAIR(vals)) {
-                VM_ERROR(vm, "restore_continuation: invalid letrec values");
-                return;
-            }
-            vals = cdr(vals);
-        }
-
-        // This must happen before restoring the environment.
-        vals = cdr(frame);
-        for (unsigned i = 0; i < cont->letrec_saved_len;
-             i++, vals = cdr(vals)) {
-            cell_set_car(vals, cont->letrec_saved[i]);
+    // Restore binding cells only after all validation and allocation succeeds.
+    unsigned saved_index = 0;
+    for (unsigned i = 0; i < cont->letrec_depth; i++) {
+        vm_letrec_state *state = &cont->letrecs[i];
+        unsigned vals = cdr(car(state->frame));
+        for (unsigned j = 0; j < state->count; j++, vals = cdr(vals)) {
+            cell_set_car(vals, cont->letrec_saved[saved_index++]);
         }
     }
 
@@ -953,13 +1027,74 @@ static void restore_continuation(vm_state *vm, unsigned cont_cell,
     memcpy(vm->frames, cont->frames, cont->fp * sizeof(vm_frame));
     vm->fp = cont->fp;
 
+    // Restore active letrec initializations for multi-shot re-entry.
+    if (cont->letrec_depth > 0) {
+        memcpy(vm->letrecs, cont->letrecs,
+               cont->letrec_depth * sizeof(vm_letrec_state));
+    }
+    vm->letrec_depth = cont->letrec_depth;
+
     // Restore execution state
     vm->code = cont->code;
     vm->ip = cont->ip;
     vm->env = cont->env;
     vm->bp = cont->bp;
-    vm->letrec_frame = cont->letrec_frame;
-    vm->letrec_count = cont->letrec_saved_len;
+    vm->signal_handler = cont->signal_handler;
+}
+
+// Invoke a VM continuation from the CPS evaluator. If the evaluator is
+// running as a callback from a VM, restore that VM in place so the callback's
+// C frame can hand control back to the normal dispatch loop. Otherwise restore
+// the continuation into a temporary VM and resume its saved dispatch state.
+vm_cont_call_status vm_call_continuation(unsigned continuation, unsigned args,
+                                         unsigned *result_out)
+{
+    if (result_out)
+        *result_out = TOK_ERROR;
+    if (!is_vm_continuation_object(continuation)) {
+        show_error("invalid continuation");
+        return VM_CONT_CALL_ERROR;
+    }
+
+    unsigned argc = 0;
+    if (!list_length_checked(args, &argc, "continuation arguments"))
+        return VM_CONT_CALL_ERROR;
+
+    GC_GUARD;
+    gc_protect(&continuation);
+    gc_protect(&args);
+
+    if (active_vm) {
+        unsigned value = values_from_list(args);
+        gc_protect(&value);
+        restore_continuation(active_vm, continuation, value);
+        if (active_vm->error)
+            return VM_CONT_CALL_ERROR;
+        active_vm->cps_continuation_transfer = true;
+        return VM_CONT_CALL_TRANSFERRED;
+    }
+
+    vm_state vm;
+    vm_init(&vm);
+    unsigned value = values_from_list(args);
+    gc_protect(&value);
+    restore_continuation(&vm, continuation, value);
+    if (vm.error) {
+        const char *error_msg = vm.error_msg;
+        vm_free(&vm);
+        if (error_msg)
+            show_error("VM error: %s", error_msg);
+        return VM_CONT_CALL_ERROR;
+    }
+    vm.running = true;
+    unsigned result = vm_dispatch(&vm);
+    bool had_error = vm.error;
+    vm_free(&vm);
+    if (had_error || result == TOK_ERROR)
+        return VM_CONT_CALL_ERROR;
+    if (result_out)
+        *result_out = result;
+    return VM_CONT_CALL_RETURNED;
 }
 
 // ============================================================================
@@ -1330,7 +1465,7 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
                 VM_ERROR(vm, "interaction-environment: expected 0 arguments");
                 return;
             }
-            vm_push(vm, vm->env);
+            vm_push(vm, exception_state_env(vm->env));
             return;
         }
 
@@ -1504,6 +1639,11 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
         gc_protect(&expr);
         while (expr) {
             result = eval_cps(car(expr), new_env);
+            if (vm->cps_continuation_transfer) {
+                vm->cps_continuation_transfer = false;
+                gc_unprotect(3);
+                return;
+            }
             expr = cdr(expr);
         }
         gc_unprotect(3);
@@ -1537,28 +1677,34 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
 // Main Execution Loop
 // ============================================================================
 
-unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
+// A TRMC call is truly tail-position only while no operation is pending.
+static bool vm_can_tailcall(vm_state *vm)
 {
-    LISP_ASSERT_MSG(vm != NULL, "vm_run: null vm");
-    if (!vm_code_is_well_formed(code)) {
-        vm->error = true;
-        vm->error_msg = "invalid bytecode";
-        show_error("VM error: %s", vm->error_msg);
-        return TOK_ERROR;
+    if (vm->code->trmc_mode == TRMC_MODE_NONE)
+        return true;
+    unsigned slot = vm->bp + vm->code->trmc_slot;
+    unsigned last = vm->code->trmc_mode == TRMC_MODE_HOLE ? slot + 1 : slot;
+    return slot >= vm->bp && last >= slot && last < vm->sp &&
+           vm->stack[last] == 0;
+}
+
+static void vm_apply_tailcall(vm_state *vm, unsigned fn, unsigned argc)
+{
+    bool tail = vm_can_tailcall(vm);
+    if (!tail && vm->code->trmc_mode == TRMC_MODE_HOLE) {
+        unsigned tail_idx;
+        if (!vm_local_index(vm, vm->code->trmc_slot + 1, &tail_idx))
+            return;
+        // A rebound callee may capture a continuation, unlike the statically
+        // proven self-call. Freeze the pending prefix: each eventual return
+        // must copy it rather than mutate a chain shared with that capture.
+        vm->stack[tail_idx] = ctx.atom_false;
     }
+    vm_apply(vm, fn, argc, tail);
+}
 
-    vm->code = code;
-    vm->ip = 0;
-    vm->env = env;
-    // Preserve arguments preloaded by vm_call_closure for stack-local
-    // closures; ordinary VM runs always start with an empty operand stack.
-    if (!code->use_locals || code->has_rest)
-        vm->sp = 0;
-    vm->fp = 0;
-    vm->bp = 0;
-    vm->running = true;
-    vm->error = false;
-
+static unsigned vm_dispatch(vm_state *vm)
+{
     // Register VM with GC system. Link to the suspended enclosing VM so the
     // GC can forward the entire chain, not just the innermost VM.
     vm_state *saved_active_vm = active_vm;
@@ -1781,6 +1927,12 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
         }
 
         case OP_TRMC_PUSH: {
+            unsigned symbol_index = vm->code->code[vm->ip++];
+            unsigned symbol = 0;
+            if (!vm_get_const(vm->code, symbol_index, &symbol) || !IS_ATOM(symbol)) {
+                VM_ERROR(vm, "invalid deferred operator");
+                break;
+            }
             // FOLD mode. Prepending allocates but mutates nothing, so a
             // continuation captured anywhere in the body restores its own
             // accumulator value and rebuilds independently. That is the whole
@@ -1795,8 +1947,12 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             // survive it. The slot is on the traced stack, v is not any more.
             GC_GUARD;
             gc_protect(&v);
-            unsigned cell = alloc_cons(v, vm->stack[slot]);
-            vm->stack[slot] = cell;
+            // Keep the lexical environment, not the current operator value:
+            // arguments (including recursion) finish before callee lookup.
+            unsigned pending = alloc_cons(vm->code->constants[symbol_index], vm->env);
+            gc_protect(&pending);
+            pending = alloc_cons(v, pending);
+            vm->stack[slot] = alloc_cons(pending, vm->stack[slot]);
             break;
         }
 
@@ -1857,7 +2013,14 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                     !vm_local_index(vm, vm->code->trmc_slot + 1, &tail_idx))
                     break;
                 unsigned tail = vm->stack[tail_idx];
-                if (tail) {
+                if (tail == ctx.atom_false) {
+                    unsigned args[2] = {vm->stack[base], val};
+                    val = apply_primitive_argv(PAPPEND, 2, args);
+                    if (val == TOK_ERROR) {
+                        VM_ERROR(vm, "recursive call prefix copy failed");
+                        break;
+                    }
+                } else if (tail) {
                     cell_set_cdr(tail, val);
                     val = vm->stack[base];
                 }
@@ -1870,35 +2033,27 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                 unsigned acc_slot;
                 if (!vm_local_index(vm, vm->code->trmc_slot, &acc_slot))
                     break;
-                unsigned fold_op = vm->code->trmc_op;
-                // Both the running result and the cursor live on the operand
-                // stack, because applying the primitive can collect and the
-                // stack is what the collectors trace. Reusing the
-                // accumulator's own slot as the cursor keeps it rooted too.
-                unsigned result_slot = vm->sp;
-                vm_push(vm, val);
-                while (!vm->error && vm->stack[acc_slot]) {
+                if (vm->stack[acc_slot]) {
                     unsigned cell = vm->stack[acc_slot];
-                    vm_push(vm, car(cell));
-                    vm_push(vm, vm->stack[result_slot]);
-                    if (vm->error)
-                        break;
-                    unsigned res =
-                        apply_primitive_argv(fold_op, 2,
-                                             &vm->stack[vm->sp - 2]);
-                    vm->sp -= 2;
-                    if (res == TOK_ERROR) {
-                        VM_ERROR(vm, ctx.last_error[0] ? ctx.last_error
-                                                       : "trmc: fold failed");
+                    unsigned pending = car(cell);
+                    unsigned binding = cdr(pending);
+                    int64_t symbol = CELL_ID(car(binding));
+                    unsigned fn = lookup_silent(symbol, cdr(binding));
+                    if (fn == TOK_ERROR) {
+                        vm_show_undefined_variable(symbol);
+                        vm_signal_error(vm, ctx.last_error);
                         break;
                     }
-                    vm->stack[result_slot] = res;
-                    vm->stack[acc_slot] = cdr(vm->stack[acc_slot]);
-                }
-                if (vm->error)
+                    // Re-enter this return after one pending application.
+                    // Normal VM frames make captured continuations replay the
+                    // remaining immutable accumulator independently.
+                    vm->stack[acc_slot] = cdr(cell);
+                    vm_push(vm, car(pending));
+                    vm_push(vm, val);
+                    vm->ip -= 2;
+                    vm_apply(vm, fn, 2, vm->stack[acc_slot] == 0);
                     break;
-                val = vm->stack[result_slot];
-                vm->sp = result_slot;
+                }
             }
             if (vm->fp == 0) {
                 vm->sp = vm->bp;
@@ -2025,14 +2180,71 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
             unsigned fn = vm_pop(vm);
             if (vm->error)
                 break;
-            bool empty = false;
-            unsigned slot = vm->bp + vm->code->trmc_slot;
-            unsigned last = (vm->code->trmc_mode == TRMC_MODE_HOLE)
-                                ? slot + 1
-                                : slot;
-            if (last >= slot && last < vm->sp)
-                empty = (vm->stack[last] == 0);
-            vm_apply(vm, fn, argc, empty);
+            vm_apply_tailcall(vm, fn, argc);
+            break;
+        }
+
+        case OP_GUARD_PRIMITIVE: {
+            unsigned target = vm->code->code[vm->ip++];
+            unsigned symbol = vm->code->code[vm->ip++];
+            unsigned expected = vm->code->code[vm->ip++];
+            unsigned argc = vm->code->code[vm->ip++];
+            bool tail = vm->code->code[vm->ip++];
+            unsigned *cache = &vm->code->code[vm->ip];
+            vm->ip += 2;
+            unsigned fn = ic_lookup(symbol, vm->env, cache);
+            if (fn == TOK_ERROR) {
+                vm_show_undefined_variable(symbol);
+                vm_signal_error(vm, ctx.last_error);
+            } else if (!IS_BUILTIN(fn) || CELL_ID(fn) != expected) {
+                vm->ip = target;
+                if (tail)
+                    vm_apply_tailcall(vm, fn, argc);
+                else
+                    vm_apply(vm, fn, argc, false);
+            }
+            break;
+        }
+
+        case OP_RECURSE: {
+            unsigned target = vm->code->code[vm->ip++];
+            unsigned argc = vm->code->code[vm->ip++];
+            unsigned depth = vm->code->code[vm->ip++];
+            unsigned fn = vm_pop(vm);
+            if (vm->error)
+                break;
+            unsigned entry_env = vm->env;
+            while (depth && IS_PAIR(entry_env)) {
+                entry_env = cdr(entry_env);
+                depth--;
+            }
+            if (depth) {
+                VM_ERROR(vm, "recursive call environment depth out of bounds");
+                break;
+            }
+            if (vm->code->use_locals && !vm->code->has_rest &&
+                argc == vm->code->arity && is_bytecode_closure_object(fn) &&
+                GET_CLOSURE_CODE(fn) == vm->code &&
+                GET_CLOSURE_ENV(fn) == entry_env) {
+                unsigned extra = vm->code->trmc_mode == TRMC_MODE_HOLE ? 2 :
+                    (vm->code->trmc_mode == TRMC_MODE_FOLD ? 1 : 0);
+                if (argc > vm->sp || vm->bp > vm->sp - argc ||
+                    argc > vm->sp - argc - vm->bp ||
+                    extra > vm->sp - argc - vm->bp - argc) {
+                    VM_ERROR(vm, "recursive call stack window out of bounds");
+                    break;
+                }
+                // Keep the TRMC accumulator after the parameter window.
+                // Parameter names may be shadowed in the current scope; the
+                // callee's original slots are always the first argc locals.
+                memmove(&vm->stack[vm->bp], &vm->stack[vm->sp - argc],
+                        argc * sizeof(unsigned));
+                vm->sp = vm->bp + argc + extra;
+                vm->env = entry_env;
+                vm->ip = target;
+            } else {
+                vm_apply_tailcall(vm, fn, argc);
+            }
             break;
         }
 
@@ -2263,7 +2475,7 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
                     VM_ERROR_BREAK(
                         vm, "interaction-environment: expected 0 arguments");
                 }
-                vm_push(vm, vm->env); // Return current environment
+                vm_push(vm, exception_state_env(vm->env));
                 break;
             }
 
@@ -2337,29 +2549,33 @@ unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
 
         case OP_POPENV: {
             // Pop frame from environment
+            unsigned old_env = vm->env;
             if (vm->env) {
                 vm->env = cdr(vm->env);
             }
-            // Clear letrec tracking if we're popping the letrec frame
-            if (vm->letrec_frame && vm->env != vm->letrec_frame) {
-                vm->letrec_frame = 0;
-                vm->letrec_count = 0;
-            }
+            // Normally OP_LETREC_DONE already removed this mark. Keep this
+            // defensive cleanup for malformed/unusual bytecode without
+            // disturbing an outer initializer while a callee pops its scopes.
+            if (vm->letrec_depth > 0 &&
+                vm->letrecs[vm->letrec_depth - 1].frame == old_env)
+                vm->letrec_depth--;
             break;
         }
 
         case OP_LETREC_MARK: {
             // Mark the current environment frame as being letrec-initialized
             unsigned count = vm->code->code[vm->ip++];
-            vm->letrec_frame = vm->env;
-            vm->letrec_count = count;
+            (void)vm_push_letrec(vm, vm->env, count);
             break;
         }
 
         case OP_LETREC_DONE: {
-            // End letrec initialization - clear the tracking
-            vm->letrec_frame = 0;
-            vm->letrec_count = 0;
+            // End the innermost active letrec initialization.
+            if (vm->letrec_depth == 0) {
+                VM_ERROR(vm, "letrec initialization stack underflow");
+                break;
+            }
+            vm->letrec_depth--;
             break;
         }
 
@@ -3694,6 +3910,30 @@ vm_dispatch_error:
     return 0;
 }
 
+unsigned vm_run(vm_state *vm, code_object *code, unsigned env)
+{
+    LISP_ASSERT_MSG(vm != NULL, "vm_run: null vm");
+    if (!vm_code_is_well_formed(code)) {
+        vm->error = true;
+        vm->error_msg = "invalid bytecode";
+        show_error("VM error: %s", vm->error_msg);
+        return TOK_ERROR;
+    }
+
+    vm->code = code;
+    vm->ip = 0;
+    vm->env = env;
+    // Preserve arguments preloaded by vm_call_closure for stack-local
+    // closures; ordinary VM runs always start with an empty operand stack.
+    if (!code->use_locals || code->has_rest)
+        vm->sp = 0;
+    vm->fp = 0;
+    vm->bp = 0;
+    vm->running = true;
+    vm->error = false;
+    return vm_dispatch(vm);
+}
+
 // ============================================================================
 // GC Integration
 // ============================================================================
@@ -3715,7 +3955,8 @@ void gc_update_vm_roots(vm_state *vm)
 
     // Update current environment
     vm->env = collect(vm->env);
-    vm->letrec_frame = collect(vm->letrec_frame);
+    for (unsigned i = 0; i < vm->letrec_depth; i++)
+        vm->letrecs[i].frame = collect(vm->letrecs[i].frame);
     vm->signal_handler = collect(vm->signal_handler);
 
     // Update code object constants
@@ -3740,6 +3981,7 @@ void gc_update_vm_roots_minor(vm_state *vm, unsigned (*collector)(unsigned))
 
     // Update current environment
     vm->env = collector(vm->env);
-    vm->letrec_frame = collector(vm->letrec_frame);
+    for (unsigned i = 0; i < vm->letrec_depth; i++)
+        vm->letrecs[i].frame = collector(vm->letrecs[i].frame);
     vm->signal_handler = collector(vm->signal_handler);
 }

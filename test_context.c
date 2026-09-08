@@ -294,6 +294,35 @@ TEST(equal_hash_table_handles_cyclic_numeric_payload)
     PASS();
 }
 
+TEST(string_slice_set_survives_an_exhausted_nursery)
+{
+    GC_GUARD;
+    char buffer[INT_CACHE_MAX + 16];
+    memset(buffer, 'a', sizeof(buffer) - 1);
+    buffer[sizeof(buffer) - 1] = '\0';
+    unsigned original = make_string_copy(buffer);
+    gc_protect(&original);
+    unsigned slice_args[3] = {original, MAKE_FIXNUM(INT_CACHE_MAX + 1),
+                             MAKE_FIXNUM(INT_CACHE_MAX + 3)};
+    unsigned slice = apply_primitive_argv(PSTRSLICE, 3, slice_args);
+    ASSERT(IS_STRING(slice));
+    gc_protect(&slice);
+    unsigned value = make_char(0x1D11E);
+    gc_protect(&value);
+    if (ctx.card_table) {
+        unsigned nursery_end =
+            (ctx.mmin < SEMISPACE_SIZE) ? SEMISPACE_SIZE : 2 * SEMISPACE_SIZE;
+        ctx.nursery_ptr = nursery_end;
+    }
+    unsigned args[3] = {slice, MAKE_FIXNUM(1), value};
+    unsigned result = apply_primitive_argv(PSTRSET, 3, args);
+    ASSERT(result != TOK_ERROR);
+    ASSERT_STR_EQ(GET_STRING_PTR(original) + INT_CACHE_MAX + 1,
+                  "a𝄞aaaaaaaaaaaa");
+    ASSERT_STR_EQ(GET_STRING_PTR(slice), "a𝄞");
+    PASS();
+}
+
 TEST(hash_table_enumeration_survives_gc_rehash)
 {
     enum { ENTRY_COUNT = 32 };
@@ -908,6 +937,24 @@ TEST(list_append_builds_list)
     ASSERT_EQ(CELL_ID(car(head)), 1);
     ASSERT_EQ(CELL_ID(cadr(head)), 2);
     ASSERT_EQ(CELL_ID(caddr(head)), 3);
+    PASS();
+}
+
+TEST(numeric_comparison_roots_middle_argument_across_gc)
+{
+    GC_GUARD;
+    unsigned args[3] = {0, 0, 0};
+    for (unsigned i = 0; i < 3; i++)
+        gc_protect(&args[i]);
+    args[0] = normalize_rational(1, 2);
+    args[1] = store_inexact(0.5);
+    args[2] = normalize_rational(1, 2);
+    if (ctx.card_table) {
+        unsigned nursery_end =
+            (ctx.mmin < SEMISPACE_SIZE) ? SEMISPACE_SIZE : 2 * SEMISPACE_SIZE;
+        ctx.nursery_ptr = nursery_end;
+    }
+    ASSERT(numeric_compare(3, args, CMP_EQ) == ctx.atom_true);
     PASS();
 }
 
@@ -1757,6 +1804,59 @@ TEST(disassemble_handles_cyclic_children)
     PASS();
 }
 
+TEST(peephole_optimize_preserves_recursive_call_operands)
+{
+    code_object *code = code_new();
+    ASSERT(code != NULL);
+    code_emit(code, OP_CONST);
+    code_emit(code, 0);
+    code_emit(code, OP_POP);
+    code_emit(code, OP_RECURSE);
+    code_emit(code, 7);
+    code_emit(code, OP_JUMP); // argument count happens to equal an opcode
+    code_emit(code, 7);       // lexical depth must not be relocated
+    code_emit(code, OP_HALT);
+    peephole_optimize(code);
+    ASSERT_EQ(code->code_len, 5);
+    ASSERT_EQ(code->code[0], OP_RECURSE);
+    ASSERT_EQ(code->code[1], 4);
+    ASSERT_EQ(code->code[2], OP_JUMP);
+    ASSERT_EQ(code->code[3], 7);
+    ASSERT_EQ(code->code[4], OP_HALT);
+    code_free(code);
+    PASS();
+}
+
+TEST(peephole_optimize_preserves_primitive_guard_operands)
+{
+    code_object *code = code_new();
+    ASSERT(code != NULL);
+    code_emit(code, OP_CONST);
+    code_emit(code, 0);
+    code_emit(code, OP_POP);
+    code_emit(code, OP_GUARD_PRIMITIVE);
+    code_emit(code, 11);
+    code_emit(code, OP_JUMP); // symbol and primitive IDs are not instructions
+    code_emit(code, OP_JUMP);
+    code_emit(code, 2);
+    code_emit(code, 1);
+    code_emit(code, 0xFFFFFFFF);
+    code_emit(code, 0xFFFFFFFF);
+    code_emit(code, OP_HALT);
+    peephole_optimize(code);
+    ASSERT_EQ(code->code_len, 9);
+    ASSERT_EQ(code->code[0], OP_GUARD_PRIMITIVE);
+    ASSERT_EQ(code->code[1], 8);
+    ASSERT_EQ(code->code[2], OP_JUMP);
+    ASSERT_EQ(code->code[3], OP_JUMP);
+    ASSERT_EQ(code->code[4], 2);
+    ASSERT_EQ(code->code[5], 1);
+    ASSERT_EQ(code->code[6], 0xFFFFFFFF);
+    ASSERT_EQ(code->code[7], 0xFFFFFFFF);
+    code_free(code);
+    PASS();
+}
+
 TEST(peephole_optimize_does_not_thread_into_operand)
 {
     code_object *code = code_new();
@@ -2457,14 +2557,21 @@ TEST(vm_continuation_rejects_truncated_letrec_values)
     unsigned frame = alloc_cons(0, 0);
     unsigned letrec_frame = alloc_cons(frame, 0);
     unsigned cont_cell = alloc();
-    size_t block_size = sizeof(vm_continuation) + sizeof(unsigned);
+    size_t block_size = sizeof(vm_continuation) + sizeof(vm_letrec_state) +
+                        sizeof(unsigned);
     vm_continuation *cont = checked_calloc_array(1, block_size);
     ASSERT(cont != NULL);
     cont->code = restore_code;
     cont->ip = 0;
-    cont->letrec_frame = letrec_frame;
+    cont->letrec_depth = 1;
+    cont->letrecs =
+        (vm_letrec_state *)((char *)cont + sizeof(vm_continuation));
+    cont->letrecs[0].frame = letrec_frame;
+    cont->letrecs[0].count = 1;
     cont->letrec_saved_len = 1;
-    cont->letrec_saved = (unsigned *)((char *)cont + sizeof(vm_continuation));
+    cont->letrec_saved =
+        (unsigned *)((char *)cont + sizeof(vm_continuation) +
+                     sizeof(vm_letrec_state));
     cont->letrec_saved[0] = store(42);
     vm_continuation_register(cont);
     CELL_TYPE(cont_cell) = BT_VMCONT;
@@ -2694,13 +2801,19 @@ TEST(gc_updates_vm_continuation_letrec_roots)
     gc_protect(&letrec_frame);
 
     unsigned cont_cell = alloc();
-    size_t block_size = sizeof(vm_continuation) + sizeof(unsigned);
+    size_t block_size = sizeof(vm_continuation) + sizeof(vm_letrec_state) +
+                        sizeof(unsigned);
     vm_continuation *cont = checked_calloc_array(1, block_size);
     ASSERT(cont != NULL);
-    cont->letrec_frame = letrec_frame;
+    cont->letrec_depth = 1;
+    cont->letrecs =
+        (vm_letrec_state *)((char *)cont + sizeof(vm_continuation));
+    cont->letrecs[0].frame = letrec_frame;
+    cont->letrecs[0].count = 1;
     cont->letrec_saved_len = 1;
     cont->letrec_saved =
-        (unsigned *)((char *)cont + sizeof(vm_continuation));
+        (unsigned *)((char *)cont + sizeof(vm_continuation) +
+                     sizeof(vm_letrec_state));
     cont->letrec_saved[0] = saved;
     vm_continuation_register(cont);
     CELL_TYPE(cont_cell) = BT_VMCONT;
@@ -2708,7 +2821,7 @@ TEST(gc_updates_vm_continuation_letrec_roots)
 
     cont_cell = gc(cont_cell);
     cont = (vm_continuation *)CELL_PTR(cont_cell);
-    ASSERT(CELL_TYPE(cont->letrec_frame) == BT_CONS);
+    ASSERT(CELL_TYPE(cont->letrecs[0].frame) == BT_CONS);
     ASSERT(CELL_TYPE(cont->letrec_saved[0]) == BT_STRING);
     ASSERT_STR_EQ(GET_STRING_PTR(cont->letrec_saved[0]), "saved");
     PASS();
@@ -2723,13 +2836,18 @@ TEST(gc_ignores_malformed_vm_continuation_arrays)
     string_register(GET_STRING_PTR(env_marker));
 
     unsigned cont_cell = alloc();
-    vm_continuation *cont = checked_calloc_array(1, sizeof(vm_continuation));
+    size_t block_size = sizeof(vm_continuation) + sizeof(vm_letrec_state);
+    vm_continuation *cont = checked_calloc_array(1, block_size);
     ASSERT(cont != NULL);
     cont->sp = UINT_MAX;
     cont->fp = UINT_MAX;
+    cont->letrec_depth = UINT_MAX;
+    cont->letrecs =
+        (vm_letrec_state *)((char *)cont + sizeof(vm_continuation));
+    cont->letrecs[0].frame = env_marker;
     cont->letrec_saved_len = UINT_MAX;
+    cont->letrec_saved = (unsigned *)cont;
     cont->env = env_marker;
-    cont->letrec_frame = env_marker;
     vm_continuation_register(cont);
     CELL_TYPE(cont_cell) = BT_VMCONT;
     CELL_PTR(cont_cell) = cont;
@@ -2739,7 +2857,6 @@ TEST(gc_ignores_malformed_vm_continuation_arrays)
     cont = (vm_continuation *)CELL_PTR(cont_cell);
     ASSERT(cont != NULL);
     ASSERT(CELL_TYPE(cont->env) == BT_STRING);
-    ASSERT(CELL_TYPE(cont->letrec_frame) == BT_STRING);
 
     CELL_TYPE(cont_cell) = BT_FREE;
     CELL_PTR(cont_cell) = NULL;
@@ -2757,6 +2874,8 @@ TEST(vm_continuation_capture_copies_after_gc)
 
     unsigned env = empty_environment();
     unsigned old_env = env;
+    unsigned handler = make_string_copy("handler");
+    ASSERT(IS_STRING(handler));
 
     if (ctx.card_table) {
         unsigned nursery_end =
@@ -2766,6 +2885,7 @@ TEST(vm_continuation_capture_copies_after_gc)
 
     vm_state vm;
     vm_init(&vm);
+    vm.signal_handler = handler;
     unsigned result = vm_run(&vm, code, env);
     vm_free(&vm);
 
@@ -2774,6 +2894,8 @@ TEST(vm_continuation_capture_copies_after_gc)
     ASSERT(cont != NULL);
     ASSERT(cont->env != old_env);
     ASSERT(CELL_TYPE(cont->env) == BT_CONS);
+    ASSERT(CELL_TYPE(cont->signal_handler) == BT_STRING);
+    ASSERT_STR_EQ(GET_STRING_PTR(cont->signal_handler), "handler");
 
     vm_continuation_unregister(cont);
     free(cont);
@@ -2793,6 +2915,64 @@ TEST(gc_updates_vm_signal_handler_root)
     gc_update_vm_roots_minor(&vm, test_gc_forward_one);
 
     ASSERT_EQ(vm.signal_handler, test_gc_collector_to);
+    PASS();
+}
+
+TEST(vm_continuation_restores_signal_handler)
+{
+    code_object *restore_code = code_new();
+    ASSERT(restore_code != NULL);
+    code_emit(restore_code, OP_HALT);
+
+    unsigned cont_cell = alloc();
+    vm_continuation *cont = checked_calloc_array(1, sizeof(vm_continuation));
+    ASSERT(cont != NULL);
+    cont->code = restore_code;
+    cont->ip = 0;
+    cont->signal_handler = store(41);
+    vm_continuation_register(cont);
+    CELL_TYPE(cont_cell) = BT_VMCONT;
+    CELL_PTR(cont_cell) = cont;
+
+    code_object *call_code = make_test_continuation_call_code(cont_cell);
+    ASSERT(call_code != NULL);
+
+    vm_state vm;
+    vm_init(&vm);
+    vm.signal_handler = store(42);
+    unsigned result = vm_run(&vm, call_code, empty_environment());
+
+    ASSERT(result != TOK_ERROR);
+    ASSERT_EQ(vm.signal_handler, store(41));
+    vm_free(&vm);
+    CELL_TYPE(cont_cell) = BT_FREE;
+    CELL_PTR(cont_cell) = NULL;
+    vm_continuation_unregister(cont);
+    free(cont);
+    code_free(call_code);
+    code_free(restore_code);
+    PASS();
+}
+
+TEST(gc_updates_active_vm_letrec_roots)
+{
+    vm_state vm = {0};
+    vm_letrec_state letrecs[2] = {{0}};
+    test_gc_collector_from = store(51);
+    test_gc_collector_to = store(52);
+    letrecs[0].frame = test_gc_collector_from;
+    letrecs[0].count = 3;
+    letrecs[1].frame = store(53);
+    letrecs[1].count = 1;
+    vm.letrecs = letrecs;
+    vm.letrec_depth = 2;
+
+    gc_update_vm_roots_minor(&vm, test_gc_forward_one);
+
+    ASSERT_EQ(vm.letrecs[0].frame, test_gc_collector_to);
+    ASSERT_EQ(vm.letrecs[0].count, 3);
+    ASSERT_EQ(vm.letrecs[1].frame, store(53));
+    ASSERT_EQ(vm.letrecs[1].count, 1);
     PASS();
 }
 
@@ -3533,6 +3713,7 @@ int main(void)
     RUN_TEST(malformed_symbol_payload_is_safe);
     RUN_TEST(out_of_range_value_is_not_a_cell);
     RUN_TEST(equal_hash_table_handles_cyclic_numeric_payload);
+    RUN_TEST(string_slice_set_survives_an_exhausted_nursery);
     RUN_TEST(hash_table_enumeration_survives_gc_rehash);
     RUN_TEST(error_rejects_malformed_string_message);
     RUN_TEST(string_port_rejects_malformed_source_string);
@@ -3581,6 +3762,7 @@ int main(void)
     RUN_TEST(metadata_list_helpers_reject_circular_lists);
     RUN_TEST(list_length_three);
     RUN_TEST(list_append_builds_list);
+    RUN_TEST(numeric_comparison_roots_middle_argument_across_gc);
     RUN_TEST(append_primitive_roots_arguments_across_gc);
 
     // Deep equality
@@ -3630,6 +3812,8 @@ int main(void)
     RUN_TEST(peephole_optimize_ignores_truncated_child_instruction);
     RUN_TEST(peephole_optimize_handles_cyclic_children);
     RUN_TEST(disassemble_handles_cyclic_children);
+    RUN_TEST(peephole_optimize_preserves_recursive_call_operands);
+    RUN_TEST(peephole_optimize_preserves_primitive_guard_operands);
     RUN_TEST(peephole_optimize_does_not_thread_into_operand);
     RUN_TEST(vm_run_rejects_truncated_bytecode);
     RUN_TEST(vm_memq_rejects_circular_list);
@@ -3673,6 +3857,8 @@ int main(void)
     RUN_TEST(gc_ignores_malformed_vm_continuation_arrays);
     RUN_TEST(vm_continuation_capture_copies_after_gc);
     RUN_TEST(gc_updates_vm_signal_handler_root);
+    RUN_TEST(vm_continuation_restores_signal_handler);
+    RUN_TEST(gc_updates_active_vm_letrec_roots);
     RUN_TEST(gc_closes_unreachable_file_port);
     RUN_TEST(gc_forgets_unreachable_file_port_reader_state);
     RUN_TEST(gc_preserves_current_file_port_until_replaced);

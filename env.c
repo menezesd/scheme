@@ -657,6 +657,23 @@ unsigned defvar_alias(unsigned var, unsigned target_var, unsigned target_val_cel
     return defvar(var, ref, env);
 }
 
+// Immutability belongs to the frame owning the binding. A binding reference
+// may forward into a mutable frame, so it is deliberately not proven stable.
+bool env_binding_is_immutable(int64_t var, unsigned env)
+{
+    if (!env_chain_acyclic(env))
+        return false;
+    while (env) {
+        unsigned frame = 0, next = 0, cell = 0;
+        if (!env_frame(env, &frame, &next))
+            return false;
+        if (env_find_in_frame_indexed(frame, var, car(frame), cdr(frame), &cell, NULL))
+            return environment_is_immutable(env) && !IS_BINDING_REF(car(cell));
+        env = next;
+    }
+    return false;
+}
+
 unsigned env_find_binding_cell(int64_t var, unsigned env)
 {
     if (!env_chain_acyclic(env))

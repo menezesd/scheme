@@ -804,6 +804,19 @@ TEST(read_bytevector_rejects_unterminated_literal)
     PASS();
 }
 
+TEST(read_unknown_dispatch_has_valid_error_text)
+{
+    ASSERT(read_from_string("#") == TOK_ERROR);
+    ASSERT_STR_EQ(ctx.last_error, "unexpected end of file after #");
+    ASSERT(read_from_string("#\xff") == TOK_ERROR);
+    ASSERT_STR_EQ(ctx.last_error, "unknown # syntax: #\\xff");
+    ASSERT(read_from_string("#u8\xc3\xa9") == TOK_ERROR);
+    ASSERT_STR_EQ(ctx.last_error, "unknown # syntax: #u8\\xc3");
+    ASSERT(read_from_string("#z") == TOK_ERROR);
+    ASSERT_STR_EQ(ctx.last_error, "unknown # syntax: #z");
+    PASS();
+}
+
 TEST(read_bytevector_rejects_incomplete_prefix)
 {
     ASSERT(read_from_string("#u") == TOK_ERROR);
@@ -1096,6 +1109,7 @@ int main(void)
     RUN_TEST(read_bytevector_rejects_out_of_range);
     RUN_TEST(read_bytevector_rejects_non_integer);
     RUN_TEST(read_bytevector_rejects_unterminated_literal);
+    RUN_TEST(read_unknown_dispatch_has_valid_error_text);
     RUN_TEST(read_bytevector_rejects_incomplete_prefix);
     RUN_TEST(read_datum_label_number);
     RUN_TEST(read_datum_label_empty_list);

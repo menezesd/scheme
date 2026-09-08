@@ -594,8 +594,9 @@ static const unary_number_math_entry *find_unary_number_math(unsigned prim_id)
  * Returns the root if base is a perfect nth power, NULL otherwise.
  * Caller must free the returned bignum.
  */
-// Newton's method for the integer nth root (approximately floor(base^1/n);
-// may be off by one, so callers needing exactness must verify)
+// Starting above the root, integer Newton steps decrease until the floor
+// root is reached. Stop when the next step no longer decreases: non-perfect
+// powers can cycle between adjacent integers instead of reaching a fixed point.
 static bignum *bn_approx_nth_root(const bignum *base, int64_t n)
 {
     if (n <= 0 || bn_is_zero(base))
@@ -648,25 +649,13 @@ static bignum *bn_approx_nth_root(const bignum *base, int64_t n)
         return NULL;
     }
 
-    for (int iter = 0; iter < 100; iter++) {
-        // Compute guess^(n-1)
-        bignum *power = bn_from_int(1);
+    for (;;) {
+        bignum *power = bn_pow(guess, (uint64_t)(n - 1));
         if (!power) {
             bn_free(guess);
             bn_free(n_bn);
             bn_free(n_minus_1);
             return NULL;
-        }
-        for (int64_t i = 0; i < n - 1; i++) {
-            bignum *temp = bn_mul(power, guess);
-            bn_free(power);
-            power = temp;
-            if (!power) {
-                bn_free(guess);
-                bn_free(n_bn);
-                bn_free(n_minus_1);
-                return NULL;
-            }
         }
 
         // Compute base / guess^(n-1)
@@ -710,9 +699,10 @@ static bignum *bn_approx_nth_root(const bignum *base, int64_t n)
             return NULL;
         }
 
-        // Check convergence
+        // A fixed iteration limit can discard an exact root before the
+        // descending sequence converges, especially for high degrees.
         int cmp = bn_cmp(new_guess, guess);
-        if (cmp == 0) {
+        if (cmp >= 0) {
             bn_free(new_guess);
             break;
         }
@@ -733,19 +723,10 @@ static bignum *bn_exact_nth_root(const bignum *base, int64_t n)
         return NULL;
 
     // Verify: guess^n == base
-    bignum *check = bn_from_int(1);
+    bignum *check = bn_pow(guess, (uint64_t)n);
     if (!check) {
         bn_free(guess);
         return NULL;
-    }
-    for (int64_t i = 0; i < n; i++) {
-        bignum *temp = bn_mul(check, guess);
-        bn_free(check);
-        check = temp;
-        if (!check) {
-            bn_free(guess);
-            return NULL;
-        }
     }
 
     if (bn_cmp(check, base) == 0) {
@@ -756,6 +737,35 @@ static bignum *bn_exact_nth_root(const bignum *base, int64_t n)
     bn_free(check);
     bn_free(guess);
     return NULL; // Not a perfect nth power
+}
+
+static unsigned inexact_rational_sqrt(unsigned numerator, unsigned denominator,
+                                      const char *name)
+{
+    double num_top, den_top;
+    size_t num_scale, den_scale;
+    bool num_negative, den_negative;
+    if (!exact_integer_top_double(numerator, &num_top, &num_scale,
+                                  &num_negative) ||
+        !exact_integer_top_double(denominator, &den_top, &den_scale,
+                                  &den_negative) ||
+        den_top == 0.0 || num_negative != den_negative) {
+        show_error("%s: invalid nonnegative rational", name);
+        return TOK_ERROR;
+    }
+    // Limbs have an even number of bits, so halving their exponent is exact.
+    // Taking the root before restoring the scale avoids overflow/underflow
+    // of the rational itself when its square root is still representable.
+    double result = sqrt(num_top / den_top);
+    size_t delta = num_scale >= den_scale ? num_scale - den_scale
+                                         : den_scale - num_scale;
+    if (delta > (size_t)INT_MAX / (LIMB_BITS / 2)) {
+        result = num_scale >= den_scale ? HUGE_VAL : 0.0;
+    } else {
+        int exponent = (int)(delta * (LIMB_BITS / 2));
+        result = scalbn(result, num_scale >= den_scale ? exponent : -exponent);
+    }
+    return store_inexact(result);
 }
 
 static unsigned sqrt_value(unsigned arg, const char *name)
@@ -776,6 +786,26 @@ static unsigned sqrt_value(unsigned arg, const char *name)
             real = b / (2 * imag);
         }
         return make_complex_inexact(real, imag);
+    }
+
+    bool negative_exact = IS_RATIONAL(arg)
+                              ? is_negative_number(CELL_CAR(arg))
+                              : IS_EXACT_INT(arg) && is_negative_number(arg);
+    if (negative_exact) {
+        // Negate in the exact tower before finding the magnitude's root.
+        // Going through double first can turn a nearby non-square into a
+        // square, or overflow a finite bignum whose square root is finite.
+        GC_GUARD;
+        unsigned magnitude = prim_minus(1, &arg);
+        if (magnitude == TOK_ERROR)
+            return TOK_ERROR;
+        gc_protect(&magnitude);
+        unsigned imaginary = sqrt_value(magnitude, name);
+        if (imaginary == TOK_ERROR)
+            return TOK_ERROR;
+        gc_protect(&imaginary);
+        unsigned real = store(0);
+        return store_complex(real, imaginary);
     }
 
     if (IS_RATIONAL(arg)) {
@@ -799,6 +829,7 @@ static unsigned sqrt_value(unsigned arg, const char *name)
             }
             bn_free(sqrt_num);
             bn_free(sqrt_denom);
+            return inexact_rational_sqrt(num_cell, denom_cell, name);
         }
     }
 
@@ -852,24 +883,7 @@ static unsigned sqrt_value(unsigned arg, const char *name)
         GC_GUARD;
         unsigned real_part = store(0);
         gc_protect(&real_part);
-        unsigned imag_part;
-        // Strict: -(double)INT64_MAX rounds up to -2^63, so >= would admit
-        // x = INT64_MIN whose negation overflows the int64_t cast below
-        if (exact_integer_arg && x > -(double)INT64_MAX) {
-            int64_t m = (int64_t)(-x);
-            int64_t r = (int64_t)sqrt((double)m);
-            uint64_t um = (uint64_t)m;
-            if ((uint64_t)r * (uint64_t)r == um)
-                imag_part = store(r);
-            else if (r > 0 && (uint64_t)(r - 1) * (uint64_t)(r - 1) == um)
-                imag_part = store(r - 1);
-            else if ((uint64_t)(r + 1) * (uint64_t)(r + 1) == um)
-                imag_part = store(r + 1);
-            else
-                imag_part = store_inexact(sqrt(-x));
-        } else {
-            imag_part = store_inexact(sqrt(-x));
-        }
+        unsigned imag_part = store_inexact(sqrt(-x));
         gc_protect(&imag_part);
         return store_complex(real_part, imag_part);
     }
@@ -1082,33 +1096,15 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned argc,
                     uint64_t p =
                         neg_exp ? -(uint64_t)exp_numer : (uint64_t)exp_numer;
 
-                    bignum *num_power = bn_from_int(1);
-                    bignum *den_power = bn_from_int(1);
+                    // Use repeated squaring: even a unit base can have an
+                    // enormous numerator in its rational exponent.
+                    bignum *num_power = bn_pow(num_root, p);
+                    bignum *den_power = bn_pow(den_root, p);
                     if (!num_power || !den_power) {
                         free_bignum_pair(num_power, den_power);
                         free_bignum_pair(num_root, den_root);
                         show_error("expt: out of memory");
                         return TOK_ERROR;
-                    }
-                    for (uint64_t i = 0; i < p; i++) {
-                        bignum *temp = bn_mul(num_power, num_root);
-                        bn_free(num_power);
-                        num_power = temp;
-                        if (!num_power) {
-                            bn_free(den_power);
-                            free_bignum_pair(num_root, den_root);
-                            show_error("expt: out of memory");
-                            return TOK_ERROR;
-                        }
-                        temp = bn_mul(den_power, den_root);
-                        bn_free(den_power);
-                        den_power = temp;
-                        if (!den_power) {
-                            bn_free(num_power);
-                            free_bignum_pair(num_root, den_root);
-                            show_error("expt: out of memory");
-                            return TOK_ERROR;
-                        }
                     }
                     free_bignum_pair(num_root, den_root);
 

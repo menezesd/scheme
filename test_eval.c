@@ -167,6 +167,7 @@ static unsigned eval_string_gc(const char *src, unsigned *env_ptr)
         return TOK_ERROR;
     set_alloc_gc_root(env_ptr);
     unsigned result = eval_obj(expr, *env_ptr);
+    set_alloc_gc_root(NULL);
     return result;
 }
 
@@ -1334,6 +1335,105 @@ TEST(compiled_callcc_result_is_procedure)
     unsigned result =
         compiled_eval_string("(procedure? (call/cc call/cc))", env);
     ASSERT(is_bool(result, 1));
+    PASS();
+}
+
+TEST(eval_can_invoke_vm_continuation)
+{
+    unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
+    unsigned cont =
+        compiled_eval_string("(call/cc (lambda (k) k))", env);
+    ASSERT(IS_CELL(cont) && CELL_TYPE(cont) == BT_VMCONT);
+    gc_protect(&cont);
+
+    unsigned name = atom_from_string("saved-vm-continuation");
+    gc_protect(&name);
+    defvar(name, cont, env);
+
+    unsigned result = eval_string("(saved-vm-continuation 42)", env);
+    ASSERT(is_int(result, 42));
+    PASS();
+}
+
+TEST(eval_vm_continuation_preserves_multiple_values)
+{
+    unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
+
+    // Capture a VM continuation inside a call-with-values producer.  The
+    // first return gives list one value (the continuation itself), so C can
+    // recover and install it for the interpreter to invoke later.
+    unsigned captured = compiled_eval_string(
+        "(call-with-values (lambda () (call/cc (lambda (k) k))) list)", env);
+    ASSERT(IS_PAIR(captured) && cdr(captured) == 0);
+    gc_protect(&captured);
+    unsigned cont = car(captured);
+    ASSERT(IS_CELL(cont) && CELL_TYPE(cont) == BT_VMCONT);
+    gc_protect(&cont);
+
+    unsigned name = atom_from_string("saved-vm-values-continuation");
+    gc_protect(&name);
+    defvar(name, cont, env);
+
+    // With no VM currently active, the evaluator uses the temporary-VM path.
+    // Re-entering the producer must still deliver zero or several values to
+    // call-with-values exactly as a native VM continuation invocation does.
+    unsigned result = eval_string("(saved-vm-values-continuation)", env);
+    ASSERT(result == 0);
+
+    result = eval_string("(saved-vm-values-continuation 1 2)", env);
+    ASSERT(IS_PAIR(result));
+    ASSERT(is_int(car(result), 1));
+    ASSERT(IS_PAIR(cdr(result)));
+    ASSERT(is_int(cadr(result), 2));
+    ASSERT(cddr(result) == 0);
+    PASS();
+}
+
+TEST(interpreted_vm_continuation_call_transfers_active_vm)
+{
+    unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
+
+    // These are legacy interpreted closures.  A compiled caller therefore
+    // enters eval_cps from vm_apply before each saved VM continuation is used.
+    ASSERT(eval_string(
+               "(define invoke-vm-k (lambda (k) (+ 100 (k 41))))", env) !=
+           TOK_ERROR);
+    ASSERT(eval_string(
+               "(define invoke-vm-k-many (lambda (k) (begin (k 7 8) 999)))",
+               env) != TOK_ERROR);
+    ASSERT(eval_string(
+               "(define invoke-vm-k-zero (lambda (k) (begin (k) 999)))", env) !=
+           TOK_ERROR);
+
+    // Invoking k abandons both the interpreted call and the rest of the
+    // call/cc body.  The restored VM resumes at the continuation of call/cc.
+    unsigned result = compiled_eval_string(
+        "(+ 1 (call/cc (lambda (k) (+ 10 (invoke-vm-k k)))))", env);
+    ASSERT(is_int(result, 42));
+
+    result = compiled_eval_string(
+        "(call-with-values"
+        "  (lambda () (call/cc (lambda (k) (invoke-vm-k-many k))))"
+        "  list)",
+        env);
+    ASSERT(IS_PAIR(result));
+    ASSERT(is_int(car(result), 7));
+    ASSERT(IS_PAIR(cdr(result)));
+    ASSERT(is_int(cadr(result), 8));
+    ASSERT(cddr(result) == 0);
+
+    result = compiled_eval_string(
+        "(call-with-values"
+        "  (lambda () (call/cc (lambda (k) (invoke-vm-k-zero k))))"
+        "  list)",
+        env);
+    ASSERT(result == 0);
     PASS();
 }
 
@@ -3076,6 +3176,56 @@ TEST(eval_sqrt_preserves_exact_very_large_bignum_squares)
     PASS();
 }
 
+TEST(eval_sqrt_negative_exact_values_preserve_magnitude)
+{
+    GC_GUARD;
+    unsigned env = default_environment();
+    gc_protect(&env);
+    const char *cases[] = {
+        "(not (exact? (sqrt -18014398509481985)))",
+        "(exact? (sqrt -18014398777917441))",
+        "(= (imag-part (sqrt -18014398777917441)) 134217729)",
+        "(= (expt (sqrt -18014398777917441) 2) -18014398777917441)",
+        "(= (imag-part (sqrt -9/16)) 3/4)",
+        "(exact? (sqrt -9/16))",
+        "(= (imag-part (sqrt (- (expt 10 400)))) (expt 10 200))",
+        "(exact? (sqrt (- (expt 10 400))))",
+        "(finite? (imag-part (sqrt (- (+ (expt 10 400) 1)))))",
+        "(> (imag-part (sqrt -9223372036854775808)) 3000000000)",
+        "(not (exact? (sqrt -9223372036854775808)))",
+        "(= (sqrt -4) (make-rectangular 0 2))",
+        "(= (sqrt -4.0) (make-rectangular 0.0 2.0))",
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        ASSERT(eval_string(cases[i], env) == ctx.atom_true);
+        ASSERT(compiled_eval_string(cases[i], env) == ctx.atom_true);
+    }
+    PASS();
+}
+
+TEST(eval_sqrt_rational_scales_before_conversion)
+{
+    GC_GUARD;
+    unsigned env = default_environment();
+    gc_protect(&env);
+    const char *cases[] = {
+        "(let ((x (sqrt (/ 2 (expt 10 400))))) (and (> x 1.4e-200) (< x 1.5e-200)))",
+        "(let ((x (sqrt (/ (expt 10 400) 3)))) (and (> x 5.7e199) (< x 5.8e199)))",
+        "(let ((x (sqrt (/ (expt 10 4000) (+ (expt 10 4000) 1))))) "
+        "  (and (> x 0.99) (<= x 1.0)))",
+        "(let ((x (imag-part (sqrt (/ -2 (expt 10 400)))))) "
+        "  (and (> x 1.4e-200) (< x 1.5e-200)))",
+        "(let ((x (sqrt 2/3))) (and (> x 0.8164) (< x 0.8165)))",
+        "(= (sqrt 9/16) 3/4)",
+        "(exact? (sqrt 9/16))",
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        ASSERT(eval_string(cases[i], env) == ctx.atom_true);
+        ASSERT(compiled_eval_string(cases[i], env) == ctx.atom_true);
+    }
+    PASS();
+}
+
 TEST(eval_exact_to_inexact_huge_bignum_overflows_to_infinity)
 {
     const char *src =
@@ -3086,6 +3236,21 @@ TEST(eval_exact_to_inexact_huge_bignum_overflows_to_infinity)
     gc_protect(&env);
     ASSERT(is_bool(eval_string(src, env), 1));
     ASSERT(is_bool(compiled_eval_string(src, env), 1));
+    PASS();
+}
+
+TEST(eval_rational_to_inexact_preserves_mantissa_bits)
+{
+    GC_GUARD;
+    unsigned env = default_environment();
+    gc_protect(&env);
+    const char *src =
+        "(let ((a (+ (expt 2 96) (expt 2 63))) (b (+ (expt 2 96) 1))) "
+        "  (and (= (exact->inexact (/ a b)) 1.0000000001164153) "
+        "       (= (exact->inexact (/ b a)) 0.9999999998835847) "
+        "       (= (exact->inexact (/ (- a) b)) -1.0000000001164153)))";
+    ASSERT(eval_string(src, env) == ctx.atom_true);
+    ASSERT(compiled_eval_string(src, env) == ctx.atom_true);
     PASS();
 }
 
@@ -3307,6 +3472,34 @@ TEST(eval_exact_tiny_complex_imag_part_is_not_zero)
     PASS();
 }
 
+TEST(eval_exact_rational_exponent)
+{
+    GC_GUARD;
+    unsigned env = default_environment();
+    gc_protect(&env);
+    const char *cases[] = {
+        "(= (expt 1 9223372036854775807/3) 1)",
+        "(= (expt 1 -9223372036854775808/3) 1)",
+        "(= (expt 0 9223372036854775807/3) 0)",
+        "(= (expt 16 3/2) 64)",
+        "(= (expt 16 -3/2) 1/64)",
+        "(= (expt 9/4 3/2) 27/8)",
+        "(= (expt 9/4 -3/2) 8/27)",
+        "(exact? (expt 9/4 -3/2))",
+        "(= (expt (expt 513 999) 1/999) 513)",
+        "(exact? (expt (expt 513 999) 1/999))",
+        "(= (expt (expt 513/512 999) -1/999) 512/513)",
+        "(= (expt 1 1/999) 1)",
+        "(and (> (sqrt 3) 1) (< (sqrt 3) 2))",
+        "(and (> (expt 7 1/3) 1) (< (expt 7 1/3) 2))",
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        ASSERT(eval_string(cases[i], env) == ctx.atom_true);
+        ASSERT(compiled_eval_string(cases[i], env) == ctx.atom_true);
+    }
+    PASS();
+}
+
 TEST(eval_math_rejects_non_numbers)
 {
     unsigned env = default_environment();
@@ -3462,6 +3655,19 @@ TEST(eval_compiled_parity_macro_introduced_bindings)
         "                     (list a b))))))) "
         "  (let ((tmp 'outer) (a 'left) (b 'right)) "
         "    (list tmp (swap-list a b))))"));
+    PASS();
+}
+
+TEST(compiled_iife_rest_parameter_shadows_stack_local)
+{
+    ASSERT(eval_compiled_equal(
+        "(begin "
+        "  (define (f x) ((lambda x x) 1 2)) "
+        "  (f 99))"));
+    ASSERT(eval_compiled_equal(
+        "(begin "
+        "  (define (f x) ((lambda (y . x) x) 1 2 3)) "
+        "  (f 99))"));
     PASS();
 }
 
@@ -6295,7 +6501,8 @@ static bool code_tree_jump_targets_zero(const code_object *code)
         unsigned size = instruction_size(code->code[ip]);
         if (size == 0 || size > code->code_len - ip)
             break;
-        if (code->code[ip] == OP_JUMP && code->code[ip + 1] == 0)
+        if ((code->code[ip] == OP_JUMP || code->code[ip] == OP_RECURSE) &&
+            code->code[ip + 1] == 0)
             return true;
         ip += size;
     }
@@ -6464,6 +6671,8 @@ TEST(trmc_transforms_cons_over_a_self_tail_call)
     unsigned env = default_environment();
     GC_GUARD;
     gc_protect(&env);
+    // HOLE mode requires stable primitives as well as a capture-free body.
+    mark_immutable_environment(env);
     code_object *code = trmc_compile(TRMC_BUILD, env);
     ASSERT(code != NULL);
     ASSERT(code_tree_has_opcode(code, OP_TRMC_INIT));
@@ -6483,6 +6692,205 @@ TEST(trmc_loop_jump_clears_the_accumulator_init)
     ASSERT(code != NULL);
     ASSERT(code_tree_has_opcode(code, OP_TRMC_INIT));
     ASSERT(!code_tree_jump_targets_zero(code));
+    PASS();
+}
+
+TEST(compiled_recursive_calls_respect_rebinding)
+{
+    const char *cases[] = {
+        "(let ((saved #f) (first #f) (phase 0)) "
+        "  (letrec ((f (lambda (n) (if (= n 0) '() (cons n (f (- n 1))))))) "
+        "    (let ((old f)) "
+        "      (set! f (lambda (n) (call/cc (lambda (k) (set! saved k) '(a))))) "
+        "      (let ((answer (old 2))) "
+        "        (if (= phase 0) "
+        "            (begin (set! first answer) (set! phase 1) (saved '(b))) "
+        "            (list first answer))))))",
+        "(letrec ((f (lambda (n) (if (= n 0) 0 "
+        "  (begin (set! f (lambda (n) 99)) (f (- n 1))))))) (f 2))",
+        "(letrec ((f (lambda (n) (if (= n 0) 0 (f (- n 1)))))) "
+        "  (let ((old f)) (set! f (lambda (n) 99)) (old 2)))",
+        "(letrec ((f (lambda (n) (if (= n 0) 0 "
+        "  (+ (begin (set! f (lambda (n) 99)) n) (f (- n 1))))))) (f 2))",
+        "(letrec ((f (lambda (f) (f 2)))) (f (lambda (n) 99)))",
+        "(let ((other #f)) "
+        "  (let ((make (lambda (x) "
+        "    (letrec ((f (lambda (n) (if (= n 0) x "
+        "      (begin (set! f other) (f (- n 1))))))) f)))) "
+        "    (let ((one (make 1)) (two (make 2))) (set! other two) (one 1))))",
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
+        ASSERT(eval_compiled_equal(cases[i]));
+    PASS();
+}
+
+TEST(compiled_primitive_calls_respect_rebinding)
+{
+    const char *cases[] = {
+        "(let ((f (lambda (x) (+ x 1)))) (set! + (lambda (a b) 42)) (f 2))",
+        "(let ((f (lambda () (+ 2 3)))) (set! + (lambda (a b) 42)) (f))",
+        "(let ((f (lambda (x) (car x)))) (set! car (lambda (x) 42)) (f '(1)))",
+        "(let ((f (lambda (x) (list x)))) (set! list (lambda (x) 42)) (f 1))",
+        "(let ((f (lambda (x) (vector-ref x 0)))) "
+        "  (set! vector-ref (lambda (x i) 42)) (f '#(1)))",
+        "(let ((f (lambda (x) (call/cc x)))) "
+        "  (set! call/cc (lambda (x) 42)) (f (lambda (k) 1)))",
+        "(let ((f (lambda (x) (car x)))) (set! car length) (f '(1 2 3)))",
+        "(let ((count 0)) "
+        "  (let ((f (lambda (x) (+ x 1)))) "
+        "    (set! + (lambda (a b) (set! count (- count -1)) 42)) "
+        "    (list (f 1) count)))",
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        if (!eval_compiled_equal(cases[i])) {
+            fprintf(stderr, "rebound primitive case %zu: %s\n", i, cases[i]);
+            ASSERT(false);
+        }
+    }
+    PASS();
+}
+
+TEST(compiled_rebinding_preserves_vm_evaluation_order)
+{
+    // Vesper's VM evaluates arguments before the callee; the CPS engine
+    // evaluates the callee first. Compare transformed and ordinary VM calls
+    // here because Scheme permits either order, and the mutation observes it.
+    const char *cases[][2] = {
+        {"(+ 2 (begin (set! + (lambda (a b) 42)) 3))",
+         "((if #t + +) 2 (begin (set! + (lambda (a b) 42)) 3))"},
+        {"(letrec ((f (lambda (n) (if (= n 0) (begin (set! cons +) 0) "
+         "  (cons n (f (- n 1))))))) (f 3))",
+         "(letrec ((f (lambda (n) (if (= n 0) (begin (set! cons +) 0) "
+         "  ((if #t cons cons) n (f (- n 1))))))) (f 3))"},
+        {"(letrec ((f (lambda (n) (if (= n 0) "
+         "  (begin (set! + (lambda (a b) (cons a b))) '()) "
+         "  (+ n (f (- n 1))))))) (f 3))",
+         "(letrec ((f (lambda (n) (if (= n 0) "
+         "  (begin (set! + (lambda (a b) (cons a b))) '()) "
+         "  ((if #t + +) n (f (- n 1))))))) (f 3))"},
+        {"(letrec ((f (lambda (n) (if (= n 0) "
+         "  (begin (set! append (lambda (a b) (cons a b))) '()) "
+         "  (append (list n) (f (- n 1))))))) (f 3))",
+         "(letrec ((f (lambda (n) (if (= n 0) "
+         "  (begin (set! append (lambda (a b) (cons a b))) '()) "
+         "  ((if #t append append) (list n) (f (- n 1))))))) (f 3))"},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        GC_GUARD;
+        unsigned env = default_environment();
+        gc_protect(&env);
+        unsigned actual = compiled_eval_string(cases[i][0], env);
+        gc_protect(&actual);
+        env = default_environment();
+        unsigned expected = compiled_eval_string(cases[i][1], env);
+        ASSERT(actual != TOK_ERROR && expected != TOK_ERROR);
+        ASSERT(deep_equal(actual, expected));
+    }
+    PASS();
+}
+
+TEST(compiled_lookup_observes_new_nearer_bindings)
+{
+    GC_GUARD;
+    unsigned env = default_environment();
+    gc_protect(&env);
+    // The original binding is immutable, but a nearer mutable frame can
+    // acquire a shadowing definition after a closure has been compiled/run.
+    mark_immutable_environment(env);
+    env = extend_env_empty(env);
+    ASSERT(compiled_eval_string("(define read-plus (lambda () +))", env) != TOK_ERROR);
+    ASSERT(compiled_eval_string("(define add (lambda (x) (+ x 1)))", env) != TOK_ERROR);
+    ASSERT(IS_BUILTIN(compiled_eval_string("(read-plus)", env)));
+    ASSERT(is_int(compiled_eval_string("(add 2)", env), 3));
+    ASSERT(compiled_eval_string("(define + (lambda (a b) 42))", env) != TOK_ERROR);
+    ASSERT(is_int(compiled_eval_string("((read-plus) 2 3)", env), 42));
+    ASSERT(is_int(compiled_eval_string("(add 2)", env), 42));
+    PASS();
+}
+
+TEST(trmc_rebound_operator_can_capture_and_resume)
+{
+    const char *prefix =
+        "(let ((original-cons cons) (saved #f) (first #f) (phase 0)) "
+        "  (letrec ((f (lambda (n) "
+        "    (if (= n 0) "
+        "      (begin (set! cons (lambda (a b) "
+        "        (call/cc (lambda (k) "
+        "          (if (= a 2) (set! saved k)) (original-cons a b))))) '()) "
+        "      (";
+    const char *suffix = " n (f (- n 1))))))) "
+        "    (let ((answer (f 3))) "
+        "      (if (= phase 0) "
+        "        (begin (set! first answer) (set! phase 1) (saved '(x))) "
+        "        (list first answer)))))";
+    GC_GUARD;
+    unsigned env = default_environment();
+    gc_protect(&env);
+    char source[2048];
+    snprintf(source, sizeof(source), "%scons%s", prefix, suffix);
+    code_object *code = trmc_compile(source, env);
+    ASSERT(code && code_tree_has_opcode(code, OP_TRMC_PUSH));
+    unsigned actual = compiled_eval_string(source, env);
+    gc_protect(&actual);
+    env = default_environment();
+    snprintf(source, sizeof(source), "%s(if #t cons cons)%s", prefix, suffix);
+    unsigned expected = compiled_eval_string(source, env);
+    ASSERT(actual != TOK_ERROR && expected != TOK_ERROR);
+    ASSERT(deep_equal(actual, expected));
+    unsigned answer = eval_string("'((3 2 1) (3 x))", env);
+    ASSERT(deep_equal(actual, answer));
+    PASS();
+}
+
+TEST(let_initializer_continuations_keep_independent_bindings)
+{
+    const char *cases[] = {
+        "(let ((saved #f) (old #f) (phase 0)) "
+        "  (let ((x (call/cc (lambda (k) (set! saved k) 1)))) "
+        "    (if (= phase 0) "
+        "      (begin (set! old (lambda () x)) (set! phase 1) (saved 2)) "
+        "      (list (old) x))))",
+        "(let ((kx #f) (ky #f) (old-ky #f) (phase 0)) "
+        "  (let ((x (call/cc (lambda (k) (set! kx k) 1))) "
+        "        (y (call/cc (lambda (k) (set! ky k) 10)))) "
+        "    (cond ((= phase 0) (set! old-ky ky) (set! phase 1) (kx 2)) "
+        "          ((= phase 1) (set! phase 2) (old-ky 20)) "
+        "          (else (list x y)))))",
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
+        ASSERT(eval_compiled_equal(cases[i]));
+    PASS();
+}
+
+TEST(trmc_mixed_operators_share_one_accumulator)
+{
+    const char *list_source =
+        "(letrec ((loop (lambda (k) (if (= k 0) '() "
+        "  (if (= (modulo k 2) 0) (cons k (loop (- k 1))) "
+        "    (append (list k k) (loop (- k 1)))))))) (loop 40))";
+    const char *arithmetic_source =
+        "(letrec ((loop (lambda (k) (if (= k 0) 0 "
+        "  (if (= (modulo k 2) 0) (+ k (loop (- k 1))) "
+        "    (- k (loop (- k 1)))))))) (loop 40))";
+    for (unsigned immutable = 0; immutable < 2; immutable++) {
+        GC_GUARD;
+        unsigned env = default_environment();
+        gc_protect(&env);
+        if (immutable)
+            mark_immutable_environment(env);
+        code_object *code = trmc_compile(list_source, env);
+        ASSERT(code && code_tree_has_trmc_mode(code, immutable ? TRMC_MODE_HOLE
+                                                               : TRMC_MODE_FOLD));
+        unsigned result = compiled_eval_string(list_source, env);
+        gc_protect(&result);
+        unsigned expected = eval_string(list_source, env);
+        ASSERT(result != TOK_ERROR && expected != TOK_ERROR);
+        ASSERT(deep_equal(result, expected));
+        code = trmc_compile(arithmetic_source, env);
+        ASSERT(code && code_tree_has_trmc_mode(code, TRMC_MODE_FOLD));
+        result = compiled_eval_string(arithmetic_source, env);
+        ASSERT(is_int(result, 40));
+    }
     PASS();
 }
 
@@ -6592,6 +7000,8 @@ TEST(trmc_follows_cond_clauses)
     gc_protect(&env);
     // cond pushes no environment frame, so a site in a clause body is at the
     // same depth as one directly under an if.
+    // HOLE mode requires stable primitives as well as a capture-free body.
+    mark_immutable_environment(env);
     code_object *code = trmc_compile(
         "(define trmc-cond (lambda (n)"
         "  (letrec ((loop (lambda (k)"
@@ -6602,14 +7012,10 @@ TEST(trmc_follows_cond_clauses)
     ASSERT(code != NULL);
     ASSERT(code_tree_has_opcode(code, OP_TRMC_APPEND));
     ASSERT(code_tree_has_trmc_mode(code, TRMC_MODE_HOLE));
-    ASSERT(compiled_eval_string(
-               "(define trmc-cond (lambda (n)"
-               "  (letrec ((loop (lambda (k)"
-               "    (cond ((= k 0) '())"
-               "          (else (cons k (loop (- k 1))))))))"
-               "    (loop n))))",
-               env) != TOK_ERROR);
-    unsigned len = compiled_eval_string("(length (trmc-cond 200000))", env);
+    unsigned len = compiled_eval_string(
+        "(length (letrec ((loop (lambda (k)"
+        "  (cond ((= k 0) '()) (else (cons k (loop (- k 1))))))))"
+        "  (loop 200000)))", env);
     ASSERT(is_int(len, 200000));
     PASS();
 }
@@ -6725,6 +7131,8 @@ TEST(trmc_transforms_append_over_a_self_tail_call)
     unsigned env = default_environment();
     GC_GUARD;
     gc_protect(&env);
+    // HOLE mode requires stable primitives as well as a capture-free body.
+    mark_immutable_environment(env);
     code_object *code = trmc_compile(
         "(define trmc-spans (lambda (n)"
         "  (letrec ((loop (lambda (k)"
@@ -6973,6 +7381,9 @@ int main(void)
     RUN_TEST(compiled_callcc_escape);
     RUN_TEST(compiled_callcc_accepts_callcc);
     RUN_TEST(compiled_callcc_result_is_procedure);
+    RUN_TEST(eval_can_invoke_vm_continuation);
+    RUN_TEST(eval_vm_continuation_preserves_multiple_values);
+    RUN_TEST(interpreted_vm_continuation_call_transfers_active_vm);
     RUN_TEST(compiled_callcc_rejects_wrong_arity);
     RUN_TEST(eval_call_with_values_accepts_zero_values);
     RUN_TEST(eval_call_with_values_zero_values_to_list);
@@ -7083,7 +7494,10 @@ int main(void)
     RUN_TEST(eval_magnitude_preserves_bignum);
     RUN_TEST(eval_sqrt_preserves_exact_bignum_squares);
     RUN_TEST(eval_sqrt_preserves_exact_very_large_bignum_squares);
+    RUN_TEST(eval_sqrt_negative_exact_values_preserve_magnitude);
+    RUN_TEST(eval_sqrt_rational_scales_before_conversion);
     RUN_TEST(eval_exact_to_inexact_huge_bignum_overflows_to_infinity);
+    RUN_TEST(eval_rational_to_inexact_preserves_mantissa_bits);
     RUN_TEST(eval_exact_to_inexact_huge_rational_stays_finite);
     RUN_TEST(eval_string_to_number_radix_bignum);
     RUN_TEST(eval_string_to_number_radix_rejects_invalid);
@@ -7098,6 +7512,7 @@ int main(void)
     RUN_TEST(eval_exact_rejects_non_numbers);
     RUN_TEST(eval_numtower_rejects_non_numbers);
     RUN_TEST(eval_exact_tiny_complex_imag_part_is_not_zero);
+    RUN_TEST(eval_exact_rational_exponent);
     RUN_TEST(eval_math_rejects_non_numbers);
     RUN_TEST(compiled_div_fixnum_boundary);
     RUN_TEST(compiled_constant_folding_releases_gc_roots);
@@ -7109,6 +7524,7 @@ int main(void)
     RUN_TEST(eval_compiled_parity_bignum_promotion);
     RUN_TEST(eval_compiled_parity_exact_rationals);
     RUN_TEST(eval_compiled_parity_macro_introduced_bindings);
+    RUN_TEST(compiled_iife_rest_parameter_shadows_stack_local);
     RUN_TEST(compiled_macro_pattern_roots_survive_rational_gc);
     RUN_TEST(compiled_letrec_tail_call_many_args);
     RUN_TEST(compiled_let_forms_preserve_enclosing_tail_context);
@@ -7219,6 +7635,13 @@ int main(void)
     RUN_TEST(code_object_stays_registered_when_the_index_cannot_grow);
     RUN_TEST(trmc_transforms_cons_over_a_self_tail_call);
     RUN_TEST(trmc_loop_jump_clears_the_accumulator_init);
+    RUN_TEST(compiled_recursive_calls_respect_rebinding);
+    RUN_TEST(compiled_primitive_calls_respect_rebinding);
+    RUN_TEST(compiled_rebinding_preserves_vm_evaluation_order);
+    RUN_TEST(compiled_lookup_observes_new_nearer_bindings);
+    RUN_TEST(trmc_rebound_operator_can_capture_and_resume);
+    RUN_TEST(trmc_mixed_operators_share_one_accumulator);
+    RUN_TEST(let_initializer_continuations_keep_independent_bindings);
     RUN_TEST(trmc_uses_fold_mode_when_the_element_can_capture);
     RUN_TEST(trmc_uses_fold_mode_when_the_base_case_can_capture);
     RUN_TEST(trmc_declines_when_cons_is_rebound);

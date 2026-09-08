@@ -29,6 +29,8 @@ static void *calloc_array_plus_one(unsigned count, size_t elem_size)
 bool is_jump_opcode(unsigned op)
 {
     switch (op) {
+    case OP_GUARD_PRIMITIVE:
+    case OP_RECURSE:
     case OP_JUMP:
     case OP_JUMPIF:
     case OP_JUMPIFNOT:
@@ -57,6 +59,9 @@ bool is_jump_opcode(unsigned op)
 unsigned instruction_size(unsigned op)
 {
     switch (op) {
+    case OP_GUARD_PRIMITIVE:
+        return 8;
+    case OP_RECURSE:
     case OP_LOOKUP:
     case OP_LOOKUP_ADD1:
     case OP_LOOKUP_SUB1:
@@ -68,6 +73,7 @@ unsigned instruction_size(unsigned op)
     case OP_GT_JUMPIFNOT:
     case OP_LE_JUMPIFNOT:
     case OP_GE_JUMPIFNOT:
+    case OP_TRMC_PUSH:
     case OP_RETURN_LOCALS:
     case OP_LOCAL_GET:
     case OP_LOCAL_SET:
@@ -756,20 +762,16 @@ void peephole_optimize(code_object *code)
         // Copy opcode
         c[write++] = op;
 
-        // Handle operands, fixing jump targets
-        if (is_jump_opcode(op)) {
-            unsigned old_target = c[read + 1];
-            unsigned new_target =
-                (old_target < len) ? offset_map[old_target] : final_len;
-            c[write++] = new_target;
-            read += 2;
-        } else {
-            // Copy remaining operands as-is
-            for (unsigned j = 1; j < size; j++) {
-                c[write++] = c[read + j];
-            }
-            read += size;
+        // Only the first operand is a branch target. Other operands (such
+        // as RECURSE's arity and lexical depth) are data even if their values
+        // happen to equal opcode numbers.
+        for (unsigned j = 1; j < size; j++) {
+            unsigned operand = c[read + j];
+            if (j == 1 && is_jump_opcode(op))
+                operand = operand < len ? offset_map[operand] : final_len;
+            c[write++] = operand;
         }
+        read += size;
     }
 
     code->code_len = write;
@@ -802,6 +804,8 @@ static const char *opcode_names[] = {
     [OP_CLOSURE] = "CLOSURE",
     [OP_CALL] = "CALL",
     [OP_TAILCALL] = "TAILCALL",
+    [OP_RECURSE] = "RECURSE",
+    [OP_GUARD_PRIMITIVE] = "GUARD_PRIMITIVE",
     [OP_RETURN] = "RETURN",
     [OP_JUMP] = "JUMP",
     [OP_JUMPIF] = "JUMPIF",
@@ -978,6 +982,16 @@ void disassemble(code_object *code, const char *name)
         }
 
         switch (op) {
+        case OP_GUARD_PRIMITIVE:
+            printf(" %u %s prim=%u argc=%u tail=%u", code->code[start + 1],
+                   disassemble_atom_name(code->code[start + 2]),
+                   code->code[start + 3], code->code[start + 4], code->code[start + 5]);
+            break;
+        case OP_RECURSE:
+            printf(" %u argc=%u depth=%u", code->code[start + 1],
+                   code->code[start + 2], code->code[start + 3]);
+            break;
+        case OP_TRMC_PUSH:
         case OP_CONST:
         case OP_CLOSURE:
             printf(" %u", code->code[start + 1]);

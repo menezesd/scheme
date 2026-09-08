@@ -171,16 +171,15 @@ unsigned numeric_compare(unsigned argc, unsigned *argv, cmp_op op)
     }
 
     slow_path:;
-    unsigned prev = argv[0];
-    gc_protect(&prev);
+    // Pair comparison can allocate while converting inexact values or
+    // cross-multiplying rationals. Read both operands from rooted argv on
+    // every iteration rather than carrying a stale local across a collection.
     for (unsigned i = 1; i < argc; i++) {
-        unsigned curr = argv[i];
         bool ok;
-        if (!compare_number_pair(prev, curr, op, name, &ok))
+        if (!compare_number_pair(argv[i - 1], argv[i], op, name, &ok))
             return TOK_ERROR;
         if (!ok)
             return ctx.atom_false;
-        prev = curr;
     }
     return ctx.atom_true;
 }

@@ -499,8 +499,10 @@ static bool handle_named_let(unsigned id, unsigned env, unsigned cont)
     gc_protect(&b);
     for (; b; b = cdr(b)) {
         unsigned binding = car(b);
+        gc_protect(&binding);
         list_append(&params, &params_tail, car(binding));
         list_append(&args, &args_tail, cadr(binding));
+        gc_unprotect(1);
     }
     gc_unprotect(1);
 
@@ -578,52 +580,25 @@ bool handle_let(unsigned id, unsigned env, unsigned cont)
     gc_protect(&env);
     gc_protect(&cont);
 
-    // Pre-allocate the full vars/vals lists once, up front (mirroring
-    // handle_letrec below), so handle_cont_let_vals only ever writes a
-    // specific, already-existing cell rather than destructively growing a
-    // shared list across steps - see the comment on CONT_LET_VALS in
-    // eval_cont.c for why that matters for multi-shot call/cc.
-    unsigned vars = 0, vals = 0;
-    unsigned vars_tail = 0, vals_tail = 0;
+    // Names can be shared, but values accumulated by initializer
+    // continuations must be immutable snapshots. The final step creates a
+    // fresh value list for each entry into the let body.
+    unsigned vars = 0, tail = 0;
     gc_protect(&vars);
-    gc_protect(&vals);
-    gc_protect(&vars_tail);
-    gc_protect(&vals_tail);
-
-    unsigned b_iter = bindings;
-    gc_protect(&b_iter);
-    for (; b_iter; b_iter = cdr(b_iter)) {
-        unsigned var = caar(b_iter);
-        unsigned vc = 0;
-        gc_protect(&vc);
-        vc = alloc_cons(var, 0);
-        unsigned vlc = alloc_cons(0, 0);
-        gc_unprotect(1); // vc
-        if (!vars) {
-            vars = vc;
-            vals = vlc;
-        } else {
-            cell_set_cdr(vars_tail, vc);
-            cell_set_cdr(vals_tail, vlc);
-        }
-        vars_tail = vc;
-        vals_tail = vlc;
-    }
-    gc_unprotect(1); // b_iter
+    gc_protect(&tail);
+    unsigned binding = bindings;
+    gc_protect(&binding);
+    for (; binding; binding = cdr(binding))
+        list_append(&vars, &tail, caar(binding));
 
     unsigned first_val_expr = cadr(car(bindings));
     gc_protect(&first_val_expr);
 
-    // data = (vars . (vals_ptr . (rest_bindings . (vals . body))))
-    // vals_ptr starts at the head of vals (the cell for binding 0).
-    unsigned inner3 = 0, inner2 = 0, inner1 = 0;
-    gc_protect(&inner3);
-    gc_protect(&inner2);
-    gc_protect(&inner1);
-    inner3 = alloc_cons(vals, body);
-    inner2 = alloc_cons(cdr(bindings), inner3);
-    inner1 = alloc_cons(vals, inner2);
-    unsigned data = alloc_cons(vars, inner1);
+    // data = (vars . (reversed-values . (remaining-bindings . body)))
+    unsigned inner = alloc_cons(cdr(bindings), body);
+    gc_protect(&inner);
+    inner = alloc_cons(0, inner);
+    unsigned data = alloc_cons(vars, inner);
     unsigned k = make_cont(CONT_LET_VALS, data, env, cont);
     tramp_eval(first_val_expr, env, k);
     return true;

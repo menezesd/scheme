@@ -34,6 +34,7 @@
 #include "utf8.h"
 #include <ctype.h>
 #include <errno.h>
+#include <float.h>
 #include <locale.h>
 #include <limits.h>
 #include <math.h>
@@ -741,9 +742,11 @@ static void maybe_major_after_minor(void)
 {
     unsigned old_gen_used = ctx.hptr - ctx.mmin;
     unsigned old_gen_size = ctx.nursery_start - ctx.mmin;
-    if (old_gen_used > old_gen_size * 8 / 10 && alloc_gc_root &&
-        *alloc_gc_root) {
-        *alloc_gc_root = gc(*alloc_gc_root);
+    if (old_gen_used > old_gen_size * 8 / 10) {
+        if (alloc_gc_root && *alloc_gc_root)
+            *alloc_gc_root = gc(*alloc_gc_root);
+        else
+            (void)gc(0);
     }
 }
 
@@ -768,8 +771,11 @@ unsigned alloc(void)
         }
 
         // Check if we're at 90% capacity - trigger major GC
-        if (ctx.hptr >= limit * 9 / 10 && alloc_gc_root && *alloc_gc_root) {
-            *alloc_gc_root = gc(*alloc_gc_root);
+        if (ctx.hptr >= limit * 9 / 10) {
+            if (alloc_gc_root && *alloc_gc_root)
+                *alloc_gc_root = gc(*alloc_gc_root);
+            else
+                (void)gc(0);
             // Recalculate limit after GC (we may have switched semispaces)
             limit = (ctx.hptr < SEMISPACE_SIZE) ? SEMISPACE_SIZE
                                                 : 2 * SEMISPACE_SIZE;
@@ -1042,6 +1048,10 @@ static void collect_vm_continuation_roots(vm_continuation *cont,
     unsigned fp = (cont->frames && cont->fp <= VM_MAX_FRAMES_SIZE)
                       ? cont->fp
                       : 0;
+    unsigned letrec_depth =
+        (cont->letrecs && cont->letrec_depth <= VM_MAX_STACK_SIZE)
+            ? cont->letrec_depth
+            : 0;
     unsigned letrec_saved_len =
         (cont->letrec_saved && cont->letrec_saved_len <= VM_MAX_STACK_SIZE)
             ? cont->letrec_saved_len
@@ -1051,10 +1061,13 @@ static void collect_vm_continuation_roots(vm_continuation *cont,
         cont->stack[i] = collector(cont->stack[i]);
     }
     cont->env = collector(cont->env);
+    cont->signal_handler = collector(cont->signal_handler);
     for (unsigned i = 0; i < fp; i++) {
         cont->frames[i].env = collector(cont->frames[i].env);
     }
-    cont->letrec_frame = collector(cont->letrec_frame);
+    for (unsigned i = 0; i < letrec_depth; i++) {
+        cont->letrecs[i].frame = collector(cont->letrecs[i].frame);
+    }
     for (unsigned i = 0; i < letrec_saved_len; i++) {
         cont->letrec_saved[i] = collector(cont->letrec_saved[i]);
     }
@@ -1339,11 +1352,12 @@ static bool numeric_cell_well_formed(unsigned x, bool allow_complex,
 }
 
 /*
- * Return the leading one or two limbs of an exact integer and the number of
- * omitted low limbs.  Keeping the scale separate lets rational conversion
- * divide two huge integers without first turning both into infinity.
+ * Return enough leading limbs for a double's significand and the number of
+ * omitted low limbs. The highest limb may contain only one significant bit,
+ * so two 32-bit limbs can give just 33 bits, silently discarding usable double
+ * precision. Keeping the scale separate also avoids premature overflow.
  */
-static bool exact_integer_top_double(unsigned value, double *top,
+bool exact_integer_top_double(unsigned value, double *top,
                                      size_t *omitted_limbs, bool *negative)
 {
     int64_t small;
@@ -1361,7 +1375,8 @@ static bool exact_integer_top_double(unsigned value, double *top,
             *negative = false;
             return true;
         }
-        size_t taken = bn->len < 2 ? bn->len : 2;
+        size_t needed = 1 + (DBL_MANT_DIG + LIMB_BITS - 1) / LIMB_BITS;
+        size_t taken = bn->len < needed ? bn->len : needed;
         size_t start = bn->len - taken;
         double leading = 0.0;
         for (size_t i = bn->len; i > start; i--)

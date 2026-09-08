@@ -469,6 +469,7 @@ static unsigned read_or_peek_char(FILE *fport, string_port *sport, int ptype,
         sport->last_read_valid = true;
         if (sport->source_string != ctx.atom_false)
             sport->source_pos_chars++;
+        sport->last_read_source_pos = sport->source_pos_chars;
     }
     return make_char((int)codepoint);
 }
@@ -798,6 +799,32 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
             return TOK_ERROR;
         if (ptype == 0 && !require_textual_file_port(fport, "unread-char"))
             return TOK_ERROR;
+        if (ptype == 1 && sport->source_string != ctx.atom_false &&
+            sport->last_read_valid) {
+            // Source mutations can change byte widths before the last read.
+            // Match the saved character position first, then locate that
+            // character in the current encoding. Reads since read-char must
+            // still invalidate pushback even if they consumed the same text.
+            size_t previous = 0;
+            const char *utf8_error = NULL;
+            bool valid = sport->source_pos_chars > 0 &&
+                sport->source_pos_chars == sport->last_read_source_pos &&
+                scheme_utf8_byte_offset_for_index(
+                    sport->data, sport->source_pos_chars - 1, false,
+                    &previous, &utf8_error);
+            uint32_t current = 0;
+            size_t after = previous;
+            if (valid)
+                valid = scheme_utf8_decode_next(sport->data, sport->len,
+                                               &after, &current, &utf8_error) &&
+                        after == sport->pos && current == (uint32_t)sport->last_read_char;
+            if (valid) {
+                sport->last_read_pos = previous;
+                sport->last_read_len = after - previous;
+            } else {
+                sport->last_read_valid = false;
+            }
+        }
         if (ptype == 1) {
             if (!sport->last_read_valid ||
                 sport->last_read_char != c ||

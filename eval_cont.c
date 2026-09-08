@@ -15,7 +15,8 @@
  *
  * ## GC Safety
  * Handlers must protect local variables across allocations. The val, data,
- * env, and next parameters are already on the shadow stack.
+ * env, and next parameters arrive by value: their caller's roots do not
+ * update these local copies. Root every copy used after an allocation.
  */
 
 #include "eval_internal.h"
@@ -224,78 +225,48 @@ static void handle_cont_cond_arrow(unsigned val, unsigned data, unsigned env,
 }
 
 /**
- * CONT_LET_VALS: Accumulate let binding values.
- * data = (vars . (vals_ptr . (rest_bindings . (vals . body))))
- * vars/vals are the complete, fixed-length lists for ALL bindings,
- * pre-allocated once by handle_let (mirroring handle_letrec's approach).
- * vals_ptr points at the specific, already-existing cell for the binding
- * whose result we're receiving; each step only ever writes that one
- * cell's car and passes an ADVANCED COPY of the pointer to the next
- * step - it never restructures the vars/vals lists themselves.
+ * CONT_LET_VALS: Accumulate initializer results without mutating a snapshot.
+ * data = (vars . (reversed-values . (remaining-bindings . body)))
  *
- * This matters for multi-shot call/cc: the previous implementation grew a
- * shared vars/vals list in place via cell_set_cdr as each binding's value
- * arrived. Since a continuation captured mid-let holds a direct reference
- * to that same list, reinvoking an EARLIER step's continuation (e.g. after
- * later steps had already run once and grown the list) made
- * list_last(vals) resolve to a cell claimed by a later binding, so the
- * write landed on the wrong slot and the list kept growing with duplicate
- * entries on every reinvocation. Writing through a per-step vals_ptr
- * captured by value sidesteps this entirely: reinvoking any step's
- * continuation always targets exactly the cell it originally captured.
+ * A continuation captured in an initializer may be resumed after an earlier
+ * body has returned closures over its bindings, or after another initializer
+ * continuation has run. Keep the pending values immutable and copy them into
+ * a fresh binding frame at completion, so neither case changes older frames
+ * or the values saved by another continuation.
  */
 void handle_cont_let_vals(unsigned val, unsigned data, unsigned env,
                           unsigned next)
 {
+    GC_GUARD;
     unsigned vars = car(data);
-    unsigned rest1 = cdr(data);
-    unsigned vals_ptr = car(rest1);
-    unsigned rest2 = cdr(rest1);
-    unsigned rest_bindings = car(rest2);
-    unsigned rest3 = cdr(rest2);
-    unsigned vals = car(rest3);
-    unsigned body = cdr(rest3);
+    unsigned reversed = cadr(data);
+    unsigned remaining = car(cddr(data));
+    unsigned body = cdr(cddr(data));
+    gc_protect(&val);
+    gc_protect(&vars);
+    gc_protect(&reversed);
+    gc_protect(&remaining);
+    gc_protect(&body);
+    gc_protect(&env);
+    gc_protect(&next);
+    reversed = alloc_cons(val, reversed);
 
-    cell_set_car(vals_ptr, val);
-
-    if (!rest_bindings) {
-        // Protect vars, vals, body and next across extend_env which allocates
-        GC_GUARD;
-        gc_protect(&vars);
-        gc_protect(&vals);
-        gc_protect(&body);
-        gc_protect(&next);
-        unsigned new_env = extend_env(vars, vals, env);
+    if (!remaining) {
+        unsigned values = 0;
+        gc_protect(&values);
+        for (; reversed; reversed = cdr(reversed))
+            values = alloc_cons(car(reversed), values);
+        unsigned new_env = extend_env(vars, values, env);
         eval_body(body, new_env, next);
     } else {
-        GC_GUARD;
-        unsigned bind = car(rest_bindings);
-
-        // Protect everything before any allocations (including next)
-        gc_protect(&vars);
-        gc_protect(&vals);
-        gc_protect(&bind);
-        gc_protect(&vals_ptr);
-        gc_protect(&rest_bindings);
-        gc_protect(&body);
-        gc_protect(&env);
-        gc_protect(&next);
-
-        unsigned next_vals_ptr = cdr(vals_ptr);
-        gc_protect(&next_vals_ptr);
-        unsigned next_val_expr = cadr(bind);
-        gc_protect(&next_val_expr);
-
-        unsigned inner3 = 0, inner2 = 0, inner1 = 0;
-        gc_protect(&inner3);
-        gc_protect(&inner2);
-        gc_protect(&inner1);
-        inner3 = alloc_cons(vals, body);
-        inner2 = alloc_cons(cdr(rest_bindings), inner3);
-        inner1 = alloc_cons(next_vals_ptr, inner2);
-        unsigned new_data = alloc_cons(vars, inner1);
-        unsigned k2 = make_cont(CONT_LET_VALS, new_data, env, next);
-        tramp_eval(next_val_expr, env, k2);
+        unsigned expr = cadr(car(remaining));
+        gc_protect(&expr);
+        unsigned inner = alloc_cons(cdr(remaining), body);
+        gc_protect(&inner);
+        inner = alloc_cons(reversed, inner);
+        unsigned new_data = alloc_cons(vars, inner);
+        unsigned k = make_cont(CONT_LET_VALS, new_data, env, next);
+        tramp_eval(expr, env, k);
     }
 }
 

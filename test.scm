@@ -624,7 +624,7 @@
         (list (u8-ready? port)
               (eof-object? (read-u8 port)))))
 (test "read/write-u8 binary file preserves bytes" '(195 169)
-      (let ((path "/tmp/vesper-u8-roundtrip.bin"))
+      (let ((path (temporary-file-path)))
         (let ((out (open-binary-output-file path)))
           (write-u8 195 out)
           (write-u8 169 out)
@@ -635,7 +635,7 @@
             (delete-file path)
             result))))
 (test "call-with-binary-output-file writes and closes" '(#u8(0 255) #f)
-      (let ((path "/tmp/vesper-call-with-binary-output-test.bin")
+      (let ((path (temporary-file-path))
             (port #f))
         (call-with-binary-output-file
           path
@@ -713,6 +713,33 @@
             (list (char=? char (integer->char 955))
                   (begin (unread-char char port)
                          (char=? (read-char port) char)))))))
+(test "unread-char follows a re-encoded source prefix" '(#\b #\c)
+      (let* ((source (string-copy "abc"))
+             (port (open-input-string source)))
+        (read-char port)
+        (let ((c (read-char port)))
+          (string-set! source 0 #\𝄞)
+          (unread-char c port)
+          (list (read-char port) (read-char port)))))
+(test "unread-char follows a shrinking sliced prefix" #\b
+      (let* ((source (string-copy "z𝄞bc"))
+             (slice (string-slice source 1 4))
+             (port (open-input-string slice)))
+        (read-char port)
+        (let ((c (read-char port)))
+          (string-set! source 1 #\a)
+          (unread-char c port)
+          (read-char port))))
+(test "unread-char rejects a source character changed since reading" #t
+      (let* ((source (string-copy "ab"))
+             (port (open-input-string source))
+             (c (read-char port)))
+        (string-set! source 0 #\z)
+        (guard (e (#t #t)) (unread-char c port) #f)))
+(test "unread-char rejects intervening string reads" #t
+      (let* ((port (open-input-string "aaa")) (c (read-char port)))
+        (read-string 1 port)
+        (guard (e (#t #t)) (unread-char c port) #f)))
 (test "unread-char validates most recent character" #t
       (guard (e (#t #t))
         (call-with-input-string "ab"
@@ -764,11 +791,12 @@
 (section "File Port Dynamic Extents")
 
 (test "call-with-output-file preserves port on continuation escape" #\x
-      (let ((escaped-port #f))
+      (let ((escaped-port #f)
+            (path (temporary-file-path)))
         (call/cc
           (lambda (k)
             (call-with-output-file
-              "/tmp/vesper-call-with-output-escape-test.txt"
+              path
               (lambda (p)
                 (set! escaped-port p)
                 (display "x" p)
@@ -776,26 +804,29 @@
                 (k #t)))))
         (let ((result
                (call-with-input-file
-                 "/tmp/vesper-call-with-output-escape-test.txt"
+                 path
                  (lambda (p) (read-char p)))))
           (close-output-port escaped-port)
+          (delete-file path)
           result)))
 
 (test "with-output-to-file restores on continuation escape" "after"
       (let ((old (current-output-port))
             (p (open-output-string))
-            (escaped-port #f))
+            (escaped-port #f)
+            (path (temporary-file-path)))
         (set-current-output-port! p)
         (call/cc
           (lambda (k)
             (with-output-to-file
-              "/tmp/vesper-with-output-escape-test.txt"
+              path
               (lambda ()
                 (set! escaped-port (current-output-port))
                 (k #t)))))
         (display "after")
         (set-current-output-port! old)
         (close-output-port escaped-port)
+        (delete-file path)
         (get-output-string p)))
 
 ;;; ============================================================================
@@ -1886,8 +1917,9 @@
            (string-join '("a" 2))
            #f))))
 
-; File/OS helpers
-(define compat-file "/tmp/vesper-compat-test.bin")
+; File/OS helpers. Each run owns its files so VM and interpreter suites
+; can execute concurrently without overwriting or deleting each other's data.
+(define compat-file (temporary-file-path))
 (define compat-out (open-binary-output-file compat-file))
 (test "binary output port predicate" #t (binary-port? compat-out))
 (test "binary output not textual" #f (textual-port? compat-out))
@@ -1907,7 +1939,7 @@
 (close-input-port compat-in-slice)
 (delete-file compat-file)
 (test "delete-file compat file" #f (file-exists? compat-file))
-(define compat-transcript-file "/tmp/vesper-compat-transcript.txt")
+(define compat-transcript-file (temporary-file-path))
 (transcript-on compat-transcript-file)
 (display "transcript text")
 (write #t)
@@ -1920,7 +1952,7 @@
       (read-line compat-transcript-in))
 (close-input-port compat-transcript-in)
 (delete-file compat-transcript-file)
-(define compat-text-file "/tmp/vesper-compat-text.txt")
+(define compat-text-file (temporary-file-path))
 (define compat-text-out (open-output-file compat-text-file))
 (test "text output port predicate" #t (textual-port? compat-text-out))
 (test "text output not binary" #f (binary-port? compat-text-out))
@@ -1928,7 +1960,7 @@
 (delete-file compat-text-file)
 (test "current-directory returns string" #t (string? (current-directory)))
 (test "directory-files returns list" #t (list? (directory-files ".")))
-(define compat-dir "/tmp/vesper-compat-dir")
+(define compat-dir (temporary-file-path))
 (make-directory compat-dir)
 (test "make-directory/file-directory?" #t (file-directory? compat-dir))
 (delete-directory compat-dir)
@@ -2588,11 +2620,11 @@
 (test "file-error? structured object"
       #t
       (file-error? (make-error-object 'file "missing" '("x"))))
-(define include-test-file "/tmp/vesper-include-test.scm")
+(define include-test-file (temporary-file-path))
 (define include-test-out (open-output-file include-test-file))
 (write-string "(define included-value 77)" include-test-out)
 (close-output-port include-test-out)
-(include "/tmp/vesper-include-test.scm")
+(include include-test-file)
 (test "include" 77 included-value)
 (delete-file include-test-file)
 (define-record-type record-collision

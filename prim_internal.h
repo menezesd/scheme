@@ -991,6 +991,7 @@ static inline string_port *strport_alloc_with_data(char *data, size_t len,
     sp->pos = 0;
     sp->last_read_pos = 0;
     sp->last_read_len = 0;
+    sp->last_read_source_pos = 0;
     sp->last_read_char = 0;
     sp->last_read_valid = false;
     sp->source_string = ctx.atom_false;
@@ -1046,6 +1047,7 @@ static inline string_port *strport_from_string_cell(unsigned source,
     sp->pos = 0;
     sp->last_read_pos = 0;
     sp->last_read_len = 0;
+    sp->last_read_source_pos = 0;
     sp->last_read_char = 0;
     sp->last_read_valid = false;
     sp->source_string = source;

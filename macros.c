@@ -370,7 +370,9 @@ unsigned extend_env_with_internal_defines(unsigned env, unsigned body)
     unsigned frame = 0;
     gc_protect(&frame);
 
-    for (unsigned it = body; IS_PAIR(it); it = cdr(it)) {
+    unsigned it = body;
+    gc_protect(&it);
+    for (; IS_PAIR(it); it = cdr(it)) {
         unsigned form = car(it);
         if (!IS_PAIR(form) || !IS_ATOM(car(form)) ||
             CELL_ID(car(form)) != ctx.kw_define)
@@ -1053,10 +1055,10 @@ static unsigned add_let_bounds(unsigned bindings, unsigned binding_list)
     gc_protect(&bindings);
     gc_protect(&binding_list);
 
-    unsigned bl = binding_list;
-    gc_protect(&bl);
-    for (; IS_PAIR(bl); bl = cdr(bl)) {
-        unsigned binding = car(bl);
+    unsigned binding_cursor = binding_list;
+    gc_protect(&binding_cursor);
+    for (; IS_PAIR(binding_cursor); binding_cursor = cdr(binding_cursor)) {
+        unsigned binding = car(binding_cursor);
         if (!let_binding_has_value(binding))
             continue;
         unsigned var = car(binding);
@@ -1104,10 +1106,10 @@ static unsigned collect_free_ids_let(unsigned tmpl, unsigned bindings,
     if (is_letrec)
         body_bindings = add_let_bounds(body_bindings, binding_list);
 
-    unsigned bl = binding_list;
-    gc_protect(&bl);
-    for (; IS_PAIR(bl); bl = cdr(bl)) {
-        unsigned binding = car(bl);
+    unsigned binding_cursor = binding_list;
+    gc_protect(&binding_cursor);
+    for (; IS_PAIR(binding_cursor); binding_cursor = cdr(binding_cursor)) {
+        unsigned binding = car(binding_cursor);
         if (!let_binding_has_value(binding))
             continue;
 
@@ -1556,13 +1558,16 @@ static unsigned drop_renames_bound_by_params(unsigned rename_map,
     unsigned tail = 0;
     gc_protect(&out);
     gc_protect(&tail);
-    for (unsigned m = rename_map; m; m = cdr(m)) {
+    unsigned m = rename_map;
+    gc_protect(&m);
+    for (; m; m = cdr(m)) {
         unsigned entry = car(m);
         if (IS_ATOM(car(entry)) &&
             lambda_params_bind_id(params, CELL_ID(car(entry))))
             continue;
         list_append(&out, &tail, entry);
     }
+    gc_unprotect(1);
     return out;
 }
 
@@ -1576,13 +1581,16 @@ static unsigned drop_renames_bound_by_binding_list(unsigned rename_map,
     unsigned tail = 0;
     gc_protect(&out);
     gc_protect(&tail);
-    for (unsigned m = rename_map; m; m = cdr(m)) {
+    unsigned m = rename_map;
+    gc_protect(&m);
+    for (; m; m = cdr(m)) {
         unsigned entry = car(m);
         if (IS_ATOM(car(entry)) &&
             binding_list_binds_id(binding_list, CELL_ID(car(entry))))
             continue;
         list_append(&out, &tail, entry);
     }
+    gc_unprotect(1);
     return out;
 }
 
@@ -2203,7 +2211,9 @@ static unsigned rename_in_syntax_rules(unsigned tmpl, int64_t old_id,
     gc_protect(&new_rules);
     gc_protect(&new_rules_tail);
 
-    for (unsigned r = rules; r; r = cdr(r)) {
+    unsigned r = rules;
+    gc_protect(&r);
+    for (; r; r = cdr(r)) {
         unsigned rule = car(r);
         if (!IS_PAIR(rule) || !IS_PAIR(cdr(rule))) {
             list_append(&new_rules, &new_rules_tail, rule);
@@ -2231,6 +2241,7 @@ static unsigned rename_in_syntax_rules(unsigned tmpl, int64_t old_id,
         list_append(&new_rules, &new_rules_tail, new_rule);
         gc_unprotect(5);
     }
+    gc_unprotect(1);
 
     cell_set_cdr(prefix_tail, new_rules);
     return prefix;
@@ -2606,8 +2617,10 @@ static unsigned hygienize_named_let(unsigned tmpl, unsigned bindings)
         gc_unprotect(2);
     }
 
-    for (unsigned bl = binding_list; IS_PAIR(bl); bl = cdr(bl)) {
-        unsigned binding = car(bl);
+    unsigned binding_cursor = binding_list;
+    gc_protect(&binding_cursor);
+    for (; IS_PAIR(binding_cursor); binding_cursor = cdr(binding_cursor)) {
+        unsigned binding = car(binding_cursor);
         if (!let_binding_has_value(binding))
             continue;
         unsigned var = car(binding);
