@@ -38,7 +38,7 @@ void apply_syntax_bindings(unsigned env, unsigned bindings);
 unsigned extend_env_with_binder_names(unsigned parent_env, unsigned params);
 
 // Frame with the names of a body's leading (define ...) forms layered over
-// env, for expansion-time scope decisions.
+// env, for expansion and for establishing their scope before evaluation.
 unsigned extend_env_with_internal_defines(unsigned env, unsigned body);
 
 // Check if an identifier is a special form keyword

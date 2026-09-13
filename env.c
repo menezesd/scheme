@@ -129,8 +129,8 @@ bool environment_is_immutable(unsigned env)
     unsigned vars = car(frame);
     // The marker, when present, is always the FIRST entry:
     // mark_immutable_environment conses it onto the front of the binding
-    // list, and defvar refuses to extend an environment that is already
-    // immutable, so nothing can ever be prepended in front of it. Searching
+    // list, and defvar inserts private macro bindings after that marker.
+    // Nothing can ever be prepended in front of it. Searching
     // the whole list (plus a cycle pre-walk) cost O(frame) on every define
     // and on every successful set!, against a global frame of ~950 bindings.
     // Reading position 0 is equivalent, and needs no cycle check because it
@@ -578,7 +578,8 @@ unsigned defvar(unsigned var, unsigned aval, unsigned env)
         show_error("define: invalid environment");
         return TOK_ERROR;
     }
-    if (environment_is_immutable(env)) {
+    bool immutable = environment_is_immutable(env);
+    if (immutable && !atom_is_uninterned(var)) {
         show_error("define: environment is immutable");
         return TOK_ERROR;
     }
@@ -623,6 +624,13 @@ unsigned defvar(unsigned var, unsigned aval, unsigned env)
 
     vars = car(frame);
     vals = cdr(frame);
+    // Expanding a macro may install fresh private identifiers even in an
+    // immutable import environment. Its public bindings remain immutable,
+    // and the marker must stay first for environment_is_immutable.
+    if (immutable) {
+        vars = cdr(vars);
+        vals = cdr(vals);
+    }
     // Protect all variables used across allocations
     unsigned new_vars, new_vals;
     {
@@ -636,8 +644,13 @@ unsigned defvar(unsigned var, unsigned aval, unsigned env)
         gc_protect(&new_vars);
         new_vals = alloc_cons(aval, vals);
     }
-    cell_set_car(frame, new_vars);
-    cell_set_cdr(frame, new_vals);
+    if (immutable) {
+        cell_set_cdr(car(frame), new_vars);
+        cell_set_cdr(cdr(frame), new_vals);
+    } else {
+        cell_set_car(frame, new_vars);
+        cell_set_cdr(frame, new_vals);
+    }
     // A new binding in the indexed frame has to reach the index, or the next
     // lookup would report it missing - the index is treated as complete for
     // the frame it describes.
@@ -1399,6 +1412,21 @@ unsigned environment_with_imports(unsigned source, unsigned specs)
                 unsigned visible_cell =
                     env_find_binding_cell(CELL_ID(var), source);
                 if (visible_cell != vals) {
+                    vars = cdr(vars);
+                    vals = cdr(vals);
+                    continue;
+                }
+                // Macro templates retain definition-time uninterned aliases
+                // for their helpers. Preserve these private bindings even
+                // when the public helper name is not exported. Copy the
+                // reference itself so later changes at the definition site
+                // remain visible. Printed names cannot access these symbols.
+                if (atom_is_uninterned(var)) {
+                    unsigned value = car(vals);
+                    gc_protect(&value);
+                    if (defvar(var, value, result) == TOK_ERROR)
+                        return TOK_ERROR;
+                    gc_unprotect(1);
                     vars = cdr(vars);
                     vals = cdr(vals);
                     continue;

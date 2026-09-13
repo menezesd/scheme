@@ -1386,56 +1386,43 @@ static unsigned number_to_string_value(unsigned num, int radix,
         format_double_repr(buf, sizeof(buf), d);
         return make_string_immutable_owned(checked_string_copy(buf));
     } else if (IS_COMPLEX(num)) {
-        if (radix != 10) {
-            show_error("%s: complex numbers require radix 10", name);
+        GC_GUARD;
+        gc_protect(&num);
+        unsigned real = number_to_string_value(CELL_CAR(num), radix, name);
+        if (real == TOK_ERROR)
+            return TOK_ERROR;
+        gc_protect(&real);
+        unsigned imag = number_to_string_value(CELL_CDR(num), radix, name);
+        if (imag == TOK_ERROR)
+            return TOK_ERROR;
+        gc_protect(&imag);
+        const char *real_text = GET_STRING_PTR(real);
+        const char *imag_text = GET_STRING_PTR(imag);
+        size_t real_len = strlen(real_text), imag_len = strlen(imag_text);
+        bool needs_plus = *imag_text != '+' && *imag_text != '-';
+        size_t suffix_len = needs_plus ? 3 : 2; // optional '+', 'i', and NUL
+        if (imag_len > SIZE_MAX - suffix_len ||
+            real_len > SIZE_MAX - imag_len - suffix_len) {
+            show_error("%s: result too large", name);
             return TOK_ERROR;
         }
-        char *buf = object_to_string(num, name);
-        if (!buf)
+        char *buf = checked_malloc_size(real_len + imag_len + suffix_len);
+        if (!buf) {
+            show_error("%s: out of memory", name);
             return TOK_ERROR;
+        }
+        memcpy(buf, real_text, real_len);
+        size_t pos = real_len;
+        if (needs_plus)
+            buf[pos++] = '+';
+        memcpy(buf + pos, imag_text, imag_len);
+        buf[pos + imag_len] = 'i';
+        buf[pos + imag_len + 1] = '\0';
         return make_string_immutable_owned(buf);
     } else {
         show_error("%s: not a number", name);
         return TOK_ERROR;
     }
-}
-
-// Parse an integer or num/den rational in the given radix. Returns
-// ctx.atom_false if the string is not valid in that radix.
-static unsigned parse_radix_number(const char *s, int radix, const char *name)
-{
-    const char *slash = strchr(s, '/');
-    if (!slash) {
-        bignum *bn = bn_from_string(s, radix);
-        if (!bn)
-            return ctx.atom_false;
-        return store_integer(bn);
-    }
-
-    // R7RS rational syntax: sign only on the numerator, denominator unsigned
-    if (slash[1] == '+' || slash[1] == '-')
-        return ctx.atom_false;
-    char *num_str = checked_string_copy_len(s, (size_t)(slash - s));
-    if (!num_str) {
-        show_error("%s: out of memory", name);
-        return TOK_ERROR;
-    }
-    bignum *num = bn_from_string(num_str, radix);
-    free(num_str);
-    bignum *den = num ? bn_from_string(slash + 1, radix) : NULL;
-    if (!num || !den || bn_is_zero(den)) {
-        bn_free(num);
-        bn_free(den);
-        return ctx.atom_false;
-    }
-    GC_GUARD;
-    unsigned num_cell = store_integer(num);
-    gc_protect(&num_cell);
-    unsigned den_cell = store_integer(den);
-    if (num_cell == TOK_ERROR || den_cell == TOK_ERROR)
-        return TOK_ERROR;
-    gc_protect(&den_cell);
-    return normalize_rational_cells(num_cell, den_cell);
 }
 
 static unsigned string_to_number_value(unsigned str, int radix,
@@ -1444,75 +1431,15 @@ static unsigned string_to_number_value(unsigned str, int radix,
     char *s = require_string_ptr(str, name);
     if (!s)
         return TOK_ERROR;
-
-    // R7RS number prefixes: one radix (#b #o #d #x) and one exactness
-    // (#e #i) marker, in either order, overriding the radix argument
-    int exactness = 0; // 1 = exact, -1 = inexact, 0 = as written
-    bool have_radix = false, have_exact = false;
-    while (s[0] == '#') {
-        char p = s[1];
-        if (!have_radix && (p == 'b' || p == 'B')) {
-            radix = 2;
-            have_radix = true;
-        } else if (!have_radix && (p == 'o' || p == 'O')) {
-            radix = 8;
-            have_radix = true;
-        } else if (!have_radix && (p == 'd' || p == 'D')) {
-            radix = 10;
-            have_radix = true;
-        } else if (!have_radix && (p == 'x' || p == 'X')) {
-            radix = 16;
-            have_radix = true;
-        } else if (!have_exact && (p == 'e' || p == 'E')) {
-            exactness = 1;
-            have_exact = true;
-        } else if (!have_exact && (p == 'i' || p == 'I')) {
-            exactness = -1;
-            have_exact = true;
-        } else {
-            return ctx.atom_false;
-        }
-        s += 2;
+    // Parsing can allocate between components. Own a stable copy of the
+    // text independently of the Scheme string and its backing storage.
+    char *copy = checked_string_copy(s);
+    if (!copy) {
+        show_error("%s: out of memory", name);
+        return TOK_ERROR;
     }
-
-    GC_GUARD;
-    unsigned parsed;
-    if (radix == 10) {
-        char *copy = checked_string_copy(s);
-        if (!copy) {
-            show_error("%s: out of memory", name);
-            return TOK_ERROR;
-        }
-        parsed = TOK_ERROR;
-        if (exactness == 1) {
-            // #e1.5 must yield 3/2 exactly, not a converted double
-            bool handled = false;
-            parsed = read_exact_decimal_number(copy, &handled);
-            if (!handled)
-                parsed = TOK_ERROR;
-        }
-        if (parsed == TOK_ERROR)
-            parsed = atom_from_string(copy);
-        free(copy);
-        if (parsed == TOK_ERROR)
-            return TOK_ERROR;
-        if (!is_numeric(parsed))
-            return ctx.atom_false;
-    } else {
-        parsed = parse_radix_number(s, radix, name);
-        if (parsed == TOK_ERROR || parsed == ctx.atom_false)
-            return parsed;
-    }
-
-    gc_protect(&parsed);
-    if (exactness == -1 && is_exact(parsed) && !IS_COMPLEX(parsed))
-        return store_inexact(to_double(parsed));
-    if (exactness == 1 && IS_INEXACT(parsed)) {
-        double d = to_double(parsed);
-        if (isnan(d) || isinf(d))
-            return ctx.atom_false; // no exact representation
-        return prim_inexact_to_exact(parsed);
-    }
+    unsigned parsed = parse_number_string(copy, radix);
+    free(copy);
     return parsed;
 }
 
@@ -2238,50 +2165,39 @@ static uint64_t hash_combine(uint64_t a, uint64_t b)
 }
 
 #define HASH_RECURSION_MARKER 0x4f1bbcdc9a1322d5ull
-#define HASH_SEEN_STACK_MAX 1024
+#define HASH_NODE_BUDGET 1024
 
-static bool hash_seen_contains(const unsigned *seen, unsigned seen_len,
-                               unsigned key)
+// equal? compares cyclic objects by their unfolded contents: a one-pair
+// cycle can equal a two-pair cycle. Stopping at a repeated cell would hash
+// these equal keys differently. Instead, hash a bounded depth-first prefix
+// of the unfolding, independent of sharing and cycle length. A node budget
+// also bounds work for wide vectors and heavily shared acyclic structures.
+static uint64_t hash_key_bounded(unsigned key, unsigned *remaining)
 {
-    for (unsigned i = 0; i < seen_len; i++) {
-        if (seen[i] == key)
-            return true;
-    }
-    return false;
-}
-
-static uint64_t hash_key_for_table_seen(hash_table_data *ht, unsigned key,
-                                        unsigned *seen, unsigned seen_len)
-{
+    if (*remaining == 0)
+        return HASH_RECURSION_MARKER;
+    (*remaining)--;
     if (IS_FIXNUM(key) || !IS_CELL(key))
         return scheme_hash(key);
 
-    enum lisp_type key_type = CELL_TYPE(key);
-    bool track_path = key_type == BT_CONS || key_type == BT_VECTOR ||
-                      key_type == BT_RATIONAL || key_type == BT_COMPLEX;
-    if (track_path) {
-        if (hash_seen_contains(seen, seen_len, key))
-            return HASH_RECURSION_MARKER;
-        if (seen_len >= HASH_SEEN_STACK_MAX)
-            return HASH_RECURSION_MARKER;
-        seen[seen_len++] = key;
-    }
-
-    switch (key_type) {
+    switch (CELL_TYPE(key)) {
     case BT_RATIONAL:
     case BT_COMPLEX:
-    case BT_CONS:
-        return hash_combine(hash_key_for_table_seen(ht, car(key), seen,
-                                                    seen_len),
-                            hash_key_for_table_seen(ht, cdr(key), seen,
-                                                    seen_len));
+    case BT_CONS: {
+        // Sequence the visits explicitly: both consume the shared budget.
+        uint64_t head = hash_key_bounded(car(key), remaining);
+        uint64_t tail = hash_key_bounded(cdr(key), remaining);
+        return hash_combine(head, tail);
+    }
     case BT_VECTOR: {
-        uint64_t h = PRIM_FNV_OFFSET_BASIS;
         unsigned len = vector_len(key);
+        uint64_t h = hash_combine(PRIM_FNV_OFFSET_BASIS, len);
         unsigned *data = vector_data_ptr(key);
-        for (unsigned i = 0; i < len; i++)
-            h = hash_combine(h, hash_key_for_table_seen(ht, data[i], seen,
-                                                        seen_len));
+        for (unsigned i = 0; i < len; i++) {
+            if (*remaining == 0)
+                return hash_combine(h, HASH_RECURSION_MARKER);
+            h = hash_combine(h, hash_key_bounded(data[i], remaining));
+        }
         return h;
     }
     case BT_BYTEVEC: {
@@ -2322,8 +2238,8 @@ static uint64_t hash_key_for_table(hash_table_data *ht, unsigned key)
                    ? scheme_hash(key)
                    : (uint64_t)key * PRIM_FNV_PRIME;
 
-    unsigned seen[HASH_SEEN_STACK_MAX];
-    return hash_key_for_table_seen(ht, key, seen, 0);
+    unsigned remaining = HASH_NODE_BUDGET;
+    return hash_key_bounded(key, &remaining);
 }
 
 static bool hash_key_equal(hash_table_data *ht, unsigned a, unsigned b)
@@ -2711,7 +2627,7 @@ static unsigned make_public_gensym(void)
 {
     char buf[32];
     snprintf(buf, sizeof(buf), "g%u", gensym_counter++);
-    return atom_from_string(buf);
+    return make_uninterned_symbol(buf);
 }
 
 static unsigned transcript_on(unsigned filename_arg, const char *name)

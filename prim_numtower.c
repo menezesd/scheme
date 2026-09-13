@@ -5,10 +5,6 @@
 
 #include "prim_internal.h"
 
-/**
- * Convert an inexact real number to an exact rational.
- * Uses IEEE754 representation: value = mantissa * 2^exponent
- */
 // Apply rationalize's exactness contagion to a computed exact result
 static unsigned rationalize_result(unsigned value, bool inexact)
 {
@@ -19,6 +15,153 @@ static unsigned rationalize_result(unsigned value, bool inexact)
     return store_inexact(to_double(value));
 }
 
+static bool exact_real_negative(unsigned value)
+{
+    return is_negative_number(IS_RATIONAL(value) ? CELL_CAR(value) : value);
+}
+
+// Find the simplest rational in a closed positive interval by removing its
+// common continued-fraction terms. Reciprocal steps reverse the endpoints;
+// an integer in the interval ends the search. Unlike a mediant-at-a-time
+// search this also handles intervals near 1/N without taking N iterations.
+static unsigned simplest_positive_rational(unsigned low, unsigned high)
+{
+    GC_GUARD;
+    gc_protect(&low);
+    gc_protect(&high);
+    unsigned terms = 0, a = 0, b = 0, value = 0, low_fraction = 0;
+    gc_protect(&terms);
+    gc_protect(&a);
+    gc_protect(&b);
+    gc_protect(&value);
+    gc_protect(&low_fraction);
+    unsigned one = store(1);
+    gc_protect(&one);
+
+    for (;;) {
+        if (IS_EXACT_INT(low)) {
+            value = low;
+            break;
+        }
+        a = apply_math_primitive(PFLOOR, 1, &low);
+        if (a == TOK_ERROR)
+            return TOK_ERROR;
+        b = apply_math_primitive(PFLOOR, 1, &high);
+        if (b == TOK_ERROR)
+            return TOK_ERROR;
+        int cmp;
+        if (!compare_exact_integers(a, b, &cmp)) {
+            show_error("rationalize: invalid interval");
+            return TOK_ERROR;
+        }
+        if (cmp < 0) {
+            value = add_cells(a, one);
+            if (value == TOK_ERROR)
+                return TOK_ERROR;
+            break;
+        }
+
+        terms = alloc_cons(a, terms);
+        low_fraction = binary_sub(low, a);
+        if (low_fraction == TOK_ERROR)
+            return TOK_ERROR;
+        high = binary_sub(high, a);
+        if (high == TOK_ERROR)
+            return TOK_ERROR;
+        low = binary_div(one, high);
+        if (low == TOK_ERROR)
+            return TOK_ERROR;
+        high = binary_div(one, low_fraction);
+        if (high == TOK_ERROR)
+            return TOK_ERROR;
+    }
+
+    for (; terms; terms = cdr(terms)) {
+        value = binary_div(one, value);
+        if (value == TOK_ERROR)
+            return TOK_ERROR;
+        value = binary_add(car(terms), value);
+        if (value == TOK_ERROR)
+            return TOK_ERROR;
+    }
+    return value;
+}
+
+static unsigned rationalize_value(unsigned x, unsigned tolerance)
+{
+    if (!require_real(x, "rationalize") ||
+        !require_real(tolerance, "rationalize"))
+        return TOK_ERROR;
+    bool inexact_result = !is_exact(x) || !is_exact(tolerance);
+    if ((IS_INEXACT(x) && !isfinite(to_double(x))) ||
+        (IS_INEXACT(tolerance) && isnan(to_double(tolerance)))) {
+        show_error("rationalize: expected finite real arguments");
+        return TOK_ERROR;
+    }
+    if (IS_INEXACT(tolerance) && isinf(to_double(tolerance)))
+        return store_inexact(0.0);
+
+    GC_GUARD;
+    gc_protect(&x);
+    gc_protect(&tolerance);
+    // Compute the endpoints exactly, including for inexact inputs. Rounding
+    // x to double would lose exact integers beyond 53 bits before the search.
+    if (IS_INEXACT(x)) {
+        x = prim_inexact_to_exact(x);
+        if (x == TOK_ERROR)
+            return TOK_ERROR;
+    }
+    if (IS_INEXACT(tolerance)) {
+        tolerance = prim_inexact_to_exact(tolerance);
+        if (tolerance == TOK_ERROR)
+            return TOK_ERROR;
+    }
+    if (exact_real_negative(tolerance)) {
+        tolerance = binary_sub(store(0), tolerance);
+        if (tolerance == TOK_ERROR)
+            return TOK_ERROR;
+    }
+    unsigned low = binary_sub(x, tolerance);
+    if (low == TOK_ERROR)
+        return TOK_ERROR;
+    gc_protect(&low);
+    unsigned high = binary_add(x, tolerance);
+    if (high == TOK_ERROR)
+        return TOK_ERROR;
+    gc_protect(&high);
+
+    if (!exact_real_negative(high) &&
+        (exact_real_negative(low) || is_zero_number(low)))
+        return rationalize_result(store(0), inexact_result);
+
+    bool negative = exact_real_negative(high);
+    if (negative) {
+        unsigned old_low = low;
+        gc_protect(&old_low);
+        low = binary_sub(store(0), high);
+        if (low == TOK_ERROR)
+            return TOK_ERROR;
+        high = binary_sub(store(0), old_low);
+        gc_unprotect(1);
+        if (high == TOK_ERROR)
+            return TOK_ERROR;
+    }
+    unsigned result = simplest_positive_rational(low, high);
+    if (result == TOK_ERROR)
+        return TOK_ERROR;
+    gc_protect(&result);
+    if (negative) {
+        result = binary_sub(store(0), result);
+        if (result == TOK_ERROR)
+            return TOK_ERROR;
+    }
+    return rationalize_result(result, inexact_result);
+}
+
+/**
+ * Convert an inexact real number to an exact rational.
+ * Uses IEEE754 representation: value = mantissa * 2^exponent
+ */
 unsigned prim_inexact_to_exact(unsigned x)
 {
     double d = to_double(x);
@@ -214,21 +357,14 @@ static unsigned numeric_real_test(unsigned x, real_test test,
     }
 
     if (IS_COMPLEX(x)) {
-        double real = to_double(CELL_CAR(x));
-        double imag = to_double(CELL_CDR(x));
-        bool result = false;
-        switch (test) {
-        case REAL_TEST_FINITE:
-            result = isfinite(real) && isfinite(imag);
-            break;
-        case REAL_TEST_INFINITE:
-            result = isinf(real) || isinf(imag);
-            break;
-        case REAL_TEST_NAN:
-            result = isnan(real) || isnan(imag);
-            break;
-        }
-        return scheme_bool(result);
+        // Exact components are finite regardless of whether they fit in a
+        // double. Classify each component before combining the results.
+        unsigned real = numeric_real_test(CELL_CAR(x), test, name);
+        unsigned imag = numeric_real_test(CELL_CDR(x), test, name);
+        if (real == TOK_ERROR || imag == TOK_ERROR)
+            return TOK_ERROR;
+        bool r = real == ctx.atom_true, i = imag == ctx.atom_true;
+        return scheme_bool(test == REAL_TEST_FINITE ? r && i : r || i);
     }
 
     return scheme_bool(test == REAL_TEST_FINITE);
@@ -324,11 +460,7 @@ unsigned apply_numtower_primitive(unsigned prim_id, unsigned argc,
         if (!require_real(argv[0], "make-polar") ||
             !require_real(argv[1], "make-polar"))
             return TOK_ERROR;
-        double mag = to_double(argv[0]);
-        double ang = to_double(argv[1]);
-        double real = mag * cos(ang);
-        double imag = mag * sin(ang);
-        return make_complex_inexact(real, imag);
+        return make_polar_number(argv[0], argv[1]);
     }
     case PREALPART: {
         REQUIRE_ARGC(argc, 1, 1, "real-part");
@@ -356,6 +488,8 @@ unsigned apply_numtower_primitive(unsigned prim_id, unsigned argc,
         unsigned x = argv[0];
         if (!require_number(x, "exact->inexact"))
             return TOK_ERROR;
+        if (!is_exact(x))
+            return x;
         if (IS_COMPLEX(x)) {
             return make_complex_inexact(to_double(CELL_CAR(x)),
                                         to_double(CELL_CDR(x)));
@@ -373,11 +507,22 @@ unsigned apply_numtower_primitive(unsigned prim_id, unsigned argc,
             return x;
 
         if (IS_COMPLEX(x)) {
-            // Convert both parts to exact
+            // A complex number can mix exact and inexact components. Keep
+            // exact components intact and root x while converting the real
+            // part, since conversion can collect before we read the other.
             GC_GUARD;
-            unsigned real_exact = prim_inexact_to_exact(CELL_CAR(x));
+            gc_protect(&x);
+            unsigned real_exact = CELL_CAR(x);
+            if (!is_exact(real_exact))
+                real_exact = prim_inexact_to_exact(real_exact);
+            if (real_exact == TOK_ERROR)
+                return TOK_ERROR;
             gc_protect(&real_exact);
-            unsigned imag_exact = prim_inexact_to_exact(CELL_CDR(x));
+            unsigned imag_exact = CELL_CDR(x);
+            if (!is_exact(imag_exact))
+                imag_exact = prim_inexact_to_exact(imag_exact);
+            if (imag_exact == TOK_ERROR)
+                return TOK_ERROR;
             return store_complex(real_exact, imag_exact);
         }
 
@@ -385,78 +530,7 @@ unsigned apply_numtower_primitive(unsigned prim_id, unsigned argc,
     }
     case PRATIONALIZE: {
         REQUIRE_ARGC(argc, 2, 2, "rationalize");
-        if (!require_real(argv[0], "rationalize") ||
-            !require_real(argv[1], "rationalize"))
-            return TOK_ERROR;
-        // R7RS exactness contagion: an inexact argument makes the result
-        // inexact (e.g. (rationalize .3 1/10) => #i1/3)
-        bool inexact_result = !is_exact(argv[0]) || !is_exact(argv[1]);
-        // Find simplest rational within epsilon using continued fractions
-        double x = to_double(argv[0]);
-        double epsilon = fabs(to_double(argv[1]));
-
-        // Handle negative numbers
-        bool negative = x < 0;
-        if (negative)
-            x = -x;
-
-        // Integer case
-        if (!isfinite(x) || isnan(epsilon)) {
-            show_error("rationalize: expected finite real arguments");
-            return TOK_ERROR;
-        }
-        if (x >= 0x1p63) {
-            if (negative && x == 0x1p63 && epsilon >= 0.0) {
-                return rationalize_result(store(INT64_MIN), inexact_result);
-            }
-            show_error("rationalize: magnitude too large");
-            return TOK_ERROR;
-        }
-        int64_t n = (int64_t)floor(x);
-        if (x - n <= epsilon) {
-            return rationalize_result(store(negative ? -n : n),
-                                      inexact_result);
-        }
-        if (n + 1 - x <= epsilon) {
-            return rationalize_result(store(negative ? -(n + 1) : n + 1),
-                                      inexact_result);
-        }
-
-        // Continued fraction approximation (Stern-Brocot)
-        int64_t lo_n = 0, lo_d = 1; // 0/1
-        int64_t hi_n = 1, hi_d = 0; // 1/0 = infinity
-        int64_t mid_n, mid_d;
-
-        for (int iter = 0; iter < 100; iter++) {
-            if (__builtin_add_overflow(lo_n, hi_n, &mid_n) ||
-                __builtin_add_overflow(lo_d, hi_d, &mid_d) || mid_d <= 0) {
-                show_error("rationalize: result too large");
-                return TOK_ERROR;
-            }
-            double mid = (double)mid_n / mid_d;
-
-            if (fabs(mid - x) <= epsilon) {
-                // Found it - return as rational
-                if (negative)
-                    mid_n = -mid_n;
-                return rationalize_result(normalize_rational(mid_n, mid_d),
-                                          inexact_result);
-            }
-
-            if (mid < x) {
-                lo_n = mid_n;
-                lo_d = mid_d;
-            } else {
-                hi_n = mid_n;
-                hi_d = mid_d;
-            }
-        }
-
-        // Fallback: return best approximation found
-        if (negative)
-            mid_n = -mid_n;
-        return rationalize_result(normalize_rational(mid_n, mid_d),
-                                  inexact_result);
+        return rationalize_value(argv[0], argv[1]);
     }
     default:
         return TOK_ERROR;

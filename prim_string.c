@@ -194,6 +194,15 @@ unsigned prim_string_slice(unsigned argc, unsigned *argv)
     view->start = (size_t)start;
     view->end = (size_t)end;
     view->immutable = string_cell_is_immutable(argv[0]);
+    // Keep ranges relative to the original string. Retaining each
+    // intermediate slice creates chains that eventually exceed the view
+    // traversal limit, leaving reads stale and preventing writes.
+    if (string_cell_is_view(view->parent)) {
+        string_view_data *parent = (string_view_data *)CELL_PTR(view->parent);
+        view->start += parent->start;
+        view->end += parent->start;
+        view->parent = parent->parent;
+    }
     string_register(copy);
     string_view_register(view);
 

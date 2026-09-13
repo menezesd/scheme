@@ -239,6 +239,7 @@ test-repl-exit: $(TARGET)
 
 # Compare a stable semantic probe set against MIT/GNU Scheme.
 test-diff: $(TARGET)
+	@python3 tools/test_mit_differential.py
 	@python3 tools/run_mit_differential.py
 
 # Force a collection every N allocations while loading the stdlib and running

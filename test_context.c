@@ -498,6 +498,31 @@ TEST(intern_different_strings)
     PASS();
 }
 
+TEST(uninterned_symbols_keep_distinct_identities)
+{
+    GC_GUARD;
+    unsigned first = make_uninterned_symbol("fresh-identity");
+    gc_protect(&first);
+    unsigned ordinary = atom_from_string("fresh-identity");
+    gc_protect(&ordinary);
+    unsigned second = make_uninterned_symbol("fresh-identity");
+    gc_protect(&second);
+    ASSERT(atom_is_uninterned(first));
+    ASSERT(atom_is_uninterned(second));
+    ASSERT(!atom_is_uninterned(ordinary));
+    ASSERT(CELL_ID(first) != CELL_ID(second));
+    ASSERT(CELL_ID(first) != CELL_ID(ordinary));
+    ASSERT(CELL_ID(second) != CELL_ID(ordinary));
+    ASSERT_EQ(intern("fresh-identity"), CELL_ID(ordinary));
+    ASSERT_STR_EQ(ctx.atom_table[CELL_ID(first)], "fresh-identity");
+    ASSERT(!deep_equal(first, ordinary));
+    ASSERT(!deep_equal(first, second));
+    gc(0);
+    ASSERT(atom_is_uninterned(first));
+    ASSERT_EQ(intern("fresh-identity"), CELL_ID(ordinary));
+    PASS();
+}
+
 TEST(atom_from_string_creates_atom)
 {
     unsigned x = atom_from_string("test-symbol");
@@ -3226,9 +3251,8 @@ TEST(environment_metadata_does_not_collide_with_hygiene_symbol)
 TEST(immutable_environment_is_detected_and_enforced)
 {
     // environment_is_immutable now reads position 0 instead of scanning the
-    // whole binding list, relying on the invariant that the marker is consed
-    // onto the front and that defvar refuses to extend an already-immutable
-    // environment. Pin both halves of that invariant.
+    // whole binding list. Public definitions are rejected, and private macro
+    // bindings must be inserted after the marker rather than ahead of it.
     unsigned env = empty_environment();
     unsigned before = atom_from_string("immutable-before-marking");
     unsigned after = atom_from_string("immutable-after-marking");
@@ -3241,10 +3265,17 @@ TEST(immutable_environment_is_detected_and_enforced)
 
     // Bindings present before marking must remain visible...
     ASSERT_EQ(CELL_ID(lookup(CELL_ID(before), env)), 1);
-    // ...and no new binding may be added, which is what keeps the marker at
-    // position 0 and therefore keeps the O(1) check correct.
+    // ...and no new public binding may be added.
     ASSERT_EQ(defvar(after, store(2), env), TOK_ERROR);
     ASSERT(environment_is_immutable(env));
+
+    unsigned private_name = make_uninterned_symbol("immutable-after-marking");
+    ASSERT(defvar(private_name, store(4), env) != TOK_ERROR);
+    ASSERT(environment_is_immutable(env));
+    ASSERT_EQ(CELL_ID(lookup(CELL_ID(private_name), env)), 4);
+    ASSERT_EQ(lookup_silent(CELL_ID(after), env), TOK_ERROR);
+    ASSERT_EQ(defvar(after, store(5), env), TOK_ERROR);
+    ASSERT_EQ(setvar(CELL_ID(before), store(6), env), TOK_ERROR);
 
     // Marking is idempotent and must not stack a second marker.
     mark_immutable_environment(env);
@@ -3724,6 +3755,7 @@ int main(void)
     // Interning
     RUN_TEST(intern_same_string);
     RUN_TEST(intern_different_strings);
+    RUN_TEST(uninterned_symbols_keep_distinct_identities);
     RUN_TEST(atom_from_string_creates_atom);
     RUN_TEST(atom_from_string_parses_number);
 

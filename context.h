@@ -317,6 +317,10 @@ int hash_function(const char *s);
 // Intern a string into the atom table
 int intern(const char *s);
 
+// Create a fresh symbol whose name cannot be used to recover its identity.
+unsigned make_uninterned_symbol(const char *name);
+bool atom_is_uninterned(unsigned atom);
+
 // Convert string to atom or number
 unsigned atom_from_string(const char *s);
 

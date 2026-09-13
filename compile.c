@@ -189,9 +189,8 @@ static bool body_defines_internally(unsigned body, unsigned env)
             return true;
         if (IS_PAIR(expr) && IS_KEYWORD(car(expr), ctx.kw_begin) &&
             !is_keyword_shadowed(ctx.kw_begin, env)) {
-            for (unsigned b = cdr(expr); IS_PAIR(b); b = cdr(b))
-                if (is_internal_define(car(b), env))
-                    return true;
+            if (body_defines_internally(cdr(expr), env))
+                return true;
         }
     }
     return false;
@@ -1661,10 +1660,8 @@ static void bind_gensym_transformer_at_compile_time(compile_ctx *cctx,
                                                     unsigned gensym,
                                                     unsigned transformer)
 {
-    // The DEFINE already emitted reports an immutable frame at runtime;
-    // doing it again here would print the error twice.
-    if (environment_is_immutable(cctx->env))
-        return;
+    // Uninterned expansion identifiers may be installed in an immutable
+    // import environment; they do not alter any of its public bindings.
     defvar(gensym, transformer, cctx->env);
 }
 
@@ -1892,14 +1889,12 @@ static bool collect_syntax_free_vars(compile_ctx *cctx, unsigned rules,
             unsigned val = lookup_silent(var_id, cctx->env);
             if (val != TOK_ERROR) {
                 extern unsigned gensym_counter;
-                // "##gensym##" is 10 chars and %u is up to 10 digits, so 21
-                // bytes are needed. At 20 the name would silently truncate
-                // once the counter passes 1e9 and two distinct gensyms could
-                // then collide, which defeats the whole point of a gensym.
+                // Keep the complete generated name for diagnostics. Symbol
+                // identity is independent of its printable name.
                 char name[32];
                 snprintf(name, sizeof(name), "##gensym##%u",
                          gensym_counter++);
-                unsigned gensym_atom = atom_from_string(name);
+                unsigned gensym_atom = make_uninterned_symbol(name);
                 gc_protect(&gensym_atom);
                 gc_protect(&val);
 
@@ -2380,12 +2375,11 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
                             if (val != TOK_ERROR) {
                                 // Create gensym
                                 extern unsigned gensym_counter;
-                                // See the note on the other gensym site: 20
-                                // bytes truncates past a billion gensyms.
+                                // Leave room for the complete diagnostic name.
                                 char name[32];
                                 snprintf(name, sizeof(name), "##gensym##%u",
                                          gensym_counter++);
-                                unsigned gensym_atom = atom_from_string(name);
+                                unsigned gensym_atom = make_uninterned_symbol(name);
                                 gc_protect(&gensym_atom);
                                 gc_protect(&val);
 
@@ -3385,17 +3379,16 @@ static unsigned is_internal_define(unsigned expr, unsigned env)
     }
 }
 
-// Scan body for internal defines and collect variable names
-// Internal defines can appear at the start of a body, including inside begin
-// Returns a list of variable names that are defined
-static unsigned scan_internal_defines(unsigned body, unsigned env)
+// Splice nested begins while collecting the leading definitions. Return
+// false at the first expression so callers stop scanning the enclosing body.
+static bool collect_internal_defines(unsigned body, unsigned env,
+                                     unsigned *names)
 {
-    unsigned names = 0;
-    gc_protect(&names);
+    GC_GUARD;
     gc_protect(&body);
     gc_protect(&env);
 
-    while (body) {
+    while (IS_PAIR(body)) {
         unsigned expr = car(body);
         gc_protect(&expr);
 
@@ -3403,46 +3396,35 @@ static unsigned scan_internal_defines(unsigned body, unsigned env)
         unsigned name = is_internal_define(expr, env);
         if (name) {
             gc_protect(&name);
-            unsigned cell = alloc_cons(name, names);
-            names = cell;
+            *names = alloc_cons(name, *names);
             gc_unprotect(1);
             body = cdr(body);
             gc_unprotect(1);
             continue;
         }
 
-        // Check for begin containing defines (only if begin is not shadowed)
+        // A begin can contain more begins, all in the same definition scope.
         if (IS_PAIR(expr) && IS_KEYWORD(car(expr), ctx.kw_begin) &&
             !is_keyword_shadowed(ctx.kw_begin, env)) {
-            // Scan inside the begin
-            unsigned begin_body = cdr(expr);
-            while (begin_body) {
-                unsigned inner = car(begin_body);
-                unsigned inner_name = is_internal_define(inner, env);
-                if (inner_name) {
-                    gc_protect(&inner_name);
-                    unsigned cell = alloc_cons(inner_name, names);
-                    names = cell;
-                    gc_unprotect(1);
-                    begin_body = cdr(begin_body);
-                } else {
-                    break; // Non-define in begin, stop scanning begin
-                }
-            }
-            // If begin was all defines, continue to next expr
-            if (!begin_body) {
+            if (collect_internal_defines(cdr(expr), env, names)) {
                 body = cdr(body);
                 gc_unprotect(1);
                 continue;
             }
         }
 
-        // Not a define or begin-with-defines, stop scanning
-        gc_unprotect(1);
-        break;
+        return false;
     }
+    return body == 0;
+}
 
-    gc_unprotect(3);
+// Internal definitions may be nested inside any number of begin forms.
+static unsigned scan_internal_defines(unsigned body, unsigned env)
+{
+    GC_GUARD;
+    unsigned names = 0;
+    gc_protect(&names);
+    collect_internal_defines(body, env, &names);
     return names;
 }
 

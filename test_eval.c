@@ -434,6 +434,27 @@ TEST(eval_reciprocal_exact_complex)
     PASS();
 }
 
+TEST(eval_unary_exact_complex_rationals)
+{
+    GC_GUARD;
+    unsigned env = default_environment();
+    gc_protect(&env);
+    const char *cases[] = {
+        "(= (- 1/2+3/4i) -1/2-3/4i)",
+        "(= (- -1/2-3/4i) 1/2+3/4i)",
+        "(= (/ 1/2+3/4i) 8/13-12/13i)",
+        "(= (/ -1/2-3/4i) -8/13+12/13i)",
+        "(let ((z (make-rectangular 9007199254740993/2 1/3)))"
+        "  (and (= (+ z (- z)) 0) (= (* z (/ z)) 1)"
+        "       (exact? (- z)) (exact? (/ z))))",
+    };
+    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        ASSERT(eval_string(cases[i], env) == ctx.atom_true);
+        ASSERT(compiled_eval_string(cases[i], env) == ctx.atom_true);
+    }
+    PASS();
+}
+
 // ============================================================================
 // Comparison Tests
 // ============================================================================
@@ -1039,6 +1060,38 @@ TEST(compiled_empty_let_forms_do_not_leak_internal_defines)
     ASSERT(is_int(result, 1));
     ASSERT(compiled_eval_string("compiled-empty-letrec-leak", env) ==
            TOK_ERROR);
+    PASS();
+}
+
+TEST(nested_begin_definitions_keep_function_scope)
+{
+    unsigned (*engines[])(const char *, unsigned) = {
+        eval_string, compiled_eval_string};
+    for (unsigned i = 0; i < sizeof(engines) / sizeof(engines[0]); i++) {
+        GC_GUARD;
+        unsigned env = default_environment();
+        gc_protect(&env);
+        ASSERT(engines[i]("(define outer 7)", env) != TOK_ERROR);
+        ASSERT(engines[i](
+            "(define (nested x) "
+            "  (begin (begin (begin "
+            "    (define outer 42) (define (inner) x)))) "
+            "  (+ outer (inner)))", env) != TOK_ERROR);
+        ASSERT(is_int(engines[i]("(nested 5)", env), 47));
+        ASSERT(is_int(engines[i]("(nested 8)", env), 50));
+        ASSERT(is_int(engines[i]("outer", env), 7));
+        ASSERT(lookup_silent(intern("inner"), env) == TOK_ERROR);
+
+        // The nested definition must shadow the outer syntax binding even
+        // while compiling an earlier local procedure that calls it.
+        ASSERT(is_int(engines[i](
+            "(let-syntax ((h (syntax-rules () ((_) 99)))) "
+            "  (letrec ((f (lambda (x) "
+            "                (define (g) (h)) "
+            "                (begin (begin (define (h) x))) "
+            "                (g)))) "
+            "    (f 42)))", env), 42));
+    }
     PASS();
 }
 
@@ -1997,7 +2050,7 @@ TEST(eval_close_port_rejects_wrong_direction)
     PASS();
 }
 
-TEST(eval_set_current_port_rejects_closed_port)
+TEST(eval_set_current_port_accepts_closed_port_but_io_rejects_it)
 {
     unsigned env = default_environment();
     GC_GUARD;
@@ -2005,8 +2058,11 @@ TEST(eval_set_current_port_rejects_closed_port)
     unsigned result = eval_string(
         "(let ((p (open-output-string))) "
         "  (close-output-port p) "
-        "  (set-current-output-port! p))",
+        "  (set-current-output-port! p) "
+        "  (eq? p (current-output-port)))",
         env);
+    ASSERT(result == ctx.atom_true);
+    result = eval_string("(newline)", env);
     ctx.current_output_cell = 0;
     ctx.current_output = stdout;
     ASSERT(result == TOK_ERROR);
@@ -2014,8 +2070,11 @@ TEST(eval_set_current_port_rejects_closed_port)
     result = eval_string(
         "(let ((p (open-input-string \"x\"))) "
         "  (close-input-port p) "
-        "  (set-current-input-port! p))",
+        "  (set-current-input-port! p) "
+        "  (eq? p (current-input-port)))",
         env);
+    ASSERT(result == ctx.atom_true);
+    result = eval_string("(read-char)", env);
     ctx.current_input_cell = 0;
     ctx.current_input = stdin;
     ASSERT(result == TOK_ERROR);
@@ -2910,6 +2969,39 @@ TEST(eval_inexact_to_exact_positive_int64_boundary)
     PASS();
 }
 
+TEST(eval_inexact_to_exact_complex_components)
+{
+    GC_GUARD;
+    unsigned env = default_environment();
+    gc_protect(&env);
+    const char *cases[] = {
+        "(= (inexact->exact (make-rectangular 1/3 0.5)) 1/3+1/2i)",
+        "(= (inexact->exact (make-rectangular 0.5 1/3)) 1/2+1/3i)",
+        "(= (inexact->exact (make-rectangular 9007199254740993 0.5))"
+        "   9007199254740993+1/2i)",
+        "(let* ((n (expt 10 400))"
+        "       (z (inexact->exact (make-rectangular n 0.5))))"
+        "  (and (exact? z) (= (real-part z) n) (= (imag-part z) 1/2)))",
+        "(= (inexact->exact (make-rectangular 0.1 0.2))"
+        "   (make-rectangular (inexact->exact 0.1) (inexact->exact 0.2)))",
+    };
+    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        ASSERT(eval_string(cases[i], env) == ctx.atom_true);
+        ASSERT(compiled_eval_string(cases[i], env) == ctx.atom_true);
+    }
+    const char *errors[] = {
+        "(inexact->exact (make-rectangular +inf.0 1.0))",
+        "(inexact->exact (make-rectangular 1.0 +inf.0))",
+        "(inexact->exact (make-rectangular +nan.0 1.0))",
+        "(inexact->exact (make-rectangular 1.0 +nan.0))",
+    };
+    for (unsigned i = 0; i < sizeof(errors) / sizeof(errors[0]); i++) {
+        ASSERT(eval_string(errors[i], env) == TOK_ERROR);
+        ASSERT(compiled_eval_string(errors[i], env) == TOK_ERROR);
+    }
+    PASS();
+}
+
 TEST(eval_number_to_string_int64_min_radix)
 {
     unsigned env = default_environment();
@@ -3041,13 +3133,75 @@ TEST(eval_arithmetic_shift_negative_large_left_promotes)
     PASS();
 }
 
-TEST(eval_rationalize_rejects_large_inexact)
+TEST(eval_rationalize_preserves_large_inexact)
 {
     unsigned env = default_environment();
     GC_GUARD;
     gc_protect(&env);
     unsigned result = eval_string("(rationalize 1e100 0.0)", env);
-    ASSERT(result == TOK_ERROR);
+    ASSERT(IS_INEXACT(result));
+    ASSERT(to_double(result) == 1e100);
+    result = compiled_eval_string("(rationalize 1e100 0.0)", env);
+    ASSERT(IS_INEXACT(result));
+    ASSERT(to_double(result) == 1e100);
+    PASS();
+}
+
+TEST(rationalize_respects_exact_interval)
+{
+    GC_GUARD;
+    unsigned env = default_environment();
+    gc_protect(&env);
+    const char *cases[] = {
+        "(= (rationalize 1/1000 0) 1/1000)",
+        "(= (rationalize 1/1000 1/1000000) 1/1000)",
+        "(= (rationalize -1/1000 -1/1000000) -1/1000)",
+        "(= (rationalize 9007199254740993 0) 9007199254740993)",
+        "(= (rationalize -9223372036854775809 0) -9223372036854775809)",
+        "(= (rationalize (expt 10 400) 0) (expt 10 400))",
+        "(let ((x (/ 1 (expt 10 400)))) (= (rationalize x 0) x))",
+        "(= (rationalize 3/10 1/10) 1/3)",
+        "(= (rationalize 7/10 1/10) 2/3)",
+        "(= (rationalize 3/2 1/2) 1)",
+        "(= (rationalize -3/2 1/2) -1)",
+        "(= (rationalize 9/5 1/5) 2)",
+        "(= (rationalize 5 10) 0)",
+        "(= (rationalize -5 10) 0)",
+        "(= (rationalize 0 0) 0)",
+        "(inexact? (rationalize 3/10 0.1))",
+        "(= (rationalize 3.5 0.0) 3.5)",
+        "(= (rationalize 1e-320 0.0) 1e-320)",
+        "(= (rationalize 42 +inf.0) 0.0)",
+    };
+    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        ASSERT(eval_string(cases[i], env) == ctx.atom_true);
+        ASSERT(compiled_eval_string(cases[i], env) == ctx.atom_true);
+    }
+    ASSERT(eval_string("(rationalize +inf.0 0)", env) == TOK_ERROR);
+    ASSERT(eval_string("(rationalize 1 +nan.0)", env) == TOK_ERROR);
+    PASS();
+}
+
+TEST(complex_finiteness_preserves_exact_components)
+{
+    GC_GUARD;
+    unsigned env = default_environment();
+    gc_protect(&env);
+    const char *cases[] = {
+        "(finite? (make-rectangular (expt 10 400) 1))",
+        "(finite? (make-rectangular 1 (expt 10 400)))",
+        "(finite? (make-rectangular (expt 10 400) 1.0))",
+        "(not (infinite? (make-rectangular (expt 10 400) 1)))",
+        "(not (nan? (make-rectangular (expt 10 400) 1)))",
+        "(infinite? (make-rectangular (expt 10 400) +inf.0))",
+        "(not (finite? (make-rectangular (expt 10 400) +inf.0)))",
+        "(nan? (make-rectangular (expt 10 400) +nan.0))",
+        "(not (finite? (make-rectangular (expt 10 400) +nan.0)))",
+    };
+    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        ASSERT(eval_string(cases[i], env) == ctx.atom_true);
+        ASSERT(compiled_eval_string(cases[i], env) == ctx.atom_true);
+    }
     PASS();
 }
 
@@ -3103,6 +3257,195 @@ TEST(eval_complex_large_components_stay_finite)
 
     result = compiled_eval_string(src, default_environment());
     ASSERT(is_bool(result, 1));
+    PASS();
+}
+
+TEST(eval_complex_math_range_and_branch_cuts)
+{
+    GC_GUARD;
+    unsigned env = default_environment();
+    gc_protect(&env);
+    const char *cases[] = {
+        "(< (magnitude (- (atan 1+1i)"
+        "                 1.0172219678978514+0.40235947810852507i)) 1e-14)",
+        "(< (magnitude (- (atan 0+2i)"
+        "                 1.5707963267948966+0.5493061443340549i)) 1e-14)",
+        "(let ((z (atan 0+1i)))"
+        "  (and (= (real-part z) 0) (= (imag-part z) +inf.0)))",
+        "(let ((z (atan 0-1i)))"
+        "  (and (= (real-part z) 0) (= (imag-part z) -inf.0)))",
+        "(= (imag-part (sqrt (make-rectangular -4.0 -0.0))) -2.0)",
+        "(= (imag-part (sqrt (make-rectangular -4.0 0.0))) 2.0)",
+        "(let ((z (sqrt 1.7e308+1.7e308i)))"
+        "  (and (finite? z)"
+        "       (< (abs (- (/ (real-part z) 1.4325088230154573e154) 1)) 1e-14)"
+        "       (< (abs (- (/ (imag-part z) 5.933645827121221e153) 1)) 1e-14)))",
+        "(let ((z (sqrt (make-rectangular +inf.0 1.0))))"
+        "  (and (infinite? (real-part z)) (= (imag-part z) 0)))",
+        "(let ((z (sqrt (make-rectangular 1.0 +inf.0))))"
+        "  (and (infinite? (real-part z)) (infinite? (imag-part z))))",
+        "(< (magnitude (- (log 1.7e308+1.7e308i)"
+        "                 710.0734104835082+0.7853981633974483i)) 1e-12)",
+    };
+    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        ASSERT(eval_string(cases[i], env) == ctx.atom_true);
+        ASSERT(compiled_eval_string(cases[i], env) == ctx.atom_true);
+    }
+    ASSERT(eval_string("(atan 1+1i 1)", env) == TOK_ERROR);
+    ASSERT(compiled_eval_string("(atan 1 1+1i)", env) == TOK_ERROR);
+    PASS();
+}
+
+TEST(eval_complex_transcendentals_avoid_intermediate_overflow)
+{
+    GC_GUARD;
+    unsigned env = default_environment();
+    gc_protect(&env);
+    const char *cases[] = {
+        "(< (abs (- (imag-part (asin 0.0+1e100i)) 230.95165647996453)) 1e-12)",
+        "(finite? (asin 1e300+1e300i))",
+        "(finite? (acos 1e300+1e300i))",
+        "(< (magnitude (- (tan 1.0+1000.0i) 0+1i)) 1e-14)",
+        "(let ((z (exp (make-rectangular 1000.0 0.0))))"
+        "  (and (infinite? (real-part z)) (= (imag-part z) 0)))",
+        "(let ((z (sin (make-rectangular 0.0 1000.0))))"
+        "  (and (= (real-part z) 0) (infinite? (imag-part z))))",
+        "(let ((z (cos (make-rectangular 0.0 1000.0))))"
+        "  (and (infinite? (real-part z)) (= (imag-part z) 0)))",
+        "(> (imag-part (asin (make-rectangular 2.0 0.0))) 0)",
+        "(< (imag-part (asin (make-rectangular 2.0 -0.0))) 0)",
+        "(> (imag-part (acos (make-rectangular -2.0 -0.0))) 0)",
+        "(< (imag-part (acos (make-rectangular -2.0 0.0))) 0)",
+        "(let ((z (log -0.0)))"
+        "  (and (= (real-part z) -inf.0)"
+        "       (< (abs (- (imag-part z) 3.141592653589793)) 1e-14)))",
+        "(= (sqrt1pm1 +inf.0) +inf.0)",
+        "(< (abs (- (/ (imag-part (sqrt1pm1 1.0+1e-20i))"
+        "              3.5355339059327375e-21) 1)) 1e-14)",
+        "(let ((z (sqrt1pm1 0.0+1e-20i)))"
+        "  (and (< (abs (- (/ (real-part z) 1.25e-41) 1)) 1e-14)"
+        "       (< (abs (- (/ (imag-part z) 5e-21) 1)) 1e-14)))",
+        "(finite? (sqrt1pm1 1.7e308+1.7e308i))",
+        "(= (imag-part (sqrt1pm1 (make-rectangular -2.0 -0.0))) -1.0)",
+    };
+    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        ASSERT(eval_string(cases[i], env) == ctx.atom_true);
+        ASSERT(compiled_eval_string(cases[i], env) == ctx.atom_true);
+    }
+    PASS();
+}
+
+TEST(eval_stable_complex_helpers_keep_small_components)
+{
+    GC_GUARD;
+    unsigned env = default_environment();
+    gc_protect(&env);
+    const char *cases[] = {
+        "(< (abs (- (/ (real-part (log1p 1e-20+1e-20i)) 1e-20) 1)) 1e-14)",
+        "(< (abs (- (/ (real-part (log1p 0.0+1e-20i)) 5e-41) 1)) 1e-14)",
+        "(< (abs (- (/ (real-part (expm1 0.0+1e-20i)) -5e-41) 1)) 1e-14)",
+        "(finite? (log1p 1.7e308+1.7e308i))",
+        "(let ((z (expm1 (make-rectangular 1000.0 0.0))))"
+        "  (and (= (real-part z) +inf.0) (= (imag-part z) 0)))",
+        "(< (abs (- (/ (real-part (log1pexp -50.0+1.0i))"
+        "              1.0421079902977286e-22) 1)) 1e-14)",
+        "(< (magnitude (- (log1pexp 1e-20+3.141592653589793i)"
+        "                 -36.63870900937511+1.570877982991481i)) 1e-13)",
+        "(< (magnitude (- (log1pexp -1e-20+3.141592653589793i)"
+        "                 -36.63870900937511+1.570714670598312i)) 1e-13)",
+    };
+    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        ASSERT(eval_string(cases[i], env) == ctx.atom_true);
+        ASSERT(compiled_eval_string(cases[i], env) == ctx.atom_true);
+    }
+    PASS();
+}
+
+TEST(eval_expt_zero_and_complex_range)
+{
+    GC_GUARD;
+    unsigned env = default_environment();
+    gc_protect(&env);
+    const char *cases[] = {
+        "(= (expt 0.0+0.0i 2) 0.0)",
+        "(= (expt 0.0+0.0i 0) 1.0)",
+        "(= (expt 0.0+0.0i 0.0) 1.0)",
+        "(= (expt 0.0+0.0i 2+1i) 0.0)",
+        "(exact? (expt 0 2+1i))",
+        "(inexact? (expt 0.0+0.0i 2))",
+        "(= (expt 0 (/ 1 (expt 10 400))) 0)",
+        "(let ((z (expt 1.7e308+1.7e308i 0.5)))"
+        "  (and (finite? z)"
+        "       (< (abs (- (/ (real-part z) 1.4325088230154573e154) 1)) 1e-12)"
+        "       (< (abs (- (/ (imag-part z) 5.933645827121221e153) 1)) 1e-12)))",
+    };
+    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        ASSERT(eval_string(cases[i], env) == ctx.atom_true);
+        ASSERT(compiled_eval_string(cases[i], env) == ctx.atom_true);
+    }
+    const char *errors[] = {"(expt 0.0+0.0i -1)", "(expt 0.0+0.0i 0+1i)",
+                           "(expt 0 -1/3)", "(expt 0.0 +nan.0)"};
+    for (unsigned i = 0; i < sizeof(errors) / sizeof(errors[0]); i++) {
+        ASSERT(eval_string(errors[i], env) == TOK_ERROR);
+        ASSERT(compiled_eval_string(errors[i], env) == TOK_ERROR);
+    }
+    PASS();
+}
+
+TEST(eval_inexact_preserves_complex_arguments)
+{
+    GC_GUARD;
+    unsigned env = default_environment();
+    gc_protect(&env);
+    const char *cases[] = {
+        "(let ((z (make-rectangular -4.0 -0.0)))"
+        "  (= (imag-part (sqrt (exact->inexact z))) -2.0))",
+        "(let* ((z (make-rectangular 1/3 0.5)) (w (exact->inexact z)))"
+        "  (and (eqv? (real-part w) 1/3) (= (imag-part w) 0.5)))",
+        "(let* ((n (expt 10 400))"
+        "       (z (exact->inexact (make-rectangular n 1.0))))"
+        "  (eqv? (real-part z) n))",
+    };
+    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        ASSERT(eval_string(cases[i], env) == ctx.atom_true);
+        ASSERT(compiled_eval_string(cases[i], env) == ctx.atom_true);
+    }
+    PASS();
+}
+
+TEST(eval_complex_number_text_round_trips)
+{
+    GC_GUARD;
+    unsigned env = default_environment();
+    gc_protect(&env);
+    const char *cases[] = {
+        "(let* ((z (make-rectangular 1.0 -0.0))"
+        "       (w (string->number (number->string z))))"
+        "  (and (number? w) (eqv? (imag-part w) -0.0)))",
+        "(let* ((z (make-rectangular 1 (expt 10 400)))"
+        "       (w (string->number (number->string z)))) (= z w))",
+        "(let* ((z (make-rectangular 1 (- (/ 1 (expt 10 400)))))"
+        "       (w (string->number (number->string z)))) (= z w))",
+        "(let* ((z (make-rectangular +inf.0 1.0))"
+        "       (w (string->number (number->string z))))"
+        "  (and (= (real-part w) +inf.0) (= (imag-part w) 1.0)))",
+        "(let* ((z (make-rectangular 1.0 +nan.0))"
+        "       (w (string->number (number->string z))))"
+        "  (and (= (real-part w) 1.0) (nan? (imag-part w))))",
+        "(let* ((z (make-rectangular +nan.0 -1.0))"
+        "       (w (string->number (number->string z))))"
+        "  (and (nan? (real-part w)) (= (imag-part w) -1.0)))",
+        "(= (string->number \"+INF.0\") +inf.0)",
+        "(= (string->number \"+I\") 0+1i)",
+        "(nan? (imag-part (string->number \"1+NaN.0i\")))",
+        "(let ((s (string->symbol \"+inf.0+1.0i\")) (p (open-output-string)))"
+        "  (write s p)"
+        "  (eq? s (read (open-input-string (get-output-string p)))))",
+    };
+    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        ASSERT(eval_string(cases[i], env) == ctx.atom_true);
+        ASSERT(compiled_eval_string(cases[i], env) == ctx.atom_true);
+    }
     PASS();
 }
 
@@ -3282,6 +3625,62 @@ TEST(eval_string_to_number_radix_bignum)
     PASS();
 }
 
+TEST(eval_numeric_prefixes_share_reader_semantics)
+{
+    GC_GUARD;
+    unsigned env = default_environment();
+    gc_protect(&env);
+    const struct { const char *text; const char *expected; } cases[] = {
+        {"#i1+2i", "1.0+2.0i"},
+        {"#i1+0i", "1.0+0.0i"},
+        {"#i1-0i", "1.0-0.0i"},
+        {"#i-0", "-0.0"},
+        {"#i+i", "0.0+1.0i"},
+        {"#e1.5+2.5i", "3/2+5/2i"},
+        {"#e1.234567890123456789+1.0i", "1234567890123456789/1000000000000000000+1i"},
+        {"#e1e400+1.0i", "(make-rectangular (expt 10 400) 1)"},
+        {"#e1e-400+1.0i", "(make-rectangular (/ 1 (expt 10 400)) 1)"},
+        {"#x1e-2i", "30-2i"},
+        {"#x#i1e+ai", "30.0+10.0i"},
+        {"#b+i", "0+1i"},
+        {"#o-7/10+1/2i", "-7/8+1/2i"},
+        {"#x#e-10/3+i", "-16/3+1i"},
+        {"#d+inf.0", "+inf.0"},
+        {"#x+inf.0", "+inf.0"},
+        {".5+2i", "0.5+2i"},
+        {"#e.5-2.5i", "1/2-5/2i"},
+    };
+    char src[1024];
+    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        snprintf(src, sizeof(src),
+                 "(let ((s (string->number \"%s\"))"
+                 "      (r (read (open-input-string \"%s\"))))"
+                 "  (and (eqv? s r) (eqv? s %s)))",
+                 cases[i].text, cases[i].text, cases[i].expected);
+        ASSERT(eval_string(src, env) == ctx.atom_true);
+        ASSERT(compiled_eval_string(src, env) == ctx.atom_true);
+    }
+    const char *exact_cases[] = {
+        "(exact? (string->number \"#e1.5+2.5i\"))",
+        "(inexact? (real-part (string->number \"#i1+2i\")))",
+        "(inexact? (imag-part (string->number \"#i1+2i\")))",
+        "(= (string->number \"1e-2i\" 16) 30-2i)",
+        "(= (string->number \"#d12\" 16) 12)",
+    };
+    for (unsigned i = 0; i < sizeof(exact_cases) / sizeof(exact_cases[0]); i++) {
+        ASSERT(eval_string(exact_cases[i], env) == ctx.atom_true);
+        ASSERT(compiled_eval_string(exact_cases[i], env) == ctx.atom_true);
+    }
+    const char *invalid[] = {"#e+inf.0+1i", "#e1.0+nan.0i", "#i#i1",
+                             "#x#x1", "#", "#i", "1/0", "1+2/0i", "1+-2i"};
+    for (unsigned i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+        snprintf(src, sizeof(src), "(string->number \"%s\")", invalid[i]);
+        ASSERT(eval_string(src, env) == ctx.atom_false);
+        ASSERT(compiled_eval_string(src, env) == ctx.atom_false);
+    }
+    PASS();
+}
+
 TEST(eval_string_to_number_radix_rejects_invalid)
 {
     unsigned env = default_environment();
@@ -3289,6 +3688,29 @@ TEST(eval_string_to_number_radix_rejects_invalid)
     gc_protect(&env);
     unsigned result = eval_string("(string->number \"12abc\" 10)", env);
     ASSERT(result == ctx.atom_false);
+    PASS();
+}
+
+TEST(eval_complex_radix_round_trips)
+{
+    GC_GUARD;
+    unsigned env = default_environment();
+    gc_protect(&env);
+    const char *cases[] = {
+        "(equal? (number->string 30-2i 16) \"1e-2i\")",
+        "(equal? (number->string 1/2+3/4i 2) \"1/10+11/100i\")",
+        "(equal? (number->string -15/8+9/2i 8) \"-17/10+11/2i\")",
+        "(let ((z (make-rectangular (/ (expt 10 100) 3) -7/11)))"
+        "  (and (eqv? z (string->number (number->string z 2) 2))"
+        "       (eqv? z (string->number (number->string z 8) 8))"
+        "       (eqv? z (string->number (number->string z 16) 16))))",
+    };
+    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        ASSERT(eval_string(cases[i], env) == ctx.atom_true);
+        ASSERT(compiled_eval_string(cases[i], env) == ctx.atom_true);
+    }
+    ASSERT(eval_string("(number->string 1.0+2i 16)", env) == TOK_ERROR);
+    ASSERT(compiled_eval_string("(number->string 1+2.0i 16)", env) == TOK_ERROR);
     PASS();
 }
 
@@ -7314,6 +7736,7 @@ int main(void)
     RUN_TEST(eval_divide);
     RUN_TEST(eval_divide_exact_complex);
     RUN_TEST(eval_reciprocal_exact_complex);
+    RUN_TEST(eval_unary_exact_complex_rationals);
 
     // Comparison
     RUN_TEST(eval_exact_rational_comparison_preserves_precision);
@@ -7357,6 +7780,7 @@ int main(void)
     RUN_TEST(eval_let_nested);
     RUN_TEST(eval_empty_let_forms_do_not_leak_internal_defines);
     RUN_TEST(compiled_empty_let_forms_do_not_leak_internal_defines);
+    RUN_TEST(nested_begin_definitions_keep_function_scope);
     RUN_TEST(eval_empty_syntax_binding_forms_splice_internal_defines);
     RUN_TEST(compiled_empty_syntax_binding_forms_splice_internal_defines);
     RUN_TEST(eval_letstar);
@@ -7417,7 +7841,7 @@ int main(void)
     RUN_TEST(eval_flush_rejects_closed_output_port);
     RUN_TEST(eval_io_rejects_nil_port_argument);
     RUN_TEST(eval_close_port_rejects_wrong_direction);
-    RUN_TEST(eval_set_current_port_rejects_closed_port);
+    RUN_TEST(eval_set_current_port_accepts_closed_port_but_io_rejects_it);
     RUN_TEST(eval_write_to_string_escapes_strings);
     RUN_TEST(eval_write_large_acyclic_list);
     RUN_TEST(write_simple_rejects_cyclic_data);
@@ -7479,6 +7903,7 @@ int main(void)
     RUN_TEST(eval_modulo_int64_min_by_negative_one);
     RUN_TEST(eval_inexact_to_exact_int64_min);
     RUN_TEST(eval_inexact_to_exact_positive_int64_boundary);
+    RUN_TEST(eval_inexact_to_exact_complex_components);
     RUN_TEST(eval_number_to_string_int64_min_radix);
     RUN_TEST(eval_number_to_string_exact_non_int64);
     RUN_TEST(eval_radix_rejects_out_of_range_values);
@@ -7488,7 +7913,9 @@ int main(void)
     RUN_TEST(eval_arithmetic_shift_large_left_promotes);
     RUN_TEST(eval_arithmetic_shift_overflow_left_promotes);
     RUN_TEST(eval_arithmetic_shift_negative_large_left_promotes);
-    RUN_TEST(eval_rationalize_rejects_large_inexact);
+    RUN_TEST(eval_rationalize_preserves_large_inexact);
+    RUN_TEST(rationalize_respects_exact_interval);
+    RUN_TEST(complex_finiteness_preserves_exact_components);
     RUN_TEST(eval_floor_preserves_bignum);
     RUN_TEST(eval_magnitude_preserves_rational);
     RUN_TEST(eval_magnitude_preserves_bignum);
@@ -7500,7 +7927,9 @@ int main(void)
     RUN_TEST(eval_rational_to_inexact_preserves_mantissa_bits);
     RUN_TEST(eval_exact_to_inexact_huge_rational_stays_finite);
     RUN_TEST(eval_string_to_number_radix_bignum);
+    RUN_TEST(eval_numeric_prefixes_share_reader_semantics);
     RUN_TEST(eval_string_to_number_radix_rejects_invalid);
+    RUN_TEST(eval_complex_radix_round_trips);
     RUN_TEST(eval_integer_to_char_rejects_surrogates);
     RUN_TEST(compiled_integer_to_char_rejects_surrogates);
     RUN_TEST(eval_complex_reader_accepts_implicit_imaginary_unit);
@@ -7618,6 +8047,12 @@ int main(void)
         syntax_rules_matches_large_flat_pattern_without_stack_overflow);
     RUN_TEST(syntax_rules_expands_large_flat_template_without_stack_overflow);
     RUN_TEST(eval_complex_large_components_stay_finite);
+    RUN_TEST(eval_complex_math_range_and_branch_cuts);
+    RUN_TEST(eval_complex_transcendentals_avoid_intermediate_overflow);
+    RUN_TEST(eval_stable_complex_helpers_keep_small_components);
+    RUN_TEST(eval_expt_zero_and_complex_range);
+    RUN_TEST(eval_inexact_preserves_complex_arguments);
+    RUN_TEST(eval_complex_number_text_round_trips);
     RUN_TEST(eval_complex_division_scales_finite_components);
     RUN_TEST(eval_macro_set_target_is_referentially_transparent);
     RUN_TEST(compiled_macro_set_target_is_referentially_transparent);

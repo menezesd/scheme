@@ -219,55 +219,104 @@ static bool cell_is_datum_label_value(unsigned datum)
     return false;
 }
 
-// Replace every reference to `from` with `to` inside `root` (cycle-safe).
-// Used when a chained label abandons its placeholder for the inner label's
-// object: forward references created while reading still point at the
-// abandoned placeholder.
-static void patch_datum_references(unsigned root, unsigned from, unsigned to,
-                                   unsigned **visited, size_t *visited_len,
-                                   size_t *visited_cap)
+typedef struct {
+    unsigned *nodes;
+    size_t count, capacity;
+    unsigned *seen;
+    size_t seen_capacity;
+} datum_patch_work;
+
+static size_t datum_patch_hash(unsigned cell)
 {
-    if (!IS_CELL(root))
-        return;
-    enum lisp_type type = CELL_TYPE(root);
-    if (type != BT_CONS && type != BT_VECTOR)
-        return;
-    for (size_t i = 0; i < *visited_len; i++)
-        if ((*visited)[i] == root)
-            return;
-    if (*visited_len == *visited_cap) {
-        size_t new_cap = *visited_cap ? *visited_cap * 2 : 32;
-        unsigned *grown = realloc(*visited, new_cap * sizeof(**visited));
+    return (cell ^ (cell >> 16)) * 2654435761u;
+}
+
+static bool datum_patch_enqueue(datum_patch_work *work, unsigned cell)
+{
+    if (!IS_PAIR(cell) && !IS_VECTOR(cell))
+        return true;
+    if (!work->seen_capacity || work->count >= work->seen_capacity / 2) {
+        size_t capacity = 64, bytes;
+        if (work->seen_capacity &&
+            !checked_grow_capacity_size(work->seen_capacity,
+                                        sizeof(*work->seen), &capacity))
+            return false;
+        if (!checked_flex_size(0, capacity, sizeof(*work->seen), &bytes))
+            return false;
+        unsigned *seen = calloc(1, bytes);
+        if (!seen)
+            return false;
+        for (size_t i = 0; i < work->count; i++) {
+            unsigned value = work->nodes[i];
+            size_t slot = datum_patch_hash(value) & (capacity - 1);
+            while (seen[slot])
+                slot = (slot + 1) & (capacity - 1);
+            seen[slot] = value;
+        }
+        free(work->seen);
+        work->seen = seen;
+        work->seen_capacity = capacity;
+    }
+    size_t slot = datum_patch_hash(cell) & (work->seen_capacity - 1);
+    while (work->seen[slot]) {
+        if (work->seen[slot] == cell)
+            return true;
+        slot = (slot + 1) & (work->seen_capacity - 1);
+    }
+    if (work->count == work->capacity) {
+        size_t capacity = 32, bytes;
+        if (work->capacity &&
+            !checked_grow_capacity_size(work->capacity,
+                                        sizeof(*work->nodes), &capacity))
+            return false;
+        if (!checked_flex_size(0, capacity, sizeof(*work->nodes), &bytes))
+            return false;
+        unsigned *grown = checked_realloc_size(work->nodes, bytes);
         if (!grown)
-            return; // out of memory: leave remaining references unpatched
-        *visited = grown;
-        *visited_cap = new_cap;
+            return false;
+        work->nodes = grown;
+        work->capacity = capacity;
     }
-    (*visited)[(*visited_len)++] = root;
+    work->nodes[work->count++] = cell;
+    work->seen[slot] = cell;
+    return true;
+}
 
-    if (type == BT_CONS) {
-        if (car(root) == from)
-            cell_set_car(root, to);
-        else
-            patch_datum_references(car(root), from, to, visited, visited_len,
-                                   visited_cap);
-        if (cdr(root) == from)
-            cell_set_cdr(root, to);
-        else
-            patch_datum_references(cdr(root), from, to, visited, visited_len,
-                                   visited_cap);
-        return;
+// Chained labels share the inner label's object and redirect references to
+// the abandoned outer placeholder. Use an iterative graph walk: a linear
+// visited list made long inputs quadratic, and recursion consumed C stack.
+// Only C scratch memory is allocated here; cell indices remain stable.
+static bool patch_datum_references(unsigned root, unsigned from, unsigned to)
+{
+    datum_patch_work work = {0};
+    bool ok = datum_patch_enqueue(&work, root);
+    for (size_t i = 0; ok && i < work.count; i++) {
+        unsigned node = work.nodes[i];
+        if (IS_PAIR(node)) {
+            if (car(node) == from)
+                cell_set_car(node, to);
+            else
+                ok = datum_patch_enqueue(&work, car(node));
+            if (cdr(node) == from)
+                cell_set_cdr(node, to);
+            else if (ok)
+                ok = datum_patch_enqueue(&work, cdr(node));
+        } else {
+            unsigned len = vector_len(node);
+            for (unsigned j = 0; ok && j < len; j++) {
+                unsigned elem = vector_data_ptr(node)[j];
+                if (elem == from)
+                    vector_set_elem(node, j, to);
+                else
+                    ok = datum_patch_enqueue(&work, elem);
+            }
+        }
     }
-
-    unsigned len = vector_len(root);
-    for (unsigned i = 0; i < len; i++) {
-        unsigned elem = vector_data_ptr(root)[i];
-        if (elem == from)
-            vector_set_elem(root, i, to);
-        else
-            patch_datum_references(elem, from, to, visited, visited_len,
-                                   visited_cap);
-    }
+    free(work.nodes);
+    free(work.seen);
+    if (!ok)
+        show_error("datum labels: out of memory patching references");
+    return ok;
 }
 
 static void resolve_datum_label_placeholder(unsigned placeholder,
@@ -395,7 +444,6 @@ typedef struct {
 
 static void sb_free(string_buffer *sb);
 static inline bool is_delimiter(int c);
-static bool reject_invalid_prefixed_tail(int c, const char *name);
 
 static void sb_init(string_buffer *sb)
 {
@@ -729,30 +777,6 @@ static void sb_free(string_buffer *sb)
     sb->len = sb->cap = 0;
 }
 
-static unsigned read_prefixed_integer(const char *digits, int base, bool neg)
-{
-    errno = 0;
-    char *end = NULL;
-    int64_t val = strtoll(digits, &end, base);
-    if (end && *end == '\0' && errno != ERANGE) {
-        if (neg) {
-            bignum *bn = bn_from_int(val);
-            if (!bn)
-                return TOK_ERROR;
-            bn_neg_ip(bn);
-            return store_integer(bn);
-        }
-        return store(val);
-    }
-
-    bignum *bn = bn_from_string(digits, base);
-    if (!bn)
-        return TOK_ERROR;
-    if (neg)
-        bn_neg_ip(bn);
-    return store_integer(bn);
-}
-
 typedef enum {
     READER_EXACTNESS_UNSPECIFIED,
     READER_EXACTNESS_EXACT,
@@ -797,36 +821,6 @@ static bool prefix_exactness(int c, reader_exactness *exactness)
     default:
         return false;
     }
-}
-
-static bool radix_digit_p(int c, int base)
-{
-    if (base <= 10)
-        return c >= '0' && c < '0' + base;
-    return isxdigit(c) &&
-           (isdigit(c) || ((c | 32) >= 'a' && (c | 32) < 'a' + base - 10));
-}
-
-static unsigned maybe_apply_exactness(unsigned value, reader_exactness exactness)
-{
-    if (exactness != READER_EXACTNESS_INEXACT || !is_numeric(value) ||
-        IS_INEXACT(value))
-        return value;
-    if (IS_COMPLEX(value)) {
-        // #i applies to both components (e.g. #i1+2i => 1.0+2.0i)
-        GC_GUARD;
-        gc_protect(&value);
-        unsigned real_part = CELL_CAR(value);
-        unsigned imag_part = CELL_CDR(value);
-        gc_protect(&real_part);
-        gc_protect(&imag_part);
-        if (!IS_INEXACT(real_part))
-            real_part = store_inexact(to_double(real_part));
-        if (!IS_INEXACT(imag_part))
-            imag_part = store_inexact(to_double(imag_part));
-        return store_complex(real_part, imag_part);
-    }
-    return store_inexact(to_double(value));
 }
 
 static bignum *reader_pow10(uint64_t exp)
@@ -984,6 +978,163 @@ unsigned read_exact_decimal_number(const char *s, bool *handled)
     return normalize_rational_cells(num_cell, den_cell);
 }
 
+static unsigned parse_radix_real(const char *s, int radix)
+{
+    const char *slash = strchr(s, '/');
+    if (!slash) {
+        bignum *value = bn_from_string(s, radix);
+        return value ? store_integer(value) : ctx.atom_false;
+    }
+    if (slash[1] == '+' || slash[1] == '-')
+        return ctx.atom_false;
+    char *numerator_text = checked_string_copy_len(s, (size_t)(slash - s));
+    if (!numerator_text) {
+        show_error("numeric literal: out of memory");
+        return TOK_ERROR;
+    }
+    bignum *num = bn_from_string(numerator_text, radix);
+    free(numerator_text);
+    bignum *den = num ? bn_from_string(slash + 1, radix) : NULL;
+    if (!num || !den || bn_is_zero(den)) {
+        bn_free(num);
+        bn_free(den);
+        return ctx.atom_false;
+    }
+    GC_GUARD;
+    unsigned numerator = store_integer(num);
+    gc_protect(&numerator);
+    unsigned denominator = store_integer(den);
+    return normalize_rational_cells(numerator, denominator);
+}
+
+static unsigned parse_real_component(const char *s, int radix,
+                                      reader_exactness exactness)
+{
+    size_t len = strlen(s);
+    // A component must be real. Reject nested imaginary suffixes before
+    // calling atom_from_string, which also accepts complete complex values.
+    if (!len || s[len - 1] == 'i' || s[len - 1] == 'I')
+        return ctx.atom_false;
+
+    unsigned value;
+    if (radix == 10 && !strchr(s, '/')) {
+        bool handled = false;
+        if (exactness == READER_EXACTNESS_EXACT) {
+            value = read_exact_decimal_number(s, &handled);
+            if (value == TOK_ERROR)
+                return TOK_ERROR;
+        }
+        if (!handled)
+            value = atom_from_string(s);
+    } else {
+        // Infinities and NaNs use the same spelling in every radix.
+        if ((*s == '+' || *s == '-') &&
+            (strcasecmp(s + 1, "inf.0") == 0 ||
+             strcasecmp(s + 1, "nan.0") == 0))
+            value = atom_from_string(s);
+        else
+            value = parse_radix_real(s, radix);
+    }
+    if (value == TOK_ERROR)
+        return TOK_ERROR;
+    if (!is_numeric(value) || IS_COMPLEX(value))
+        return ctx.atom_false;
+    if (exactness == READER_EXACTNESS_EXACT && !is_exact(value))
+        return ctx.atom_false;
+    if (exactness == READER_EXACTNESS_INEXACT && !IS_INEXACT(value)) {
+        double inexact = to_double(value);
+        if (inexact == 0.0 && *s == '-')
+            inexact = -0.0;
+        return store_inexact(inexact);
+    }
+    return value;
+}
+
+static unsigned parse_component_slice(const char *s, size_t len, int radix,
+                                       reader_exactness exactness, bool imaginary)
+{
+    if (imaginary && len == 1 && (*s == '+' || *s == '-')) {
+        int value = *s == '-' ? -1 : 1;
+        return exactness == READER_EXACTNESS_INEXACT
+                   ? store_inexact((double)value) : store(value);
+    }
+    char *copy = checked_string_copy_len(s, len);
+    if (!copy) {
+        show_error("numeric literal: out of memory");
+        return TOK_ERROR;
+    }
+    unsigned value = parse_real_component(copy, radix, exactness);
+    free(copy);
+    return value;
+}
+
+unsigned parse_number_string(const char *s, int default_radix)
+{
+    int radix = default_radix;
+    reader_exactness exactness = READER_EXACTNESS_UNSPECIFIED;
+    bool have_radix = false, have_exactness = false;
+    if (radix != 2 && radix != 8 && radix != 10 && radix != 16)
+        return ctx.atom_false;
+    while (*s == '#') {
+        if (!have_radix && prefix_radix((unsigned char)s[1], &radix))
+            have_radix = true;
+        else if (!have_exactness &&
+                 prefix_exactness((unsigned char)s[1], &exactness))
+            have_exactness = true;
+        else
+            return ctx.atom_false;
+        s += 2;
+    }
+
+    const char *polar = strchr(s, '@');
+    if (polar) {
+        GC_GUARD;
+        unsigned magnitude = parse_component_slice(
+            s, (size_t)(polar - s), radix, exactness, false);
+        if (magnitude == TOK_ERROR || magnitude == ctx.atom_false)
+            return magnitude;
+        gc_protect(&magnitude);
+        unsigned angle = parse_real_component(polar + 1, radix, exactness);
+        if (angle == TOK_ERROR || angle == ctx.atom_false)
+            return angle;
+        return make_polar_number(magnitude, angle);
+    }
+
+    size_t len = strlen(s);
+    if (len <= 1 || (s[len - 1] != 'i' && s[len - 1] != 'I'))
+        return parse_real_component(s, radix, exactness);
+
+    const char *separator = NULL;
+    for (size_t i = 1; i < len - 1; i++) {
+        if (s[i] != '+' && s[i] != '-')
+            continue;
+        // In hexadecimal, e is a digit, so #x1e-2i has a separator here.
+        if (radix == 10 && (s[i - 1] == 'e' || s[i - 1] == 'E'))
+            continue;
+        separator = s + i;
+    }
+
+    GC_GUARD;
+    unsigned real = store(0);
+    gc_protect(&real);
+    if (separator) {
+        real = parse_component_slice(s, (size_t)(separator - s), radix,
+                                     exactness, false);
+        if (real == TOK_ERROR || real == ctx.atom_false)
+            return real;
+    } else {
+        separator = s;
+        if (exactness == READER_EXACTNESS_INEXACT)
+            real = store_inexact(0.0);
+    }
+    unsigned imag = parse_component_slice(separator,
+                                           (size_t)(s + len - 1 - separator),
+                                           radix, exactness, true);
+    if (imag == TOK_ERROR || imag == ctx.atom_false)
+        return imag;
+    return store_complex(real, imag);
+}
+
 // Dispatch characters are bytes, not Unicode scalar values. Formatting EOF
 // or a non-ASCII byte with %c would create an invalid UTF-8 error message.
 static unsigned unknown_dispatch_syntax(const char *prefix, int c)
@@ -999,128 +1150,27 @@ static unsigned unknown_dispatch_syntax(const char *prefix, int c)
 
 static unsigned read_prefixed_number(int prefix)
 {
-    int base = 10;
-    reader_exactness exactness = READER_EXACTNESS_UNSPECIFIED;
-    bool have_radix = false;
-
-    if (prefix_radix(prefix, &base)) {
-        have_radix = true;
-    } else if (!prefix_exactness(prefix, &exactness)) {
-        return unknown_dispatch_syntax("#", prefix);
-    }
-
-    int c = reader_getchar();
-    if (c == '#') {
-        int second = reader_getchar();
-        if (!have_radix && prefix_radix(second, &base)) {
-            c = reader_getchar();
-        } else if (have_radix && exactness == READER_EXACTNESS_UNSPECIFIED &&
-                   prefix_exactness(second, &exactness)) {
-            c = reader_getchar();
-        } else {
-            show_error("invalid numeric prefix");
-            return TOK_ERROR;
-        }
-    }
-
-    bool neg = false;
-    if (c == '-') {
-        neg = true;
-        c = reader_getchar();
-    } else if (c == '+') {
-        c = reader_getchar();
-    }
-
     string_buffer sb;
     sb_init(&sb);
-    if (base == 10) {
-        if (neg)
-            sb_append(&sb, '-');
-        while (!is_delimiter(c)) {
-            if (c == 0) {
-                show_error("null character in numeric literal");
-                sb_free(&sb);
-                return TOK_ERROR;
-            }
-            sb_append(&sb, c);
-            c = reader_getchar();
-        }
-        reader_ungetc(c);
-        if (sb.len == (neg ? 1U : 0U)) {
+    sb_append(&sb, '#');
+    sb_append(&sb, prefix);
+    int c;
+    while (!is_delimiter(c = reader_getchar())) {
+        if (c == 0) {
+            show_error("null character in numeric literal");
             sb_free(&sb);
-            show_error("invalid decimal literal");
             return TOK_ERROR;
         }
-        unsigned value;
-        if (exactness == READER_EXACTNESS_EXACT) {
-            bool handled = false;
-            value = read_exact_decimal_number(sb.data, &handled);
-            if (value == TOK_ERROR) {
-                sb_free(&sb);
-                return TOK_ERROR;
-            }
-            if (!handled)
-                value = atom_from_string(sb.data);
-        } else {
-            value = atom_from_string(sb.data);
-        }
-        sb_free(&sb);
-        if (!is_numeric(value)) {
-            show_error("invalid decimal literal");
-            return TOK_ERROR;
-        }
-        return maybe_apply_exactness(value, exactness);
-    }
-
-    while (radix_digit_p(c, base)) {
         sb_append(&sb, c);
-        c = reader_getchar();
     }
-    if (sb.len > 0 && c == '/') {
-        // Rational in this radix: <digits>/<digits> (R7RS <num R>)
-        string_buffer den;
-        sb_init(&den);
-        c = reader_getchar();
-        while (radix_digit_p(c, base)) {
-            sb_append(&den, c);
-            c = reader_getchar();
-        }
-        if (den.len == 0 ||
-            reject_invalid_prefixed_tail(c, "prefixed rational")) {
-            if (den.len == 0)
-                show_error("invalid prefixed rational literal");
-            sb_free(&den);
-            sb_free(&sb);
-            return TOK_ERROR;
-        }
-        unsigned num_cell = read_prefixed_integer(sb.data, base, neg);
-        sb_free(&sb);
-        if (num_cell == TOK_ERROR) {
-            sb_free(&den);
-            return TOK_ERROR;
-        }
-        GC_GUARD;
-        gc_protect(&num_cell);
-        unsigned den_cell = read_prefixed_integer(den.data, base, false);
-        sb_free(&den);
-        if (den_cell == TOK_ERROR)
-            return TOK_ERROR;
-        gc_protect(&den_cell);
-        unsigned value = normalize_rational_cells(num_cell, den_cell);
-        return maybe_apply_exactness(value, exactness);
-    }
-    if (reject_invalid_prefixed_tail(c, "prefixed integer")) {
-        sb_free(&sb);
-        return TOK_ERROR;
-    }
-    if (sb.len == 0) {
-        sb_free(&sb);
-        show_error("invalid prefixed integer literal");
-        return TOK_ERROR;
-    }
-    unsigned value = read_prefixed_integer(sb.data, base, neg);
+    reader_ungetc(c);
+    unsigned value = parse_number_string(sb.data, 10);
     sb_free(&sb);
-    return maybe_apply_exactness(value, exactness);
+    if (value == ctx.atom_false) {
+        show_error("invalid prefixed numeric literal");
+        return TOK_ERROR;
+    }
+    return value;
 }
 
 static bool read_byte_value(unsigned obj, uint8_t *out)
@@ -1187,20 +1237,6 @@ invalid:
     reader_ungetc(c);
     show_error("invalid boolean literal");
     return TOK_ERROR;
-}
-
-static bool reject_invalid_prefixed_tail(int c, const char *name)
-{
-    if (is_delimiter(c)) {
-        reader_ungetc(c);
-        return false;
-    }
-
-    while (!is_delimiter(c))
-        c = reader_getchar();
-    reader_ungetc(c);
-    show_error("invalid %s literal", name);
-    return true;
 }
 
 // ============================================================================
@@ -1577,7 +1613,12 @@ static unsigned read_escaped_identifier(void)
         sb_free(&sb);
         return TOK_ERROR;
     }
-    unsigned res = atom_from_string(sb.data);
+    // Quoting makes every spelling an identifier, including "123", "+i",
+    // and infinity/NaN literals. Do not send it through numeric parsing.
+    unsigned symbol_id = intern(sb.data);
+    unsigned res = alloc();
+    CELL_TYPE(res) = BT_ATOM;
+    CELL_ID(res) = symbol_id;
     sb_free(&sb);
     return res;
 }
@@ -1590,26 +1631,22 @@ static unsigned read_decimal_number(void)
     sb_append(&sb, '.');
 
     int c;
-    while (isdigit(c = reader_getchar()) || c == 'e' || c == 'E' || c == '+' ||
-           c == '-') {
+    while (!is_delimiter(c = reader_getchar())) {
+        if (c == 0) {
+            show_error("null character in numeric literal");
+            sb_free(&sb);
+            return TOK_ERROR;
+        }
         sb_append(&sb, c);
-    }
-    if (c == 0) {
-        show_error("null character in numeric literal");
-        sb_free(&sb);
-        return TOK_ERROR;
-    }
-    // R7RS requires a delimiter after a number: .5x is an error, not 0.5
-    // followed by the symbol x
-    if (!is_delimiter(c)) {
-        show_error("invalid character in numeric literal");
-        sb_free(&sb);
-        return TOK_ERROR;
     }
     reader_ungetc(c);
 
-    unsigned res = atom_from_string(sb.data);
+    unsigned res = parse_number_string(sb.data, 10);
     sb_free(&sb);
+    if (res == ctx.atom_false) {
+        show_error("invalid character in numeric literal");
+        return TOK_ERROR;
+    }
     return res;
 }
 
@@ -1671,7 +1708,9 @@ static unsigned read_number_or_symbol_token(int c)
         sb_free(&sb);
         return TOK_ERROR;
     }
-    unsigned res = atom_from_string(sb.data);
+    unsigned res = is_number ? parse_number_string(sb.data, 10) : ctx.atom_false;
+    if (res == ctx.atom_false)
+        res = atom_from_string(sb.data);
     sb_free(&sb);
     return res;
 }
@@ -1893,12 +1932,8 @@ unsigned read_token(void)
                     // and patch forward references to our placeholder.
                     if (cell_is_datum_label_value(datum)) {
                         datum_labels[idx].value = datum;
-                        unsigned *visited = NULL;
-                        size_t visited_len = 0, visited_cap = 0;
-                        patch_datum_references(datum, placeholder, datum,
-                                               &visited, &visited_len,
-                                               &visited_cap);
-                        free(visited);
+                        if (!patch_datum_references(datum, placeholder, datum))
+                            return TOK_ERROR;
                         return datum;
                     }
                     resolve_datum_label_placeholder(placeholder, datum);

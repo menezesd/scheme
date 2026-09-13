@@ -4,6 +4,7 @@
 #include "reader.h"
 #include "test_framework.h"
 #include "types.h"
+#include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -57,6 +58,22 @@ TEST(read_floating_point)
     ASSERT(CELL_TYPE(x) == BT_INEXACT);
     double val = to_double(x);
     ASSERT(val > 3.13 && val < 3.15);
+    PASS();
+}
+
+TEST(read_complex_nonfinite_components)
+{
+    const char *cases[] = {"+inf.0+1.0i", "-inf.0+1.0i", "+nan.0+1.0i",
+                           "1.0+nan.0i", "+inf.0i", "-nan.0i",
+                           "+INF.0+NaN.0i", "+I", "-I"};
+    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        unsigned value = read_from_string(cases[i]);
+        ASSERT(IS_COMPLEX(value));
+        ASSERT(is_numeric(value));
+    }
+    unsigned value = read_from_string("+inf.0-1.0i");
+    ASSERT(to_double(CELL_CAR(value)) == HUGE_VAL);
+    ASSERT(to_double(CELL_CDR(value)) == -1.0);
     PASS();
 }
 
@@ -180,6 +197,71 @@ TEST(read_exactness_and_radix_prefixes)
     x = read_from_string("#e1.25e2");
     ASSERT(CELL_TYPE(x) == BT_NUM);
     ASSERT_EQ(CELL_ID(x), 125);
+    PASS();
+}
+
+TEST(read_prefixed_complex_exactness)
+{
+    unsigned x = read_from_string("#e1.5+2.5i");
+    ASSERT(IS_COMPLEX(x));
+    ASSERT(is_exact(x));
+    ASSERT(to_double(CELL_CAR(x)) == 1.5);
+    ASSERT(to_double(CELL_CDR(x)) == 2.5);
+
+    x = read_from_string("#i#x1e+ai");
+    ASSERT(IS_COMPLEX(x));
+    ASSERT(IS_INEXACT(CELL_CAR(x)));
+    ASSERT(IS_INEXACT(CELL_CDR(x)));
+    ASSERT(to_double(CELL_CAR(x)) == 30.0);
+    ASSERT(to_double(CELL_CDR(x)) == 10.0);
+
+    x = read_from_string(".5+2i");
+    ASSERT(IS_COMPLEX(x));
+    ASSERT(to_double(CELL_CAR(x)) == 0.5);
+    ASSERT(to_double(CELL_CDR(x)) == 2.0);
+    ASSERT(read_from_string("#e+inf.0+1i") == TOK_ERROR);
+    ASSERT(read_from_string("#e1+nan.0i") == TOK_ERROR);
+    ASSERT(read_from_string("#i#i1+2i") == TOK_ERROR);
+    PASS();
+}
+
+TEST(read_repeated_imaginary_suffix_does_not_recurse)
+{
+    char input[8192];
+    input[0] = '2';
+    memset(input + 1, 'i', sizeof(input) - 2);
+    input[sizeof(input) - 1] = '\0';
+    unsigned value = read_from_string(input);
+    ASSERT(CELL_TYPE(value) == BT_ATOM);
+    ASSERT_STR_EQ(ctx.atom_table[CELL_ID(value)], input);
+    PASS();
+}
+
+TEST(read_polar_numbers)
+{
+    unsigned x = read_from_string("1/2@0");
+    ASSERT(IS_RATIONAL(x));
+    ASSERT(is_exact(x));
+    ASSERT(to_double(x) == 0.5);
+
+    x = read_from_string("#x10@0");
+    ASSERT(is_exact(x));
+    ASSERT(to_double(x) == 16.0);
+
+    x = read_from_string(".5@0");
+    ASSERT(IS_INEXACT(x));
+    ASSERT(to_double(x) == 0.5);
+
+    x = read_from_string("#i2@0");
+    ASSERT(IS_COMPLEX(x));
+    ASSERT(to_double(CELL_CAR(x)) == 2.0);
+    ASSERT(IS_INEXACT(CELL_CDR(x)));
+
+    x = read_from_string("1@-0.0");
+    ASSERT(IS_COMPLEX(x));
+    ASSERT(signbit(to_double(CELL_CDR(x))));
+    ASSERT(parse_number_string("1@2@3", 10) == ctx.atom_false);
+    ASSERT(parse_number_string("1@+i", 10) == ctx.atom_false);
     PASS();
 }
 
@@ -581,6 +663,19 @@ TEST(read_escaped_identifier)
     PASS();
 }
 
+TEST(read_escaped_numeric_identifier)
+{
+    const char *inputs[] = {"|123|", "|1/3|", "|+i|", "|+inf.0+1.0i|",
+                            "|+nan.0|", "||"};
+    const char *names[] = {"123", "1/3", "+i", "+inf.0+1.0i", "+nan.0", ""};
+    for (unsigned i = 0; i < sizeof(inputs) / sizeof(inputs[0]); i++) {
+        unsigned value = read_from_string(inputs[i]);
+        ASSERT(CELL_TYPE(value) == BT_ATOM);
+        ASSERT_STR_EQ(ctx.atom_table[CELL_ID(value)], names[i]);
+    }
+    PASS();
+}
+
 TEST(read_escaped_identifier_rejects_invalid_escape)
 {
     ASSERT(read_from_string("|abc") == TOK_ERROR);
@@ -858,6 +953,37 @@ TEST(read_datum_label_cyclic_vector)
     PASS();
 }
 
+TEST(read_chained_labels_in_large_shared_graph)
+{
+    const unsigned count = 40000;
+    char *source = malloc((size_t)count * 2 + 64);
+    ASSERT(source != NULL);
+    char *cursor = source;
+    const char *prefix = "#1=#2=(";
+    memcpy(cursor, prefix, strlen(prefix));
+    cursor += strlen(prefix);
+    for (unsigned i = 1; i < count; i++) {
+        *cursor++ = '0';
+        *cursor++ = ' ';
+    }
+    strcpy(cursor, "#(#1# #2#))");
+    unsigned value = read_from_string(source);
+    free(source);
+    ASSERT(IS_PAIR(value));
+    unsigned tail = value;
+    for (unsigned i = 1; i < count; i++) {
+        ASSERT(IS_PAIR(tail));
+        tail = cdr(tail);
+    }
+    ASSERT(IS_PAIR(tail));
+    ASSERT_EQ(cdr(tail), 0);
+    unsigned shared = car(tail);
+    ASSERT(IS_VECTOR(shared));
+    ASSERT_EQ(vector_data_ptr(shared)[0], value);
+    ASSERT_EQ(vector_data_ptr(shared)[1], value);
+    PASS();
+}
+
 TEST(read_datum_label_rejects_missing_datum)
 {
     unsigned x = read_from_string("#0=");
@@ -1022,6 +1148,7 @@ int main(void)
     RUN_TEST(read_negative_integer);
     RUN_TEST(read_zero);
     RUN_TEST(read_floating_point);
+    RUN_TEST(read_complex_nonfinite_components);
     RUN_TEST(read_rational);
     RUN_TEST(read_bignum);
     RUN_TEST(read_hex_integer);
@@ -1033,6 +1160,9 @@ int main(void)
     RUN_TEST(read_prefixed_int64_min);
     RUN_TEST(read_prefixed_integer_rejects_trailing_junk);
     RUN_TEST(read_exactness_and_radix_prefixes);
+    RUN_TEST(read_prefixed_complex_exactness);
+    RUN_TEST(read_repeated_imaginary_suffix_does_not_recurse);
+    RUN_TEST(read_polar_numbers);
     RUN_TEST(read_malformed_rational_as_symbol);
     RUN_TEST(read_malformed_denominator_as_symbol);
     RUN_TEST(read_exact_decimal_rejects_scale_overflow);
@@ -1081,6 +1211,7 @@ int main(void)
     RUN_TEST(read_no_fold_case_preserves_unicode_identifier);
     RUN_TEST(read_symbol_rejects_invalid_utf8);
     RUN_TEST(read_escaped_identifier);
+    RUN_TEST(read_escaped_numeric_identifier);
     RUN_TEST(read_escaped_identifier_rejects_invalid_escape);
 
     // Booleans
@@ -1115,6 +1246,7 @@ int main(void)
     RUN_TEST(read_datum_label_empty_list);
     RUN_TEST(read_datum_label_cyclic_pair);
     RUN_TEST(read_datum_label_cyclic_vector);
+    RUN_TEST(read_chained_labels_in_large_shared_graph);
     RUN_TEST(read_datum_label_rejects_missing_datum);
     RUN_TEST(read_datum_label_rejects_bare_self_reference);
     RUN_TEST(read_datum_label_rejects_special_tokens);

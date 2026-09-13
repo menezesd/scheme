@@ -32,8 +32,9 @@
  * template-introduced bindings from capturing references in the macro use site.
  *
  * 2. **Protection markers**: When a pattern variable is substituted with an
- *    identifier, that identifier is wrapped as (##protected## . id). This marks
- *    it as "coming from input" so that nested macro expansions don't rename it.
+ *    identifier or compound datum, it is wrapped as (##protected## . value).
+ *    This marks it as "coming from input" so expansion cleanup does not walk
+ *    user data, which can contain cycles or shared structure.
  *    The protection marker is preserved through:
  *    - hygienize_template: Skips protected wrappers
  *    - rename_in_template: Skips protected wrappers
@@ -90,23 +91,12 @@ static unsigned do_gensym(void)
 {
     char buf[32];
     snprintf(buf, sizeof(buf), "##gensym##%u", gensym_counter++);
-    return atom_from_string(buf);
+    return make_uninterned_symbol(buf);
 }
 
 static bool generated_gensym_atom(unsigned atom)
 {
-    if (!atom_is_valid(atom))
-        return false;
-    const char *name = ctx.atom_table[CELL_ID(atom)];
-    const char prefix[] = "##gensym##";
-    size_t prefix_len = sizeof(prefix) - 1;
-    if (!name || strncmp(name, prefix, prefix_len) != 0 || !name[prefix_len])
-        return false;
-    for (const char *p = name + prefix_len; *p; p++) {
-        if (*p < '0' || *p > '9')
-            return false;
-    }
-    return true;
+    return atom_is_uninterned(atom);
 }
 
 // ============================================================================
@@ -359,35 +349,53 @@ unsigned extend_env_with_binder_names(unsigned parent_env, unsigned params)
     return frame_env;
 }
 
-// Layer a frame with the names bound by a body's leading (define ...)
-// forms over env, so later forms in that body expand with those names
-// shadowing outer bindings. Mirrors the compiler's scan_internal_defines.
-unsigned extend_env_with_internal_defines(unsigned env, unsigned body)
+// Return 1 for an all-definition sequence, 0 at the first expression, and
+// -1 on failure. Nested begins splice into the same definition scope.
+static int bind_internal_definitions(unsigned env, unsigned body,
+                                     unsigned *frame)
 {
     GC_GUARD;
     gc_protect(&env);
     gc_protect(&body);
-    unsigned frame = 0;
-    gc_protect(&frame);
-
-    unsigned it = body;
-    gc_protect(&it);
-    for (; IS_PAIR(it); it = cdr(it)) {
-        unsigned form = car(it);
-        if (!IS_PAIR(form) || !IS_ATOM(car(form)) ||
-            CELL_ID(car(form)) != ctx.kw_define)
-            break;
+    for (; IS_PAIR(body); body = cdr(body)) {
+        unsigned form = car(body);
+        if (!IS_PAIR(form) || !IS_ATOM(car(form)))
+            return 0;
+        int64_t kw = CELL_ID(car(form));
+        if (kw == ctx.kw_begin && lookup_silent(kw, env) == TOK_ERROR) {
+            int status = bind_internal_definitions(env, cdr(form), frame);
+            if (status != 1)
+                return status;
+            continue;
+        }
+        if (kw != ctx.kw_define || lookup_silent(kw, env) != TOK_ERROR ||
+            !IS_PAIR(cdr(form)))
+            return 0;
         unsigned target = cadr(form);
         unsigned name = IS_PAIR(target) ? car(target) : target;
         if (!IS_ATOM(name))
-            break;
-        if (!frame) {
-            frame = extend_env_empty(env);
-        }
-        if (defvar(name, ctx.atom_false, frame) == TOK_ERROR)
-            return TOK_ERROR;
+            return 0;
+        gc_protect(&name);
+        if (!*frame)
+            *frame = extend_env_empty(env);
+        if (*frame == TOK_ERROR ||
+            defvar(name, ctx.atom_false, *frame) == TOK_ERROR)
+            return -1;
+        gc_unprotect(1);
     }
+    return body == 0;
+}
 
+// Layer a frame with all leading internal names over env before expansion,
+// matching the compiler's scan_internal_defines, including nested begins.
+unsigned extend_env_with_internal_defines(unsigned env, unsigned body)
+{
+    GC_GUARD;
+    gc_protect(&env);
+    unsigned frame = 0;
+    gc_protect(&frame);
+    if (bind_internal_definitions(env, body, &frame) < 0)
+        return TOK_ERROR;
     return frame ? frame : env;
 }
 
@@ -798,7 +806,7 @@ static bool ellipsis_vars_iteration_count(unsigned ellipsis_vars,
 
 // Unwrap protected identifiers: (##protected## . x) → x
 // Called after expansion to remove protection markers
-static unsigned unwrap_protected(unsigned expr)
+static unsigned unwrap_protected(unsigned expr, bool preserve_identifiers)
 {
     if (!expr)
         return 0;
@@ -811,13 +819,16 @@ static unsigned unwrap_protected(unsigned expr)
         unsigned head = car(expr);
         if (IS_ATOM(head) && CELL_ID(head) == ctx.kw_protected) {
             // Unwrap: (##protected## . x) → x
+            if (preserve_identifiers && IS_ATOM(cdr(expr)))
+                return expr;
             return cdr(expr);
         }
 
-        // Don't unwrap inside syntax-rules - those templates will be
-        // processed later by their own apply_syntax
+        // Nested transformers still need identifier protection for hygiene.
+        // Compound substitutions, however, must regain their original shape
+        // before the nested patterns/templates are processed.
         if (IS_ATOM(head) && CELL_ID(head) == ctx.kw_syntax_rules) {
-            return expr;
+            preserve_identifiers = true;
         }
         // Walk the spine iteratively, recursing only into the cars. Recursing
         // on the cdr as well cost one C frame per list element, so a macro
@@ -844,11 +855,11 @@ static unsigned unwrap_protected(unsigned expr)
             bool spine_end = !IS_PAIR(cursor);
             if (!spine_end && IS_ATOM(car(cursor))) {
                 int64_t id = CELL_ID(car(cursor));
-                spine_end =
-                    (id == ctx.kw_protected || id == ctx.kw_syntax_rules);
+                spine_end = id == ctx.kw_protected ||
+                            (id == ctx.kw_syntax_rules && cursor != expr);
             }
             if (spine_end) {
-                tail = unwrap_protected(cursor);
+                tail = unwrap_protected(cursor, preserve_identifiers);
                 if (tail == TOK_ERROR)
                     return TOK_ERROR;
                 if (tail != cursor && !changed) {
@@ -866,7 +877,7 @@ static unsigned unwrap_protected(unsigned expr)
                 break;
             }
 
-            unsigned new_car = unwrap_protected(car(cursor));
+            unsigned new_car = unwrap_protected(car(cursor), preserve_identifiers);
             if (new_car == TOK_ERROR)
                 return TOK_ERROR;
             if (!changed && new_car == car(cursor)) {
@@ -907,7 +918,7 @@ static unsigned unwrap_protected(unsigned expr)
             unsigned *data = vector_data_ptr(expr);
             unsigned orig = data[i];
             gc_protect(&orig);
-            unsigned unwrapped = unwrap_protected(orig);
+            unsigned unwrapped = unwrap_protected(orig, preserve_identifiers);
             if (unwrapped == TOK_ERROR)
                 return TOK_ERROR;
             if (unwrapped != orig)
@@ -931,7 +942,7 @@ static unsigned unwrap_protected(unsigned expr)
             // Refresh data pointers - GC may have moved vectors
             unsigned *data = vector_data_ptr(expr);
             unsigned elem = data[i];
-            unsigned unwrapped = unwrap_protected(elem);
+            unsigned unwrapped = unwrap_protected(elem, preserve_identifiers);
             if (unwrapped == TOK_ERROR) {
                 gc_unprotect(2);
                 return TOK_ERROR;
@@ -3267,9 +3278,10 @@ unsigned syntax_expand(unsigned tmpl, unsigned bindings, unsigned mark,
         if (lookup_result != TOK_ERROR) {
             // Protect lookup_result BEFORE any allocations - this is critical!
             gc_protect(&lookup_result);
-            // If substituting with an identifier, wrap it to protect from
-            // future renaming by nested macros (mark-based hygiene)
-            if (IS_ATOM(lookup_result)) {
+            // Keep compound input opaque to cleanup as well: traversing it
+            // can loop on cyclic literals or break their shared identity.
+            if (IS_ATOM(lookup_result) || IS_PAIR(lookup_result) ||
+                IS_VECTOR(lookup_result)) {
                 unsigned protected_marker = alloc();
                 CELL_TYPE(protected_marker) = BT_ATOM;
                 CELL_ID(protected_marker) = ctx.kw_protected;
@@ -3769,16 +3781,8 @@ unsigned apply_syntax(unsigned transformer, unsigned input, unsigned use_env,
                            !generated_gensym_atom(free_atom)) {
                     // Found in closure env - create gensym and record the
                     // binding needed to materialize it at the call site.
-                    // An identifier that is ALREADY a generated gensym (e.g.
-                    // from the compiler's own definition-time hygiene
-                    // renaming for define-syntax/let-syntax) is left alone:
-                    // it's already hygienic by construction (its name can't
-                    // collide with anything a user could write), and
-                    // aliasing it again would create a second layer of
-                    // BT_BINDING_REF indirection that the single-level
-                    // dereference in try_deref_binding_value doesn't unwind,
-                    // leaving the reference resolving to a binding-ref cell
-                    // instead of the real value.
+                    // Definition-time gensyms already have private bindings
+                    // in the use environment (including imported ones).
                     unsigned gensym = do_gensym();
                     gc_protect(&gensym);
                     gc_protect(&closure_val);
@@ -3805,6 +3809,7 @@ unsigned apply_syntax(unsigned transformer, unsigned input, unsigned use_env,
                     unsigned entry = alloc_cons(free_atom, gensym);
                     gc_protect(&entry);
                     rename_map = alloc_cons(entry, rename_map);
+                    gc_unprotect(1);
 
                     gc_unprotect(2); // gensym, closure_val
                 } else if (!generated_gensym_atom(free_atom) &&
@@ -3843,7 +3848,7 @@ unsigned apply_syntax(unsigned transformer, unsigned input, unsigned use_env,
 
             if (bindings_out)
                 append_bindings_chain(bindings_out, produced_bindings);
-            return unwrap_protected(result);
+            return unwrap_protected(result, false);
         }
     }
 
@@ -3857,6 +3862,7 @@ void apply_syntax_bindings(unsigned env, unsigned bindings)
         return;
 
     GC_GUARD;
+    gc_protect(&env);
     unsigned b = bindings;
     gc_protect(&b);
     for (; b; b = cdr(b)) {

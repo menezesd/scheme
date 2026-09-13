@@ -240,6 +240,7 @@ typedef struct {
     size_t last_read_source_pos; // character position after the last read-char
     int last_read_char;
     bool last_read_valid;
+    bool closed;
     // For input ports opened on a Scheme string, retain the source cell so
     // mutations and GC relocation are visible to the port.  Owned buffers
     // use ctx.atom_false as the sentinel and are freed with the port.
@@ -295,6 +296,7 @@ typedef struct {
     unsigned nmin;
     cons_cell *cons_cells;   // Dynamically allocated heap
     const char **atom_table; // Dynamically allocated atom table
+    bool *atom_uninterned;   // Slots excluded from name-based interning
     unsigned atom_count;     // Number of atoms in table (for load factor)
     unsigned atom_table_cap; // Current capacity of atom table
     unsigned atom_quote;

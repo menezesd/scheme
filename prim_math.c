@@ -29,11 +29,23 @@
 
 #define _USE_MATH_DEFINES
 #include "prim_internal.h"
+#include <complex.h>
 #include <time.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+
+static double complex complex_math_arg(double real, double imag)
+{
+    // C specifies the same representation as a two-element real array.
+    // Constructing real + imag*I can lose signed zero or turn infinity
+    // into NaN before libm gets to handle it.
+    double parts[2] = {real, imag};
+    double complex result;
+    memcpy(&result, parts, sizeof(result));
+    return result;
+}
 
 // xoshiro256** PRNG - fast, high-quality random number generator
 // Based on: https://prng.di.unimi.it/
@@ -319,8 +331,7 @@ static unsigned apply_rounding(unsigned x, round_mode mode, const char *name)
     return make_real_result(r, is_exact(x));
 }
 
-typedef void (*complex_unary_func)(double real, double imag, double *out_real,
-                                   double *out_imag);
+typedef double complex (*complex_unary_func)(double complex);
 
 typedef struct {
     unsigned id;
@@ -336,10 +347,10 @@ static unsigned apply_unary_number_math(unsigned x, double (*real_func)(double),
     if (!require_number(x, name))
         return TOK_ERROR;
     if (IS_COMPLEX(x)) {
-        double real, imag, out_real, out_imag;
+        double real, imag;
         get_complex_parts(x, &real, &imag);
-        complex_func(real, imag, &out_real, &out_imag);
-        return make_complex_inexact(out_real, out_imag);
+        double complex result = complex_func(complex_math_arg(real, imag));
+        return make_complex_inexact(creal(result), cimag(result));
     }
     return store_inexact(real_func(to_double(x)));
 }
@@ -347,6 +358,18 @@ static unsigned apply_unary_number_math(unsigned x, double (*real_func)(double),
 static unsigned atan_value(unsigned y_arg, unsigned x_arg, bool has_x,
                            const char *name)
 {
+    if (!require_number(y_arg, name))
+        return TOK_ERROR;
+    if (!has_x && IS_COMPLEX(y_arg)) {
+        double real, imag;
+        get_complex_parts(y_arg, &real, &imag);
+        // Some libm implementations return pi/4 at these poles, where
+        // the limiting real component is zero.
+        if (real == 0.0 && fabs(imag) == 1.0)
+            return make_complex_inexact(real, copysign(HUGE_VAL, imag));
+        double complex result = catan(complex_math_arg(real, imag));
+        return make_complex_inexact(creal(result), cimag(result));
+    }
     if (!require_real(y_arg, name) || (has_x && !require_real(x_arg, name)))
         return TOK_ERROR;
     double y = to_double(y_arg);
@@ -363,21 +386,20 @@ static unsigned log_value(unsigned arg, const char *name)
     if (IS_COMPLEX(arg)) {
         double real, imag;
         get_complex_parts(arg, &real, &imag);
-        double mag = hypot(real, imag);
-        double angle = atan2(imag, real);
-        return make_complex_inexact(log(mag), angle);
+        double complex result = clog(complex_math_arg(real, imag));
+        return make_complex_inexact(creal(result), cimag(result));
     }
 
     double x = to_double(arg);
-    if (x < 0)
+    if (x < 0 || (x == 0.0 && signbit(x)))
         return make_complex_inexact(log(-x), M_PI);
     return store_inexact(log(x));
 }
 
 static double sqrt1pm1_double(double x)
 {
-    if (x == 0.0)
-        return 0.0;
+    if (x == 0.0 || x == HUGE_VAL)
+        return x;
     return x / (sqrt(1.0 + x) + 1.0);
 }
 
@@ -390,6 +412,17 @@ static double log1pexp_double(double x)
     if (x <= 33.3)
         return x + exp(-x);
     return x;
+}
+
+static double complex complex_log1p(double real, double imag)
+{
+    if (fabs(real) <= 0.5 && fabs(imag) <= 0.5) {
+        // log|1+z| = log1p(2*Re(z) + |z|^2)/2. Forming 1+z
+        // first would round away a small real component entirely.
+        double log_abs = 0.5 * log1p(real * (2.0 + real) + imag * imag);
+        return complex_math_arg(log_abs, atan2(imag, 1.0 + real));
+    }
+    return clog(complex_math_arg(1.0 + real, imag));
 }
 
 static unsigned log1p_value(unsigned arg, const char *name)
@@ -405,8 +438,8 @@ static unsigned log1p_value(unsigned arg, const char *name)
 
     double real, imag;
     get_complex_parts(arg, &real, &imag);
-    real += 1.0;
-    return make_complex_inexact(log(hypot(real, imag)), atan2(imag, real));
+    double complex result = complex_log1p(real, imag);
+    return make_complex_inexact(creal(result), cimag(result));
 }
 
 static unsigned expm1_value(unsigned arg, const char *name)
@@ -418,18 +451,14 @@ static unsigned expm1_value(unsigned arg, const char *name)
 
     double real, imag;
     get_complex_parts(arg, &real, &imag);
-    double exp_real = exp(real);
-    double out_real = expm1(real) * cos(imag) + (cos(imag) - 1.0);
-    double out_imag = exp_real * sin(imag);
-    return make_complex_inexact(out_real, out_imag);
-}
-
-static void complex_sqrt_inexact(double a, double b, double *out_real,
-                                 double *out_imag)
-{
-    double r = hypot(a, b);
-    *out_real = sqrt((r + a) / 2.0);
-    *out_imag = (b >= 0.0 ? 1.0 : -1.0) * sqrt((r - a) / 2.0);
+    if (fabs(real) <= 0.5) {
+        double half_sine = sin(imag / 2.0);
+        double out_real = expm1(real) * cos(imag) - 2.0 * half_sine * half_sine;
+        double out_imag = exp(real) * sin(imag);
+        return make_complex_inexact(out_real, out_imag);
+    }
+    double complex result = cexp(complex_math_arg(real, imag));
+    return make_complex_inexact(creal(result) - 1.0, cimag(result));
 }
 
 static unsigned sqrt1pm1_value(unsigned arg, const char *name)
@@ -445,18 +474,15 @@ static unsigned sqrt1pm1_value(unsigned arg, const char *name)
 
     double real, imag;
     get_complex_parts(arg, &real, &imag);
-    double wr, wi;
-    complex_sqrt_inexact(real + 1.0, imag, &wr, &wi);
-
-    // z / (sqrt(1 + z) + 1)
-    double denom_real = wr + 1.0;
-    double denom_imag = wi;
-    double denom = denom_real * denom_real + denom_imag * denom_imag;
-    if (denom == 0.0)
-        return make_complex_inexact(wr - 1.0, wi);
-    double out_real = (real * denom_real + imag * denom_imag) / denom;
-    double out_imag = (imag * denom_real - real * denom_imag) / denom;
-    return make_complex_inexact(out_real, out_imag);
+    double complex root = csqrt(complex_math_arg(real + 1.0, imag));
+    // Near zero, subtraction discards the small result. Rationalize there;
+    // elsewhere subtraction avoids overflow in the rationalized numerator.
+    if (fabs(real) <= 0.5 && fabs(imag) <= 0.5) {
+        double complex result = complex_math_arg(real, imag) /
+                                complex_math_arg(creal(root) + 1.0, cimag(root));
+        return make_complex_inexact(creal(result), cimag(result));
+    }
+    return make_complex_inexact(creal(root) - 1.0, cimag(root));
 }
 
 static unsigned log1pexp_value(unsigned arg, const char *name)
@@ -472,74 +498,35 @@ static unsigned log1pexp_value(unsigned arg, const char *name)
     double sin_imag = sin(imag);
     if (real > 0.0) {
         double exp_neg_real = exp(-real);
-        double log_abs =
-            real + 0.5 * log1p(2.0 * exp_neg_real * cos_imag +
-                               exp_neg_real * exp_neg_real);
+        if (real <= 0.5) {
+            // Near odd multiples of pi, cos(imag)+exp(-real) loses
+            // both small terms. Retain them before taking the logarithm.
+            double half_cosine = cos(imag / 2.0);
+            double scaled_real = expm1(-real) + 2.0 * half_cosine * half_cosine;
+            double complex scaled_log =
+                clog(complex_math_arg(scaled_real, sin_imag));
+            return make_complex_inexact(real + creal(scaled_log),
+                                        cimag(scaled_log));
+        }
+        double complex correction = complex_log1p(exp_neg_real * cos_imag,
+                                                  -exp_neg_real * sin_imag);
+        double log_abs = real + creal(correction);
         double angle = atan2(sin_imag, cos_imag + exp_neg_real);
         return make_complex_inexact(log_abs, angle);
     }
 
     double exp_real = exp(real);
-    double one_plus_real = 1.0 + exp_real * cos_imag;
-    double one_plus_imag = exp_real * sin_imag;
-    return make_complex_inexact(log(hypot(one_plus_real, one_plus_imag)),
-                                atan2(one_plus_imag, one_plus_real));
-}
-
-static void complex_exp_parts(double real, double imag, double *out_real,
-                              double *out_imag)
-{
-    double mag = exp(real);
-    *out_real = mag * cos(imag);
-    *out_imag = mag * sin(imag);
-}
-
-static void complex_sin_parts(double real, double imag, double *out_real,
-                              double *out_imag)
-{
-    *out_real = sin(real) * cosh(imag);
-    *out_imag = cos(real) * sinh(imag);
-}
-
-static void complex_cos_parts(double real, double imag, double *out_real,
-                              double *out_imag)
-{
-    *out_real = cos(real) * cosh(imag);
-    *out_imag = -sin(real) * sinh(imag);
-}
-
-static void complex_tan_parts(double real, double imag, double *out_real,
-                              double *out_imag)
-{
-    double denom = cos(2 * real) + cosh(2 * imag);
-    *out_real = sin(2 * real) / denom;
-    *out_imag = sinh(2 * imag) / denom;
-}
-
-// asin(z) = -i*ln(iz + sqrt(1 - z^2)), and acos(z) = pi/2 - asin(z).
-// Writing -i*ln(u) out in parts gives arg(u) - i*ln|u|.
-static void complex_asin_parts(double a, double b, double *out_real,
-                               double *out_imag)
-{
-    // 1 - z^2
-    double sq_real = 1.0 - (a * a - b * b);
-    double sq_imag = -2.0 * a * b;
-    double w_real, w_imag;
-    complex_sqrt_inexact(sq_real, sq_imag, &w_real, &w_imag);
-    // u = i*z + sqrt(1 - z^2)
-    double u_real = w_real - b;
-    double u_imag = w_imag + a;
-    *out_real = atan2(u_imag, u_real);
-    *out_imag = -log(hypot(u_real, u_imag));
-}
-
-static void complex_acos_parts(double a, double b, double *out_real,
-                               double *out_imag)
-{
-    double s_real, s_imag;
-    complex_asin_parts(a, b, &s_real, &s_imag);
-    *out_real = M_PI / 2.0 - s_real;
-    *out_imag = -s_imag;
+    if (real >= -0.5) {
+        double half_cosine = cos(imag / 2.0);
+        double sum_real =
+            -expm1(real) + 2.0 * exp_real * half_cosine * half_cosine;
+        double complex result =
+            clog(complex_math_arg(sum_real, exp_real * sin_imag));
+        return make_complex_inexact(creal(result), cimag(result));
+    }
+    double complex result =
+        complex_log1p(exp_real * cos_imag, exp_real * sin_imag);
+    return make_complex_inexact(creal(result), cimag(result));
 }
 
 // asin/acos outside [-1, 1] have complex values, and this numeric tower
@@ -556,26 +543,24 @@ static unsigned inverse_trig_value(unsigned x, bool is_asin, const char *name)
         get_complex_parts(x, &real, &imag);
     } else {
         real = to_double(x);
-        imag = 0.0;
-        // In-domain reals (and NaN, which propagates) keep the libm result:
-        // it is more accurate near the branch points than the identity above.
+        // Scheme chooses the lower side of the cut for real x > 1 and
+        // the upper side for x < -1. Explicit complex arguments retain
+        // the side selected by their imaginary component, including -0.0.
+        imag = real > 1.0 ? -0.0 : 0.0;
         if (isnan(real) || (real >= -1.0 && real <= 1.0))
             return store_inexact(is_asin ? asin(real) : acos(real));
     }
 
-    double out_real, out_imag;
-    if (is_asin)
-        complex_asin_parts(real, imag, &out_real, &out_imag);
-    else
-        complex_acos_parts(real, imag, &out_real, &out_imag);
-    return make_complex_inexact(out_real, out_imag);
+    double complex arg = complex_math_arg(real, imag);
+    double complex result = is_asin ? casin(arg) : cacos(arg);
+    return make_complex_inexact(creal(result), cimag(result));
 }
 
 static const unary_number_math_entry unary_number_math_funcs[] = {
-    {PEXP, exp, complex_exp_parts, "exp"},
-    {PSIN, sin, complex_sin_parts, "sin"},
-    {PCOS, cos, complex_cos_parts, "cos"},
-    {PTAN, tan, complex_tan_parts, "tan"},
+    {PEXP, exp, cexp, "exp"},
+    {PSIN, sin, csin, "sin"},
+    {PCOS, cos, ccos, "cos"},
+    {PTAN, tan, ctan, "tan"},
     {0, NULL, NULL, NULL},
 };
 
@@ -776,16 +761,8 @@ static unsigned sqrt_value(unsigned arg, const char *name)
     if (IS_COMPLEX(arg)) {
         double a, b;
         get_complex_parts(arg, &a, &b);
-        double r = hypot(a, b);
-        double real, imag;
-        if (a >= 0) {
-            real = sqrt(r / 2 + a / 2);
-            imag = (real == 0.0) ? 0.0 : b / (2 * real);
-        } else {
-            imag = (b >= 0 ? 1 : -1) * sqrt(r / 2 - a / 2);
-            real = b / (2 * imag);
-        }
-        return make_complex_inexact(real, imag);
+        double complex result = csqrt(complex_math_arg(a, b));
+        return make_complex_inexact(creal(result), cimag(result));
     }
 
     bool negative_exact = IS_RATIONAL(arg)
@@ -800,12 +777,12 @@ static unsigned sqrt_value(unsigned arg, const char *name)
         if (magnitude == TOK_ERROR)
             return TOK_ERROR;
         gc_protect(&magnitude);
-        unsigned imaginary = sqrt_value(magnitude, name);
-        if (imaginary == TOK_ERROR)
+        unsigned imag_part = sqrt_value(magnitude, name);
+        if (imag_part == TOK_ERROR)
             return TOK_ERROR;
-        gc_protect(&imaginary);
+        gc_protect(&imag_part);
         unsigned real = store(0);
-        return store_complex(real, imaginary);
+        return store_complex(real, imag_part);
     }
 
     if (IS_RATIONAL(arg)) {
@@ -903,20 +880,11 @@ static unsigned inexact_expt_value(unsigned base_arg, unsigned exp_arg)
     if (needs_complex) {
         double b_real, b_imag;
         get_complex_parts(base_arg, &b_real, &b_imag);
-
-        double mag = hypot(b_real, b_imag);
-        double angle = atan2(b_imag, b_real);
-        double log_real = log(mag);
-        double log_imag = angle;
-
         double e_real, e_imag;
         get_complex_parts(exp_arg, &e_real, &e_imag);
-        double prod_real = e_real * log_real - e_imag * log_imag;
-        double prod_imag = e_real * log_imag + e_imag * log_real;
-
-        double r_mag = exp(prod_real);
-        return make_complex_inexact(r_mag * cos(prod_imag),
-                                    r_mag * sin(prod_imag));
+        double complex result = cpow(complex_math_arg(b_real, b_imag),
+                                     complex_math_arg(e_real, e_imag));
+        return make_complex_inexact(creal(result), cimag(result));
     }
 
     return store_inexact(pow(base_d, exp_d));
@@ -1042,6 +1010,26 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned argc,
         if (!require_number(base_arg, "expt") ||
             !require_number(exp_arg, "expt"))
             return TOK_ERROR;
+
+        // log(0) cannot be used to implement zero powers: multiplying its
+        // infinity by a zero component produces NaN. Handle the Scheme
+        // zero cases before entering either exponentiation algorithm.
+        bool exact = is_exact(base_arg) && is_exact(exp_arg);
+        if (is_zero_number(exp_arg))
+            return exact ? store(1) : store_inexact(1.0);
+        if (is_zero_number(base_arg)) {
+            unsigned real_exp = IS_COMPLEX(exp_arg) ? CELL_CAR(exp_arg) : exp_arg;
+            unsigned sign_value = IS_RATIONAL(real_exp) ? CELL_CAR(real_exp)
+                                                        : real_exp;
+            bool positive = IS_INEXACT(real_exp)
+                                ? to_double(real_exp) > 0.0
+                                : !is_zero_number(sign_value) &&
+                                  !is_negative_number(sign_value);
+            if (positive)
+                return exact ? store(0) : store_inexact(0.0);
+            show_error("expt: zero base requires zero exponent or positive real part");
+            return TOK_ERROR;
+        }
 
         // Exact base with exact integer exponent -> exact result
         // Covers integers, rationals, and complex with exact parts

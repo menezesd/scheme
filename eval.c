@@ -977,6 +977,15 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
             return;
         }
         unsigned new_env = alloc_cons(frame, def_env);
+        gc_protect(&new_env);
+        // Internal names must already shadow outer macros when an earlier
+        // local procedure is created and expands its body. The definitions
+        // below will fill these bindings as evaluation reaches them.
+        new_env = extend_env_with_internal_defines(new_env, body);
+        if (new_env == TOK_ERROR) {
+            cps_signal_current_error(env, cont);
+            return;
+        }
 
         if (!cdr(body)) {
             tramp_eval(car(body), new_env, cont);
@@ -985,7 +994,6 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
             unsigned rest_body = cdr(body);
             gc_protect(&first_expr);
             gc_protect(&rest_body);
-            gc_protect(&new_env);
             unsigned k = make_cont(CONT_APPLY_FUNC, rest_body, new_env, cont);
             tramp_eval(first_expr, new_env, k);
         }

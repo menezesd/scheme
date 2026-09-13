@@ -12,9 +12,13 @@ static void close_string_port(unsigned port)
     string_port *sp = GET_STRPORT_PTR(port);
     if (!string_port_is_registered(sp) || !string_port_well_formed(sp))
         return;
-    /* Keep the port cell and its registered backing object alive so that a
-       second close is harmless, as required for close-input/output-port.
-       The GC will reclaim the empty backing object with the port cell. */
+    sp->closed = true;
+    // Output remains available through get-output-string after closing.
+    // The GC reclaims the buffer when the port itself becomes unreachable.
+    if (IS_STROUTPORT(port))
+        return;
+    /* Keep the registered backing object alive so a second close is harmless.
+       Input ports can release their source immediately. */
     if (!sp->borrowed_data)
         free(sp->data);
     sp->data = NULL;
@@ -143,8 +147,8 @@ static unsigned output_string_value(unsigned port, const char *name)
         return TOK_ERROR;
     }
     string_port *sp = GET_STRPORT_PTR(port);
-    if (!string_port_well_formed(sp)) {
-        show_error("%s: port is closed", name);
+    if (!string_port_buffer_valid(sp)) {
+        show_error("%s: invalid string output port", name);
         return TOK_ERROR;
     }
     char *copy = checked_string_copy_len(sp->data, sp->len);
@@ -155,38 +159,38 @@ static unsigned output_string_value(unsigned port, const char *name)
     return make_string_immutable_owned(copy);
 }
 
-static unsigned set_current_port(unsigned port, bool input)
+static unsigned set_current_port(unsigned port, unsigned prim_id)
 {
-    const char *name =
-        input ? "set-current-input-port!" : "set-current-output-port!";
+    bool input = prim_id == PSETCURRENTINPUT;
+    bool error = prim_id == PSETCURRENTERROR;
+    const char *name = input ? "set-current-input-port!"
+                            : error ? "set-current-error-port!"
+                                    : "set-current-output-port!";
     const char *direction = input ? "input" : "output";
+    FILE **current_file = input ? &ctx.current_input
+                               : error ? &ctx.current_error : &ctx.current_output;
+    unsigned *current_cell = input ? &ctx.current_input_cell
+                                   : error ? &ctx.current_error_cell
+                                           : &ctx.current_output_cell;
 
     if ((input && IS_INPORT(port)) || (!input && IS_OUTPORT(port))) {
-        FILE *f = file_port_file(port);
-        if (!f) {
-            show_error("%s: port is closed", name);
+        file_port *fp = GET_FILE_PORT_PTR(port);
+        if (!file_port_well_formed(fp)) {
+            show_error("%s: invalid port", name);
             return TOK_ERROR;
         }
-        if (input) {
-            ctx.current_input = f;
-            ctx.current_input_cell = port;
-        } else {
-            ctx.current_output = f;
-            ctx.current_output_cell = port;
-        }
+        // Closed ports remain valid parameter values. I/O checks openness.
+        *current_file = fp->file;
+        *current_cell = port;
         return port;
     }
 
     if ((input && IS_STRINPORT(port)) || (!input && IS_STROUTPORT(port))) {
-        if (!string_port_well_formed(GET_STRPORT_PTR(port))) {
-            show_error("%s: port is closed", name);
+        if (!string_port_is_registered(GET_STRPORT_PTR(port))) {
+            show_error("%s: invalid port", name);
             return TOK_ERROR;
         }
-        if (input) {
-            ctx.current_input_cell = port;
-        } else {
-            ctx.current_output_cell = port;
-        }
+        *current_cell = port;
         return port;
     }
 
@@ -217,16 +221,7 @@ static unsigned set_current_port(unsigned port, bool input)
                              (uint64_t)end <= bv->len;
         }
         if (tag_matches && payload_ok && (!input || input_state_ok)) {
-            bool open = input ? CELL_ID(tag) == (unsigned)intern("bvin")
-                              : CELL_ID(tag) == (unsigned)intern("bvout");
-            if (!open) {
-                show_error("%s: port is closed", name);
-                return TOK_ERROR;
-            }
-            if (input)
-                ctx.current_input_cell = port;
-            else
-                ctx.current_output_cell = port;
+            *current_cell = port;
             return port;
         }
     }
@@ -235,29 +230,18 @@ static unsigned set_current_port(unsigned port, bool input)
     return TOK_ERROR;
 }
 
-static unsigned set_current_error_port(unsigned port)
+static unsigned current_port(FILE *file, unsigned *cell, bool input,
+                             const char *name)
 {
-    if (IS_OUTPORT(port)) {
-        FILE *f = file_port_file(port);
-        if (!f) {
-            show_error("set-current-error-port!: port is closed");
-            return TOK_ERROR;
-        }
-        ctx.current_error = f;
-        ctx.current_error_cell = port;
-        return port;
+    if (*cell == 0) {
+        unsigned port = make_file_port_cell(file, false, input, false,
+                                            input ? BT_INPORT : BT_OUTPORT, name);
+        if (port == TOK_ERROR)
+            return port;
+        // Cache the initial wrapper so repeated calls return the same port.
+        *cell = port;
     }
-    if (IS_STROUTPORT(port)) {
-        if (!string_port_well_formed(GET_STRPORT_PTR(port))) {
-            show_error("set-current-error-port!: port is closed");
-            return TOK_ERROR;
-        }
-        ctx.current_error_cell = port;
-        return port;
-    }
-    show_error("set-current-error-port!: not an output port, got %s",
-               type_name(port));
-    return TOK_ERROR;
+    return *cell;
 }
 
 static bool flush_output_port_arg(unsigned port)
@@ -332,29 +316,18 @@ unsigned apply_port_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
     }
     case PCURRENTINPUT: {
         REQUIRE_ARGC(argc, 0, 0, "current-input-port");
-        // Return rooted current port cell if active, otherwise wrap FILE*.
-        if (ctx.current_input_cell != 0) {
-            return ctx.current_input_cell;
-        }
-        return make_file_port_cell(ctx.current_input, false, true, false,
-                                   BT_INPORT, "current-input-port");
+        return current_port(ctx.current_input, &ctx.current_input_cell, true,
+                            "current-input-port");
     }
     case PCURRENTOUTPUT: {
         REQUIRE_ARGC(argc, 0, 0, "current-output-port");
-        // Return rooted current port cell if active, otherwise wrap FILE*.
-        if (ctx.current_output_cell != 0) {
-            return ctx.current_output_cell;
-        }
-        return make_file_port_cell(ctx.current_output, false, false, false,
-                                   BT_OUTPORT, "current-output-port");
+        return current_port(ctx.current_output, &ctx.current_output_cell, false,
+                            "current-output-port");
     }
     case PCURRENTERROR: {
         REQUIRE_ARGC(argc, 0, 0, "current-error-port");
-        if (ctx.current_error_cell != 0) {
-            return ctx.current_error_cell;
-        }
-        return make_file_port_cell(ctx.current_error, false, false, false,
-                                   BT_OUTPORT, "current-error-port");
+        return current_port(ctx.current_error, &ctx.current_error_cell, false,
+                            "current-error-port");
     }
     // String ports
     case POPENOUTPUTSTRING: {
@@ -406,15 +379,15 @@ unsigned apply_port_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
     // Internal port setters (used by with-input-from-file etc.)
     case PSETCURRENTINPUT: {
         REQUIRE_ARGC(argc, 1, 1, "set-current-input-port!");
-        return set_current_port(argv[0], true);
+        return set_current_port(argv[0], prim_id);
     }
     case PSETCURRENTOUTPUT: {
         REQUIRE_ARGC(argc, 1, 1, "set-current-output-port!");
-        return set_current_port(argv[0], false);
+        return set_current_port(argv[0], prim_id);
     }
     case PSETCURRENTERROR: {
         REQUIRE_ARGC(argc, 1, 1, "set-current-error-port!");
-        return set_current_error_port(argv[0]);
+        return set_current_port(argv[0], prim_id);
     }
     case PFLUSHOUTPUT: {
         REQUIRE_ARGC(argc, 0, 1, "flush-output-port");

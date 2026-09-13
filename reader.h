@@ -10,6 +10,10 @@ unsigned read_token(void);
 // Sets *handled to false if the string is not a plain decimal literal.
 unsigned read_exact_decimal_number(const char *s, bool *handled);
 
+// Parse one complete numeric spelling, including optional radix/exactness
+// prefixes. Returns #f for invalid syntax, TOK_ERROR for allocation/size errors.
+unsigned parse_number_string(const char *s, int default_radix);
+
 // Read and parse the next object from input (from stdin)
 unsigned read_obj(void);
 

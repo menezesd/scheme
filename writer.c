@@ -399,13 +399,13 @@ static bool symbol_looks_numeric(const char *s)
 {
     if (!s[0])
         return false;
-    // Special spellings the reader parses as numbers
-    if (strcmp(s, "+inf.0") == 0 || strcmp(s, "-inf.0") == 0 ||
-        strcmp(s, "+nan.0") == 0 || strcmp(s, "-nan.0") == 0 ||
-        strcmp(s, "+i") == 0 || strcmp(s, "-i") == 0)
-        return true;
-    if ((s[0] == '+' || s[0] == '-') && s[1])
+    if ((s[0] == '+' || s[0] == '-') && s[1]) {
         s++;
+        // Include complex literals starting with an infinity or NaN.
+        if (strcmp(s, "i") == 0 || strncmp(s, "inf.0", 5) == 0 ||
+            strncmp(s, "nan.0", 5) == 0)
+            return true;
+    }
     if (s[0] == '.' && s[1] == '\0')
         return false;
     return (s[0] >= '0' && s[0] <= '9') ||
@@ -797,11 +797,18 @@ static void write_obj_fp_inner(unsigned s, bool with_quotes, FILE *fp)
         }
         write_obj_fp(CELL_CAR(s), with_quotes, fp);
         unsigned imag = CELL_CDR(s);
-        double imag_val = to_double(imag);
-        // format_double_repr already signs +inf.0/-inf.0/+nan.0; adding
-        // another "+" would emit unparseable forms like 1++inf.0i
-        if (imag_val >= 0 && imag_val == imag_val &&
-            imag_val < (double)INFINITY)
+        bool needs_plus;
+        if (IS_INEXACT(imag)) {
+            double value = to_double(imag);
+            // Infinities, NaNs, and negative zero already print a sign.
+            needs_plus = isfinite(value) && !signbit(value);
+        } else {
+            // Exact components can overflow or underflow a double, so
+            // determine their sign in the exact tower.
+            unsigned sign_value = IS_RATIONAL(imag) ? CELL_CAR(imag) : imag;
+            needs_plus = !is_negative_number(sign_value);
+        }
+        if (needs_plus)
             fprintf(fp, "+");
         write_obj_fp(imag, with_quotes, fp);
         fprintf(fp, "i");

@@ -368,6 +368,33 @@
 
 (test "map single" '(2 4 6) (map (lambda (x) (* x 2)) '(1 2 3)))
 (test "map multiple" '(5 7 9) (map + '(1 2 3) '(4 5 6)))
+(test "map continuation returns preserve earlier lists"
+      '((1 2 3) (1 20 3) (1 200 3))
+      (let ((saved #f) (results '()) (round 0))
+        (let ((result
+               (map (lambda (x)
+                      (if (= x 2)
+                          (call-with-current-continuation
+                            (lambda (k) (set! saved k) x))
+                          x))
+                    '(1 2 3))))
+          (set! results (cons result results))
+          (cond ((= round 0) (set! round 1) (saved 20))
+                ((= round 1) (set! round 2) (saved 200))
+                (else (reverse results))))))
+(test "multi-list map continuation returns preserve earlier lists"
+      '((11 22 33) (11 200 33))
+      (let ((saved #f) (first #f) (again? #f))
+        (let ((result
+               (map (lambda (x y)
+                      (if (= x 2)
+                          (call-with-current-continuation
+                            (lambda (k) (set! saved k) (+ x y)))
+                          (+ x y)))
+                    '(1 2 3) '(10 20 30))))
+          (if again?
+              (list first result)
+              (begin (set! first result) (set! again? #t) (saved 200))))))
 (test "for-each" 6
       (let ((sum 0))
         (for-each (lambda (x) (set! sum (+ sum x))) '(1 2 3))
@@ -763,6 +790,41 @@
       v))
 (test "force simple" 3 (force (delay (+ 1 2))))
 (test "force memoized" '(3 3) (let ((p (delay (+ 1 2)))) (list (force p) (force p))))
+(test "delay preserves a promise-valued result" #t
+    (promise? (force (delay (delay 42)))))
+(test "nested delays require separate forces" 42
+    (force (force (delay (delay 42)))))
+(test "forcing an outer delay does not evaluate the inner delay" 0
+    (let ((count 0))
+      (force (delay (delay (set! count (+ count 1)))))
+      count))
+(test "recursive force preserves the first memoized result" '(2 2)
+    (let ((first #t) (p #f))
+      (set! p (delay (if first
+                        (begin (set! first #f) (+ 1 (force p)))
+                        2)))
+      (list (force p) (force p))))
+(test "delay-force shares the source promise cache" '(42 42 42 1)
+    (let ((count 0))
+      (let* ((p (delay (begin (set! count (+ count 1)) 42)))
+             (q (delay-force p))
+             (r (delay-force q)))
+        (let ((result (force r)))
+          (gc-flip)
+          (list result (force q) (force p) count)))))
+(test "delay-force preserves an already cached promise-valued result" #t
+    (let* ((inner (delay 42))
+           (p (delay inner)))
+      (force p)
+      (eq? inner (force (delay-force p)))))
+(test "recursive delay-force preserves shared memoized state" '(2 2)
+    (let ((first #t) (p #f) (q #f))
+      (set! p (delay-force
+                (if first
+                    (begin (set! first #f) (force q) (delay 3))
+                    (delay 2))))
+      (set! q (delay-force p))
+      (list (force p) (force q))))
 ;; force used to recurse through a delay-force chain (one C/interpreter
 ;; stack frame per link), so a long chain of delay-forced promises - the
 ;; standard lazy-stream idiom - could overflow the stack. force is now
@@ -1130,6 +1192,15 @@
     (let ((noop-rename-free-y 99))
       (guard (e (#t 'unbound)) (noop-rename-usey))))
 
+(test "gensym-looking names cannot capture macro free identifiers" 'unbound
+    (let-syntax ((m (syntax-rules () ((_) |##gensym##999999|))))
+      (let ((|##gensym##999999| 7))
+        (guard (e (#t 'unbound)) (m)))))
+(test "gensym-looking names preserve their definition-site binding" 42
+    (let ((|##gensym##999998| 42))
+      (let-syntax ((m (syntax-rules () ((_) |##gensym##999998|))))
+        (let ((|##gensym##999998| 7)) (m)))))
+
 (test-section "Macro expansion timing")
 (define-syntax redefine-hygiene-m (syntax-rules () ((_ x) (+ x 1))))
 (define (redefine-hygiene-f) (redefine-hygiene-m 5))
@@ -1346,6 +1417,144 @@
         (set! log (cons (p) log)))
       (set! log (cons (p) log))
       (reverse log)))
+(test "parameterize evaluates all values before rebinding" '(10 1 1 2)
+    (let ((p (make-parameter 1)) (q (make-parameter 2)))
+      (append (parameterize ((p 10) (q (p))) (list (p) (q)))
+              (list (p) (q)))))
+(test "parameterize evaluates parameter expressions before rebinding" '(9 2)
+    (let ((p (make-parameter 1)) (q (make-parameter 2)))
+      (let ((selector (make-parameter p)))
+        (parameterize ((selector q) ((selector) 9))
+          (list (p) (q))))))
+(test "parameterize converts in the original dynamic environment" '(10 1)
+    (let ((p (make-parameter 1)))
+      (let ((q (make-parameter 0 (lambda (x) (+ x (p))))))
+        (parameterize ((p 10) (q 0)) (list (p) (q))))))
+(test "parameterize converter error leaves bindings unchanged" 1
+    (let ((p (make-parameter 1))
+          (q (make-parameter 0 (lambda (x) (if (= x 9) (error "bad") x)))))
+      (guard (e (#t (p))) (parameterize ((p 10) (q 9)) #f))))
+(test "parameterize converts once across continuation reentry" 2
+    (let ((saved #f) (passes 0) (count 0))
+      (let ((p (make-parameter 0
+                 (lambda (x) (set! count (+ count 1)) x))))
+        (parameterize ((p 1))
+          (call/cc (lambda (k) (set! saved k)))
+          (set! passes (+ passes 1)))
+        (if (= passes 1) (saved #f) count))))
+(test "parameterize reentry restores the value changed inside its extent" 2
+    (let ((saved #f) (passes 0) (p (make-parameter 0)))
+      (let ((result (parameterize ((p 1))
+                      (call/cc (lambda (k) (set! saved k)))
+                      (set! passes (+ passes 1))
+                      (if (= passes 1) (p 2))
+                      (p))))
+        (if (= passes 1) (saved #f) result))))
+
+(test-section "Macros preserve substituted data")
+(test "let accepts a cyclic quoted list" #t
+    (let ((x '#1=(1 #1#))) (eq? (cadr x) x)))
+(test "let accepts a cyclic quoted vector with chained labels" #t
+    (let ((x '#1=#2=#(#1#))) (eq? (vector-ref x 0) x)))
+(test "macro substitution preserves shared quoted identity" #t
+    (let-syntax ((identity (syntax-rules () ((_ x) x))))
+      (let ((x (identity '#1=(a b))) (y (identity '#1#)))
+        (eq? x y))))
+(test "nested transformer receives compound pattern substitutions" 8
+    (let-syntax ((outer
+                   (syntax-rules ()
+                     ((_ pattern expression)
+                      (let-syntax ((inner (syntax-rules () (pattern expression))))
+                        (inner 7))))))
+      (outer (_ x) (+ x 1))))
+(test "user data cannot impersonate a macro protection marker" '(|##protected##| . x)
+    (let-syntax ((m (syntax-rules () ((_ ) '(|##protected##| . x)))))
+      (m)))
+
+(test-section "Current ports as parameters")
+(test "parameterize redirects primitive textual input and output" "(42 #\\x)"
+    (parameterize ((current-input-port (open-input-string "42 x"))
+                   (current-output-port (open-output-string)))
+      (let* ((datum (read)) (space (read-char)) (char (read-char)))
+        (write (list datum char))
+        (get-output-string (current-output-port)))))
+(test "parameterize redirects current-error-port" "problem"
+    (parameterize ((current-error-port (open-output-string)))
+      (display "problem" (current-error-port))
+      (get-output-string (current-error-port))))
+(test "port parameter setters share runtime state" '(#t #t)
+    (let ((p (open-output-string)) (q (open-output-string)))
+      (parameterize ((current-output-port p))
+        (current-output-port q)
+        (let ((first (eq? q (current-output-port))))
+          (set-current-output-port! p)
+          (list first (eq? p (current-output-port)))))))
+(test "port parameter restores after an exception" #t
+    (let ((old (current-output-port)))
+      (guard (e (#t #f))
+        (parameterize ((current-output-port (open-output-string)))
+          (error "escape port parameter")))
+      (eq? old (current-output-port))))
+(test "invalid port conversion leaves all parameters unchanged" '(1 #t)
+    (let ((p (make-parameter 1)) (old (current-output-port)))
+      (guard (e (#t (list (p) (eq? old (current-output-port)))))
+        (parameterize ((p 2) (current-output-port 42)) #f))))
+(test "port parameter rejects the wrong direction" #t
+    (guard (e (#t #t))
+      (parameterize ((current-output-port (open-input-string "x"))) #f)))
+(test "parameterize can restore a port closed inside a nested extent" #t
+    (let ((p (open-output-string)) (q (open-output-string)))
+      (parameterize ((current-output-port p))
+        (parameterize ((current-output-port q)) (close-output-port p))
+        (and (eq? p (current-output-port))
+             (not (output-port-open? (current-output-port)))))))
+(test "port parameter reentry preserves changes by explicit setters" #t
+    (let ((saved #f) (passes 0)
+          (p (open-output-string)) (q (open-output-string)))
+      (let ((result
+              (parameterize ((current-output-port p))
+                (call/cc (lambda (k) (set! saved k)))
+                (set! passes (+ passes 1))
+                (if (= passes 1) (set-current-output-port! q))
+                (eq? q (current-output-port)))))
+        (if (= passes 1) (saved #f) result))))
+(test "port parameter reentry accepts a closed port" '(#t #f)
+    (let ((saved #f) (passes 0) (p (open-output-string)))
+      (let ((result
+              (parameterize ((current-output-port p))
+                (call/cc (lambda (k) (set! saved k)))
+                (set! passes (+ passes 1))
+                (if (= passes 1) (close-output-port p))
+                (list (eq? p (current-output-port))
+                      (output-port-open? (current-output-port))))))
+        (if (= passes 1) (saved #f) result))))
+(test "port parameterization supports bytevector ports" '#u8(65 66)
+    (let ((out (open-output-bytevector)))
+      (parameterize ((current-input-port (open-input-bytevector #u8(65 66)))
+                     (current-output-port out))
+        (write-u8 (read-u8))
+        (write-u8 (read-u8)))
+      (get-output-bytevector out)))
+(test "error port parameter supports bytevector ports" '#u8(65)
+    (let ((out (open-output-bytevector)))
+      (parameterize ((current-error-port out))
+        (write-u8 65 (current-error-port)))
+      (get-output-bytevector out)))
+(test "port parameters work in imported environments" "42"
+    (eval '(parameterize ((current-output-port (open-output-string)))
+             (display 42)
+             (get-output-string (current-output-port)))
+          (environment '(scheme base) '(scheme write))))
+(test "imported guard retains its private helper macros" 42
+    (eval '(guard (e (#t 42)) (error "imported guard"))
+          (environment '(scheme base))))
+(test "macro expansion preserves import environment immutability" '(3 #t #t)
+    (let ((env (environment '(scheme base))))
+      (let ((result
+              (eval '(parameterize (((make-parameter 1) 2)) 3) env)))
+        (list result
+              (guard (e (#t #t)) (eval '(define public-name 42) env) #f)
+              (guard (e (#t #t)) (eval '%call-with-parameterization env) #f)))))
 
 (test-section "Bytevector ports: peek-u8/u8-ready?")
 ;; Byte-oriented operations require binary ports.  The wrappers support the

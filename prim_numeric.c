@@ -596,10 +596,10 @@ slow_path:;
             gc_protect(&real_res);
             gc_protect(&imag_res);
             if (argc == 1) {
-                unsigned neg_real = negate_number(real_res);
+                unsigned neg_real = binary_sub(store(0), real_res);
                 RETURN_IF_ERROR(neg_real);
                 gc_protect(&neg_real);
-                unsigned neg_imag = negate_number(imag_res);
+                unsigned neg_imag = binary_sub(store(0), imag_res);
                 RETURN_IF_ERROR(neg_imag);
                 return make_complex_exact(neg_real, neg_imag);
             }
@@ -804,7 +804,7 @@ slow_path:;
                 unsigned new_real = binary_div(real_res, denom);
                 RETURN_IF_ERROR(new_real);
                 gc_protect(&new_real);
-                unsigned neg_imag = negate_number(imag_res);
+                unsigned neg_imag = binary_sub(store(0), imag_res);
                 RETURN_IF_ERROR(neg_imag);
                 gc_protect(&neg_imag);
                 unsigned new_imag = binary_div(neg_imag, denom);

@@ -1180,19 +1180,15 @@
 ; Still rejects circular lists (Floyd's cycle detection) so callers can't
 ; hang walking one.
 (define (%require-finite-list who lst)
-  ; Accept proper and dotted lists, but do not mistake an arbitrary atom
-  ; for a zero-element list.  The latter used to let list-copy/take-right/
-  ; drop-right silently accept values such as 42.
-  (if (and (not (null? lst)) (not (pair? lst)))
-      (error (string-append who ": expected finite list"))
-      (let loop ((slow lst) (fast lst))
-        (cond ((not (pair? fast)) lst)
-              ((not (pair? (cdr fast))) lst)
-              (else
-               (let ((fast2 (cddr fast)) (slow2 (cdr slow)))
-                 (if (eq? fast2 slow2)
-                     (error (string-append who ": circular list"))
-                     (loop slow2 fast2))))))))
+  ; Non-pair values are zero-length dotted lists in SRFI-1 terminology.
+  (let loop ((slow lst) (fast lst))
+    (cond ((not (pair? fast)) lst)
+          ((not (pair? (cdr fast))) lst)
+          (else
+           (let ((fast2 (cddr fast)) (slow2 (cdr slow)))
+             (if (eq? fast2 slow2)
+                 (error (string-append who ": circular list"))
+                 (loop slow2 fast2)))))))
 
 ; Like %require-proper-lists, but the LAST element of `lists` may be any
 ; object (R7RS `append`'s convention: every argument but the last must be
@@ -1217,7 +1213,6 @@
   lists)
 
 (define (list-ref lst k)
-  (%require-proper-list "list-ref" lst)
   (%require-nonnegative-integer "list-ref" k)
   (let loop ((lst lst) (k k))
     (cond ((not (pair? lst)) (error "list-ref: index out of bounds"))
@@ -1225,7 +1220,6 @@
           (else (loop (cdr lst) (- k 1))))))
 
 (define (list-tail lst k)
-  (%require-proper-list "list-tail" lst)
   (%require-nonnegative-integer "list-tail" k)
   (let loop ((lst lst) (k k))
     (cond ((= k 0) lst)
@@ -1234,16 +1228,16 @@
 
 ; Membership functions
 (define (memq obj lst)
-  (%require-proper-list "memq" lst)
   (let loop ((lst lst))
     (cond ((null? lst) #f)
+          ((not (pair? lst)) (error "memq: improper list"))
           ((eq? obj (car lst)) lst)
           (else (loop (cdr lst))))))
 
 (define (memv obj lst)
-  (%require-proper-list "memv" lst)
   (let loop ((lst lst))
     (cond ((null? lst) #f)
+          ((not (pair? lst)) (error "memv: improper list"))
           ((eqv? obj (car lst)) lst)
           (else (loop (cdr lst))))))
 
@@ -1252,21 +1246,20 @@
       (error "member: too many arguments"))
   (if (null? lst)
       #f
-      (begin
-        (%require-proper-list "member" lst)
-        (let ((compare (%require-procedure
-                        "member"
-                        (if (null? maybe-compare) equal? (car maybe-compare)))))
-          (let loop ((lst lst))
-            (cond ((null? lst) #f)
-                  ((compare obj (car lst)) lst)
-                  (else (loop (cdr lst)))))))))
+      (let ((compare (%require-procedure
+                      "member"
+                      (if (null? maybe-compare) equal? (car maybe-compare)))))
+        (let loop ((lst lst))
+          (cond ((null? lst) #f)
+                ((not (pair? lst)) (error "member: improper list"))
+                ((compare obj (car lst)) lst)
+                (else (loop (cdr lst))))))))
 
 (define (member-procedure predicate)
   (lambda (obj lst)
-    (%require-proper-list "member-procedure" lst)
     (let loop ((lst lst))
       (cond ((null? lst) #f)
+            ((not (pair? lst)) (error "member-procedure: improper list"))
             ((predicate obj (car lst)) lst)
             (else (loop (cdr lst)))))))
 
@@ -1406,24 +1399,19 @@
       (begin
         (%require-circular-lists "map" (cons lst lsts))
         (if (null? lsts)
-            ; Single list case - tail-recursive, builds in order via set-cdr!
-            (let ((head (cons '() '())))
-              (let loop ((lst lst) (tail head))
-                (if (null? lst)
-                    (cdr head)
-                    (let ((new-cell (cons (proc (car lst)) '())))
-                      (set-cdr! tail new-cell)
-                      (loop (cdr lst) new-cell)))))
-            ; Multiple lists case - tail-recursive, builds in order
-            (let ((head (cons '() '())))
-              (let loop ((lst lst) (lsts lsts) (tail head))
-                (if (or (null? lst) (any null? lsts))
-                    (cdr head)
-                    (let ((new-cell
-                           (cons (apply proc (car lst) (map car lsts))
-                                 '())))
-                      (set-cdr! tail new-cell)
-                      (loop (cdr lst) (map cdr lsts) new-cell)))))))))
+            ; Keep accumulated prefixes immutable. A continuation captured
+            ; by proc can return through map repeatedly; an earlier result
+            ; must not be modified by a later return (R7RS 6.10).
+            (let loop ((lst lst) (acc '()))
+              (if (null? lst)
+                  (reverse acc)
+                  (let ((value (proc (car lst))))
+                    (loop (cdr lst) (cons value acc)))))
+            (let loop ((lst lst) (lsts lsts) (acc '()))
+              (if (or (null-list? lst) (%search-list-end? lsts))
+                  (reverse acc)
+                  (let ((value (apply proc (car lst) (map car lsts))))
+                    (loop (cdr lst) (map cdr lsts) (cons value acc)))))))))
 
 ; SRFI-1's map-in-order is the deterministic counterpart to map.  This
 ; implementation already evaluates map's procedure calls left-to-right.
@@ -1441,14 +1429,14 @@
             ; large proper list does not consume one Scheme stack frame per
             ; element.
             (let loop ((lst lst))
-              (if (pair? lst)
+              (if (not (null-list? lst))
                   (begin
                     (proc (car lst))
                     (loop (cdr lst)))))
             ; Multiple lists case.  Stop at the first finite list, while
             ; allowing circular companions as SRFI-1 does.
             (let loop ((lst lst) (lsts lsts))
-              (if (and (pair? lst) (not (any null? lsts)))
+              (if (not (or (null-list? lst) (%search-list-end? lsts)))
                   (begin
                     (apply proc (car lst) (map car lsts))
                     (loop (cdr lst) (map cdr lsts)))))))))
@@ -1463,44 +1451,48 @@
 (define *promise-tag* (list 'promise))
 
 (define (%make-lazy-promise thunk)
-  (vector *promise-tag* #f thunk))
+  (vector *promise-tag* (cons #f thunk)))
+
+(define (%make-eager-promise value)
+  (vector *promise-tag* (cons #t value)))
 
 (define (make-promise obj)
   (if (promise? obj)
       obj
-      (vector *promise-tag* #t obj)))
+      (%make-eager-promise obj)))
 
 (define (promise? obj)
   (and (vector? obj)
-       (= (vector-length obj) 3)
+       (= (vector-length obj) 2)
        (eq? (vector-ref obj 0) *promise-tag*)))
 
 ; Force/delay
 (define-syntax delay
   (syntax-rules ()
     ((delay expr)
-     (%make-lazy-promise (lambda () expr)))))
+     (%make-lazy-promise (lambda () (%make-eager-promise expr))))))
 
 (define (force promise)
   (if (not (promise? promise))
       (error "force: not a promise")
-      ; Iterative, not recursive: a chain of delay-force promises (the
-      ; standard lazy-stream idiom) must force in constant stack space per
-      ; R7RS 4.2.5. Recursing via (force result) here would grow the stack
-      ; by one frame per link in the chain.
-      (let loop ((p promise))
-        (if (vector-ref p 1)
-            (vector-ref p 2)
-            (let ((result ((vector-ref p 2))))
-              (if (promise? result)
-                  (begin
-                    (vector-set! p 1 (vector-ref result 1))
-                    (vector-set! p 2 (vector-ref result 2))
-                    (loop p))
-                  (begin
-                    (vector-set! p 1 #t)
-                    (vector-set! p 2 result)
-                    result)))))))
+      ; Promises joined by delay-force share a mutable state pair. Updating
+      ; that pair memoizes every alias without retaining a chain of thunks.
+      (let loop ()
+        (let ((state (vector-ref promise 1)))
+          (if (car state)
+              (cdr state)
+              (let* ((next ((cdr state)))
+                     ; The thunk can recursively force this same promise.
+                     ; Re-read its state and preserve any value cached there.
+                     (state (vector-ref promise 1)))
+                (if (not (car state))
+                    (if (not (promise? next))
+                        (error "delay-force: expected a promise")
+                        (let ((next-state (vector-ref next 1)))
+                          (set-car! state (car next-state))
+                          (set-cdr! state (cdr next-state))
+                          (vector-set! next 1 state))))
+                (loop)))))))
 
 (define-syntax delay-force
   (syntax-rules ()
@@ -1606,14 +1598,10 @@
 ; filter - return list of elements satisfying predicate (tail-recursive, in-order)
 (define (filter pred lst)
   (%require-proper-list "filter" lst)
-  (let ((head (cons '() '()))) ; dummy head cell
-    (let loop ((lst lst) (tail head))
-      (cond ((null? lst) (cdr head))
-            ((pred (car lst))
-             (let ((new-cell (cons (car lst) '())))
-               (set-cdr! tail new-cell)
-               (loop (cdr lst) new-cell)))
-            (else (loop (cdr lst) tail))))))
+  (let loop ((lst lst) (acc '()))
+    (cond ((null? lst) (reverse acc))
+          ((pred (car lst)) (loop (cdr lst) (cons (car lst) acc)))
+          (else (loop (cdr lst) acc)))))
 
 ; remove - return list of elements NOT satisfying predicate
 (define (remove pred lst)
@@ -1628,26 +1616,26 @@
 
 ; find - return first element satisfying predicate, or #f
 (define (find pred lst)
-  (%require-proper-list "find" lst)
   (let loop ((lst lst))
     (cond ((null? lst) #f)
+          ((not (pair? lst)) (error "find: improper list"))
           ((pred (car lst)) (car lst))
           (else (loop (cdr lst))))))
 
-; any - return #t if any element satisfies predicate
 ; any - return the predicate's true value for the first element(s) that
 ; satisfy it (not a bare #t), stopping at the shortest of any number of
 ; lists; #f if none satisfy (SRFI-1)
 (define (any pred lst . more-lists)
   (if (null? lst)
       #f
-      (begin
-        (%require-circular-lists "any" (cons lst more-lists))
-        (let loop ((lsts (cons lst more-lists)))
-          (if (any-null? lsts)
-              #f
-              (or (apply pred (map car lsts))
-                  (loop (map cdr lsts))))))))
+      (let loop ((lsts (cons lst more-lists)))
+        (if (%search-list-end? lsts)
+            #f
+            (let ((next (map cdr lsts)))
+              (if (%search-list-end? next)
+                  (apply pred (map car lsts))
+                  (or (apply pred (map car lsts))
+                      (loop next))))))))
 
 ; every - return the predicate's value for the last element(s) (not a bare
 ; #t), stopping at the shortest of any number of lists; #t if all satisfy
@@ -1655,13 +1643,29 @@
 (define (every pred lst . more-lists)
   (if (null? lst)
       #t
-      (begin
-        (%require-circular-lists "every" (cons lst more-lists))
-        (let loop ((lsts (cons lst more-lists)) (last-result #t))
-          (if (any-null? lsts)
-              last-result
-              (let ((r (apply pred (map car lsts))))
-                (if r (loop (map cdr lsts) r) #f)))))))
+      (let loop ((lsts (cons lst more-lists)))
+        (if (%search-list-end? lsts)
+            #t
+            (let ((next (map cdr lsts)))
+              (if (%search-list-end? next)
+                  (apply pred (map car lsts))
+                  (and (apply pred (map car lsts))
+                       (loop next))))))))
+
+; Inspect only the current pairs. Successful searches need not validate
+; the unvisited tail; checking successors identifies the final tail call.
+(define (%search-list-end? lists)
+  (and (pair? lists)
+       (or (null-list? (car lists))
+           (%search-list-end? (cdr lists)))))
+
+; MIT's folds validate every current tail even if one has already ended.
+; Map and the other traversals stop inspecting arguments at the first end.
+(define (%fold-list-end? lists)
+  (let loop ((lists lists) (ended? #f))
+    (if (null? lists)
+        ended?
+        (loop (cdr lists) (or (null-list? (car lists)) ended?)))))
 
 (define (any-null? lsts)
   (if (null? lsts) #f (or (null? (car lsts)) (any-null? (cdr lsts)))))
@@ -1673,7 +1677,7 @@
       (begin
         (%require-circular-lists "count" (cons lst more-lists))
         (let loop ((lists (cons lst more-lists)) (n 0))
-          (if (any null? lists)
+          (if (%search-list-end? lists)
               n
               (loop (map cdr lists)
                     (if (apply pred (map car lists))
@@ -1684,7 +1688,7 @@
 (define (fold proc init lst . more-lists)
   (%require-circular-lists "fold" (cons lst more-lists))
   (let loop ((lists (cons lst more-lists)) (acc init))
-    (if (any null? lists)
+    (if (%fold-list-end? lists)
         acc
         (loop (map cdr lists)
               (apply proc (append (map car lists) (list acc)))))))
@@ -1693,7 +1697,7 @@
 (define (fold-right proc init lst . more-lists)
   (%require-circular-lists "fold-right" (cons lst more-lists))
   (let loop ((lists (cons lst more-lists)))
-    (if (any null? lists)
+    (if (%fold-list-end? lists)
         init
         (apply proc
                (append (map car lists)
@@ -1745,13 +1749,8 @@
 ; shortest list (SRFI-1).
 (define (zip . lists)
   (if (null? lists)
-      (error "zip: expected at least one list"))
-  (%require-proper-lists "zip" lists)
-  (let loop ((lists lists) (result '()))
-    (if (any null? lists)
-        (reverse result)
-        (loop (map cdr lists)
-              (cons (map car lists) result)))))
+      (error "zip: expected at least one list")
+      (apply map list lists)))
 
 ; flatten - flatten nested list structure
 (define (flatten lst)
@@ -1763,8 +1762,8 @@
 
 ; last - return last element of list
 (define (last lst)
-  (%require-proper-list "last" lst)
-  (if (null? lst)
+  (%require-finite-list "last" lst)
+  (if (not (pair? lst))
       (error "last: expected non-empty list"))
   (car (last-pair lst)))
 
@@ -1899,9 +1898,9 @@
        (not (proper-list? x))
        (not (dotted-list? x))))
 
-; Validate a family of proper or circular lists.  SRFI-1 permits circular
-; inputs for multi-list traversals, but requires at least one finite list so
-; the traversal has a defined stopping point.
+; Reject unbounded all-circular traversals. A dotted input is permitted
+; when another list ends before its terminal atom is inspected; traversal
+; loops validate current pairs with null-list?, in argument order.
 (define (%require-circular-lists who lists)
   (%require-proper-list who lists)
   (if (null? lists)
@@ -1913,13 +1912,13 @@
                                   ": at least one list must be finite"))
             #t)
         (let ((lst (car lists)))
-          (cond ((proper-list? lst)
-                 (loop (cdr lists) #f))
-                ((circular-list? lst)
-                 (loop (cdr lists) all-circular?))
-                (else
+          (cond ((null? lst) #t)
+                ((not (pair? lst))
                  (error (string-append who
-                                       ": expected proper or circular list"))))))))
+                                       ": expected list")))
+                (else
+                 (loop (cdr lists)
+                       (and all-circular? (circular-list? lst)))))))))
 
 ; length+ - length for a proper list, or #f for a circular list.
 (define (length+ x)
@@ -1931,18 +1930,17 @@
 (define (list= elt= . lists)
   (or (null? lists)
       (null? (cdr lists))
-      (begin
-        (%require-proper-lists "list=" lists)
-        (let loop ((lists lists))
-          (or (null? (cdr lists))
-              (let ((a (car lists)) (b (cadr lists)))
-                (and (let cmp ((a a) (b b))
-                       (cond ((null? a) (null? b))
-                             ((null? b) #f)
-                             ((elt= (car a) (car b))
-                              (cmp (cdr a) (cdr b)))
-                             (else #f)))
-                     (loop (cdr lists)))))))))
+      (let loop ((lists lists))
+        (or (null? (cdr lists))
+            (let ((a (car lists)) (b (cadr lists)))
+              (and (let cmp ((a a) (b b))
+                     (cond ((null-list? a) (null-list? b))
+                           ((null-list? b) #f)
+                           ((eq? a b) #t)
+                           ((elt= (car a) (car b))
+                            (cmp (cdr a) (cdr b)))
+                           (else #f)))
+                   (loop (cdr lists))))))))
 
 ;;; ============================================================================
 ;;; Additional SRFI-1 Selectors
@@ -2031,7 +2029,7 @@
 
 ; concatenate - append all lists in list-of-lists
 (define (concatenate lists)
-  (%require-proper-lists "concatenate" lists)
+  (%require-proper-list "concatenate" lists)
   (apply append lists))
 
 ; append-reverse - (append (reverse rev-head) tail)
@@ -2044,27 +2042,27 @@
 
 ; unzip1 - extract first elements from list of lists
 (define (unzip1 lists)
-  (%require-proper-lists "unzip1" lists)
+  (%require-proper-list "unzip1" lists)
   (map car lists))
 
 ; unzip2 - extract first two elements from list of lists
 (define (unzip2 lists)
-  (%require-proper-lists "unzip2" lists)
+  (%require-proper-list "unzip2" lists)
   (values (map car lists) (map cadr lists)))
 
 ; unzip3 - extract first three elements
 (define (unzip3 lists)
-  (%require-proper-lists "unzip3" lists)
+  (%require-proper-list "unzip3" lists)
   (values (map car lists) (map cadr lists) (map caddr lists)))
 
 ; unzip4 - extract first four elements
 (define (unzip4 lists)
-  (%require-proper-lists "unzip4" lists)
+  (%require-proper-list "unzip4" lists)
   (values (map car lists) (map cadr lists) (map caddr lists) (map cadddr lists)))
 
 ; unzip5 - extract first five elements
 (define (unzip5 lists)
-  (%require-proper-lists "unzip5" lists)
+  (%require-proper-list "unzip5" lists)
   (values (map car lists) (map cadr lists) (map caddr lists)
           (map cadddr lists) (map fifth lists)))
 
@@ -2079,10 +2077,10 @@
       (begin
         (%require-circular-lists "pair-fold" (cons lst more-lists))
         (let loop ((lists (cons lst more-lists)) (acc init))
-          (if (any null? lists)
+          (if (%search-list-end? lists)
               acc
-              (loop (map cdr lists)
-                    (apply proc (append lists (list acc)))))))))
+              (let ((next (map cdr lists)))
+                (loop next (apply proc (append lists (list acc))))))))))
 
 ; pair-fold-right - like fold-right but proc receives pairs.
 (define (pair-fold-right proc init lst . more-lists)
@@ -2091,7 +2089,7 @@
       (begin
         (%require-circular-lists "pair-fold-right" (cons lst more-lists))
         (let loop ((lists (cons lst more-lists)))
-          (if (any null? lists)
+          (if (%search-list-end? lists)
               init
               (apply proc
                      (append lists
@@ -2152,7 +2150,7 @@
       (begin
         (%require-circular-lists "filter-map" (cons lst more-lists))
         (let loop ((lists (cons lst more-lists)) (acc '()))
-          (if (any null? lists)
+          (if (%search-list-end? lists)
               (reverse acc)
               (let ((result (apply proc (map car lists))))
                 (loop (map cdr lists)
@@ -2167,7 +2165,7 @@
       (begin
         (%require-circular-lists "pair-for-each" (cons lst more-lists))
         (let loop ((lists (cons lst more-lists)))
-          (if (not (any-null? lists))
+          (if (not (%search-list-end? lists))
               (let ((next (map cdr lists)))
                 ; Capture successors before the callback: SRFI-1 permits the
                 ; callback to mutate the pairs it receives, without changing
@@ -2181,23 +2179,22 @@
 
 ; find-tail - return tail of list starting at first match
 (define (find-tail pred lst)
-  (%require-proper-list "find-tail" lst)
   (let loop ((lst lst))
     (cond ((null? lst) #f)
+          ((not (pair? lst)) (error "find-tail: improper list"))
           ((pred (car lst)) lst)
           (else (loop (cdr lst))))))
 
 ; list-index - return index of first element satisfying pred
 (define (list-index pred lst)
-  (%require-proper-list "list-index" lst)
   (let loop ((lst lst) (i 0))
     (cond ((null? lst) #f)
+          ((not (pair? lst)) (error "list-index: improper list"))
           ((pred (car lst)) i)
           (else (loop (cdr lst) (+ i 1))))))
 
 ; take-while - return longest prefix satisfying pred
 (define (take-while pred lst)
-  (%require-proper-list "take-while" lst)
   (let loop ((lst lst))
     (if (or (null? lst) (not (pred (car lst))))
         '()
@@ -2205,7 +2202,6 @@
 
 ; drop-while - drop longest prefix satisfying pred
 (define (drop-while pred lst)
-  (%require-proper-list "drop-while" lst)
   (let loop ((lst lst))
     (cond ((null? lst) '())
           ((pred (car lst)) (loop (cdr lst)))
@@ -2213,7 +2209,12 @@
 
 ; span - split at first element not satisfying pred
 (define (span pred lst)
-  (values (take-while pred lst) (drop-while pred lst)))
+  ; A single search keeps the two results complementary even when pred has
+  ; state. Immutable accumulation also preserves earlier continuation returns.
+  (let loop ((rest lst) (prefix '()))
+    (if (or (null? rest) (not (pred (car rest))))
+        (values (reverse prefix) rest)
+        (loop (cdr rest) (cons (car rest) prefix)))))
 
 ; break - split at first element satisfying pred
 (define (break pred lst)
@@ -2396,36 +2397,33 @@
 
 ; take! - destructive version of take
 (define (take! lst n)
-  (%require-proper-list "take!" lst)
   (%require-nonnegative-integer "take!" n)
-  (cond ((<= n 0) '())
-        ((null? lst) '())
+  (cond ((= n 0) '())
         (else
          (let ((tail (drop lst (- n 1))))
-           (if (null? tail)
-               lst
+           (if (not (pair? tail))
+               (error "take!: list is shorter than requested count")
                (begin
                  (set-cdr! tail '())
                  lst))))))
 
 ; drop-right! - destructive version of drop-right
 (define (drop-right! lst n)
-  (%require-proper-list "drop-right!" lst)
+  (%require-finite-list "drop-right!" lst)
   (%require-nonnegative-integer "drop-right!" n)
-  (let ((len (length lst)))
-    (if (<= (- len n) 0)
-        '()
+  (let ((len (%pair-count lst)))
+    (if (> n len)
+        (error "drop-right!: list is shorter than requested count")
         (take! lst (- len n)))))
 
 ; split-at! - destructive version of split-at
 (define (split-at! lst n)
-  (%require-proper-list "split-at!" lst)
   (%require-nonnegative-integer "split-at!" n)
-  (if (<= n 0)
+  (if (= n 0)
       (values '() lst)
       (let ((tail (drop lst (- n 1))))
-        (if (null? tail)
-            (values lst '())
+        (if (not (pair? tail))
+            (error "split-at!: list is shorter than requested count")
             (let ((rest (cdr tail)))
               (set-cdr! tail '())
               (values lst rest))))))
@@ -2457,7 +2455,7 @@
 
 ; concatenate! - destructive concatenate
 (define (concatenate! list-of-lists)
-  (%require-proper-lists "concatenate!" list-of-lists)
+  (%require-proper-list "concatenate!" list-of-lists)
   (apply append! list-of-lists))
 
 ; reverse! - destructive reverse
@@ -2514,14 +2512,14 @@
 
 ; filter! - destructive filter
 (define (filter! pred lst)
-  (%require-proper-list "filter!" lst)
+  (%require-finite-list "filter!" lst)
   ; Skip leading non-matching elements to find new head
   (let find-head ((lst lst))
     (cond ((null? lst) '())
           ((pred (car lst))
            ; Found head, now filter rest in place
            (let loop ((prev lst) (curr (cdr lst)))
-             (cond ((null? curr) lst)
+             (cond ((not (pair? curr)) lst)
                    ((pred (car curr))
                     (loop curr (cdr curr)))
                    (else
@@ -2536,17 +2534,32 @@
 
 ; partition! - destructive partition
 (define (partition! pred lst)
-  (let ((yes (filter! pred (list-copy lst)))
-        (no (remove! pred lst)))
-    (values yes no)))
+  (%require-finite-list "partition!" lst)
+  (if (and (not (null? lst)) (not (pair? lst)))
+      (error "partition!: expected a list"))
+  ; Classify each pair once. Separate filter/remove passes can disagree
+  ; when the predicate has state, duplicating or losing input elements.
+  (let ((yes (cons #f '())) (no (cons #f '())))
+    (let loop ((rest lst) (yes-tail yes) (no-tail no))
+      (if (not (pair? rest))
+          (begin
+            ; Preserve a dotted terminal tail in both results, as MIT does.
+            (set-cdr! yes-tail rest)
+            (set-cdr! no-tail rest)
+            (values (cdr yes) (cdr no)))
+          (let ((next (cdr rest)))
+            (if (pred (car rest))
+                (begin (set-cdr! yes-tail rest)
+                       (loop next rest no-tail))
+                (begin (set-cdr! no-tail rest)
+                       (loop next yes-tail rest))))))))
 
 ; take-while! - destructive take-while
 (define (take-while! pred lst)
-  (%require-proper-list "take-while!" lst)
   (if (or (null? lst) (not (pred (car lst))))
       '()
       (let loop ((prev lst) (curr (cdr lst)))
-        (cond ((null? curr) lst)
+        (cond ((not (pair? curr)) lst)
               ((pred (car curr)) (loop curr (cdr curr)))
               (else
                (set-cdr! prev '())
@@ -2554,7 +2567,6 @@
 
 ; span! - destructive span
 (define (span! pred lst)
-  (%require-proper-list "span!" lst)
   (if (or (null? lst) (not (pred (car lst))))
       (values '() lst)
       (let loop ((prev lst) (curr (cdr lst)))
@@ -2730,6 +2742,20 @@
 ;; state for any converter that isn't idempotent (R7RS 4.2.6: the dynamic
 ;; extent's original value is restored, not reconverted).
 (define %parameter-raw-set-tag (list 'parameter-raw-set))
+(define %parameter-convert-tag (list 'parameter-convert))
+
+(define (%make-parameter-procedure getter setter converter)
+  (lambda args
+    (cond ((null? args)
+           (getter))
+          ((null? (cdr args))
+           (setter (converter (car args))))
+          ((and (null? (cddr args)) (eq? (cadr args) %parameter-raw-set-tag))
+           (setter (car args)))
+          ((and (null? (cddr args)) (eq? (cadr args) %parameter-convert-tag))
+           (converter (car args)))
+          (else
+           (error "parameter: expected zero or one argument")))))
 
 (define (make-parameter init . maybe-converter)
   (if (> (length maybe-converter) 1)
@@ -2739,28 +2765,58 @@
                        (car maybe-converter)))
         (cell (vector 'parameter #f)))
     (vector-set! cell 1 (converter init))
-    (lambda args
-      (cond ((null? args)
-             (vector-ref cell 1))
-            ((null? (cdr args))
-             (vector-set! cell 1 (converter (car args))))
-            ((and (null? (cddr args)) (eq? (cadr args) %parameter-raw-set-tag))
-             (vector-set! cell 1 (car args)))
-            (else
-             (error "parameter: expected zero or one argument"))))))
+    (%make-parameter-procedure
+      (lambda () (vector-ref cell 1))
+      (lambda (value) (vector-set! cell 1 value))
+      converter)))
+
+;; Use the runtime's port cells so parameterize, the explicit setters, and
+;; primitive I/O all observe the same value. Validation must not change it.
+(define (%make-port-parameter getter setter port? name)
+  (%make-parameter-procedure getter setter
+    (lambda (value)
+      (if (port? value)
+          value
+          (error name "invalid port" value)))))
+
+(set! current-input-port
+  (%make-port-parameter current-input-port set-current-input-port!
+                        input-port? "current-input-port"))
+(set! current-output-port
+  (%make-port-parameter current-output-port set-current-output-port!
+                        output-port? "current-output-port"))
+(set! current-error-port
+  (%make-port-parameter current-error-port set-current-error-port!
+                        output-port? "current-error-port"))
+
+(define (%call-with-parameterization parameters vals thunk)
+  ; Evaluate and convert every value before changing the dynamic environment.
+  (let ((bindings (map (lambda (p val)
+                         (cons p (p val %parameter-convert-tag)))
+                       parameters vals)))
+    (let bind ((remaining bindings))
+      (if (null? remaining)
+          (thunk)
+          (let* ((binding (car remaining))
+                 (p (car binding))
+                 (value (cdr binding)))
+            ; Swapping preserves changes made inside the extent when a
+            ; continuation reenters it, without running the converter again.
+            (define (swap!)
+              (let ((previous (p)))
+                (p value %parameter-raw-set-tag)
+                (set! value previous)))
+            (dynamic-wind swap!
+                          (lambda () (bind (cdr remaining)))
+                          swap!))))))
 
 (define-syntax parameterize
   (syntax-rules ()
     ((parameterize () body ...)
      (begin body ...))
-    ((parameterize ((param value) rest ...) body ...)
-     (let ((p param)
-           (new-value value))
-       (let ((old-value (p)))
-         (dynamic-wind
-          (lambda () (p new-value))
-          (lambda () (parameterize (rest ...) body ...))
-          (lambda () (p old-value %parameter-raw-set-tag))))))))
+    ((parameterize ((param value) ...) body ...)
+     (%call-with-parameterization (list param ...) (list value ...)
+                                 (lambda () body ...)))))
 
 ;;; ============================================================================
 ;;; SRFI-9: Defining Record Types
@@ -2887,12 +2943,17 @@
     ((define-record-constructor constructor-name
        (constructor-field ...)
        field-spec ...)
-     (define (constructor-name constructor-field ...)
-       (list->vector
-         (cons constructor-name
-               (define-record-constructor-values
-                 (list (cons 'constructor-field constructor-field) ...)
-                 field-spec ...)))))))
+     ;; The private self-binding remains the tag even if the public
+     ;; constructor name is rebound or is also a constructor field name.
+     (define constructor-name
+       (letrec ((construct
+                 (lambda (constructor-field ...)
+                   (list->vector
+                     (cons construct
+                           (define-record-constructor-values
+                             (list (cons 'constructor-field constructor-field) ...)
+                             field-spec ...))))))
+         construct)))))
 
 (define-syntax define-record-constructor-values
   (syntax-rules ()
@@ -2911,6 +2972,8 @@
 
 ;; Helper macro to define field accessors/mutators
 ;; Index starts at 1 because position 0 is the type tag
+;; Capture the predicate so rebinding its public name cannot change a field
+;; procedure's record type or bypass its type check.
 (define-syntax define-record-fields
   (syntax-rules ()
     ;; Base case: no more fields
@@ -2922,10 +2985,12 @@
        (field-name accessor-name)
        rest ...)
      (begin
-       (define (accessor-name obj)
-         (if (predicate-name obj)
-             (vector-ref obj index)
-             (error "record accessor: wrong record type" obj)))
+       (define accessor-name
+         (let ((record-predicate predicate-name))
+           (lambda (obj)
+             (if (record-predicate obj)
+                 (vector-ref obj index)
+                 (error "record accessor: wrong record type" obj)))))
        (define-record-fields type-name predicate-name (+ index 1) rest ...)))
 
     ;; Field with accessor and mutator
@@ -2933,14 +2998,18 @@
        (field-name accessor-name mutator-name)
        rest ...)
      (begin
-       (define (accessor-name obj)
-         (if (predicate-name obj)
-             (vector-ref obj index)
-             (error "record accessor: wrong record type" obj)))
-       (define (mutator-name obj val)
-         (if (predicate-name obj)
-             (vector-set! obj index val)
-             (error "record mutator: wrong record type" obj)))
+       (define accessor-name
+         (let ((record-predicate predicate-name))
+           (lambda (obj)
+             (if (record-predicate obj)
+                 (vector-ref obj index)
+                 (error "record accessor: wrong record type" obj)))))
+       (define mutator-name
+         (let ((record-predicate predicate-name))
+           (lambda (obj val)
+             (if (record-predicate obj)
+                 (vector-set! obj index val)
+                 (error "record mutator: wrong record type" obj)))))
        (define-record-fields type-name predicate-name (+ index 1) rest ...)))))
 
 ;;; ============================================================================

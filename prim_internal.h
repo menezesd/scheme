@@ -225,6 +225,26 @@ static inline unsigned make_complex_inexact(double real, double imag)
     return store_complex(real_part, imag_part);
 }
 
+// Shared by make-polar and the numeric reader. Preserve exact zero angles
+// before converting a possibly enormous radius to double, and retain signed
+// inexact zero components when trigonometry is needed.
+static inline unsigned make_polar_number(unsigned magnitude, unsigned angle)
+{
+    if (is_exact(angle) && is_zero_number(angle))
+        return magnitude;
+    double theta = to_double(angle);
+    if (is_exact(magnitude) && is_zero_number(magnitude) && isfinite(theta))
+        return magnitude;
+    double radius = to_double(magnitude);
+    double real = radius * cos(theta);
+    double imag = radius * sin(theta);
+    GC_GUARD;
+    unsigned real_part = store_inexact(real);
+    gc_protect(&real_part);
+    unsigned imag_part = store_inexact(imag);
+    return store_complex(real_part, imag_part);
+}
+
 // Helper to get rational components (num, denom) from any exact number
 // NOTE: Only works correctly if num/denom fit in int64_t
 static inline void get_rational_parts(unsigned x, int64_t *num, int64_t *denom)
@@ -994,6 +1014,7 @@ static inline string_port *strport_alloc_with_data(char *data, size_t len,
     sp->last_read_source_pos = 0;
     sp->last_read_char = 0;
     sp->last_read_valid = false;
+    sp->closed = false;
     sp->source_string = ctx.atom_false;
     sp->source_start = 0;
     sp->source_end = 0;
@@ -1050,6 +1071,7 @@ static inline string_port *strport_from_string_cell(unsigned source,
     sp->last_read_source_pos = 0;
     sp->last_read_char = 0;
     sp->last_read_valid = false;
+    sp->closed = false;
     sp->source_string = source;
     sp->source_start = start;
     sp->source_end = end;
@@ -1176,11 +1198,16 @@ static inline void strport_free(string_port *sp)
 // Port direction for extract_port
 typedef enum { PORT_INPUT, PORT_OUTPUT } port_dir;
 
-static inline bool string_port_well_formed(string_port *sp)
+static inline bool string_port_buffer_valid(string_port *sp)
 {
     return string_port_is_registered(sp) && strport_sync_source(sp) &&
            sp->data && sp->cap > 0 &&
            sp->len < sp->cap && sp->pos <= sp->len;
+}
+
+static inline bool string_port_well_formed(string_port *sp)
+{
+    return string_port_buffer_valid(sp) && !sp->closed;
 }
 
 static inline int extract_current_port_cell(unsigned current_cell, port_dir dir,

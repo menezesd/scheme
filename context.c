@@ -39,6 +39,7 @@
 #include <limits.h>
 #include <math.h>
 #include <string.h>
+#include <strings.h>
 
 // ============================================================================
 // FNV-1a Hash Constants (64-bit)
@@ -508,6 +509,11 @@ void init_heap(void)
         exit(EXIT_FAILURE);
     }
     memset(ctx.atom_table, 0, table_size);
+    ctx.atom_uninterned = calloc(ctx.atom_table_cap, sizeof(bool));
+    if (!ctx.atom_uninterned) {
+        fprintf(stderr, "Fatal: failed to allocate atom metadata\n");
+        exit(EXIT_FAILURE);
+    }
     ctx.atom_count = 0;
 
     // Generational GC enabled
@@ -1485,6 +1491,10 @@ bool is_numeric(unsigned x)
 
 static unsigned parse_real_number_slice(const char *start, size_t len)
 {
+    // A real component cannot have another imaginary suffix. Reject it
+    // before recursion through atom_from_string on malformed tokens.
+    if (len && (start[len - 1] == 'i' || start[len - 1] == 'I'))
+        return TOK_ERROR;
     char *slice = checked_string_copy_len(start, len);
     if (!slice) {
         show_error("out of memory");
@@ -1714,16 +1724,8 @@ static inline void intern_cache_insert_front(const char *str, int atom_id)
     intern_cache[0].atom_id = atom_id;
 }
 
-int intern(const char *s)
+static int atom_slot(const char *s, bool uninterned)
 {
-    // Check cache first - move to front on hit
-    for (int i = 0; i < INTERN_CACHE_SIZE; i++) {
-        if (intern_cache[i].str && strcmp(intern_cache[i].str, s) == 0) {
-            intern_cache_move_to_front(i);
-            return intern_cache[0].atom_id;
-        }
-    }
-
     // Atom IDs are table slots and are stored throughout the heap and
     // environments.  Rehashing would move entries and silently change the
     // identity of existing symbols, so this table must retain stable slots.
@@ -1734,7 +1736,8 @@ int intern(const char *s)
     int original_hash = hash_value;
 
     for (int i = 1; ctx.atom_table[hash_value] &&
-                    !str_equals(ctx.atom_table[hash_value], s);
+                    (uninterned || ctx.atom_uninterned[hash_value] ||
+                     !str_equals(ctx.atom_table[hash_value], s));
          i++) {
         hash_value = (original_hash + i) % (int)ctx.atom_table_cap;
         // Prevent an infinite probe loop if the fixed table is full.
@@ -1748,13 +1751,40 @@ int intern(const char *s)
         if (!ctx.atom_table[hash_value]) {
             lisp_panic("failed to allocate memory for atom");
         }
+        ctx.atom_uninterned[hash_value] = uninterned;
         ctx.atom_count++;
     }
 
+    return hash_value;
+}
+
+int intern(const char *s)
+{
+    // Only interned symbols participate in the name lookup cache.
+    for (int i = 0; i < INTERN_CACHE_SIZE; i++) {
+        if (intern_cache[i].str && strcmp(intern_cache[i].str, s) == 0) {
+            intern_cache_move_to_front(i);
+            return intern_cache[0].atom_id;
+        }
+    }
+    int hash_value = atom_slot(s, false);
     // Insert at front of cache
     intern_cache_insert_front(ctx.atom_table[hash_value], hash_value);
-
     return hash_value;
+}
+
+unsigned make_uninterned_symbol(const char *name)
+{
+    int id = atom_slot(name, true);
+    unsigned symbol = alloc();
+    CELL_TYPE(symbol) = BT_ATOM;
+    CELL_ID(symbol) = id;
+    return symbol;
+}
+
+bool atom_is_uninterned(unsigned atom)
+{
+    return atom_is_valid(atom) && ctx.atom_uninterned[CELL_ID(atom)];
 }
 
 // Helper: check if string could be start of a number
@@ -1763,7 +1793,9 @@ static bool is_number_start(const char *s)
     if (isdigit((unsigned char)s[0]))
         return true;
     if ((s[0] == '-' || s[0] == '+') &&
-        (isdigit((unsigned char)s[1]) || s[1] == '.'))
+        (isdigit((unsigned char)s[1]) || s[1] == '.' ||
+         strncasecmp(s + 1, "inf.0", 5) == 0 ||
+         strncasecmp(s + 1, "nan.0", 5) == 0))
         return true;
     if (s[0] == '.' && isdigit((unsigned char)s[1]))
         return true;
@@ -1775,14 +1807,14 @@ unsigned atom_from_string(const char *s)
     size_t n = strlen(s);
 
     // Check for pure imaginary: +i, -i (but not bare "i" - that's a symbol)
-    if (strcmp(s, "+i") == 0) {
+    if (strcasecmp(s, "+i") == 0) {
         GC_GUARD;
         unsigned real_part = store(0);
         gc_protect(&real_part);
         unsigned imag_part = store(1);
         return store_complex(real_part, imag_part);
     }
-    if (strcmp(s, "-i") == 0) {
+    if (strcasecmp(s, "-i") == 0) {
         GC_GUARD;
         unsigned real_part = store(0);
         gc_protect(&real_part);
@@ -1791,19 +1823,18 @@ unsigned atom_from_string(const char *s)
     }
 
     // R7RS infinity and nan literals
-    if (strcmp(s, "+inf.0") == 0)
+    if (strcasecmp(s, "+inf.0") == 0)
         return store_inexact(HUGE_VAL);
-    if (strcmp(s, "-inf.0") == 0)
+    if (strcasecmp(s, "-inf.0") == 0)
         return store_inexact(-HUGE_VAL);
-    if (strcmp(s, "+nan.0") == 0 || strcmp(s, "-nan.0") == 0)
+    if (strcasecmp(s, "+nan.0") == 0 || strcasecmp(s, "-nan.0") == 0)
         return store_inexact((double)NAN);
 
     // Check if the string might be a number
     if (is_number_start(s)) {
         char *endptr;
 
-        // Check for complex number (look for +/- followed by digits and i at
-        // end)
+        // Complex components can be ordinary reals, infinities, or NaNs.
         if (n > 1 && (s[n - 1] == 'i' || s[n - 1] == 'I')) {
             // Find the +/- that separates real and imaginary parts
             const char *sep = NULL;
@@ -1814,7 +1845,7 @@ unsigned atom_from_string(const char *s)
                      s[i - 1] == 'E') &&
                     (isdigit((unsigned char)s[i + 1]) || s[i + 1] == '.' ||
                      s[i + 1] == 'i' ||
-                     s[i + 1] == 'I')) {
+                     s[i + 1] == 'I' || s[i + 1] == 'n' || s[i + 1] == 'N')) {
                     // Check this isn't part of exponent
                     if (i >= 2 && (s[i - 1] == 'e' || s[i - 1] == 'E'))
                         continue;
@@ -3495,5 +3526,6 @@ void init_keywords(void)
     ctx.kw_arrow = intern("=>");
     ctx.kw_let_syntax = intern("let-syntax");
     ctx.kw_letrec_syntax = intern("letrec-syntax");
-    ctx.kw_protected = intern("##protected##");
+    // This marker is private syntax metadata, never a user-spellable symbol.
+    ctx.kw_protected = atom_slot("##protected##", true);
 }
