@@ -52,11 +52,58 @@ static inline void bump_acyclic_epoch(void)
     acyclic_epoch++;
 }
 
+// See env.h. Zero-initialized; a cache entry is only ever compared against
+// a stamp it was filled with, so no starting value is special.
+uint64_t env_bind_stamps[ENV_BIND_BUCKETS];
+bool env_bind_dynamic[ENV_BIND_BUCKETS];
+uint64_t env_bind_marks[ENV_BIND_BUCKETS];
+uint64_t env_gc_epoch;
+
+_Static_assert((ENV_BIND_BUCKETS & (ENV_BIND_BUCKETS - 1)) == 0 &&
+                   ENV_BIND_BUCKETS == (1u << (64 - 51)),
+               "env_bind_bucket shifts by 51 for 8192 buckets");
+
+// Was frame allocated after the cache last recorded a resolution of a name
+// in this bucket (env_note_binding_cached)? Then no cache entry for such a
+// name has an environment containing it. If no resolution has been recorded
+// since the last collection, every entry for the bucket is stale already and
+// any frame qualifies. Truncating the collection count can only make an old
+// mark look current, which errs towards answering no.
+static bool frame_unseen_by_cache(unsigned bucket, unsigned frame)
+{
+    uint64_t mark = env_bind_marks[bucket];
+    return (uint32_t)(mark >> 32) != (uint32_t)env_gc_epoch ||
+           frame >= (uint32_t)mark;
+}
+
+// A binding for var has just been added to an existing frame. Every cached
+// resolution of var may now be shadowed by it, so change var's stamp.
+//
+// A frame that is not the outermost of its environment (nested) can stand
+// between a use of var and a binding further out. Once one such frame has
+// gained var, other activations of the same code may differ in whether
+// theirs has, so from then on (env_binding_dynamic) the cache searches every
+// frame it has not seen before for var. A frame no entry has seen - a let
+// body's, freshly pushed and being filled in - therefore needs no new stamp:
+// no entry can depend on its contents, and any that meets it later searches
+// it.
+static void note_binding_added(int64_t var, bool nested, unsigned frame)
+{
+    unsigned bucket = env_bind_bucket(var);
+    if (nested) {
+        if (env_bind_dynamic[bucket] && frame_unseen_by_cache(bucket, frame))
+            return;
+        env_bind_dynamic[bucket] = true;
+    }
+    env_bind_stamps[bucket]++;
+}
+
 // Called after a GC, which can recycle cell indices and so invalidate any
 // cached verdict about a binding list's shape.
 void env_invalidate_cache(void)
 {
     bump_acyclic_epoch();
+    env_gc_epoch++;
 }
 
 static unsigned deref_binding_value(unsigned val)
@@ -583,6 +630,7 @@ unsigned defvar(unsigned var, unsigned aval, unsigned env)
         show_error("define: environment is immutable");
         return TOK_ERROR;
     }
+    bool nested = next != 0;
 
     // Invalidate lookup cache - new binding may shadow outer variables
     bump_acyclic_epoch();
@@ -656,6 +704,7 @@ unsigned defvar(unsigned var, unsigned aval, unsigned env)
     // lookup would report it missing - the index is treated as complete for
     // the frame it describes.
     env_index_note_define(frame, vid, new_vals);
+    note_binding_added(vid, nested, frame);
     return var;
 }
 

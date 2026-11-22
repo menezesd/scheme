@@ -2341,6 +2341,277 @@ TEST(vm_lookup_ignores_stale_cached_offset)
     PASS();
 }
 
+// The inline cache (vm.c, ic_lookup) remembers where a lookup instruction
+// last found its binding and trusts that while env_binding_stamp() is
+// unchanged. The tests below run one lookup instruction against several
+// environments shaped the way activations of one piece of code are - the
+// same frames, differing only in what internal defines added to them - and
+// change bindings between runs, so each reuse of a cache entry is checked
+// against the answer a full lookup gives.
+
+static unsigned run_test_lookup(code_object *code, unsigned env)
+{
+    vm_state vm;
+    vm_init(&vm);
+    unsigned result = vm_run(&vm, code, env);
+    vm_free(&vm);
+    return result;
+}
+
+static int64_t test_lookup_int(code_object *code, unsigned env)
+{
+    unsigned result = run_test_lookup(code, env);
+    if (result == TOK_ERROR)
+        return -1;
+    if (IS_FIXNUM(result))
+        return FIXNUM_VALUE(result);
+    return IS_CELL(result) && CELL_TYPE(result) == BT_NUM ? CELL_ID(result)
+                                                         : -2;
+}
+
+// A new activation frame binding var to val, in front of env.
+static unsigned push_test_frame(unsigned var, unsigned val, unsigned env)
+{
+    GC_GUARD;
+    gc_protect(&var);
+    gc_protect(&val);
+    gc_protect(&env);
+    unsigned vars = alloc_cons(var, 0);
+    gc_protect(&vars);
+    unsigned vals = alloc_cons(val, 0);
+    gc_protect(&vals);
+    unsigned frame = alloc_cons(vars, vals);
+    gc_protect(&frame);
+    return alloc_cons(frame, env);
+}
+
+TEST(vm_lookup_cache_sees_define_in_frame_it_passed)
+{
+    GC_GUARD;
+    unsigned x = atom_from_string("ic-shadowed-later");
+    unsigned y = atom_from_string("ic-frame-var");
+    gc_protect(&x);
+    gc_protect(&y);
+    unsigned global = empty_environment();
+    gc_protect(&global);
+    defvar(x, store(1), global);
+    unsigned env = push_test_frame(y, store(0), global);
+    gc_protect(&env);
+    code_object *code = make_test_lookup_code(CELL_ID(x), TEST_IC_UNCACHED,
+                                              TEST_IC_UNCACHED);
+
+    ASSERT_EQ(test_lookup_int(code, env), 1);
+    ASSERT_EQ(test_lookup_int(code, env), 1);
+    // An internal define after the instruction cached the outer binding.
+    defvar(x, store(2), env);
+    ASSERT_EQ(test_lookup_int(code, env), 2);
+    // Redefining in place and assigning reach the cached cell.
+    defvar(x, store(3), env);
+    ASSERT_EQ(test_lookup_int(code, env), 3);
+    setvar(CELL_ID(x), store(4), env);
+    ASSERT_EQ(test_lookup_int(code, env), 4);
+    code_free(code);
+    PASS();
+}
+
+TEST(vm_lookup_cache_searches_activations_with_conditional_defines)
+{
+    // (define (make flag) (if flag (define x 'local)) (lambda () x)):
+    // whether an activation's frame binds x depends on the path it took, so
+    // a binding cached from one activation says nothing about another's.
+    GC_GUARD;
+    unsigned x = atom_from_string("ic-conditional-define");
+    unsigned y = atom_from_string("ic-conditional-flag");
+    gc_protect(&x);
+    gc_protect(&y);
+    unsigned global = empty_environment();
+    gc_protect(&global);
+    defvar(x, store(1), global);
+    unsigned with_x = push_test_frame(y, ctx.atom_true, global);
+    gc_protect(&with_x);
+    defvar(x, store(2), with_x);
+    unsigned without_x = push_test_frame(y, ctx.atom_false, global);
+    gc_protect(&without_x);
+    code_object *code = make_test_lookup_code(CELL_ID(x), TEST_IC_UNCACHED,
+                                              TEST_IC_UNCACHED);
+
+    // Fill from the activation without the define, after it happened in
+    // the other one: the stamp alone cannot tell the two apart.
+    ASSERT_EQ(test_lookup_int(code, without_x), 1);
+    ASSERT_EQ(test_lookup_int(code, with_x), 2);
+    ASSERT_EQ(test_lookup_int(code, without_x), 1);
+    ASSERT_EQ(test_lookup_int(code, with_x), 2);
+    unsigned third = push_test_frame(y, ctx.atom_false, global);
+    gc_protect(&third);
+    ASSERT_EQ(test_lookup_int(code, third), 1);
+    defvar(x, store(3), third);
+    ASSERT_EQ(test_lookup_int(code, third), 3);
+    ASSERT_EQ(test_lookup_int(code, without_x), 1);
+    code_free(code);
+    PASS();
+}
+
+TEST(vm_lookup_cache_rechecks_offset_in_other_activation)
+{
+    GC_GUARD;
+    unsigned n = atom_from_string("ic-activation-param");
+    unsigned z = atom_from_string("ic-prepended-define");
+    gc_protect(&n);
+    gc_protect(&z);
+    unsigned global = empty_environment();
+    gc_protect(&global);
+    unsigned a = push_test_frame(n, store(10), global);
+    gc_protect(&a);
+    unsigned b = push_test_frame(n, store(20), global);
+    gc_protect(&b);
+    code_object *code = make_test_lookup_code(CELL_ID(n), TEST_IC_UNCACHED,
+                                              TEST_IC_UNCACHED);
+
+    ASSERT_EQ(test_lookup_int(code, a), 10);
+    ASSERT_EQ(test_lookup_int(code, b), 20);
+    ASSERT_EQ(test_lookup_int(code, a), 10);
+    // A define in one activation moves its parameter down the frame.
+    defvar(z, store(0), b);
+    ASSERT_EQ(test_lookup_int(code, b), 20);
+    ASSERT_EQ(test_lookup_int(code, a), 10);
+    ASSERT_EQ(test_lookup_int(code, b), 20);
+    code_free(code);
+    PASS();
+}
+
+TEST(vm_lookup_cache_define_in_fresh_frame_keeps_stamp)
+{
+    // A let body defines its variables into a frame pushed just before.
+    // Once the name has been defined in a nested frame at all, doing so in
+    // a frame no cache entry has seen leaves the stamp alone - and a lookup
+    // that later meets that frame searches it.
+    GC_GUARD;
+    unsigned x = atom_from_string("ic-let-bound");
+    gc_protect(&x);
+    unsigned global = empty_environment();
+    gc_protect(&global);
+    defvar(x, store(1), global);
+    unsigned older = extend_env_empty(global);
+    gc_protect(&older);
+    defvar(x, store(5), older); // the name is now defined in a nested frame
+    code_object *code = make_test_lookup_code(CELL_ID(x), TEST_IC_UNCACHED,
+                                              TEST_IC_UNCACHED);
+    unsigned first = extend_env_empty(global);
+    gc_protect(&first);
+    ASSERT_EQ(test_lookup_int(code, first), 1);
+
+    unsigned fresh = extend_env_empty(global);
+    gc_protect(&fresh);
+    uint64_t stamp = env_binding_stamp(CELL_ID(x));
+    defvar(x, store(2), fresh);
+    ASSERT(env_binding_stamp(CELL_ID(x)) == stamp);
+    ASSERT_EQ(test_lookup_int(code, fresh), 2);
+    ASSERT_EQ(test_lookup_int(code, first), 1);
+    ASSERT_EQ(test_lookup_int(code, older), 5);
+    // first has been seen by the cache now, so defining into it must
+    // change the stamp.
+    defvar(x, store(3), first);
+    ASSERT(env_binding_stamp(CELL_ID(x)) != stamp);
+    ASSERT_EQ(test_lookup_int(code, first), 3);
+    ASSERT_EQ(test_lookup_int(code, fresh), 2);
+    code_free(code);
+    PASS();
+}
+
+TEST(vm_lookup_cache_is_dropped_by_collections)
+{
+    GC_GUARD;
+    unsigned x = atom_from_string("ic-moved-binding");
+    unsigned y = atom_from_string("ic-moved-frame-var");
+    gc_protect(&x);
+    gc_protect(&y);
+    unsigned global = empty_environment();
+    gc_protect(&global);
+    defvar(x, store(1), global);
+    unsigned env = push_test_frame(y, store(0), global);
+    gc_protect(&env);
+    code_object *code = make_test_lookup_code(CELL_ID(x), TEST_IC_UNCACHED,
+                                              TEST_IC_UNCACHED);
+
+    ASSERT_EQ(test_lookup_int(code, env), 1);
+    uint64_t stamp = env_binding_stamp(CELL_ID(x));
+    env = minor_gc(env);
+    ASSERT(env_binding_stamp(CELL_ID(x)) != stamp);
+    setvar(CELL_ID(x), store(2), env);
+    ASSERT_EQ(test_lookup_int(code, env), 2);
+    env = gc(env);
+    setvar(CELL_ID(x), store(3), env);
+    ASSERT_EQ(test_lookup_int(code, env), 3);
+    defvar(x, store(4), env);
+    env = gc(env);
+    ASSERT_EQ(test_lookup_int(code, env), 4);
+    code_free(code);
+    PASS();
+}
+
+TEST(vm_lookup_cache_follows_binding_references)
+{
+    GC_GUARD;
+    unsigned target = atom_from_string("ic-alias-target");
+    unsigned alias = atom_from_string("ic-alias");
+    gc_protect(&target);
+    gc_protect(&alias);
+    unsigned env = empty_environment();
+    gc_protect(&env);
+    defvar(target, store(1), env);
+    unsigned cell = env_find_binding_cell(CELL_ID(target), env);
+    defvar_alias(alias, target, cell, env);
+    code_object *code = make_test_lookup_code(CELL_ID(alias), TEST_IC_UNCACHED,
+                                              TEST_IC_UNCACHED);
+
+    ASSERT_EQ(test_lookup_int(code, env), 1);
+    setvar(CELL_ID(target), store(2), env);
+    ASSERT_EQ(test_lookup_int(code, env), 2);
+    setvar(CELL_ID(alias), store(3), env); // writes through to the target
+    ASSERT_EQ(test_lookup_int(code, env), 3);
+    defvar(alias, store(4), env); // replaces the reference itself
+    ASSERT_EQ(test_lookup_int(code, env), 4);
+    setvar(CELL_ID(target), store(5), env);
+    ASSERT_EQ(test_lookup_int(code, env), 4);
+    code_free(code);
+    PASS();
+}
+
+TEST(vm_lookup_cache_entry_belongs_to_one_instruction)
+{
+    // Cache words are plain operands: copying an instruction copies them.
+    // An entry is only used by the instruction it was made for.
+    GC_GUARD;
+    unsigned x = atom_from_string("ic-owner-x");
+    unsigned y = atom_from_string("ic-owner-y");
+    gc_protect(&x);
+    gc_protect(&y);
+    unsigned env = empty_environment();
+    gc_protect(&env);
+    defvar(x, store(1), env);
+    defvar(y, store(2), env);
+    code_object *code = code_new();
+    ASSERT(code != NULL);
+    code_emit(code, OP_LOOKUP);
+    code_emit(code, (unsigned)CELL_ID(x));
+    code_emit(code, TEST_IC_UNCACHED);
+    code_emit(code, TEST_IC_UNCACHED);
+    code_emit(code, OP_POP);
+    code_emit(code, OP_LOOKUP);
+    code_emit(code, (unsigned)CELL_ID(y));
+    code_emit(code, TEST_IC_UNCACHED);
+    code_emit(code, TEST_IC_UNCACHED);
+    code_emit(code, OP_HALT);
+
+    ASSERT_EQ(test_lookup_int(code, env), 2);
+    code->code[7] = code->code[2];
+    code->code[8] = code->code[3];
+    ASSERT_EQ(test_lookup_int(code, env), 2);
+    ASSERT_EQ(test_lookup_int(code, env), 2);
+    code_free(code);
+    PASS();
+}
+
 static unsigned make_test_bytecode_closure(code_object *code, unsigned env)
 {
     unsigned marker = alloc();
@@ -4134,6 +4405,13 @@ int main(void)
     RUN_TEST(vm_lookup_rejects_malformed_frame_variables);
     RUN_TEST(vm_lookup_ignores_stale_cached_depth);
     RUN_TEST(vm_lookup_ignores_stale_cached_offset);
+    RUN_TEST(vm_lookup_cache_sees_define_in_frame_it_passed);
+    RUN_TEST(vm_lookup_cache_searches_activations_with_conditional_defines);
+    RUN_TEST(vm_lookup_cache_rechecks_offset_in_other_activation);
+    RUN_TEST(vm_lookup_cache_define_in_fresh_frame_keeps_stamp);
+    RUN_TEST(vm_lookup_cache_is_dropped_by_collections);
+    RUN_TEST(vm_lookup_cache_follows_binding_references);
+    RUN_TEST(vm_lookup_cache_entry_belongs_to_one_instruction);
     RUN_TEST(vm_call_closure_rejects_invalid_bytecode);
     RUN_TEST(vm_call_closure_rejects_invalid_parameter_metadata);
     RUN_TEST(vm_continuation_rejects_oversized_stack);

@@ -34,8 +34,6 @@
 // VM Constants
 // ============================================================================
 
-#define IC_UNCACHED 0xFFFFFFFF
-
 #define INITIAL_STACK_SIZE 1024
 #define INITIAL_FRAMES_SIZE 256
 #define MAX_STACK_SIZE VM_MAX_STACK_SIZE
@@ -293,10 +291,63 @@ static unsigned vm_numeq_zero(unsigned n)
 // ============================================================================
 // Inline Cached Lookup
 // ============================================================================
+//
+// OP_LOOKUP and OP_GUARD_PRIMITIVE each carry two cache
+// words. The compiler sets the first to 0xFFFFFFFF; once the instruction has
+// run it indexes code->ic_entries, whose entry records where the last full
+// lookup found the binding - its value cell, the frame holding it, and that
+// frame's depth and offset - with the environment it was found from and the
+// name's binding stamp at the time (env.h). The second word is unused.
+//
+// While the stamp is unchanged, none of the frames the entry was validated
+// against has gained a binding for the name, and no collection has moved a
+// cell, so:
+//
+//   - From the same environment, the cached cell is the answer: one compare
+//     and one load, the common case for loops and global procedures.
+//   - From a different environment - another activation of the same code -
+//     the frames between this instruction and the binding come from the same
+//     lambdas and bodies as before, and differ only in what internal defines
+//     have added to them. Until the name has been defined in a nested frame
+//     somewhere (env_binding_dynamic), no such define can be shadowing it,
+//     so the binding frame is found by following `depth` links, stopping
+//     early where the chain joins the one already validated. That frame is
+//     the same one (a global, a closure's captured frame) or another
+//     activation of it, which must hold the name at `offset`.
+//   - Once the name has been defined in a nested frame, the frames of this
+//     environment that the validated one does not share are searched for it
+//     as well - which is what every hit used to do for every frame.
+//
+// Anything else falls back to the full lookup, which refills the entry. An
+// entry belongs to the instruction whose cache word indexes it (`word`),
+// whose name never changes. The cell indices in an entry are not GC roots;
+// a collection changes every stamp, so they are never used after one.
+//
+// This rests on how environments are built and changed. A code object only
+// runs in environments laid out by its own lexical structure: top-level and
+// eval code runs once, in the environment it was compiled for, and a closure
+// runs in its captured environment extended by its own frames, whose
+// variables come from its parameter list (or start empty, for a let body).
+// After that, environments change shape only through env.c: defvar adds
+// bindings (and changes stamps), nothing removes them. Rewiring a frame or
+// an environment spine with set-car!/set-cdr! is not tracked - as it is not
+// by env.c's frame index - although assigning a binding's value that way is:
+// the cell is read on every hit.
 
-// Perform a variable lookup with inline cache. On cache hit (depth/offset are
-// valid and verified), walks depth frames and offset values — O(depth+offset).
-// On miss, does a full lookup and fills the cache in the bytecode.
+#define IC_NO_OFFSET 0xFFFFFFFFu // binding found through a frame index
+
+struct vm_ic_entry {
+    uint64_t stamp;      // env_binding_stamp(name) when last validated
+    unsigned word;       // the cache word owning this entry
+    unsigned env;        // environment last validated
+    unsigned cell;       // the binding's value cell
+    unsigned frame;      // frame holding it, seen from env
+    unsigned depth : 31; // links from env to frame
+    unsigned probe : 1;  // search unshared frames (env_binding_dynamic)
+    unsigned offset;     // position of the binding in frame, or IC_NO_OFFSET
+};
+_Static_assert(sizeof(struct vm_ic_entry) == 32, "two entries per cache line");
+
 static bool vm_try_deref_binding_value(unsigned val, unsigned *out)
 {
     if (IS_BINDING_REF(val)) {
@@ -323,193 +374,280 @@ static bool vm_try_env_frame(unsigned env_cell, unsigned *frame_out,
     return true;
 }
 
-static bool vm_try_lookup_frame(int64_t sym_id, unsigned vars, unsigned vals,
-                                unsigned *value_out, unsigned *val_cell_out,
-                                unsigned *offset_out)
-{
-    if (!env_binding_list_acyclic(vars))
-        return false;
-    unsigned offset = 0;
+typedef enum {
+    IC_ABSENT, // the frame does not bind the name
+    IC_FOUND,  // it does, and *value/*cell/*offset say where
+    IC_BAD,    // it is malformed, or its binding cannot be read
+} ic_frame_result;
 
-    while (vars) {
-        if (IS_ATOM(vars)) {
-            if (!IS_PAIR(vals))
-                return false;
-            if (CELL_ID(vars) == sym_id) {
-                if (!vm_try_deref_binding_value(car(vals), value_out))
-                    return false;
-                if (val_cell_out)
-                    *val_cell_out = vals;
-                if (offset_out)
-                    *offset_out = offset;
-                return true;
-            }
-            break;
-        }
-
-        if (!IS_PAIR(vars) || !IS_PAIR(vals))
-            return false;
-
-        unsigned var = car(vars);
-        if (!IS_ATOM(var))
-            return false;
-        if (CELL_ID(var) == sym_id) {
-            if (!vm_try_deref_binding_value(car(vals), value_out))
-                return false;
-            if (val_cell_out)
-                *val_cell_out = vals;
-            if (offset_out)
-                *offset_out = offset;
-            return true;
-        }
-
-        vars = cdr(vars);
-        vals = cdr(vals);
-        offset++;
-    }
-
-    return false;
-}
-
-// Probe a frame through its side index when available; small lexical frames
-// use the same checked list walk as uncached lookup.
-static bool vm_lookup_in_frame(unsigned frame, int64_t symbol,
-                                unsigned *value, unsigned *offset)
+// Search one frame the way lookup does: through its side index when it is
+// large enough to have one, else by walking its binding list.
+static ic_frame_result ic_find_in_frame(unsigned frame, int64_t symbol,
+                                        unsigned *value, unsigned *cell_out,
+                                        unsigned *offset_out)
 {
     unsigned cell = 0;
     if (env_frame_index_lookup(frame, symbol, &cell)) {
-        *offset = 0;
-        return cell && IS_PAIR(cell) &&
-               vm_try_deref_binding_value(car(cell), value);
+        if (!cell)
+            return IC_ABSENT;
+        if (!IS_PAIR(cell) || !vm_try_deref_binding_value(car(cell), value))
+            return IC_BAD;
+        *cell_out = cell;
+        *offset_out = IC_NO_OFFSET;
+        return IC_FOUND;
     }
-    return vm_try_lookup_frame(symbol, car(frame), cdr(frame), value, NULL, offset);
-}
-
-// Below this many bindings a frame is searched directly: env.c indexes only
-// frames several times larger, so its index has nothing to say about one, and
-// a walk that reaches the end of the variable list has itself shown the list
-// is not cyclic. Such frames - a call's parameters, a let's bindings - are
-// what the inline cache below probes for shadowing definitions on every
-// lookup of a variable bound further out, so skipping the index probe and
-// the separate acyclicity pass there is most of the cost of that lookup.
-#define VM_SHORT_FRAME 16
-
-// vm_lookup_in_frame, answered by a single walk when the frame is short.
-static bool vm_probe_frame(unsigned frame, int64_t symbol, unsigned *value,
-                           unsigned *offset)
-{
     unsigned vars = car(frame);
-    unsigned n = 0;
-    for (unsigned v = vars; IS_PAIR(v); v = cdr(v)) {
-        if (++n == VM_SHORT_FRAME)
-            return vm_lookup_in_frame(frame, symbol, value, offset);
-    }
     unsigned vals = cdr(frame);
+    if (!env_binding_list_acyclic(vars))
+        return IC_BAD;
     for (unsigned i = 0; vars; i++) {
         bool rest = IS_ATOM(vars);
         if ((!rest && !IS_PAIR(vars)) || !IS_PAIR(vals))
-            return false;
+            return IC_BAD;
         unsigned var = rest ? vars : car(vars);
         if (!IS_ATOM(var))
-            return false;
+            return IC_BAD;
         if (CELL_ID(var) == symbol) {
-            *offset = i;
-            return vm_try_deref_binding_value(car(vals), value);
+            if (!vm_try_deref_binding_value(car(vals), value))
+                return IC_BAD;
+            *cell_out = vals;
+            *offset_out = i;
+            return IC_FOUND;
         }
         if (rest)
             break;
         vars = cdr(vars);
         vals = cdr(vals);
     }
-    return false;
+    return IC_ABSENT;
 }
 
-static inline unsigned ic_lookup(int64_t sym_id, unsigned env,
-                                 unsigned *cache_slot)
+// Below this many bindings a frame is searched directly: env.c indexes only
+// frames several times larger, so its index has nothing to say about one, and
+// a walk that reaches the end of the variable list has itself shown the list
+// is not cyclic.
+#define VM_SHORT_FRAME 16
+
+// Can frame bind symbol? False only when it certainly does not - which is
+// when the full lookup would pass over it too. Anything else, a binding or a
+// frame too malformed to be sure about, is left to the full lookup.
+static bool ic_frame_may_bind(unsigned frame, int64_t symbol)
 {
-    unsigned cached_depth = cache_slot[0];
-    unsigned cached_offset = cache_slot[1];
-
-    if (cached_depth != IC_UNCACHED) {
-        // Try cached path: walk depth frames, offset values, verify sym_id
-        unsigned e = env;
-        unsigned frame = 0;
-        unsigned next = 0;
-        bool cache_valid = true;
-        for (unsigned d = 0; d <= cached_depth; d++) {
-            if (!vm_try_env_frame(e, &frame, &next)) {
-                cache_valid = false;
-                break;
+    if (!IS_PAIR(frame))
+        return true;
+    unsigned vars = car(frame);
+    for (unsigned n = 0; IS_PAIR(vars); vars = cdr(vars)) {
+        unsigned var = car(vars);
+        if (!IS_ATOM(var) || CELL_ID(var) == symbol)
+            return true;
+        if (++n == VM_SHORT_FRAME) {
+            unsigned cell = 0;
+            if (env_frame_index_lookup(frame, symbol, &cell))
+                return cell != 0;
+            if (!env_binding_list_acyclic(car(frame)))
+                return true;
+            for (vars = cdr(vars); IS_PAIR(vars); vars = cdr(vars)) {
+                var = car(vars);
+                if (!IS_ATOM(var) || CELL_ID(var) == symbol)
+                    return true;
             }
-            if (d < cached_depth) {
-                // A cached outer binding is valid only if no nearer frame
-                // has acquired a shadowing definition since the last call.
-                unsigned value = 0, offset = 0;
-                if (vm_probe_frame(frame, sym_id, &value, &offset)) {
-                    cache_slot[0] = d;
-                    cache_slot[1] = offset;
-                    return value;
-                }
-                e = next;
-            }
+            break;
         }
-        if (cache_valid) {
-            // A large frame carries a side index, which answers in one probe
-            // instead of the offset walk below - and the walk is the whole
-            // cost for a global, since the frame holding a program's
-            // definitions runs to hundreds of bindings.
-            unsigned indexed_cell = 0;
-            if (env_frame_index_lookup(frame, sym_id, &indexed_cell)) {
-                unsigned value = 0;
-                if (indexed_cell && IS_PAIR(indexed_cell) &&
-                    vm_try_deref_binding_value(car(indexed_cell), &value))
-                    return value;
-                cache_valid = false;
-            }
-        }
-        if (cache_valid) {
-            unsigned vars = car(frame);
-            unsigned vals = cdr(frame);
-            for (unsigned o = 0; o < cached_offset && vars; o++) {
-                if (!IS_PAIR(vars) || !IS_PAIR(vals)) {
-                    cache_valid = false;
-                    break;
-                }
-                vars = cdr(vars);
-                vals = cdr(vals);
-            }
-            if (cache_valid && vars) {
-                unsigned value = 0;
-                unsigned found_offset = 0;
-                if (vm_try_lookup_frame(sym_id, vars, vals, &value, NULL,
-                                        &found_offset) &&
-                    found_offset == 0) {
-                    return value; // Verified hit
-                }
-            }
-        }
-        // Cache stale — fall through to full lookup
     }
+    return vars && (!IS_ATOM(vars) || CELL_ID(vars) == symbol);
+}
 
-    // Full lookup and fill cache
+// The binding of symbol as the full lookup finds it, and where it was found.
+// *cacheable is false when a frame on the way was malformed: such a frame is
+// passed over, as lookup does, but nothing about it is safe to remember.
+static unsigned ic_resolve(int64_t symbol, unsigned env,
+                           struct vm_ic_entry *site, bool *cacheable)
+{
+    *cacheable = true;
     if (!env_chain_acyclic(env))
         return TOK_ERROR;
-
     unsigned depth = 0;
     for (unsigned e = env; e; depth++) {
         unsigned frame = 0;
         unsigned next = 0;
         if (!vm_try_env_frame(e, &frame, &next))
             return TOK_ERROR;
-        unsigned value = 0, offset = 0;
-        if (vm_lookup_in_frame(frame, sym_id, &value, &offset)) {
-            cache_slot[0] = depth;
-            cache_slot[1] = offset;
+        unsigned value = 0, cell = 0, offset = 0;
+        switch (ic_find_in_frame(frame, symbol, &value, &cell, &offset)) {
+        case IC_FOUND:
+            site->env = env;
+            site->frame = frame;
+            site->cell = cell;
+            site->depth = depth;
+            site->offset = offset;
             return value;
+        case IC_BAD:
+            *cacheable = false;
+            break;
+        case IC_ABSENT:
+            break;
         }
         e = next;
     }
     return TOK_ERROR;
+}
+
+// The entry for the cache word at code->code[word], allocated on first use.
+// NULL if none can be had; the lookup then simply goes uncached.
+static struct vm_ic_entry *ic_entry_for(code_object *code, unsigned word)
+{
+    unsigned idx = code->code[word];
+    if (idx < code->ic_len && code->ic_entries[idx].word == word)
+        return &code->ic_entries[idx];
+    if (code->ic_len == code->ic_cap) {
+        // Every cached instruction spans several words, so code_len entries
+        // are more than the instructions could ever claim between them.
+        if (code->ic_cap >= code->code_len)
+            return NULL;
+        unsigned cap = code->ic_cap ? code->ic_cap * 2 : 4;
+        if (cap > code->code_len)
+            cap = code->code_len;
+        struct vm_ic_entry *grown = checked_realloc_array(
+            code->ic_entries, cap, sizeof(struct vm_ic_entry));
+        if (!grown)
+            return NULL;
+        code->ic_entries = grown;
+        code->ic_cap = cap;
+    }
+    idx = code->ic_len++;
+    code->code[word] = idx;
+    struct vm_ic_entry *e = &code->ic_entries[idx];
+    e->word = word;
+    return e;
+}
+
+__attribute__((noinline)) static unsigned
+ic_lookup_miss(code_object *code, unsigned word, int64_t symbol, unsigned env)
+{
+    uint64_t stamp = env_binding_stamp(symbol);
+    struct vm_ic_entry site;
+    bool cacheable = true;
+    unsigned value = ic_resolve(symbol, env, &site, &cacheable);
+    if (value == TOK_ERROR || !cacheable)
+        return value;
+    struct vm_ic_entry *e = ic_entry_for(code, word);
+    if (e) {
+        e->stamp = stamp;
+        e->env = site.env;
+        e->frame = site.frame;
+        e->cell = site.cell;
+        e->depth = site.depth;
+        e->offset = site.offset;
+        e->probe = env_binding_dynamic(symbol);
+        if (e->probe)
+            env_note_binding_cached(symbol);
+    }
+    return value;
+}
+
+// Walk env out to the entry's depth, alongside the environment the entry
+// was last validated against. Returns the link at that depth, or 0 if env
+// is too short; *shared is set when the walk met that environment, past
+// which everything was validated already: those frames were searched when
+// the entry was filled, and a binding added to one since would have changed
+// the stamp. A searching entry (probe) checks each frame before that point.
+static inline unsigned ic_walk(const struct vm_ic_entry *e, int64_t symbol,
+                               unsigned env, bool probe, bool *shared)
+{
+    unsigned node = env;
+    unsigned seen = e->env;
+    for (unsigned d = e->depth; d; d--) {
+        if (!IS_PAIR(node))
+            return 0;
+        if (probe && ic_frame_may_bind(car(node), symbol))
+            return 0;
+        node = cdr(node);
+        seen = IS_PAIR(seen) ? cdr(seen) : 0;
+        if (node == seen) {
+            *shared = true;
+            return node;
+        }
+    }
+    return IS_PAIR(node) ? node : 0;
+}
+
+// A hit whose stamp matched, from an environment other than the one last
+// validated. Returns the binding's value cell, or 0 to take the full lookup.
+static unsigned ic_revalidate(struct vm_ic_entry *e, int64_t symbol,
+                              unsigned env)
+{
+    bool shared = false;
+    unsigned node = e->probe ? ic_walk(e, symbol, env, true, &shared)
+                             : ic_walk(e, symbol, env, false, &shared);
+    if (!node)
+        return 0;
+    unsigned frame = shared ? e->frame : car(node);
+    if (frame != e->frame) {
+        // Another activation of the frame the binding was found in. Its
+        // bindings were laid out by the same code, so the name sits at the
+        // same offset unless an internal define has since prepended others;
+        // check rather than assume.
+        if (e->offset == IC_NO_OFFSET || !IS_PAIR(frame))
+            return 0;
+        unsigned vars = car(frame);
+        unsigned vals = cdr(frame);
+        for (unsigned o = e->offset; o; o--) {
+            if (!IS_PAIR(vars) || !IS_PAIR(vals))
+                return 0;
+            vars = cdr(vars);
+            vals = cdr(vals);
+        }
+        unsigned var = IS_PAIR(vars) ? car(vars) : vars;
+        if (!IS_PAIR(vals) || !IS_ATOM(var) || CELL_ID(var) != symbol)
+            return 0;
+        e->frame = frame;
+        e->cell = vals;
+    }
+    e->env = env;
+    // Only a searching entry needs the mark: while the name has never been
+    // defined in a nested frame, the next such define changes its stamp
+    // regardless (note_binding_added in env.c).
+    if (e->probe)
+        env_note_binding_cached(symbol);
+    return e->cell;
+}
+
+// Everything but the commonest hit: a different environment, a binding
+// reached through a reference, or a miss.
+__attribute__((noinline)) static unsigned
+ic_lookup_slow(code_object *code, unsigned word, int64_t symbol, unsigned env)
+{
+    unsigned idx = code->code[word];
+    if (idx < code->ic_len) {
+        struct vm_ic_entry *e = &code->ic_entries[idx];
+        if (e->word == word && e->stamp == env_binding_stamp(symbol)) {
+            unsigned cell = env == e->env ? e->cell
+                                          : ic_revalidate(e, symbol, env);
+            unsigned value = 0;
+            if (cell && vm_try_deref_binding_value(car(cell), &value))
+                return value;
+        }
+    }
+    return ic_lookup_miss(code, word, symbol, env);
+}
+
+// Look up symbol from env through the cache whose first word is
+// code->code[word]. TOK_ERROR if unbound.
+static inline unsigned ic_lookup(code_object *code, unsigned word,
+                                 int64_t symbol, unsigned env)
+{
+    unsigned idx = code->code[word];
+    if (__builtin_expect(idx < code->ic_len, 1)) {
+        const struct vm_ic_entry *e = &code->ic_entries[idx];
+        if (__builtin_expect(e->word == word && e->env == env &&
+                                 e->stamp == env_binding_stamp(symbol),
+                             1)) {
+            unsigned value = car(e->cell);
+            if (__builtin_expect(!IS_BINDING_REF(value), 1))
+                return value;
+        }
+    }
+    return ic_lookup_slow(code, word, symbol, env);
 }
 
 // Global VM state for GC integration
@@ -1970,9 +2108,9 @@ static unsigned vm_dispatch(vm_state *vm)
 
         if (op == OP_LOOKUP) {
             int64_t sym_id = vm->code->code[vm->ip];
-            unsigned *cache_slot = &vm->code->code[vm->ip + 1];
+            unsigned cache_word = vm->ip + 1;
             vm->ip += 3;
-            unsigned val = ic_lookup(sym_id, vm->env, cache_slot);
+            unsigned val = ic_lookup(vm->code, cache_word, sym_id, vm->env);
             if (__builtin_expect(val != TOK_ERROR, 1)) {
                 val = vm_unbox_fixnum_if_possible(val);
                 if (__builtin_expect(vm->sp < vm->stack_cap, 1)) {
@@ -2389,9 +2527,9 @@ static unsigned vm_dispatch(vm_state *vm)
             unsigned expected = vm->code->code[vm->ip++];
             unsigned argc = vm->code->code[vm->ip++];
             bool tail = vm->code->code[vm->ip++];
-            unsigned *cache = &vm->code->code[vm->ip];
+            unsigned cache_word = vm->ip;
             vm->ip += 2;
-            unsigned fn = ic_lookup(symbol, vm->env, cache);
+            unsigned fn = ic_lookup(vm->code, cache_word, symbol, vm->env);
             if (fn == TOK_ERROR) {
                 vm_show_undefined_variable(symbol);
                 vm_signal_error(vm, ctx.last_error);

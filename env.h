@@ -83,7 +83,57 @@ unsigned lookup_silent(int64_t var, unsigned env);
 // Invalidate lookup cache (call after GC or major environment changes)
 void env_invalidate_cache(void);
 
-// Global inline cache epoch — bumped on define to invalidate bytecode ICs
+// Binding stamps, for the VM's inline variable caches (see env.c).
+//
+// env_binding_stamp(var) changes whenever a binding for var - or for another
+// name hashing to the same bucket - is added to a frame some cache entry may
+// have seen (see env_note_binding_cached for the frames that are exempt),
+// and after every collection. A cache entry recorded under the current stamp
+// therefore knows that none of the frames it was validated against has
+// gained a binding for var since, and that every cell index it holds still
+// names the same cell. Both counters are 64-bit and only ever increase, so
+// their sum changes whenever either does and never returns to an old value.
+//
+// env_binding_dynamic(var) is set, for good, once a binding for var has been
+// added to a frame that is not the outermost of its environment (an internal
+// or let-body define, rather than a top-level one). Until then every frame
+// that could stand between a use of var and its binding holds only the names
+// it was created with, so the cache need not look for var in them. Setting
+// it always changes the stamp as well.
+#define ENV_BIND_BUCKETS 8192
+extern uint64_t env_bind_stamps[ENV_BIND_BUCKETS];
+extern bool env_bind_dynamic[ENV_BIND_BUCKETS];
+extern uint64_t env_gc_epoch;
+
+static inline unsigned env_bind_bucket(int64_t var)
+{
+    return (unsigned)(((uint64_t)var * 0x9E3779B97F4A7C15ull) >> 51);
+}
+
+static inline uint64_t env_binding_stamp(int64_t var)
+{
+    return env_bind_stamps[env_bind_bucket(var)] + env_gc_epoch;
+}
+
+static inline bool env_binding_dynamic(int64_t var)
+{
+    return env_bind_dynamic[env_bind_bucket(var)];
+}
+
+// The cache has just recorded a resolution of var against some environment.
+// Remember how far allocation had got: a frame allocated after this point is
+// in no environment any cache entry for var has seen, so a binding added to
+// it cannot make one stale. That lets a let body define its variables into
+// its fresh frame on every iteration without changing their stamps. The
+// collection count is kept (truncated) beside the allocation pointer because
+// the pointer restarts at every collection; see note_binding_added.
+extern uint64_t env_bind_marks[ENV_BIND_BUCKETS];
+
+static inline void env_note_binding_cached(int64_t var)
+{
+    env_bind_marks[env_bind_bucket(var)] =
+        ((uint64_t)(uint32_t)env_gc_epoch << 32) | ctx.nursery_ptr;
+}
 
 // Bind parameters to arguments, supporting variadic (a b . rest) syntax
 unsigned bind_params(unsigned params, unsigned args);

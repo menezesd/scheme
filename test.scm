@@ -4283,6 +4283,129 @@
 (test "eval with one argument is an error" 'error (guard (e (#t 'error)) (eval '(+ 1 2))))
 
 ;;; ============================================================================
+;;; Variable lookup caches
+;;; ============================================================================
+;;; The VM remembers where each variable reference last found its binding and
+;;; reuses that until a binding for the name is added somewhere. Every case
+;;; below runs a reference once to fill its cache, then changes what it
+;;; should see.
+
+(section "Variable lookup caches")
+
+(define (ic-inc x) (+ x 1))
+(test "assigning a primitive's name reaches cached call sites"
+      '(2 0 plus 2)
+      (let* ((saved +)
+             (r1 (ic-inc 1)))
+        (set! + -)
+        (let ((r2 (ic-inc 1)))
+          (set! + (lambda args 'plus))
+          (let ((r3 (ic-inc 1)))
+            (set! + saved)
+            (list r1 r2 r3 (ic-inc 1))))))
+
+(define ic-saved-car car)
+(define (ic-first l) (car l))
+(define ic-first-before (ic-first '(1 2)))
+(define car cdr)
+(define ic-first-redefined (ic-first '(1 2)))
+(define car ic-saved-car)
+(test "redefining a primitive at top level reaches cached call sites"
+      '(1 (2) 1)
+      (list ic-first-before ic-first-redefined (ic-first '(1 2))))
+
+(define ic-x 'global)
+(define (ic-define-after-use)
+  (let ()
+    (define (g) ic-x)
+    (g)
+    (define ic-x 'local)
+    (g)))
+(test "an internal define reaches a closure that already looked the name up"
+      '(local local local)
+      (list (ic-define-after-use) (ic-define-after-use) (ic-define-after-use)))
+
+(define (ic-make flag)
+  (let ()
+    (if flag (define ic-x 'local))
+    (lambda () ic-x)))
+(test "activations that did and did not define the name"
+      '(global local global local local global)
+      (let* ((a (ic-make #t)) (b (ic-make #f)) (c (ic-make #t)))
+        (list (b) (a) (b) (c) (a) (b))))
+(test "activation defining the name after one that did not"
+      '(local global local global)
+      (let* ((d (ic-make #f)) (e (ic-make #t)))
+        (list (e) (d) (e) (d))))
+
+(define (ic-make-param flag n)
+  (if flag (define ic-extra n))
+  (lambda () n))
+(test "a define in some activations moves the parameters of their frame"
+      '(1 2 3 2 1)
+      (let* ((m1 (ic-make-param #t 1)) (m2 (ic-make-param #f 2))
+             (m3 (ic-make-param #t 3)))
+        (list (m1) (m2) (m3) (m2) (m1))))
+
+(define (ic-use-later) ic-defined-later)
+(test "a global defined by eval after the reference first failed" 42
+      (begin
+        (guard (e (#t 'unbound)) (ic-use-later))
+        (eval '(define ic-defined-later 42) (interaction-environment))
+        (ic-use-later)))
+
+(define (ic-adder n) (lambda (y) (+ y n)))
+(define (ic-deep a) (lambda (b) (lambda (c) (lambda (d) (list a b c d (+ a b c d))))))
+(test "closures over different activations of one frame"
+      '((11 12 13 14) (1 2 3 4 10) (5 6 7 8 26))
+      (list (map (lambda (f) (f 10)) (map ic-adder '(1 2 3 4)))
+            ((((ic-deep 1) 2) 3) 4)
+            ((((ic-deep 5) 6) 7) 8)))
+
+(define ic-val 'global-val)
+(test "a name both let-bound and global in one loop"
+      '(global-val 4 global-val 2 global-val 0)
+      (let loop ((i 0) (acc '()))
+        (if (= i 6) acc
+            (loop (+ i 1)
+                  (cons (if (even? i) (let ((ic-val i)) ic-val) ic-val) acc)))))
+
+(define (ic-letstar) (let* ((q 1) (+ (lambda (a b) (* a b 100))) (r (+ q 2))) r))
+(test "let* rebinding + between uses of the global +" '(200 200 3)
+      (list (ic-letstar) (ic-letstar) (+ 1 2)))
+
+(define (ic-helper v) (list 'helper v))
+(define-syntax ic-use-helper
+  (syntax-rules () ((_ v) (ic-helper v))))
+(define (ic-call-helper) (ic-use-helper 1))
+(define (ic-shadow-helper) (let ((ic-helper (lambda (v) 'shadowed))) (ic-use-helper 2)))
+(test "a macro's helper reference follows assignment and redefinition"
+      '((helper 1) (new-helper 1) (new-helper 2) (redefined 1) (redefined 2))
+      (let* ((h1 (ic-call-helper))
+             (h2 (begin (set! ic-helper (lambda (v) (list 'new-helper v)))
+                        (ic-call-helper)))
+             (h3 (ic-shadow-helper)))
+        (eval '(define ic-helper (lambda (v) (list 'redefined v)))
+              (interaction-environment))
+        (list h1 h2 h3 (ic-call-helper) (ic-shadow-helper))))
+
+(define ic-cc-global 'before)
+(define (ic-cc-run)
+  (let ((k #f) (out '()))
+    (let ((v (call-with-current-continuation (lambda (c) (set! k c) 0))))
+      (set! out (cons (list v ic-cc-global) out))
+      (if (= v 0)
+          (begin (set! ic-cc-global 'after) (k 1))
+          (reverse out)))))
+(test "a reference re-entered through a continuation" '((0 before) (1 after))
+      (ic-cc-run))
+
+(define (ic-rest . args) (lambda () args))
+(test "closures over rest-parameter frames" '((1 2) (3) (1 2))
+      (let ((a (ic-rest 1 2)) (b (ic-rest 3)))
+        (list (a) (b) (a))))
+
+;;; ============================================================================
 ;;; Summary
 ;;; ============================================================================
 

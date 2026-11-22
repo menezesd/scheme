@@ -427,6 +427,29 @@
              (case 2 ((1) 'a) ((2) 'b) (else 'c))
              (when #t 7)))
 
+;; The VM's variable caches hold cell indices that every collection moves;
+;; each collection must drop them. Under stress one lands between nearly
+;; every fill and its next use.
+(define gcs-x 'global)
+(define (gcs-make flag)
+  (let ()
+    (if flag (define gcs-x (list 'local flag)))
+    (lambda () gcs-x)))
+(check "cached lookups across activations and collections"
+       '(global (local #t) global (local #t))
+       (let* ((a (gcs-make #t)) (b (gcs-make #f)))
+         (list (b) (a) (b) (a))))
+(define (gcs-adder n) (lambda (y) (+ y n)))
+(check "closures over many activations" '(11 12 13 14 15)
+       (map (lambda (f) (f 10)) (map gcs-adder '(1 2 3 4 5))))
+(define (gcs-sum l) (if (null? l) 0 (+ (car l) (gcs-sum (cdr l)))))
+(check "assigning a global used through cached call sites" '(6 2)
+       (let* ((saved +) (r1 (gcs-sum '(1 2 3))))
+         (set! + -)
+         (let ((r2 (gcs-sum '(1 2 3))))
+           (set! + saved)
+           (list r1 r2))))
+
 ;; (command-line) is the script's own view of its invocation - its name and
 ;; arguments - without vesper's options. make test-gcstress runs this file as
 ;; `vesper [--interpreter] gc_stress_tests.scm`.

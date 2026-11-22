@@ -215,6 +215,7 @@ static void code_destroy_shallow(code_object *code)
     free(code->constants);
     free(code->children);
     free(code->instruction_boundaries);
+    free(code->ic_entries);
     free(code);
 }
 

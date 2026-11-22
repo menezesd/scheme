@@ -839,8 +839,7 @@ void disassemble(code_object *code, const char *name)
         case OP_LOOKUP:
             printf(" %s", disassemble_atom_name(code->code[start + 1]));
             if (code->code[start + 2] != 0xFFFFFFFF)
-                printf(" [d=%u o=%u]", code->code[start + 2],
-                       code->code[start + 3]);
+                printf(" [ic=%u]", code->code[start + 2]);
             else
                 printf(" [uncached]");
             break;

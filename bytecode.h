@@ -41,7 +41,8 @@ enum opcode {
     OP_SWAP,  // Swap top two stack elements
 
     // Variables
-    OP_LOOKUP, // Variable lookup: LOOKUP sym_id -> push lookup(sym_id, env)
+    OP_LOOKUP, // Variable lookup: LOOKUP sym_id cache cache -> push
+               // lookup(sym_id, env); the cache words are vm.c's (ic_lookup)
     OP_DEFINE, // Define variable: DEFINE sym_id -> pop val, defvar(sym_id, val)
     OP_SET,    // Set variable: SET sym_id -> pop val, setvar(sym_id, val)
     OP_DEFINE_ALIAS, // Define alias: DEFINE_ALIAS alias_id target_id
@@ -228,7 +229,7 @@ enum opcode {
     // this activation. Otherwise perform a normal (TRMC-aware) tail call.
     OP_RECURSE,
 
-    // target, symbol, expected primitive, argc, tail, cached depth/offset.
+    // target, symbol, expected primitive, argc, tail, two lookup-cache words.
     // Arguments remain intact until the binding is checked.
     OP_GUARD_PRIMITIVE,
 
@@ -298,6 +299,11 @@ typedef struct code_object {
     // check saved instruction pointers without decoding the code again.
     // Runtime specialization and inline-cache writes preserve word widths.
     unsigned char *instruction_boundaries;
+    // Inline variable caches (vm.c, ic_lookup): the first cache word of a
+    // lookup instruction indexes this array once the instruction has run.
+    struct vm_ic_entry *ic_entries;
+    unsigned ic_len;
+    unsigned ic_cap;
     bool verified;
     bool gc_marked; // True if reachable during current GC
     bool gc_pinned; // Never swept (internal singletons like the
