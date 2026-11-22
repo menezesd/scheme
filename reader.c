@@ -157,19 +157,75 @@ static int datum_label_count = 0;
 static int datum_label_cap = 0;
 static int reader_obj_depth = 0;
 
+// Label number -> datum_labels index for labels below this bound, so a
+// datum with many labels (write-shared output) does not read in quadratic
+// time. A slot is live only if its generation matches the current read's.
+// Larger label numbers are rare and use a linear scan.
+#define DATUM_LABEL_DIRECT_MAX (1 << 18)
+typedef struct {
+    unsigned gen;
+    int idx;
+} datum_label_slot;
+static datum_label_slot *datum_label_slots = NULL;
+static size_t datum_label_slots_cap = 0;
+static unsigned datum_label_gen = 1;
+
+// The value most recently produced by a #n= or #n# token in this read. A
+// datum read right after it that is the same cell is a label's value (a
+// chained #1=#2=... or #1=#2#). Cleared by GC, which can move cells; no
+// allocation separates producing that value from testing it.
+static unsigned last_label_value = 0;
+
 static void reset_datum_labels(void)
 {
+    // Keep the allocated buffers for reuse, just reset count
     datum_label_count = 0;
-    // Keep the allocated buffer for reuse, just reset count
+    last_label_value = 0;
+    if (++datum_label_gen == 0) {
+        if (datum_label_slots)
+            memset(datum_label_slots, 0,
+                   datum_label_slots_cap * sizeof(*datum_label_slots));
+        datum_label_gen = 1;
+    }
 }
 
 static int find_datum_label(int label)
 {
+    if (label < DATUM_LABEL_DIRECT_MAX) {
+        if ((size_t)label >= datum_label_slots_cap)
+            return -1;
+        const datum_label_slot *slot = &datum_label_slots[label];
+        return slot->gen == datum_label_gen ? slot->idx : -1;
+    }
     for (int i = 0; i < datum_label_count; i++) {
         if (datum_labels[i].label == label)
             return i;
     }
     return -1;
+}
+
+static bool index_datum_label(int label, int idx)
+{
+    if (label >= DATUM_LABEL_DIRECT_MAX)
+        return true;
+    if ((size_t)label >= datum_label_slots_cap) {
+        size_t new_cap = datum_label_slots_cap ? datum_label_slots_cap : 64;
+        while (new_cap <= (size_t)label)
+            new_cap *= 2;
+        datum_label_slot *slots = checked_realloc_array(
+            datum_label_slots, (unsigned)new_cap, sizeof(*slots));
+        if (!slots) {
+            show_error("out of memory for datum labels");
+            return false;
+        }
+        memset(slots + datum_label_slots_cap, 0,
+               (new_cap - datum_label_slots_cap) * sizeof(*slots));
+        datum_label_slots = slots;
+        datum_label_slots_cap = new_cap;
+    }
+    datum_label_slots[label].gen = datum_label_gen;
+    datum_label_slots[label].idx = idx;
+    return true;
 }
 
 static int add_datum_label(int label)
@@ -191,7 +247,10 @@ static int add_datum_label(int label)
         datum_labels = new_labels;
         datum_label_cap = new_cap;
     }
-    int idx = datum_label_count++;
+    int idx = datum_label_count;
+    if (!index_datum_label(label, idx))
+        return -1;
+    datum_label_count++;
     datum_labels[idx].label = label;
     datum_labels[idx].value = 0;
     datum_labels[idx].defined = false;
@@ -202,21 +261,26 @@ void reader_update_datum_labels(unsigned (*collector)(unsigned))
 {
     if (reader_obj_depth == 0)
         return;
+    last_label_value = 0;
     for (int i = 0; i < datum_label_count; i++) {
         if (datum_labels[i].defined)
             datum_labels[i].value = collector(datum_labels[i].value);
     }
 }
 
-// True if some defined datum label already denotes this cell (chained
-// definitions like #1=#2=<datum> make the inner label's object the outer
-// label's datum)
+// True if this datum is a defined label's object, i.e. it came straight
+// from a #n= or #n# token (chained definitions like #1=#2=<datum> make the
+// inner label's object the outer label's datum).
 static bool cell_is_datum_label_value(unsigned datum)
 {
-    for (int i = 0; i < datum_label_count; i++)
-        if (datum_labels[i].defined && datum_labels[i].value == datum)
-            return true;
-    return false;
+    return datum != 0 && datum == last_label_value;
+}
+
+// Record the value a #n= / #n# token is about to return.
+static unsigned datum_label_result(unsigned value)
+{
+    last_label_value = value;
+    return value;
 }
 
 typedef struct {
@@ -1013,7 +1077,10 @@ static unsigned parse_real_component(const char *s, int radix,
     size_t len = strlen(s);
     // A component must be real. Reject nested imaginary suffixes before
     // calling atom_from_string, which also accepts complete complex values.
-    if (!len || s[len - 1] == 'i' || s[len - 1] == 'I')
+    // (Radices of 19 and up only reach here whole, and 'i' is a digit there.)
+    if (!len ||
+        ((radix == 2 || radix == 8 || radix == 10 || radix == 16) &&
+         (s[len - 1] == 'i' || s[len - 1] == 'I')))
         return ctx.atom_false;
 
     unsigned value;
@@ -1068,12 +1135,44 @@ static unsigned parse_component_slice(const char *s, size_t len, int radix,
     return value;
 }
 
+// #e applies to the whole number. A polar literal with a nonzero angle can
+// only be computed inexactly, so convert the computed parts the way
+// (exact z) would. Non-finite parts have no exact value: not a number.
+static unsigned exact_polar_value(unsigned value)
+{
+    if (value == TOK_ERROR || is_exact(value))
+        return value;
+    GC_GUARD;
+    gc_protect(&value);
+    unsigned real = IS_COMPLEX(value) ? CELL_CAR(value) : value;
+    unsigned imag = IS_COMPLEX(value) ? CELL_CDR(value) : 0;
+    if ((!is_exact(real) && !isfinite(to_double(real))) ||
+        (imag && !is_exact(imag) && !isfinite(to_double(imag))))
+        return ctx.atom_false;
+    unsigned real_exact = is_exact(real) ? real : prim_inexact_to_exact(real);
+    if (real_exact == TOK_ERROR)
+        return TOK_ERROR;
+    if (!IS_COMPLEX(value))
+        return real_exact;
+    gc_protect(&real_exact);
+    imag = CELL_CDR(value);
+    unsigned imag_exact = is_exact(imag) ? imag : prim_inexact_to_exact(imag);
+    if (imag_exact == TOK_ERROR)
+        return TOK_ERROR;
+    return store_complex(real_exact, imag_exact);
+}
+
+static bool standard_radix(int radix)
+{
+    return radix == 2 || radix == 8 || radix == 10 || radix == 16;
+}
+
 unsigned parse_number_string(const char *s, int default_radix)
 {
     int radix = default_radix;
     reader_exactness exactness = READER_EXACTNESS_UNSPECIFIED;
     bool have_radix = false, have_exactness = false;
-    if (radix != 2 && radix != 8 && radix != 10 && radix != 16)
+    if (radix < 2 || radix > 36)
         return ctx.atom_false;
     while (*s == '#') {
         if (!have_radix && prefix_radix((unsigned char)s[1], &radix))
@@ -1086,6 +1185,13 @@ unsigned parse_number_string(const char *s, int default_radix)
         s += 2;
     }
 
+    // Radices other than 2/8/10/16 come only from string->number's radix
+    // argument (number->string accepts 2-36 too). Support exact integers and
+    // rationals there; in radix 19 and up 'i' is a digit, so complex syntax
+    // would be ambiguous anyway.
+    if (!standard_radix(radix))
+        return parse_real_component(s, radix, exactness);
+
     const char *polar = strchr(s, '@');
     if (polar) {
         GC_GUARD;
@@ -1097,7 +1203,9 @@ unsigned parse_number_string(const char *s, int default_radix)
         unsigned angle = parse_real_component(polar + 1, radix, exactness);
         if (angle == TOK_ERROR || angle == ctx.atom_false)
             return angle;
-        return make_polar_number(magnitude, angle);
+        unsigned value = make_polar_number(magnitude, angle);
+        return exactness == READER_EXACTNESS_EXACT ? exact_polar_value(value)
+                                                    : value;
     }
 
     size_t len = strlen(s);
@@ -1123,6 +1231,10 @@ unsigned parse_number_string(const char *s, int default_radix)
         if (real == TOK_ERROR || real == ctx.atom_false)
             return real;
     } else {
+        // R7RS: a pure imaginary needs an explicit sign (+2i, -i, +inf.0i);
+        // "2i" is not a number.
+        if (*s != '+' && *s != '-')
+            return ctx.atom_false;
         separator = s;
         if (exactness == READER_EXACTNESS_INEXACT)
             real = store_inexact(0.0);
@@ -1195,10 +1307,11 @@ static bool read_byte_value(unsigned obj, uint8_t *out)
 // Token Delimiter Check
 // ============================================================================
 
+// R7RS 7.1.1: <delimiter> -> <whitespace> | <vertical line> | ( | ) | " | ;
 static inline bool is_delimiter(int c)
 {
     return isspace(c) || c == '(' || c == ')' || c == '"' || c == ';' ||
-           c == EOF;
+           c == '|' || c == EOF;
 }
 
 static inline bool is_ascii_alpha(int c)
@@ -1526,6 +1639,33 @@ static unsigned read_string_literal(void)
     return x;
 }
 
+// Intern name and return a fresh symbol cell, bypassing numeric parsing.
+static unsigned make_symbol_cell(const char *name)
+{
+    unsigned symbol_id = (unsigned)intern(name);
+    unsigned res = alloc();
+    CELL_TYPE(res) = BT_ATOM;
+    CELL_ID(res) = symbol_id;
+    return res;
+}
+
+// True for [+-]<digits>/<digits> with an all-zero denominator. Such a token
+// is numeric syntax with no value; read it as an error, not as a symbol.
+static bool token_is_zero_denominator_rational(const char *s)
+{
+    if (*s == '+' || *s == '-')
+        s++;
+    if (!isdigit((unsigned char)*s))
+        return false;
+    while (isdigit((unsigned char)*s))
+        s++;
+    if (*s++ != '/' || *s != '0')
+        return false;
+    while (*s == '0')
+        s++;
+    return *s == '\0';
+}
+
 static unsigned read_escaped_identifier(void)
 {
     string_buffer sb;
@@ -1585,8 +1725,8 @@ static unsigned read_escaped_identifier(void)
                     sb_free(&sb);
                     return TOK_ERROR;
                 }
-                if (!valid_string_scalar(scalar) ||
-                    !sb_append_utf8(&sb, scalar)) {
+                // sb_append_utf8 rejects (and reports) \x0; and the like.
+                if (!sb_append_utf8(&sb, scalar)) {
                     sb_free(&hex);
                     sb_free(&sb);
                     return TOK_ERROR;
@@ -1615,10 +1755,7 @@ static unsigned read_escaped_identifier(void)
     }
     // Quoting makes every spelling an identifier, including "123", "+i",
     // and infinity/NaN literals. Do not send it through numeric parsing.
-    unsigned symbol_id = intern(sb.data);
-    unsigned res = alloc();
-    CELL_TYPE(res) = BT_ATOM;
-    CELL_ID(res) = symbol_id;
+    unsigned res = make_symbol_cell(sb.data);
     sb_free(&sb);
     return res;
 }
@@ -1660,9 +1797,11 @@ static unsigned read_number_or_symbol_token(int c)
     string_buffer sb;
     sb_init(&sb);
     bool is_number = isdigit(c) || c == '-' || c == '+';
-    bool delimiter_unread = false;
     sb_append_token_char(&sb, c);
 
+    // A '.' inside a token is an ordinary constituent ("1.5", "5.", "-a.",
+    // "->."); the dotted-pair marker is only ever a delimited token of its
+    // own, which read_token recognizes.
     for (;;) {
         c = reader_getchar();
         if (c == 0) {
@@ -1670,47 +1809,28 @@ static unsigned read_number_or_symbol_token(int c)
             sb_free(&sb);
             return TOK_ERROR;
         }
-        // Allow . in numbers (for decimals like 1.5)
-        if (c == '.' && is_number) {
-            int c2 = reader_getchar();
-            if (isdigit(c2) || c2 == 'e' || c2 == 'E') {
-                // It's a decimal number
-                sb_append(&sb, '.');
-                sb_append_token_char(&sb, c2);
-                continue;
-            } else if (is_delimiter(c2)) {
-                if (sb.len > 0 && isdigit((unsigned char)sb.data[sb.len - 1])) {
-                    // "5." is a complete decimal per R5RS (<uint> . <digit>*)
-                    reader_ungetc(c2);
-                    sb_append(&sb, '.');
-                    continue;
-                }
-                // Dot after a non-number token: the dotted-pair marker
-                reader_ungetc(c2);
-                reader_ungetc(c);
-                delimiter_unread = true;
-                break;
-            }
-            reader_ungetc(c2);
-            sb_append(&sb, '.');
-            continue;
-        }
         if (is_delimiter(c))
             break;
-        // R5RS: . + - @ are valid subsequent characters in identifiers
-        // The . as dotted-pair marker is handled in the switch above
         sb_append_token_char(&sb, c);
     }
-    if (!delimiter_unread)
-        reader_ungetc(c);
+    reader_ungetc(c);
     if (!validate_utf8_string(sb.data)) {
         show_error("symbol contains invalid UTF-8");
         sb_free(&sb);
         return TOK_ERROR;
     }
     unsigned res = is_number ? parse_number_string(sb.data, 10) : ctx.atom_false;
-    if (res == ctx.atom_false)
-        res = atom_from_string(sb.data);
+    if (res == ctx.atom_false) {
+        // parse_number_string is the authority on numeric syntax. Falling
+        // back to atom_from_string would let its laxer parser accept
+        // spellings such as 1/-2 that string->number rejects.
+        if (token_is_zero_denominator_rational(sb.data)) {
+            show_error("division by zero in rational");
+            sb_free(&sb);
+            return TOK_ERROR;
+        }
+        res = make_symbol_cell(sb.data);
+    }
     sb_free(&sb);
     return res;
 }
@@ -1741,14 +1861,13 @@ unsigned read_token(void)
         case ')':
             return TOK_CLOSE;
         case '.': {
-            // Check for ellipsis (...) or number starting with .
+            // A lone delimited '.' is the dotted-pair marker. "..." and
+            // longer dot-initial identifiers ("...x") are ordinary tokens
+            // that run to the next delimiter; ".5" starts a number.
             int c2 = reader_getchar();
             if (c2 == '.') {
-                int c3 = reader_getchar();
-                if (c3 == '.') {
-                    return atom_from_string("...");
-                }
-                reader_ungetc(c3);
+                reader_ungetc(c2);
+                return read_number_or_symbol_token(c);
             } else if (isdigit(c2)) {
                 reader_ungetc(c2);
                 return read_decimal_number();
@@ -1921,9 +2040,13 @@ unsigned read_token(void)
                         show_error("datum label cannot directly reference itself");
                         return TOK_ERROR;
                     }
-                    if (!IS_CELL(datum)) {
+                    // Immediates and permanent cells (#t, #f, cached small
+                    // integers) cannot hold forward references, and copying
+                    // one into the placeholder would create an impostor -
+                    // a fresh BT_ATOM cell carrying #t's slot is not #t.
+                    if (!IS_CELL(datum) || datum < HEAP_RESERVED) {
                         datum_labels[idx].value = datum;
-                        return datum;
+                        return datum_label_result(datum);
                     }
                     // Chained labels (#1=#2=<datum>): the datum is the inner
                     // label's object. Copying its contents would leave two
@@ -1934,10 +2057,10 @@ unsigned read_token(void)
                         datum_labels[idx].value = datum;
                         if (!patch_datum_references(datum, placeholder, datum))
                             return TOK_ERROR;
-                        return datum;
+                        return datum_label_result(datum);
                     }
                     resolve_datum_label_placeholder(placeholder, datum);
-                    return placeholder;
+                    return datum_label_result(placeholder);
                 } else if (c == '#') {
                     // Reference label: #n#
                     int idx = find_datum_label(label);
@@ -1945,7 +2068,7 @@ unsigned read_token(void)
                         show_error("undefined datum label #%d#", label);
                         return TOK_ERROR;
                     }
-                    return datum_labels[idx].value;
+                    return datum_label_result(datum_labels[idx].value);
                 } else {
                     show_error("expected = or # after #%d", label);
                     return TOK_ERROR;
@@ -2003,6 +2126,27 @@ unsigned read_vector(void)
     return vec;
 }
 
+// Read the datum after a ' ` , or ,@ prefix and wrap it as (keyword datum).
+static unsigned read_abbreviation(unsigned keyword, const char *name)
+{
+    unsigned datum = read_obj();
+    if (datum == TOK_ERROR)
+        return TOK_ERROR; // already reported
+    if (datum == TOK_EOF) {
+        show_error("unexpected end of file after %s", name);
+        return TOK_ERROR;
+    }
+    if (datum == TOK_CLOSE || datum == TOK_DOT) {
+        show_error("%s must be followed by an object", name);
+        return TOK_ERROR;
+    }
+    GC_GUARD;
+    gc_protect(&datum);
+    unsigned args = alloc_cons(datum, 0);
+    gc_protect(&args);
+    return alloc_cons(keyword, args);
+}
+
 static unsigned read_obj_inner(void)
 {
     unsigned tok = read_token();
@@ -2012,78 +2156,14 @@ static unsigned read_obj_inner(void)
     case TOK_VECTOR_OPEN:
         return read_vector();
     case TOK_QUOTE:
-        tok = read_obj();
-        switch (tok) {
-        case TOK_CLOSE:
-            show_error("quote must be followed by an object");
-            return TOK_ERROR;
-        case TOK_DOT:
-            show_error("quote must be followed by an object");
-            return TOK_ERROR;
-        case TOK_ERROR:
-            return tok;
-        case TOK_EOF:
-            show_error("unexpected end of file after quote");
-            return TOK_ERROR;
-        default: {
-            GC_GUARD;
-            gc_protect(&tok);
-            unsigned args = alloc_cons(tok, 0);
-            gc_protect(&args);
-            return alloc_cons(ctx.atom_quote, args);
-        }
-        }
+        return read_abbreviation(ctx.atom_quote, "quote");
     case TOK_QUASIQUOTE:
-        tok = read_obj();
-        if (tok == TOK_EOF) {
-            show_error("unexpected end of file after quasiquote");
-            return TOK_ERROR;
-        }
-        if (tok == TOK_CLOSE || tok == TOK_DOT || tok == TOK_ERROR) {
-            show_error("quasiquote must be followed by an object");
-            return TOK_ERROR;
-        }
-        {
-            GC_GUARD;
-            gc_protect(&tok);
-            unsigned args = alloc_cons(tok, 0);
-            gc_protect(&args);
-            return alloc_cons(ctx.atom_quasiquote, args);
-        }
+        return read_abbreviation(ctx.atom_quasiquote, "quasiquote");
     case TOK_UNQUOTE:
-        tok = read_obj();
-        if (tok == TOK_EOF) {
-            show_error("unexpected end of file after unquote");
-            return TOK_ERROR;
-        }
-        if (tok == TOK_CLOSE || tok == TOK_DOT || tok == TOK_ERROR) {
-            show_error("unquote must be followed by an object");
-            return TOK_ERROR;
-        }
-        {
-            GC_GUARD;
-            gc_protect(&tok);
-            unsigned args = alloc_cons(tok, 0);
-            gc_protect(&args);
-            return alloc_cons(ctx.atom_unquote, args);
-        }
+        return read_abbreviation(ctx.atom_unquote, "unquote");
     case TOK_UNQUOTE_SPLICING:
-        tok = read_obj();
-        if (tok == TOK_EOF) {
-            show_error("unexpected end of file after unquote-splicing");
-            return TOK_ERROR;
-        }
-        if (tok == TOK_CLOSE || tok == TOK_DOT || tok == TOK_ERROR) {
-            show_error("unquote-splicing must be followed by an object");
-            return TOK_ERROR;
-        }
-        {
-            GC_GUARD;
-            gc_protect(&tok);
-            unsigned args = alloc_cons(tok, 0);
-            gc_protect(&args);
-            return alloc_cons(ctx.atom_unquote_splicing, args);
-        }
+        return read_abbreviation(ctx.atom_unquote_splicing,
+                                 "unquote-splicing");
     default:
         return tok;
     }
@@ -2164,7 +2244,37 @@ void reader_reset_labels(void)
     reader_history_len = 0;
 }
 
-unsigned read_obj_port(FILE *port)
+void reader_recover_after_panic(void)
+{
+    // A lisp_panic longjmp out of a read skips read_obj's depth bookkeeping
+    // and read_obj_from_port's save/restore. Left alone, reader_obj_depth
+    // stays positive, so every later top-level read treats EOF as nested and
+    // returns the raw TOK_EOF token instead of the EOF object.
+    if (reader_port) {
+        // Keep the interrupted port's peeked bytes: they were physically
+        // consumed from the FILE* and live only in the reader's buffers.
+        port_reader_state *ps = port_state_find(reader_port);
+        if (ps) {
+            ps->pos = ftell(reader_port);
+            ps->line = reader_line;
+            ps->col = reader_col;
+            memcpy(ps->pushback, reader_pushback, sizeof(ps->pushback));
+            memcpy(ps->history, reader_history, sizeof(ps->history));
+            ps->pushback_len = reader_pushback_len;
+            ps->history_len = reader_history_len;
+            ps->fold_case = reader_fold_case;
+        }
+    }
+    reader_port = NULL;
+    reader_obj_depth = 0;
+    reset_datum_labels();
+    reader_pushback_len = 0;
+    reader_history_len = 0;
+    reader_fold_case = true;
+}
+
+static unsigned read_obj_from_port(FILE *port, bool keep_position,
+                                   bool *no_fold_case)
 {
     FILE *old_port = reader_port;
     int old_line = reader_line;
@@ -2190,7 +2300,7 @@ unsigned read_obj_port(FILE *port)
     memcpy(reader_history, ps->history, sizeof(reader_history));
     reader_pushback_len = ps->pushback_len;
     reader_history_len = ps->history_len;
-    reader_fold_case = ps->fold_case;
+    reader_fold_case = no_fold_case ? !*no_fold_case : ps->fold_case;
     reset_datum_labels();
     unsigned result = read_obj();
     if (ferror(port)) {
@@ -2205,16 +2315,33 @@ unsigned read_obj_port(FILE *port)
     ps->pushback_len = reader_pushback_len;
     ps->history_len = reader_history_len;
     ps->fold_case = reader_fold_case;
+    if (no_fold_case)
+        *no_fold_case = !reader_fold_case;
 
     reader_port = old_port;
-    reader_line = old_line;
-    reader_col = old_col;
+    reader_line = keep_position ? ps->line : old_line;
+    reader_col = keep_position ? ps->col : old_col;
     reader_fold_case = old_fold_case;
     memcpy(reader_pushback, old_pushback, sizeof(reader_pushback));
     memcpy(reader_history, old_history, sizeof(reader_history));
     reader_pushback_len = old_pushback_len;
     reader_history_len = old_history_len;
     return result;
+}
+
+unsigned read_obj_port(FILE *port)
+{
+    return read_obj_from_port(port, false, NULL);
+}
+
+unsigned read_obj_string_port(FILE *port, bool *no_fold_case)
+{
+    return read_obj_from_port(port, false, no_fold_case);
+}
+
+unsigned read_obj_stdin(void)
+{
+    return read_obj_from_port(stdin, true, NULL);
 }
 
 size_t reader_port_pending_bytes(FILE *port)

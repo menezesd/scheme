@@ -81,6 +81,8 @@ enum lisp_type {
     BT_BYTEVEC = 103,          // Bytevector: ptr = bytevec_data*
     BT_BINDING_REF = 104,      // Alias to an environment value cell
     BT_HASHTABLE = 105,        // Hash table: ptr = hash_table_data*
+    BT_VMCLOSURE = 106, // VM closure: car = BT_CLOSURE code cell, cdr = env.
+                        // A distinct type so pair operations reject it.
     BT_BROKENHEART = -1 // GC forwarding pointer: car = new location
 };
 
@@ -105,7 +107,7 @@ enum cont_type {
     CONT_LETSTAR_VALS, // Evaluating let* values; data = (bindings . body), env,
                        // next
     CONT_LETREC_INIT,  // Initializing letrec; data = (bindings . (vals-ptr .
-                       // body)), env, next
+                       // (saved . body))), env, next
     CONT_APPLY_FUNC,   // Apply user function; data = body, env, next
     CONT_MACRO_EXPAND, // Macro expansion done; data = 0, env, next
     CONT_CALLWITHVALUES, // call-with-values producer done; data = consumer,
@@ -241,6 +243,7 @@ typedef struct {
     int last_read_char;
     bool last_read_valid;
     bool closed;
+    bool reader_no_fold_case;
     // For input ports opened on a Scheme string, retain the source cell so
     // mutations and GC relocation are visible to the port.  Owned buffers
     // use ctx.atom_false as the sentinel and are freed with the port.
@@ -249,6 +252,10 @@ typedef struct {
     size_t source_end;
     size_t source_pos_chars;
     bool borrowed_data;
+    // Source buffer and string_buffer_epoch at the last successful sync.
+    // While both match, data/len/pos are still current.
+    const char *synced_source;
+    uint64_t synced_epoch;
 } string_port;
 
 // ============================================================================
@@ -358,11 +365,6 @@ typedef struct {
     // until main.c has one (the C test harnesses never set it).
     unsigned global_environment;
     FILE *transcript;             // NULL if not recording
-    // Callbacks for VM special primitives (set by main.c)
-    unsigned (*load_callback)(const char *filename,
-                              unsigned *env); // Returns result or TOK_ERROR
-    unsigned (*eval_callback)(unsigned expr,
-                              unsigned env); // Returns result or TOK_ERROR
     // Last error message for better error reporting
     char last_error[256];
     // When true, show_error/show_warning record the message in last_error but
@@ -782,6 +784,10 @@ static inline int32_t FIXNUM_VALUE(unsigned v)
     ((c) != 0 && (c) < 2u * SEMISPACE_SIZE && !IS_FIXNUM(c))
 #define IS_PAIR(c) (IS_CELL(c) && CELL_TYPE(c) == BT_CONS)
 #define IS_ATOM(c) (IS_CELL(c) && CELL_TYPE(c) == BT_ATOM)
+// Booleans are reserved atoms with private atom-table slots. They are never
+// symbols, even though IS_ATOM accepts them.
+#define IS_BOOLEAN(c) ((c) == CELL_ATOM_TRUE || (c) == CELL_ATOM_FALSE)
+#define IS_SYMBOL(c) (IS_ATOM(c) && !IS_BOOLEAN(c))
 #define IS_NUM(c) (IS_CELL(c) && CELL_TYPE(c) == BT_NUM)
 #define IS_BIGNUM(c) (IS_CELL(c) && CELL_TYPE(c) == BT_BIGNUM)
 #define IS_EXACT_INT(c)                                                        \
@@ -793,6 +799,15 @@ static inline int32_t FIXNUM_VALUE(unsigned v)
 #define IS_BYTEVEC(c) (IS_CELL(c) && CELL_TYPE(c) == BT_BYTEVEC)
 #define IS_BINDING_REF(c) (IS_CELL(c) && CELL_TYPE(c) == BT_BINDING_REF)
 #define IS_HASHTABLE(c) (IS_CELL(c) && CELL_TYPE(c) == BT_HASHTABLE)
+
+// Types whose car and cdr fields hold cell references the collector traces.
+static inline bool cell_type_has_children(int t)
+{
+    return t == BT_CONS || t == BT_FUNCTION || t == BT_MACRO ||
+           t == BT_SYNTAX || t == BT_CONT || t == BT_RATIONAL ||
+           t == BT_COMPLEX || t == BT_BINDING_REF || t == BT_MULTIVAL ||
+           t == BT_VMCLOSURE;
+}
 #define IS_NIL(c) ((c) == 0)
 #define IS_FALSE(c) ((c) == CELL_ATOM_FALSE)
 #define IS_TRUTHY(c) ((c) != CELL_ATOM_FALSE)

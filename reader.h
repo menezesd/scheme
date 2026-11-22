@@ -20,6 +20,12 @@ unsigned read_obj(void);
 // Read and parse the next object from specified port
 unsigned read_obj_port(FILE *port);
 
+// Read from a temporary stream that belongs to a persistent string port.
+unsigned read_obj_string_port(FILE *port, bool *no_fold_case);
+
+// Read a REPL form using stdin's shared port state and retain its location.
+unsigned read_obj_stdin(void);
+
 // Get the number of internally pushed-back bytes saved for a port
 size_t reader_port_pending_bytes(FILE *port);
 
@@ -45,6 +51,11 @@ void reader_reset_position(void);
 
 // Reset datum labels (call before each top-level read)
 void reader_reset_labels(void);
+
+// Restore a consistent reader after a lisp_panic longjmp interrupted a read
+// (resets nesting depth, current port, and datum labels; saves the
+// interrupted port's pushback). Call from the panic-recovery path.
+void reader_recover_after_panic(void);
 
 // Update datum-label cells during GC while a read is in progress
 void reader_update_datum_labels(unsigned (*collector)(unsigned));

@@ -3,6 +3,12 @@
 
 #include "types.h"
 
+// write and display use datum labels only for cycles (R7RS); write-shared
+// labels all shared pairs and vectors; write-simple uses none and rejects
+// cycles. The *_checked variants return false after reporting a failure
+// (nesting too deep, out of memory); the output may then be partial. The
+// void variants are the same writers with the result discarded.
+
 // Write object with quotes (for write) - to stdout
 void write_obj(unsigned s);
 
@@ -11,9 +17,11 @@ void display_obj(unsigned s);
 
 // Write object with quotes to specified port
 void write_obj_port(unsigned s, FILE *port);
+bool write_obj_port_checked(unsigned s, FILE *port);
 
 // Write object with labels for shared/circular structure
 void write_shared_obj_port(unsigned s, FILE *port);
+bool write_shared_obj_port_checked(unsigned s, FILE *port);
 
 // Write object without shared-structure labels
 void write_simple_obj_port(unsigned s, FILE *port);
@@ -23,6 +31,7 @@ bool write_simple_obj_port_checked(unsigned s, FILE *port);
 
 // Write object without outer quotes to specified port
 void display_obj_port(unsigned s, FILE *port);
+bool display_obj_port_checked(unsigned s, FILE *port);
 
 // Get type name for error messages
 const char *type_name(unsigned cell);

@@ -22,6 +22,7 @@
 #include "macros.h"
 #include "prim_internal.h"
 #include "primitives.h"
+#include "reader.h"
 #include "utf8.h"
 #include "writer.h"
 #include <limits.h>
@@ -144,19 +145,19 @@ static bool vm_integer_is_odd(vm_state *vm, unsigned n, const char *error_msg,
     return false;
 }
 
+static bool instruction_boundary(const unsigned char *boundaries,
+                                 unsigned offset)
+{
+    return (boundaries[offset / CHAR_BIT] & (1u << (offset % CHAR_BIT))) != 0;
+}
+
+// Only meaningful after vm_code_is_well_formed(code) succeeded, which is what
+// fills the boundary map; anything else is treated as "not a boundary".
 static bool vm_instruction_starts_at(const code_object *code, unsigned target)
 {
-    if (!code || target > code->code_len)
-        return false;
-    for (unsigned i = 0; i < code->code_len;) {
-        if (i == target)
-            return true;
-        unsigned size = instruction_size(code->code[i]);
-        if (size == 0 || size > code->code_len - i)
-            return false;
-        i += size;
-    }
-    return target == code->code_len;
+    return code && code->verified && code->instruction_boundaries &&
+           target <= code->code_len &&
+           instruction_boundary(code->instruction_boundaries, target);
 }
 
 static bool vm_code_is_well_formed(code_object *code)
@@ -172,28 +173,43 @@ static bool vm_code_is_well_formed(code_object *code)
         (code->const_len != 0 && !code->constants) ||
         (code->children_len != 0 && !code->children))
         return false;
-    // The instruction walk below is the expensive part and only depends on
-    // the arrays, which do not change once compilation is done. Every routine
-    // that does change them clears this.
     if (code->verified)
         return true;
+
+    free(code->instruction_boundaries);
+    code->instruction_boundaries = NULL;
+    unsigned char *boundaries =
+        checked_calloc_array((size_t)code->code_len / CHAR_BIT + 1,
+                             sizeof(*boundaries));
+    if (!boundaries)
+        return false;
+
     for (unsigned i = 0; i < code->code_len;) {
-        unsigned op = code->code[i];
-        if (op >= OP_COUNT)
-            return false;
-        unsigned size = instruction_size(op);
+        unsigned size = instruction_size(code->code[i]);
         if (size == 0 || size > code->code_len - i)
-            return false;
-        if (is_jump_opcode(op)) {
-            unsigned target = code->code[i + 1];
-            if (target > code->code_len ||
-                !vm_instruction_starts_at(code, target))
-                return false;
-        }
+            goto invalid;
+        boundaries[i / CHAR_BIT] |= (unsigned char)(1u << (i % CHAR_BIT));
         i += size;
     }
+    unsigned end = code->code_len;
+    boundaries[end / CHAR_BIT] |= (unsigned char)(1u << (end % CHAR_BIT));
+
+    for (unsigned i = 0; i < end;) {
+        unsigned op = code->code[i];
+        if (is_jump_opcode(op)) {
+            unsigned target = code->code[i + 1];
+            if (target > end || !instruction_boundary(boundaries, target))
+                goto invalid;
+        }
+        i += instruction_size(op);
+    }
+    code->instruction_boundaries = boundaries;
     code->verified = true;
     return true;
+
+invalid:
+    free(boundaries);
+    return false;
 }
 
 static bool vm_get_const(code_object *code, unsigned idx, unsigned *val_out)
@@ -507,6 +523,14 @@ static unsigned vm_dispatch(vm_state *vm);
 vm_state *get_active_vm(void)
 {
     return active_vm;
+}
+
+// A lisp_panic longjmps past every vm_run frame, so active_vm and its parent
+// chain point into dead stack memory; the next collection would walk them as
+// roots and write through them. The abandoned VMs' stacks are leaked.
+void vm_reset_after_panic(void)
+{
+    active_vm = NULL;
 }
 
 // ============================================================================
@@ -1236,14 +1260,19 @@ static void vm_handle_raise(vm_state *vm, unsigned argc, unsigned *argv)
 // inner VM's HALT. Run in place, both are ordinary frames of one VM.
 static void vm_handle_eval(vm_state *vm, unsigned argc, unsigned *argv)
 {
-    if (argc < 1 || argc > 2) {
+    // R7RS (and MIT Scheme, and the CPS interpreter) require the
+    // environment argument.
+    if (argc != 2) {
         vm->sp -= argc;
-        VM_ERROR(vm, "eval: expected 1 or 2 arguments");
+        VM_ERROR(vm, "eval: expected 2 arguments");
         return;
     }
     unsigned expr = argv[0];
-    unsigned eval_env = (argc == 2) ? argv[1] : vm->env;
+    unsigned eval_env = argv[1];
     vm->sp -= argc;
+    // Safe point: every live code object is in a frame or on the heap, and
+    // nothing has been compiled for this eval yet.
+    gc_sweep_code_objects_if_due();
     GC_GUARD;
     gc_protect(&expr);
     gc_protect(&eval_env);
@@ -1404,6 +1433,245 @@ static bool vm_box_stack_args(vm_state *vm, unsigned argc)
     return true;
 }
 
+// Pinned singleton code object that drives load: [OP_LOAD_STEP]. Each loaded
+// form runs in a frame that returns here, so the forms run in this VM. The
+// remaining forms sit on the stack, which continuations capture: escaping
+// out of a loaded file, or re-entering one after load returned, behaves like
+// any other call instead of crossing into a nested VM.
+static code_object *load_driver_code = NULL;
+
+static code_object *get_load_driver_code(void)
+{
+    if (load_driver_code)
+        return load_driver_code;
+    code_object *code = code_new();
+    if (!code)
+        return NULL;
+    code_emit(code, OP_LOAD_STEP);
+    code->gc_pinned = true;
+    load_driver_code = code;
+    return code;
+}
+
+static FILE *vm_open_load_file(const char *filename, char **opened_name)
+{
+    *opened_name = NULL;
+    FILE *f = fopen(filename, "r");
+    if (f) {
+        *opened_name = checked_string_copy(filename);
+        return f;
+    }
+    // Try with .scm appended, unless the name already ends in .scm
+    size_t len = strlen(filename);
+    if ((len >= 4 && strcmp(filename + len - 4, ".scm") == 0) ||
+        len > SIZE_MAX - 5)
+        return NULL;
+    char *with_ext = checked_malloc_flex(0, len + 5, 1);
+    if (!with_ext)
+        return NULL;
+    memcpy(with_ext, filename, len);
+    memcpy(with_ext + len, ".scm", 5);
+    f = fopen(with_ext, "r");
+    if (!f) {
+        free(with_ext);
+        return NULL;
+    }
+    *opened_name = with_ext;
+    return f;
+}
+
+// (load filename): read every form up front (as the interpreter does), then
+// hand them to the load driver, which evaluates them one at a time in the
+// current environment. Each form is compiled only when its turn comes, so a
+// macro defined by one form is visible to the next.
+static void vm_handle_load(vm_state *vm, unsigned argc, unsigned *argv)
+{
+    if (argc != 1) {
+        vm->sp -= argc;
+        VM_ERROR(vm, "load: expected 1 argument");
+        return;
+    }
+    unsigned filename_cell = argv[0];
+    vm->sp -= argc;
+    if (!IS_STRING(filename_cell)) {
+        VM_ERROR(vm, "load: expected string argument");
+        return;
+    }
+    code_object *driver = get_load_driver_code();
+    if (!driver) {
+        VM_ERROR(vm, "load: out of memory");
+        return;
+    }
+    char *filename_arg = require_string_ptr(filename_cell, "load");
+    if (!filename_arg) {
+        VM_ERROR(vm, ctx.last_error);
+        return;
+    }
+    char *filename = checked_string_copy(filename_arg);
+    if (!filename) {
+        VM_ERROR(vm, "load: out of memory");
+        return;
+    }
+    char *opened_name = NULL;
+    FILE *f = vm_open_load_file(filename, &opened_name);
+    if (!f) {
+        show_error("load: cannot open file: %s", filename);
+        free(filename);
+        VM_ERROR(vm, ctx.last_error);
+        return;
+    }
+    free(filename);
+
+    const char *old_filename = reader_get_filename();
+    reader_set_filename(opened_name ? opened_name : "<load>");
+    reader_reset_position();
+
+    GC_GUARD;
+    unsigned forms = 0, forms_tail = 0;
+    gc_protect(&forms);
+    gc_protect(&forms_tail);
+    bool failed = false;
+    for (;;) {
+        unsigned expr = read_obj_port(f);
+        if (expr == TOK_ERROR) {
+            failed = true;
+            break;
+        }
+        if (is_eof_object(expr))
+            break;
+        if (expr == TOK_CLOSE || expr == TOK_DOT) {
+            show_error("load: unexpected reader token");
+            failed = true;
+            break;
+        }
+        list_append(&forms, &forms_tail, expr);
+    }
+    reader_forget_port(f);
+    if (fclose(f) != 0 && !failed) {
+        show_error("load: close failed");
+        failed = true;
+    }
+    reader_set_filename(old_filename);
+    reader_reset_position();
+    free(opened_name);
+    if (failed) {
+        VM_ERROR(vm, ctx.last_error[0] ? ctx.last_error : "load failed");
+        return;
+    }
+
+    // The driver returns the last form's value through this frame.
+    push_frame(vm, vm->code, vm->ip, vm->bp, vm->sp, vm->env);
+    if (vm->error)
+        return;
+    vm->code = driver;
+    vm->ip = 0;
+    vm_push(vm, forms);
+    vm_push(vm, 0); // value of an empty file
+}
+
+// call-with-values: run the producer in THIS VM rather than a nested one,
+// stashing the consumer on the stack and arranging for the producer to
+// return into the pinned finisher code, so a continuation captured inside
+// the producer snapshots the whole computation. In tail position the
+// finisher replaces the current activation (it returns straight to our
+// caller) and applies the consumer as a tail call, as R7RS requires.
+static void vm_handle_call_with_values(vm_state *vm, unsigned argc,
+                                       unsigned *argv, bool tail)
+{
+    if (argc != 2) {
+        vm->sp -= argc;
+        VM_ERROR(vm, "call-with-values: expected 2 arguments");
+        return;
+    }
+    unsigned producer = argv[0];
+    unsigned consumer = argv[1];
+    vm->sp -= argc;
+    code_object *finish = get_cwv_finish_code();
+    if (!finish) {
+        VM_ERROR(vm, "call-with-values: out of memory");
+        return;
+    }
+    GC_GUARD;
+    gc_protect(&producer);
+    gc_protect(&consumer);
+    if (tail && vm->fp > 0) {
+        // Drop this activation's stack window (locals included); the frame
+        // that called it records where its operand stack began.
+        unsigned base = vm->frames[vm->fp - 1].sp;
+        if (base <= vm->sp)
+            vm->sp = base;
+    } else {
+        // The frame's restore point excludes the stashed consumer: the
+        // consumer is tail-applied from the finisher, and a stack-local
+        // consumer's RETURN_LOCALS restores exactly this stack pointer.
+        push_frame(vm, vm->code, vm->ip, vm->bp, vm->sp, vm->env);
+    }
+    if (vm->error)
+        return;
+    vm_push(vm, consumer);
+    if (vm->error)
+        return;
+    vm->code = finish;
+    vm->ip = 0;
+    vm_apply(vm, producer, 0, false);
+}
+
+// Primitives that need the VM itself rather than apply_primitive_argv: they
+// call back into Scheme, capture or replace control state, or run code.
+// Shared by OP_PRIM (direct calls by name) and vm_apply (first-class uses
+// such as (map call-with-values ...) or (apply apply ...)), so the two
+// paths cannot disagree. Arguments are boxed and on top of the stack.
+// Returns false if prim_id is an ordinary primitive.
+static bool vm_apply_special_primitive(vm_state *vm, int64_t prim_id,
+                                       unsigned argc, unsigned *argv,
+                                       bool tail)
+{
+    switch (prim_id) {
+    case PCALLCC: {
+        // call/cc: pass continuation to procedure
+        if (argc != 1) {
+            vm->sp -= argc;
+            VM_ERROR(vm, "call/cc: expected 1 argument");
+            return true;
+        }
+        GC_GUARD;
+        unsigned proc = argv[0];
+        vm->sp -= argc;
+        gc_protect(&proc);
+        unsigned cont = capture_continuation(vm);
+        // Push continuation as argument and call proc
+        vm_push(vm, cont);
+        vm_apply(vm, proc, 1, tail);
+        return true;
+    }
+    case PAPPLY:
+        vm_handle_apply(vm, argc, argv, tail);
+        return true;
+    case PRAISENOW:
+        vm_handle_raise(vm, argc, argv);
+        return true;
+    case PCALLWITHVALUES:
+        vm_handle_call_with_values(vm, argc, argv, tail);
+        return true;
+    case PEVAL:
+        vm_handle_eval(vm, argc, argv);
+        return true;
+    case PINTERACTIONENV:
+        vm->sp -= argc;
+        if (argc != 0) {
+            VM_ERROR(vm, "interaction-environment: expected 0 arguments");
+            return true;
+        }
+        vm_push(vm, exception_state_env(vm->env));
+        return true;
+    case PLOAD:
+        vm_handle_load(vm, argc, argv);
+        return true;
+    default:
+        return false;
+    }
+}
+
 static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
 {
     // Ensure all arguments are boxed cell indices before binding.
@@ -1419,55 +1687,11 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
         // Get pointer to arguments on stack (no list building needed)
         unsigned *argv = &vm->stack[vm->sp - argc];
 
-        // GC_GUARD for automatic cleanup of any gc_protect calls
-        GC_GUARD;
-
-        // Handle special primitives
-        if (prim_id == PCALLCC) {
-            // call/cc: pass continuation to procedure
-            if (argc != 1) {
-                vm->sp -= argc;
-                VM_ERROR(vm, "call/cc: expected 1 argument");
-                return;
-            }
-            unsigned proc = argv[0];
-            vm->sp -= argc;
-            gc_protect(&proc);
-            unsigned cont = capture_continuation(vm);
-            // Push continuation as argument and call proc
-            vm_push(vm, cont);
-            vm_apply(vm, proc, 1, tail);
+        // First-class uses of call/cc, apply, call-with-values, eval, ...
+        // (apply_primitive_argv rejects them as "should be handled in
+        // apply_function").
+        if (vm_apply_special_primitive(vm, prim_id, argc, argv, tail))
             return;
-        }
-
-        if (prim_id == PAPPLY) {
-            vm_handle_apply(vm, argc, argv, tail);
-            return;
-        }
-
-        if (prim_id == PRAISENOW) {
-            vm_handle_raise(vm, argc, argv);
-            return;
-        }
-
-        // eval and interaction-environment reach here when applied as
-        // first-class procedures - (apply eval ...), (map eval ...). The
-        // OP_PRIM fast path handles the direct call; apply_primitive_argv
-        // rejects both as "should be handled in apply_function".
-        if (prim_id == PEVAL) {
-            vm_handle_eval(vm, argc, argv);
-            return;
-        }
-
-        if (prim_id == PINTERACTIONENV) {
-            vm->sp -= argc;
-            if (argc != 0) {
-                VM_ERROR(vm, "interaction-environment: expected 0 arguments");
-                return;
-            }
-            vm_push(vm, exception_state_env(vm->env));
-            return;
-        }
 
         // Regular primitive - pass stack values directly as argv
         // Note: We keep argv on the stack during the call for GC protection,
@@ -1688,18 +1912,28 @@ static bool vm_can_tailcall(vm_state *vm)
            vm->stack[last] == 0;
 }
 
-static void vm_apply_tailcall(vm_state *vm, unsigned fn, unsigned argc)
+// Decide whether a call in tail position may really replace this activation
+// (see vm_can_tailcall). Sets vm->error if the TRMC state is malformed.
+static bool vm_prepare_tailcall(vm_state *vm)
 {
     bool tail = vm_can_tailcall(vm);
     if (!tail && vm->code->trmc_mode == TRMC_MODE_HOLE) {
         unsigned tail_idx;
         if (!vm_local_index(vm, vm->code->trmc_slot + 1, &tail_idx))
-            return;
+            return false;
         // A rebound callee may capture a continuation, unlike the statically
         // proven self-call. Freeze the pending prefix: each eventual return
         // must copy it rather than mutate a chain shared with that capture.
         vm->stack[tail_idx] = ctx.atom_false;
     }
+    return tail;
+}
+
+static void vm_apply_tailcall(vm_state *vm, unsigned fn, unsigned argc)
+{
+    bool tail = vm_prepare_tailcall(vm);
+    if (vm->error)
+        return;
     vm_apply(vm, fn, argc, tail);
 }
 
@@ -2143,11 +2377,13 @@ static unsigned vm_dispatch(vm_state *vm)
             CELL_TYPE(code_cell) = BT_CLOSURE;
             CELL_PTR(code_cell) = child;
 
-            // Create closure cell: car = code_cell, cdr = env
+            // Create closure cell: car = code_cell, cdr = env. It is built
+            // as a pair and retagged so pair operations do not accept it.
             // Protect code_cell from GC during alloc_cons
             gc_protect(&code_cell);
             unsigned closure = alloc_cons(code_cell, vm->env);
             gc_unprotect(1);
+            CELL_TYPE(closure) = BT_VMCLOSURE;
 
             vm_push(vm, closure);
             break;
@@ -2280,6 +2516,47 @@ static unsigned vm_dispatch(vm_state *vm)
             }
         }
 
+        case OP_LOAD_STEP: {
+            // Stack: [.. remaining-forms last-value]; see vm_handle_load.
+            if (vm->sp < 2)
+                VM_ERROR_BREAK(vm, "load: corrupt driver state");
+            unsigned forms = vm->stack[vm->sp - 2];
+            if (!IS_PAIR(forms)) {
+                unsigned val = vm_pop(vm);
+                vm_pop(vm);
+                if (vm->fp == 0) {
+                    vm_push(vm, val);
+                    vm->running = false;
+                } else {
+                    pop_frame(vm); // back to load's caller
+                    vm_push(vm, val);
+                }
+                break;
+            }
+            // Compile while the form list is still rooted on the stack.
+            vm->stack[vm->sp - 1] = 0;
+            // Safe point, as in vm_handle_eval: the previous unit has
+            // returned and the next is not compiled yet.
+            gc_sweep_code_objects_if_due();
+            code_object *unit = compile_for_eval(car(forms), vm->env);
+            if (!unit)
+                VM_ERROR_BREAK(vm, ctx.last_error[0] ? ctx.last_error
+                                                     : "load: compilation failed");
+            if (!vm_code_is_well_formed(unit))
+                VM_ERROR_BREAK(vm, "load: invalid bytecode");
+            forms = vm->stack[vm->sp - 2];
+            vm->stack[vm->sp - 2] = cdr(forms);
+            vm->sp--; // previous value
+            // The unit's RETURN lands back on this instruction.
+            push_frame(vm, vm->code, vm->ip - 1, vm->bp, vm->sp, vm->env);
+            if (vm->error)
+                break;
+            vm->code = unit;
+            vm->ip = 0;
+            vm->bp = vm->sp;
+            break;
+        }
+
         case OP_CWV_FINISH: {
             // The producer arranged by PCALLWITHVALUES has returned.
             // Stack: [.., consumer, producer-result]. Unpack the result and
@@ -2300,7 +2577,11 @@ static unsigned vm_dispatch(vm_state *vm)
                 vm_push(vm, result);
                 consumer_argc = 1;
             }
-            vm_apply(vm, consumer, consumer_argc, false);
+            // The consumer's continuation is that of call-with-values itself,
+            // so it replaces this finisher activation (R7RS requires a tail
+            // call). The OP_RETURN after this instruction is still reached
+            // for primitives, which push their result synchronously.
+            vm_apply(vm, consumer, consumer_argc, true);
             break;
         }
 
@@ -2330,7 +2611,8 @@ static unsigned vm_dispatch(vm_state *vm)
 
         case OP_PRIM: {
             int64_t prim_id = vm->code->code[vm->ip++];
-            unsigned argc = vm->code->code[vm->ip++];
+            unsigned argc_word = vm->code->code[vm->ip++];
+            unsigned argc = argc_word & ~PRIM_TAIL_FLAG;
 
             // Ensure all args are boxed cell indices for primitives
             if (!vm_box_stack_args(vm, argc))
@@ -2339,150 +2621,14 @@ static unsigned vm_dispatch(vm_state *vm)
             // Get pointer to arguments on stack (no list building needed)
             unsigned *argv = &vm->stack[vm->sp - argc];
 
-            // Handle special primitives that need full apply treatment
-            if (prim_id == PAPPLY) {
-                vm_handle_apply(vm, argc, argv, false);
+            // Primitives that need the VM (apply, call-with-values, eval,
+            // load, raise-now, ...). The compiler flags a call in tail
+            // position; a TRMC body may still have to keep its frame.
+            bool tail = (argc_word & PRIM_TAIL_FLAG) && vm_prepare_tailcall(vm);
+            if (vm->error)
                 break;
-            }
-
-            if (prim_id == PRAISENOW) {
-                vm_handle_raise(vm, argc, argv);
+            if (vm_apply_special_primitive(vm, prim_id, argc, argv, tail))
                 break;
-            }
-
-            // Special handling for load - uses callback to main.c
-            if (prim_id == PLOAD) {
-                if (argc != 1) {
-                    vm->sp -= argc;
-                    VM_ERROR_BREAK(vm, "load: expected 1 argument");
-                }
-                unsigned filename_cell = argv[0];
-                vm->sp -= argc;
-                if (!IS_STRING(filename_cell)) {
-                    VM_ERROR_BREAK(vm, "load: expected string argument");
-                }
-                if (!ctx.load_callback) {
-                    VM_ERROR_BREAK(vm, "load: callback not set");
-                }
-                char *filename_arg = require_string_ptr(filename_cell, "load");
-                if (!filename_arg) {
-                    VM_ERROR_BREAK(vm, ctx.last_error);
-                }
-                char *filename = checked_string_copy(filename_arg);
-                if (!filename) {
-                    VM_ERROR_BREAK(vm, "load: out of memory");
-                }
-                unsigned result = ctx.load_callback(filename, &vm->env);
-                free(filename);
-                if (result == TOK_ERROR) {
-                    VM_ERROR_BREAK(vm, "load failed");
-                }
-                vm_push(vm, result);
-                break;
-            }
-
-            // Special handling for call-with-values
-            if (prim_id == PCALLWITHVALUES) {
-                if (argc != 2) {
-                    vm->sp -= argc;
-                    VM_ERROR_BREAK(vm,
-                                   "call-with-values: expected 2 arguments");
-                }
-                unsigned producer = argv[0];
-                unsigned consumer = argv[1];
-                vm->sp -= argc;
-
-                if (is_bytecode_closure_object(producer)) {
-                    // Run the producer in THIS VM rather than a nested one:
-                    // stash the consumer on the stack, arrange the producer's
-                    // return to land in the finisher code, and let the
-                    // dispatch loop continue. A continuation captured inside
-                    // the producer then snapshots the whole computation,
-                    // including the pending consumer and caller frames.
-                    code_object *finish = get_cwv_finish_code();
-                    if (!finish)
-                        VM_ERROR_BREAK(
-                            vm, "call-with-values: out of memory");
-                    vm_push(vm, consumer);
-                    push_frame(vm, vm->code, vm->ip, vm->bp, vm->sp,
-                               vm->env);
-                    if (vm->error)
-                        break;
-                    vm->code = finish;
-                    vm->ip = 0;
-                    vm_apply(vm, producer, 0, false);
-                    break;
-                }
-
-                unsigned result;
-                gc_protect(&consumer);
-                gc_protect(&producer);
-
-                // Non-bytecode producers complete synchronously
-                if (IS_FUNCTION(producer)) {
-                    // CPS closure - use CPS evaluator via callback
-                    // Build: (producer)
-                    unsigned call_expr = alloc_cons(producer, 0);
-                    gc_protect(&call_expr);
-                    if (ctx.eval_callback) {
-                        result = ctx.eval_callback(call_expr, vm->env);
-                    } else {
-                        gc_unprotect(3);
-                        VM_ERROR(vm,
-                                 "call-with-values: cannot call CPS producer");
-                        break;
-                    }
-                    gc_unprotect(1);
-                } else if (IS_BUILTIN(producer)) {
-                    // Builtin - call directly with no args
-                    result = apply_primitive_argv(CELL_ID(producer), 0, NULL);
-                } else {
-                    gc_unprotect(2);
-                    VM_ERROR(vm,
-                             "call-with-values: producer is not a procedure");
-                    break;
-                }
-
-                gc_unprotect(1); // producer
-
-                if (result == TOK_ERROR) {
-                    gc_unprotect(1); // consumer
-                    VM_ERROR_BREAK(vm, "call-with-values: producer failed");
-                }
-
-                // If result is multival, unpack values as args to consumer
-                if (IS_MULTIVAL(result)) {
-                    unsigned vals = car(result);
-                    unsigned consumer_argc = 0;
-                    if (!vm_push_multiple_values(vm, vals, &consumer_argc)) {
-                        gc_unprotect(1); // consumer
-                        break;
-                    }
-                    vm_apply(vm, consumer, consumer_argc, false);
-                } else {
-                    // Single value - pass as single argument
-                    vm_push(vm, result);
-                    vm_apply(vm, consumer, 1, false);
-                }
-                gc_unprotect(1); // consumer
-                break;
-            }
-
-            // Special handling for interaction-environment
-            if (prim_id == PINTERACTIONENV) {
-                vm->sp -= argc;
-                if (argc != 0) {
-                    VM_ERROR_BREAK(
-                        vm, "interaction-environment: expected 0 arguments");
-                }
-                vm_push(vm, exception_state_env(vm->env));
-                break;
-            }
-
-            if (prim_id == PEVAL) {
-                vm_handle_eval(vm, argc, argv);
-                break;
-            }
 
             // Regular primitive - pass stack values directly as argv
             // Note: We keep argv on the stack during the call for GC protection,
@@ -3202,8 +3348,7 @@ static unsigned vm_dispatch(vm_state *vm)
         // Type predicates
         case OP_SYMBOLP: {
             unsigned val = vm_pop(vm);
-            vm_push(vm, (!IS_FIXNUM(val) && IS_ATOM(val)) ? ctx.atom_true
-                                                          : ctx.atom_false);
+            vm_push(vm, IS_SYMBOL(val) ? ctx.atom_true : ctx.atom_false);
             break;
         }
 
@@ -3556,8 +3701,7 @@ static unsigned vm_dispatch(vm_state *vm)
                     vm_push(vm, n);
                 }
             } else if (IS_INEXACT(n)) {
-                double d = to_double(n);
-                vm_push(vm, store_inexact(d < 0 ? -d : d));
+                vm_push(vm, store_inexact(fabs(to_double(n))));
             } else if (IS_RATIONAL(n)) {
                 if (is_negative_number(car(n))) {
                     GC_GUARD;

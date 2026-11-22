@@ -47,8 +47,8 @@
 (test "modulo" 1 (modulo 10 3))
 (test "remainder" 1 (remainder 10 3))
 (test "quotient" 3 (quotient 10 3))
-(test "min preserves NaN and signed-zero operand order"
-      '(#t #f #t #f)
+(test "min ignores NaN in either order; signed zeros keep operand order"
+      '(#f #f #t #f)
       (list (nan? (min +nan.0 1.0))
             (nan? (min 1.0 +nan.0))
             (negative? (/ 1.0 (min -0.0 0.0)))
@@ -2668,7 +2668,7 @@
             (digit-value (integer->char #x1E140))))
 (test "digit-value rejects alphabetic characters" #f
       (digit-value #\A))
-(test "character digit conversions" '(#t #t #f #\E #\9)
+(test "character digit conversions" '(#t #t #f #\e #\9)
       (list (char-alphanumeric? #\a)
             (= (char->digit #\E 16) 14)
             (char->digit #\9 8)
@@ -3096,9 +3096,11 @@
       (symbol->string (read (open-input-string "#!fold-case FOO"))))
 (test "reader unicode foldcase directive" "ssi̇ksμσσσffi"
       (symbol->string (read (open-input-string "#!fold-case ẞİKſµΣςσﬃ"))))
-(test "reader case directive toggles" '("FOO" "bar")
-      (let ((p (open-input-string "#!no-fold-case FOO #!fold-case BAR")))
-        (list (symbol->string (read p)) (symbol->string (read p)))))
+(test "reader case directive persists per string port" '("FOO" "bar" "BAZ" "quux")
+      (let ((p (open-input-string "#!no-fold-case FOO BAZ #!fold-case QUUX"))
+            (q (open-input-string "BAR")))
+        (let* ((a (read p)) (b (read q)) (c (read p)) (d (read p)))
+          (map symbol->string (list a b c d)))))
 (test "reader datum comment" 'kept
       (read (open-input-string "#;(discard (nested datum)) kept")))
 (test "reader nested block comment" 'kept
@@ -3218,10 +3220,10 @@
        (guard (e (#t #t)) (string-join '() " " "" 42) #f)))
 (test "string-join scales across many components" 1999
       (string-length (string-join (make-list 1000 "x") ",")))
-(test "string-joiner" "<a|b>" ((string-joiner 'infix "|" 'prefix "<" 'suffix ">") "a" "b"))
+(test "string-joiner" "<a>|<b>" ((string-joiner 'infix "|" 'prefix "<" 'suffix ">") "a" "b"))
 (test "string-joiner validates keyword strings" #t
       (guard (e (#t #t)) (string-joiner 'infix 42) #f))
-(test "string-joiner*" "<a|b>" ((string-joiner* 'infix "|" 'prefix "<" 'suffix ">") '("a" "b")))
+(test "string-joiner*" "<a>|<b>" ((string-joiner* 'infix "|" 'prefix "<" 'suffix ">") '("a" "b")))
 (test "string-splitter runs" '("a" "b") ((string-splitter 'delimiter #\,) "a,,b"))
 (test "string-splitter no runs" '("a" "" "b")
       ((string-splitter 'delimiter #\, 'allow-runs? #f) "a,,b"))
@@ -3348,6 +3350,565 @@
         (gc-flip)
         (let loop ((i 0) (acc 0))
           (if (= i 100) acc (loop (+ i 1) (+ acc i))))))
+
+;;; ============================================================================
+;;; Stdlib regressions
+;;; ============================================================================
+
+(section "Stdlib regressions")
+
+;; guard follows the R7RS 7.3 reference expansion.
+(test "guard supports => clauses" 42
+      (guard (e ((assq 'a e) => cdr) ((assq 'b e)))
+        (raise (list (cons 'a 42)))))
+(test "guard test-only clause returns the test value" '(b . 23)
+      (guard (e ((assq 'a e) => cdr) ((assq 'b e)))
+        (raise (list (cons 'b 23)))))
+(test "guard re-raises with raise-continuable when no clause matches" 43
+      (with-exception-handler
+        (lambda (e) 42)
+        (lambda ()
+          (+ 1 (guard (e (#f 'no)) (raise-continuable 'oops))))))
+(test "guard clauses run after unwinding to the guard" '(in out handler)
+      (let ((log '()))
+        (guard (e (#t (set! log (cons 'handler log))))
+          (dynamic-wind
+            (lambda () (set! log (cons 'in log)))
+            (lambda () (raise 'x))
+            (lambda () (set! log (cons 'out log)))))
+        (reverse log)))
+(test "guard clauses see the guard's parameterization" 1
+      (let ((p (make-parameter 1)))
+        (guard (e (#t (p)))
+          (parameterize ((p 2)) (raise 'x)))))
+(test "guard passes multiple body values through" '(1 2)
+      (call-with-values (lambda () (guard (e (#t 0)) (values 1 2))) list))
+(test "unmatched guard re-raise reaches the enclosing guard" '(outer sym)
+      (guard (e ((symbol? e) (list 'outer e)))
+        (guard (e ((string? e) 'inner))
+          (raise 'sym))))
+
+;; Bytevector output ports validate their state in O(1); this used to walk
+;; every chunk on each write, so 2500 write-u8 calls took about 9 seconds.
+(test "bytevector output port handles many single-byte writes" '(10000 255 15)
+      (let ((port (open-output-bytevector)))
+        (do ((i 0 (+ i 1))) ((= i 10000))
+          (write-u8 (modulo i 256) port))
+        (let ((bv (get-output-bytevector port)))
+          (list (bytevector-length bv)
+                (bytevector-u8-ref bv 255)
+                (bytevector-u8-ref bv 9999)))))
+
+;; Set operations on finite character sets stay range-based instead of
+;; becoming predicates that every enumeration scans over all of Unicode.
+(test "char-set-union of finite sets is finite" '(2 ((97 . 99)))
+      (let ((set (char-set-union (char-set #\a) (char-set #\b #\a))))
+        (list (char-set-size set) (char-set->code-points set))))
+(test "char-set-intersection with a finite argument" '((15 . 20))
+      (char-set->code-points
+       (char-set-intersection (char-set (cons 10 20)) (char-set (cons 15 30) 40))))
+(test "char-set-intersection mixing finite and predicate sets" '(#\a #\z)
+      (char-set->list
+       (char-set-intersection (string->char-set "abcxyz1")
+                              char-set:alphabetic
+                              (char-set #\a #\z #\q #\1))))
+(test "char-set-difference of a finite set" '((10 . 12) (13 . 15) (17 . 20))
+      (char-set->code-points
+       (char-set-difference (char-set (cons 10 20)) (char-set 12 (cons 15 17)))))
+(test "char-set-difference of a finite set and a predicate set" '(#\a #\b)
+      (char-set->list
+       (char-set-difference (string->char-set "a1b2") char-set:numeric)))
+(test "char-set sizes of ASCII splits" '(76 52)
+      (list (char-set-size (char-set-difference char-set:ascii char-set:alphabetic))
+            (char-set-size (char-set-intersection char-set:ascii char-set:alphabetic))))
+(test "char-set with a base set stays finite" '(#\a #\x #\y)
+      (char-set->list (list->char-set (list #\x #\y) (char-set #\a))))
+
+;; append! remembers the last pair instead of rescanning the result.
+(test "append-map! over many singleton lists" 20000
+      (length (append-map! list (iota 20000))))
+(test "append! edge cases" '((1 2 3 . 4) () 5 (1 2) (1 3) (1))
+      (list (append! (list 1 2) '() (list 3) 4)
+            (append!)
+            (append! '() 5)
+            (append! (list 1) 5 (list 2))
+            (append! (cons 1 2) (list 3))
+            (append! (list 1) '() '())))
+
+;; digit-value agrees with char-numeric? (Unicode Nd digits).
+(test "digit-value on Unicode digit blocks" '(#f 0 9 1 1 3 9 5 #f)
+      (map digit-value
+           (list (integer->char #x1A10) (integer->char #x1D7D8)
+                 (integer->char #x1D7FF) (integer->char #x0DE7)
+                 (integer->char #x1091) (integer->char #x104A3)
+                 (integer->char #x16B59) #\5 #\a)))
+(test "digit-value is consistent with char-numeric? through U+1FFFF" 0
+      (let loop ((n 0) (bad 0))
+        (if (> n #x1FFFF)
+            bad
+            (loop (+ n 1)
+                  (if (and (>= n #xD800) (<= n #xDFFF))
+                      bad
+                      (let* ((c (integer->char n)) (dv (digit-value c)))
+                        (if (eq? (char-numeric? c) (and dv (<= 0 dv 9) #t))
+                            bad
+                            (+ bad 1))))))))
+(test "char->digit on a double-struck digit" 0
+      (char->digit (integer->char #x1D7D8) 10))
+(test "digit->char uses lower-case letters like MIT" '(#\0 #\9 #\a #\z)
+      (map (lambda (d) (digit->char d 36)) '(0 9 10 35)))
+
+;; MIT joiner semantics: prefix and suffix wrap each joined element.
+(test "string-joiner applies the suffix to each element" "a., b."
+      ((string-joiner 'infix ", " 'suffix ".") "a" "b"))
+(test "string-joiner* wraps each element" "[a] [b] [c]"
+      ((string-joiner* 'prefix "[" 'suffix "]" 'infix " ") '("a" "b" "c")))
+(test "string-joiner* with no strings" ""
+      ((string-joiner* 'prefix "[" 'suffix "]") '()))
+
+;; list-index accepts several lists (SRFI-1).
+(test "list-index over several lists" '(1 #f 3)
+      (list (list-index = '(1 2 3) '(3 2 1))
+            (list-index < '(3 2 1) '(1 1))
+            (list-index even? '(1 3 5 6))))
+
+;; SRFI-1 fixes the argument order of the element-equality procedure.
+(define (%calls-in-order? run)
+  ; RUN receives a recording equality on integers; every call must be
+  ; (= x y) with x from the earlier list or the earlier list position.
+  (let ((calls '()))
+    (run (lambda (a b) (set! calls (cons (list a b) calls)) (= a b)))
+    (and (pair? calls)
+         (every (lambda (call) (< (car call) (cadr call))) calls))))
+(test "lset and delete-duplicates equality argument order" '(#t #t #t #t #t #t)
+      (list (%calls-in-order? (lambda (= ) (lset-intersection = '(1 2) '(3 4))))
+            (%calls-in-order? (lambda (= ) (lset-difference = '(1 2) '(3 4))))
+            (%calls-in-order? (lambda (= ) (lset<= = '(1) '(2 3))))
+            (%calls-in-order? (lambda (= ) (lset= = '(1) '(2))))
+            (%calls-in-order? (lambda (= ) (lset-adjoin = '(1 2) 3)))
+            (%calls-in-order? (lambda (= ) (delete-duplicates '(1 2 3) =)))))
+(test "delete-duplicates with an asymmetric predicate" '(1)
+      (delete-duplicates '(1 2 3 4) <))
+(test "lset results are unchanged" '((a e) (b c d) #t #t)
+      (list (lset-intersection eq? '(a b c d e) '(a e i o u))
+            (lset-difference eq? '(a b c d e) '(a e i o u))
+            (lset<= eq? '(a) '(a b a) '(a b c c))
+            (lset= eq? '(b e a) '(a e b) '(e e b a))))
+
+;; string->vector and vector->string are linear and keep ranges.
+(test "string->vector and vector->string ranges" '(#(#\b #\c) "bc" "zb")
+      (list (string->vector "abcde" 1 3)
+            (vector->string (vector #\a #\b #\c) 1)
+            (let ((s (vector->string (vector #\a #\b))))
+              (string-set! s 0 #\z)
+              s)))
+(test "string->vector and vector->string on long inputs" '(40000 40000)
+      (list (vector-length (string->vector (make-string 40000 #\a)))
+            (string-length (vector->string (make-vector 40000 #\a)))))
+
+;; Single-list right folds run in constant stack depth (the recursive
+;; versions overflowed the VM stack near 350k elements).
+(test "fold-right over a long list" 400000
+      (length (fold-right cons '() (iota 400000))))
+(test "reduce-right over a long list" 79999800000
+      (reduce-right + 0 (iota 400000)))
+(test "pair-fold-right over a long list" 400000
+      (length (pair-fold-right (lambda (p acc) (cons (car p) acc)) '()
+                               (iota 400000))))
+(test "single-list right folds keep their call order" '((1 (2 (3 z))) (1 (2 3)) ((a b c) (b c) (c) . z))
+      (list (fold-right list 'z '(1 2 3))
+            (reduce-right list 0 '(1 2 3))
+            (pair-fold-right cons 'z '(a b c))))
+(test "single-list folds reject improper lists" '(#t #t #t #t)
+      (list (guard (e (#t #t)) (fold-right cons '() '(1 2 . 3)) #f)
+            (guard (e (#t #t)) (fold cons '() '(1 2 . 3)) #f)
+            (guard (e (#t #t)) (count even? '(2 . 3)) #f)
+            (guard (e (#t #t)) (fold-right cons '() (circular-list 1)) #f)))
+(test "single-list fold and count fast paths" '((3 2 1) 2 0)
+      (list (fold cons '() '(1 2 3))
+            (count even? '(1 2 3 4))
+            (count even? '())))
+
+;; hash-table-ref accepts an optional success procedure (SRFI-125, MIT).
+(test "hash-table-ref fail and succeed procedures" '(10 fail 1 #t)
+      (let ((table (make-equal-hash-table)))
+        (hash-table-set! table 'a 1)
+        (list (hash-table-ref table 'a (lambda () 'fail) (lambda (v) (* v 10)))
+              (hash-table-ref table 'b (lambda () 'fail) (lambda (v) (* v 10)))
+              (hash-table-ref table 'a)
+              (guard (e (#t #t)) (hash-table-ref table 'b) #f))))
+
+;; Port redirections restore the port that was current when the extent was
+;; (re)entered, not the one current at the original call.
+(test "with-output-to-string restores the port current at re-entry" #t
+      (let ((a (open-output-string))
+            (b (open-output-string))
+            (orig (current-output-port))
+            (k #f)
+            (entries 0))
+        (set-current-output-port! a)
+        (with-output-to-string
+          (call-with-current-continuation (lambda (c) (set! k c)))
+          (set! entries (+ entries 1)))
+        (if (= entries 1)
+            (begin
+              (set-current-output-port! b)
+              (k #f)))
+        (let ((restored-b? (eq? (current-output-port) b)))
+          (set-current-output-port! orig)
+          restored-b?)))
+(test "with-output-to-file restores the port current at re-entry" #t
+      (let ((path (temporary-file-path))
+            (b (open-output-string))
+            (orig (current-output-port))
+            (k #f)
+            (entries 0))
+        (with-output-to-file path
+          (lambda ()
+            (call-with-current-continuation (lambda (c) (set! k c)))
+            (set! entries (+ entries 1))))
+        (if (= entries 1)
+            (begin
+              (set-current-output-port! b)
+              (k #f)))
+        (let ((restored-b? (eq? (current-output-port) b)))
+          (set-current-output-port! orig)
+          (delete-file path)
+          restored-b?)))
+
+;; min/max: NaN is missing data, independent of argument order.
+(test "max and min ignore NaN in every argument order"
+      '(1.0 1.0 2.0 2.0 2.0 1.5 1.5 +inf.0 +inf.0 1.0 1.0 1.0 1.5 1.5 -inf.0 -inf.0)
+      (list (max 1 +nan.0) (max +nan.0 1)
+            (max 1 2 +nan.0) (max +nan.0 1 2) (max 1 +nan.0 2)
+            (max 1.5 +nan.0) (max +nan.0 1.5)
+            (max +inf.0 +nan.0) (max +nan.0 +inf.0)
+            (min 1 +nan.0) (min +nan.0 1) (min 1 +nan.0 2)
+            (min 1.5 +nan.0) (min +nan.0 1.5)
+            (min -inf.0 +nan.0) (min +nan.0 -inf.0)))
+(test "max and min of only NaN are NaN" '(#t #t #t)
+      (list (nan? (max +nan.0)) (nan? (max +nan.0 +nan.0)) (nan? (min +nan.0 +nan.0))))
+(test "max and min keep MIT signed-zero selection and exactness" '(#t #f #f #t 1/2 2.0 3 #t)
+      (list (negative? (/ 1.0 (max 0.0 -0.0)))
+            (negative? (/ 1.0 (max -0.0 0.0)))
+            (negative? (/ 1.0 (min 0.0 -0.0)))
+            (negative? (/ 1.0 (min -0.0 0.0)))
+            (max 1/2 1/3)
+            (max 1 2.0)
+            (max 2 1 3)
+            (guard (e (#t #t)) (max 'a 1) #f)))
+(test "max over a long argument list" 99999
+      (apply max (iota 100000)))
+
+;; exact-integer-sqrt uses integer Newton iteration (bisection took over a
+;; minute on (expt 10 20000)).
+(test "exact-integer-sqrt small values"
+      '((0 0) (1 0) (1 1) (1 2) (2 0) (3 6) (4 0) (4 1))
+      (map (lambda (n) (call-with-values (lambda () (exact-integer-sqrt n)) list))
+           '(0 1 2 3 4 15 16 17)))
+(test "exact-integer-sqrt around 2^128"
+      '((18446744073709551615 36893488147419103230)
+        (18446744073709551616 0)
+        (18446744073709551616 1)
+        (99999999999999999999 199999999999999999998)
+        (351364182882014 298878189871694))
+      (map (lambda (n) (call-with-values (lambda () (exact-integer-sqrt n)) list))
+           (list (- (expt 2 128) 1) (expt 2 128) (+ (expt 2 128) 1)
+                 (- (expt 10 40) 1) 123456789012345678901234567890)))
+(test "exact-integer-sqrt of huge values" '(#t #t #t)
+      (list (call-with-values (lambda () (exact-integer-sqrt (expt 10 20000)))
+              (lambda (s r) (and (= s (expt 10 10000)) (= r 0))))
+            (call-with-values (lambda () (exact-integer-sqrt (- (expt 10 20000) 1)))
+              (lambda (s r) (and (= s (- (expt 10 10000) 1))
+                                 (= r (- (* 2 (expt 10 10000)) 2)))))
+            (let ((k (+ (expt 3 30001) 7)))
+              (call-with-values (lambda () (exact-integer-sqrt (- (* k k) 1)))
+                (lambda (s r) (and (= s (- k 1)) (= r (* 2 (- k 1)))))))))
+(test "exact-integer-sqrt rejects non-exact-nonnegative-integers" '(#t #t #t)
+      (list (guard (e (#t #t)) (exact-integer-sqrt -1) #f)
+            (guard (e (#t #t)) (exact-integer-sqrt 4.0) #f)
+            (guard (e (#t #t)) (exact-integer-sqrt 1/2) #f)))
+(test "integer-length uses a fast bit-length" '(0 1 8 9 0 8 9 66439 70000)
+      (list (integer-length 0) (integer-length 1) (integer-length 255)
+            (integer-length 256) (integer-length -1) (integer-length -256)
+            (integer-length -257) (integer-length (expt 10 20000))
+            (integer-length (- (expt 2 70000)))))
+
+;; Before/after thunks run outside their own dynamic-wind frame, so escaping
+;; from an after thunk does not unwind through (and re-run) that thunk.
+(test "escaping from an after thunk runs it once" '(escaped 1)
+      (let ((count 0))
+        (let ((result
+               (call-with-current-continuation
+                 (lambda (outer)
+                   (dynamic-wind
+                     (lambda () #f)
+                     (lambda () (outer 'first))
+                     (lambda ()
+                       (set! count (+ count 1))
+                       (if (< count 5) (outer 'escaped))))))))
+          (list result count))))
+(test "re-entry rewinds before thunks once per entry" '(before body after before body after)
+      (let ((log '()) (k #f) (n 0))
+        (dynamic-wind
+          (lambda () (set! log (cons 'before log)))
+          (lambda ()
+            (call-with-current-continuation (lambda (c) (set! k c)))
+            (set! log (cons 'body log)))
+          (lambda () (set! log (cons 'after log))))
+        (set! n (+ n 1))
+        (if (< n 2) (k #f))
+        (reverse log)))
+
+;; An empty parameterize still has a body: definitions stay local.
+(parameterize () (define %stdlib-regression-parameterize-leak 1) 'ignored)
+(test "parameterize () does not leak body definitions" 'undefined
+      (guard (e (#t 'undefined)) %stdlib-regression-parameterize-leak))
+(test "parameterize () body allows internal definitions" 20
+      (parameterize () (define a 2) (* a 10)))
+
+;;; ============================================================================
+;;; Runtime regressions
+;;; ============================================================================
+
+(section "Runtime regressions")
+
+;; #t and #f used to share atom ids with the symbols true and false.
+(test "#t is not a symbol" #f (symbol? #t))
+(test "'true is not #t" #f (eq? 'true #t))
+(test "'false is not #f" #f (eqv? 'false #f))
+(test "true, false and t are MIT-style variables" '(#t #f #t) (list true false t))
+(test "case does not match 'true against #t" 'no (case 'true ((#t) 'hit) (else 'no)))
+(test "memq #t skips the symbol true" #f (memq #t '(a true b)))
+(test "equal? distinguishes (true) from (#t)" #f (equal? '(true) '(#t)))
+(test "symbol->string rejects booleans" 'error (guard (e (#t 'error)) (symbol->string #f)))
+(define-syntax %reg-true-pattern (syntax-rules () ((_ true) (list true #t))))
+(test "a pattern variable named true leaves #t alone" '(5 #t) (%reg-true-pattern 5))
+(test "string->symbol \"#t\" makes a symbol, not a boolean" '(#t #f)
+      (let ((s (string->symbol "#t"))) (list (symbol? s) (eq? s #t))))
+
+;; VM closures used to be pairs whose car was a code marker.
+(define (%reg-closure x) (+ x 1))
+(test "procedures are not pairs or lists" '(#f #f #t)
+      (list (pair? %reg-closure) (list? %reg-closure) (procedure? %reg-closure)))
+(test "pair? through apply on a procedure" #f (apply pair? (list %reg-closure)))
+(test "car rejects a procedure" 'error (guard (e (#t 'error)) (car %reg-closure)))
+(test "equal? on distinct closures of one lambda" #f
+      (let ((mk (lambda (n) (lambda () n)))) (equal? (mk 1) (mk 1))))
+(test "tree walk over a list holding a procedure terminates" 3
+      (let count ((x (list 1 2 %reg-closure)))
+        (cond ((pair? x) (+ (count (car x)) (count (cdr x))))
+              ((null? x) 0)
+              (else 1))))
+
+;; Numbers
+(test "modulo with an inexact integer operand" 4.0
+      (let ((f (lambda (a b) (modulo a b)))) (f 1e10 7.0)))
+(test "+ keeps negative zero" '(-0.0 -0.0) (list (+ -0.0) (+ -0.0 -0.0)))
+(test "large inexact integers keep their decimal point" "9007199254740992.0"
+      (number->string 9007199254740992.0))
+(test "inexact integers round-trip as inexact" #f
+      (exact? (string->number (number->string (exact->inexact 1234567890123457)))))
+(test "two-argument log" '(3.0 2.0) (list (log 8 2) (log 100 10)))
+(test "log of a bignum beyond the double range is finite" #t
+      (let ((l (log (expt 10 400)))) (< 921 l 922)))
+(test "expt of -1 to an odd bignum is exact -1" -1 (expt -1 (+ 1 (expt 10 30))))
+(test "expt of 1 to a bignum stays exact" 1 (expt 1 (expt 10 30)))
+(test "expt of an exact base to a huge exponent is an error" 'error
+      (guard (e (#t 'error)) (expt 2 (expt 10 30))))
+(test "expt of a huge exact base to a fractional power" 1e200 (expt (expt 10 400) 0.5))
+(test "arithmetic-shift of zero by a huge count" 0 (arithmetic-shift 0 (expt 2 70)))
+
+;; Strings and ports
+(test "string input port follows mutation of its source" '(#\a #\x3BB #\a)
+      (let* ((s (make-string 5 #\a)) (q (open-input-string s)))
+        (let* ((a (read-char q))
+               (b (begin (string-set! s 1 (integer->char #x3BB)) (read-char q)))
+               (c (read-char q)))
+          (list a b c))))
+(test "reading a long string port is linear" 40000
+      (let ((p (open-input-string (make-string 40000 #\a))))
+        (let loop ((n 0)) (if (eof-object? (read-char p)) n (loop (+ n 1))))))
+(test "displaying #\\null to a string port raises" 'error
+      (guard (e (#t 'error)) (display (list #\a (integer->char 0)) (open-output-string))))
+(test "textual file ports carry U+0000" '(#\a 0 #\b)
+      (let ((path (temporary-file-path)))
+        (call-with-output-file path
+          (lambda (p) (write-char #\a p) (write-char (integer->char 0) p) (write-char #\b p)))
+        (let ((r (call-with-input-file path
+                   (lambda (p)
+                     (let* ((a (read-char p)) (z (read-char p)) (b (read-char p)))
+                       (list a (char->integer z) b))))))
+          (delete-file path)
+          r)))
+(test "char-upper-case? uses the Uppercase property" '(#t #t)
+      (list (char-upper-case? (integer->char #x24B6)) (char-upper-case? (integer->char #x2160))))
+(test "char-lower-case? uses the Lowercase property" '(#t #t)
+      (list (char-lower-case? (integer->char #xAA)) (char-lower-case? (integer->char #x2B0))))
+
+;; Condition kinds and environments
+(test "file-error? on a failed open" #t
+      (guard (e ((file-error? e) #t) (#t #f)) (open-input-file "/nonexistent/vesper-regression")))
+(test "read-error? on malformed input" #t
+      (guard (e ((read-error? e) #t) (#t #f)) (read (open-input-string "(1 2"))))
+(test "ordinary errors are neither file nor read errors" '(#f #f)
+      (guard (e (#t (list (file-error? e) (read-error? e)))) (car 1)))
+(test "environment binds an import under every name" '(1 3 9)
+      (eval '(list (first '(1 2)) (car '(3)) (square 3))
+            (environment '(rename (scheme base) (car first)) '(scheme base))))
+(test "null-environment has derived syntax" 'a
+      (eval '(case 1 ((1) 'a) (else 'b)) (null-environment 5)))
+(test "null-environment has no procedures" 'unbound
+      (guard (e (#t 'unbound)) (eval '(car '(1)) (null-environment 5))))
+(test "quasiquote transforms a vector in a dotted tail" '((a . #(5)) (a . #(1 5 5)))
+      (let ((y 5)) (list `(a . #(,y)) `(a . #(1 ,@(list y y))))))
+
+;; Interpreter
+(define-syntax %reg-foo (syntax-rules () ((_) 'macro)))
+(test "letrec body defines shadow a global macro" 'proc
+  (letrec ((z 1)) (define (bar) (%reg-foo)) (define (%reg-foo) 'proc) (bar)))
+(test "empty letrec body defines shadow a global macro" 'proc
+  (letrec () (define (bar) (%reg-foo)) (define (%reg-foo) 'proc) (bar)))
+(test "letrec re-entry restores earlier bindings" '(11 12 200 4)
+  (let ((k #f) (n 0))
+    (let ((r (letrec ((a 1) (b 2) (c (call/cc (lambda (c) (set! k c) 3))) (d 4))
+               (set! a (+ a 10)) (set! b (+ b 10)) (list a b c d))))
+      (set! n (+ n 1))
+      (if (< n 3) (k (* n 100)) r))))
+(test "letrec with four bindings keeps each in its slot" '(1 2 3 4)
+  (letrec ((a 1) (b 2) (c 3) (d 4)) (list a b c d)))
+(test "letrec body mixes defines and expressions" 6
+  (letrec ((z 1)) (define a 5) (set! a (+ a 0)) (define b (+ a z)) b))
+(test "shadowed keyword head is applied" 6 ((lambda (if) (if 1 2 3)) +))
+(test "letrec-bound keyword head is applied" 42 (letrec ((or (lambda (a b) (* a b)))) (or 6 7)))
+
+;; Reader and writer
+(test "reader: labeled #t is a boolean" '(#t #t) (map boolean? (read (open-input-string "(#0=#t #0#)"))))
+(test "reader: labeled #f is false" 'no (if (read (open-input-string "#0=#f")) 'yes 'no))
+(test "reader: labeled booleans in source" '(#t #f) (list (boolean? '#0=#t) (if '#1=#f #t #f)))
+(test "write: no labels for acyclic sharing" "((1 2) (1 2))" (let ((x (list 1 2))) (call-with-output-string (lambda (p) (write (list x x) p)))))
+(test "display: no labels for acyclic sharing" "((1 2) (1 2))" (let ((x (list 1 2))) (call-with-output-string (lambda (p) (display (list x x) p)))))
+(test "write: labels a cycle" "#0=(1 2 . #0#)" (let ((c (list 1 2))) (set-cdr! (cdr c) c) (call-with-output-string (lambda (p) (write c p)))))
+(test "write: labels only the cycle" "((1 . #0=(2 3 . #0#)) (1 . #0#))" (let ((d (list 1 2 3))) (set-cdr! (cddr d) (cdr d)) (call-with-output-string (lambda (p) (write (list d d) p)))))
+(test "display: symbols are not escaped" "Hello World" (call-with-output-string (lambda (p) (display (string->symbol "Hello World") p))))
+(test "display: odd symbols in a list" "(ABC  1)" (call-with-output-string (lambda (p) (display (list (string->symbol "ABC") (string->symbol "") (string->symbol "1")) p))))
+(test "write: symbols still escaped" "|Hello World|" (call-with-output-string (lambda (p) (write (string->symbol "Hello World") p))))
+(test "format ~a: symbol unescaped" "Foo" (format #f "~a" (string->symbol "Foo")))
+(test "reader: identifier ending in dot" 2 (length (read (open-input-string "(-a. b)"))))
+(test "reader: -a. round-trips" #t (let ((s (string->symbol "-a."))) (eq? s (read (open-input-string (call-with-output-string (lambda (p) (write s p))))))))
+(test "reader: +. is a symbol" #t (symbol? (read (open-input-string "+."))))
+(test "reader: 5. is inexact 5" 5.0 (read (open-input-string "5.")))
+(test "reader: ...x is one identifier" "...x" (symbol->string (read (open-input-string "...x"))))
+(test "reader: 1/-2 is a symbol" #t (symbol? (read (open-input-string "1/-2"))))
+(test "reader: 1/0 is an error" 'error (guard (e (#t 'error)) (read (open-input-string "1/0"))))
+(test "string->number: 1i needs a sign" #f (string->number "1i"))
+(test "string->number: 1/2i needs a sign" #f (string->number "1/2i"))
+(test "string->number: +1i" (make-rectangular 0 1) (string->number "+1i"))
+(test "reader: |\\x0;| reports its own error" "invalid string character scalar value" (guard (e ((error-object? e) (error-object-message e))) (read (open-input-string "|a\\x0;b|"))))
+(test "reader: vertical line is a delimiter" '(a b c) (let ((p (open-input-string "a|b|c"))) (let* ((x (read p)) (y (read p)) (z (read p))) (list x y z))))
+(test "string->number: radix 3" 3 (string->number "10" 3))
+(test "string->number: radix 36" -1295 (string->number "-zz" 36))
+(test "string->number: radix 7 rational" 5/7 (string->number "5/10" 7))
+(test "string->number: prefix overrides radix" 16 (string->number "#x10" 3))
+(test "string->number: bad digit for radix" #f (string->number "3" 3))
+(test "string->number: radix 36 round trip" 123456789 (string->number (number->string 123456789 36) 36))
+(test "string->number: #e polar is exact" #t (exact? (string->number "#e1e2@1")))
+(test "string->number: #e polar, zero angle" 2 (string->number "#e2@0"))
+(test "reader: many datum labels" #t (let* ((items (let loop ((i 0) (acc '())) (if (= i 3000) acc (loop (+ i 1) (cons (list i) acc))))) (data (append items items))) (equal? data (read (open-input-string (call-with-output-string (lambda (p) (write-shared data p))))))))
+(test "reader: chained labels share" #t (let ((x (read (open-input-string "#0=#1=(#0# #1#)")))) (and (eq? (car x) x) (eq? (cadr x) x))))
+(test "reader: large label number" #t (let ((x (read (open-input-string "(#300000=(a) #300000#)")))) (eq? (car x) (cadr x))))
+(test "write: too-deep data raises" (quote raised) (guard (e (#t (quote raised))) (let loop ((i 0) (x (quote ()))) (if (< i 20000) (loop (+ i 1) (list x)) (begin (call-with-output-string (lambda (p) (write x p))) (quote returned))))))
+
+;; Compiler and VM
+;; B2: closures made by (define (g) ...) inside a letrec body see stack-local params
+(define (reg-count-up n) (letrec ((start 0)) (define (step i) (if (< i n) (step (+ i 1)) i)) (step start)))
+(test "letrec-body define closure sees parameter" 5 (reg-count-up 5))
+(define reg-a 'global-a)
+(define (reg-f4 reg-a) (letrec ((b 1)) (define (g) reg-a) (g)))
+(test "letrec-body define closure does not see global" 44 (reg-f4 44))
+;; B8: letrec / internal define shadowing a stack-local parameter
+(define (reg-sh1 a) (letrec ((a 5)) a))
+(test "letrec binding shadows parameter" 5 (reg-sh1 1))
+(define (reg-sh2 a) (letrec ((b 2)) (define a 7) a))
+(test "internal define in letrec body shadows parameter" 7 (reg-sh2 1))
+(define (reg-sh3 a) (letrec ((a (lambda () 9))) (a)))
+(test "letrec-bound procedure shadows parameter" 9 (reg-sh3 1))
+(define (reg-sh4 a) (letrec ((a 1)) (set! a 2) a))
+(test "set! of shadowing letrec binding" 2 (reg-sh4 0))
+(define (reg-sh5 a) (letrec ((b 1)) (set! a 3)) a)
+(test "set! of unshadowed parameter inside letrec" 3 (reg-sh5 0))
+;; B3: macro-produced definitions stay local to the procedure
+(define (reg-sum3 a) (define-values (x) (values 10)) (set! x (+ x a)) (if (> a 0) (+ (reg-sum3 (- a 1)) x) 0))
+(test "define-values in recursive procedure is per-activation" 23 (reg-sum3 2))
+(define-syntax reg-def2 (syntax-rules () ((_ n v) (define n v))))
+(define (reg-h2 a) (reg-def2 reg-z 10) (+ a reg-z))
+(test "macro-generated define works" 11 (reg-h2 1))
+(test "macro-generated define does not leak" 'not-leaked (guard (e (#t 'not-leaked)) reg-z))
+(define (reg-g5 a) (define-record-type reg-pt (reg-mk u) reg-pt? (u reg-pt-u)) (reg-pt-u (reg-mk a)))
+(test "define-record-type inside procedure" 5 (reg-g5 5))
+(test "define-record-type inside procedure does not leak" 'not-leaked (guard (e (#t 'not-leaked)) reg-mk))
+;; B4: apply and call-with-values are proper tail calls
+(define (reg-apply-loop n) (if (= n 0) 'done (apply reg-apply-loop (list (- n 1)))))
+(test "apply in tail position does not grow the stack" 'done (reg-apply-loop 1100000))
+(define (reg-cwv-loop n) (if (= n 0) 'done (call-with-values (lambda () (- n 1)) reg-cwv-loop)))
+(test "call-with-values consumer is a tail call" 'done (reg-cwv-loop 600000))
+(define (reg-values-loop n) (if (= n 0) 'done (call-with-values (lambda () (values (- n 1) 2)) (lambda (a b) (reg-values-loop a)))))
+(test "call-with-values with two values in a loop" 'done (reg-values-loop 600000))
+(test "call-with-values result in non-tail position" 3 (+ 1 (call-with-values (lambda () 2) (lambda (x) x))))
+(define (reg-cwv-list a b) (list a (call-with-values (lambda () (values a b)) list) b))
+(test "call-with-values keeps caller stack intact" '(1 (1 2) 2) (reg-cwv-list 1 2))
+;; B5: first-class call-with-values
+(test "call-with-values as a first-class value" '(1 2) (let ((cwv call-with-values)) (cwv (lambda () (values 1 2)) list)))
+(test "map over call-with-values" '(3) (map call-with-values (list (lambda () (values 1 2))) (list +)))
+(test "apply call-with-values" '(3 4) (apply call-with-values (list (lambda () (values 3 4)) list)))
+;; B7: vector quasiquote with unquote-splicing
+(test "vector quasiquote splicing (R7RS 4.2.8)" '#(10 5 2 4 3 8) `#(10 5 ,(sqrt 4) ,@(map sqrt '(16 9)) 8))
+(test "vector quasiquote splicing empty" '#(start end) (let ((l '())) `#(start ,@l end)))
+(test "nested vector quasiquote keeps inner splice" '(1 #(x 2 3) (quasiquote #((unquote-splicing (list 4))))) `(1 #(x ,@(list 2 3)) `#(,@(list 4))))
+(define (forms->temp-file forms)
+  (let ((path (temporary-file-path)))
+    (call-with-output-file path
+      (lambda (p) (for-each (lambda (f) (write f p) (newline p)) forms)))
+    path))
+(define load-escape-k #f)
+(define load-after-escape #f)
+(define load-escape-count 0)
+(test "escaping from a loaded file runs the rest of the program once" '(escaped 1 #f)
+      (let* ((path (forms->temp-file '((load-escape-k 'escaped) (set! load-after-escape #t))))
+             (r (call/cc (lambda (k) (set! load-escape-k k) (load path) 'normal))))
+        (set! load-escape-count (+ load-escape-count 1))
+        (delete-file path)
+        (list r load-escape-count load-after-escape)))
+(test "guard catches an error raised by a loaded file" 'caught
+      (let ((path (forms->temp-file '((car '())))))
+        (let ((r (guard (e (#t 'caught)) (load path))))
+          (delete-file path)
+          r)))
+(define load-reentry-k #f)
+(define load-reentry-log '())
+(test "continuation captured in a loaded file can be re-entered after load returns" '(3 2 1)
+      (let ((path (forms->temp-file
+                   '((set! load-reentry-log
+                           (cons (call/cc (lambda (k) (set! load-reentry-k k) 1))
+                                 load-reentry-log))))))
+        (load path)
+        (if (file-exists? path) (delete-file path))
+        (if (< (length load-reentry-log) 3)
+            (load-reentry-k (+ (length load-reentry-log) 1)))
+        load-reentry-log))
+(test "a macro defined in a loaded file is usable by later forms of that file" 2
+      (let ((path (forms->temp-file
+                   '((define-syntax load-twice (syntax-rules () ((_ e) (begin e e))))
+                     (define load-macro-count 0)
+                     (load-twice (set! load-macro-count (+ load-macro-count 1)))
+                     load-macro-count))))
+        (let ((r (load path)))
+          (delete-file path)
+          r)))
+;; case-lambda in a restricted environment
+(test "case-lambda in (environment '(scheme case-lambda))" 4 ((eval '(case-lambda ((x) x)) (environment '(scheme case-lambda))) 4))
+;; eval requires its environment argument
+(test "eval with one argument is an error" 'error (guard (e (#t 'error)) (eval '(+ 1 2))))
 
 ;;; ============================================================================
 ;;; Summary

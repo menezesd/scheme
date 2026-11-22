@@ -46,6 +46,8 @@ void bn_free(bignum *a);
 int bn_to_int64(const bignum *a, int64_t *out);
 int bn_to_uint64(const bignum *a, uint64_t *out);
 char *bn_to_string(const bignum *a, int base);
+double bn_to_double(const bignum *a);
+bool bn_ratio_to_double(const bignum *a, const bignum *b, double *out);
 
 // Check if bignum fits in int64
 bool bn_fits_int64(const bignum *a);

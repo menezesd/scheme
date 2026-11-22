@@ -15,6 +15,8 @@
 
 #include "compiled_pattern.h"
 #include "context.h"
+#include "env.h"
+#include "macros.h"
 #include <limits.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -26,6 +28,14 @@
 
 compiled_pattern *compiled_pattern_registry = NULL;
 static pat_match_state *active_match_state = NULL;
+
+// A lisp_panic longjmp out of execute_pattern skips its restore of the
+// previous match state, leaving active_match_state pointing into a dead stack
+// frame that the next collection would walk.
+void pattern_reset_after_panic(void)
+{
+    active_match_state = NULL;
+}
 
 void pattern_register(compiled_pattern *pat)
 {
@@ -271,6 +281,8 @@ static void update_match_state_roots(pat_match_state *state,
         return;
 
     state->input = update(state->input);
+    state->literal_closure_env = update(state->literal_closure_env);
+    state->literal_use_env = update(state->literal_use_env);
     state->vec_iter_vec = update(state->vec_iter_vec);
     for (unsigned i = 0; i < state->vec_sp; i++)
         state->vec_stack[i].vec = update(state->vec_stack[i].vec);
@@ -417,6 +429,7 @@ static const char *opcode_names[] = {
     [PAT_INPUT_VEC_ITER] = "INPUT_VEC_ITER",
     [PAT_INPUT_VECREF_END] = "INPUT_VECREF_END",
     [PAT_MATCH_ATOM_ID] = "MATCH_ATOM_ID",
+    [PAT_CHECK_TAIL_PAIRS] = "CHECK_TAIL_PAIRS",
     [PAT_MATCH_LITERAL] = "MATCH_LITERAL",
     [PAT_BIND_VAR] = "BIND_VAR",
     [PAT_BIND_UNDERSCORE] = "BIND_UNDERSCORE",
@@ -574,6 +587,23 @@ static void compile_ellipsis(unsigned pattern, pattern_compile_ctx *pctx)
     unsigned rest_path = pattern_current_pos(pctx->pattern);
     pattern_patch(pctx->pattern, choice_patch, rest_path);
 
+    // R7RS 4.3.2: in (P ... Pe <ellipsis> Pm+1 ... Pn . Px) the ellipsis
+    // takes every element but the n - m the fixed patterns after it need;
+    // Px matches only the final cdr. Without this check, backtracking past
+    // an element Pe rejects - a literal bound differently at the use site,
+    // say - let a dotted Px absorb the rest of the list instead of failing.
+    // (A second ellipsis in the rest - not R7RS, but accepted - leaves the
+    // split to backtracking as before.)
+    unsigned tail_pairs = 0;
+    bool fixed_tail = true;
+    for (unsigned t = rest; IS_PAIR(t); t = cdr(t)) {
+        if (syntax_is_ellipsis(car(t), pctx->ellipsis_id))
+            fixed_tail = false;
+        tail_pairs++;
+    }
+    if (fixed_tail)
+        pattern_emit(pctx->pattern, PAT_CHECK_TAIL_PAIRS, tail_pairs);
+
     pctx->ellipsis_depth--;
     compile_pattern_node(rest, pctx);
     pctx->ellipsis_depth++;
@@ -593,8 +623,11 @@ static void compile_pattern_node(unsigned pattern, pattern_compile_ctx *pctx)
         return;
     }
 
-    // Underscore: wildcard
-    if (syntax_is_underscore(pattern)) {
+    // Underscore: wildcard - unless listed among the literals, where R7RS
+    // has it match as a literal like any other (by binding, now that the
+    // matcher checks literal bindings itself; see PAT_MATCH_ATOM_ID)
+    if (syntax_is_underscore(pattern) &&
+        !atom_list_contains_id(pctx->literals, CELL_ID(pattern))) {
         pattern_emit(pctx->pattern, PAT_BIND_UNDERSCORE, 0);
         return;
     }
@@ -1056,7 +1089,9 @@ static unsigned build_bindings_alist(pat_match_state *state)
     return result;
 }
 
-unsigned execute_pattern(compiled_pattern *pat, unsigned input)
+static unsigned execute_pattern_impl(compiled_pattern *pat, unsigned input,
+                                     bool check_literal_bindings,
+                                     unsigned closure_env, unsigned use_env)
 {
     if (!pattern_bytecode_is_well_formed(pat)) {
         show_error("pattern match: invalid compiled pattern");
@@ -1068,6 +1103,9 @@ unsigned execute_pattern(compiled_pattern *pat, unsigned input)
         show_error("pattern match: out of memory");
         return TOK_ERROR;
     }
+    state.check_literal_bindings = check_literal_bindings;
+    state.literal_closure_env = closure_env;
+    state.literal_use_env = use_env;
 
     // Protect input and state bindings from GC
     gc_protect(&input);
@@ -1171,8 +1209,18 @@ unsigned execute_pattern(compiled_pattern *pat, unsigned input)
         }
 
         case PAT_MATCH_ATOM_ID:
+            // An identifier here is a literal (other identifiers are pattern
+            // variables); it must also mean the same thing at the use site as
+            // in the macro's definition environment - an else the user bound
+            // locally is not the literal else. Checking it here rather than
+            // after the match keeps backtracking consistent: a split of an
+            // ellipsis the binding check rejects is never the one chosen.
             if (!IS_ATOM(state.input) ||
-                CELL_ID(state.input) != (int64_t)instr->operand) {
+                CELL_ID(state.input) != (int64_t)instr->operand ||
+                (state.check_literal_bindings && IS_SYMBOL(state.input) &&
+                 !macros_same_binding(CELL_ID(state.input),
+                                      state.literal_closure_env,
+                                      state.literal_use_env))) {
                 if (!backtrack(&state))
                     failed = true;
             }
@@ -1298,6 +1346,19 @@ unsigned execute_pattern(compiled_pattern *pat, unsigned input)
             matched = true;
             break;
 
+        case PAT_CHECK_TAIL_PAIRS: {
+            // Count at most operand + 1 pairs: enough to tell
+            unsigned pairs = 0;
+            for (unsigned t = state.input; IS_PAIR(t) && pairs <= instr->operand;
+                 t = cdr(t))
+                pairs++;
+            if (pairs != instr->operand) {
+                if (!backtrack(&state))
+                    failed = true;
+            }
+            break;
+        }
+
         case PAT_CHECK_VECLEN_MIN:
         {
             vector_data *vd = pattern_vector_data(state.input);
@@ -1407,4 +1468,15 @@ unsigned execute_pattern(compiled_pattern *pat, unsigned input)
     active_match_state = prev_active_match_state;
     cleanup_match_state(&state);
     return TOK_ERROR;
+}
+
+unsigned execute_pattern(compiled_pattern *pat, unsigned input)
+{
+    return execute_pattern_impl(pat, input, false, 0, 0);
+}
+
+unsigned execute_pattern_in_envs(compiled_pattern *pat, unsigned input,
+                                 unsigned closure_env, unsigned use_env)
+{
+    return execute_pattern_impl(pat, input, true, closure_env, use_env);
 }

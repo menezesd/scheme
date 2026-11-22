@@ -62,7 +62,7 @@ typedef struct {
     const char *number_only;
 } type_predicate_entry;
 
-static bool symbol_predicate(unsigned arg) { return IS_ATOM(arg); }
+static bool symbol_predicate(unsigned arg) { return IS_SYMBOL(arg); }
 static bool numeric_predicate(unsigned arg) { return is_numeric(arg); }
 static bool exact_predicate(unsigned arg)
 {

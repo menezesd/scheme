@@ -351,7 +351,9 @@ slow_path:;
             return make_complex_exact(real_sum, imag_sum);
         }
 
-        double real = 0.0, imag = 0.0;
+        // -0.0 is the IEEE additive identity; seeding with 0.0 would turn
+        // (+ -0.0 -0.0) into 0.0.
+        double real = -0.0, imag = -0.0;
         for (unsigned i = 0; i < argc; i++) {
             double r, im;
             get_complex_parts(argv[i], &r, &im);
@@ -361,7 +363,7 @@ slow_path:;
         return make_complex_result(real, imag, exact);
     }
     case NUM_INEXACT: {
-        double sum = 0.0;
+        double sum = -0.0; // IEEE additive identity, keeps (+ -0.0) negative
         for (unsigned i = 0; i < argc; i++)
             sum += to_double(argv[i]);
         return store_inexact(sum);
@@ -913,21 +915,23 @@ unsigned prim_divlike_inexact(unsigned (*fn)(unsigned, unsigned *),
         return fn(argc, argv);
 
     GC_GUARD;
-    unsigned conv[2];
+    // Root both operands before converting either: the conversion allocates,
+    // and callers such as binary_mod pass an unrooted argv.
+    unsigned conv[2] = {argv[0], argv[1]};
+    gc_protect(&conv[0]);
+    gc_protect(&conv[1]);
     for (int i = 0; i < 2; i++) {
-        unsigned v = argv[i];
-        if (IS_INEXACT(v)) {
-            double d = to_double(v);
+        if (IS_INEXACT(conv[i])) {
+            double d = to_double(conv[i]);
             if (!isfinite(d) || floor(d) != d) {
                 show_error("%s: expected integer", name);
                 return TOK_ERROR;
             }
-            v = prim_inexact_to_exact(v);
+            unsigned v = prim_inexact_to_exact(conv[i]);
             if (v == TOK_ERROR)
                 return TOK_ERROR;
+            conv[i] = v;
         }
-        conv[i] = v;
-        gc_protect(&conv[i]);
     }
     unsigned result = fn(2, conv);
     if (result == TOK_ERROR)

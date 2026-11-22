@@ -27,6 +27,16 @@ static const char *stdlib_path = NULL;
 // Track evaluation depth to only sweep code objects at top level
 static int eval_depth = 0;
 
+// Restore the baseline exception and dynamic-wind state of the interaction
+// environment after a top-level form ended abnormally.
+static void reset_toplevel_dynamic_state(unsigned env)
+{
+    unsigned dflt = lookup_silent(intern("*default-exception-handler*"), env);
+    if (dflt != TOK_ERROR)
+        setvar(intern("*current-exception-handler*"), dflt, env);
+    setvar(intern("*wind-stack*"), 0, env);
+}
+
 // Evaluate expression (interpreter or bytecode depending on mode)
 static unsigned eval_expr(unsigned expr, unsigned env)
 {
@@ -69,13 +79,8 @@ static unsigned eval_expr(unsigned expr, unsigned env)
     // top level so the next REPL expression starts clean; nested eval
     // (load/eval callbacks) must not reset while an outer guard could
     // still catch the error.
-    if (result == TOK_ERROR && eval_depth == 0) {
-        unsigned dflt = lookup_silent(intern("*default-exception-handler*"),
-                                      env);
-        if (dflt != TOK_ERROR)
-            setvar(intern("*current-exception-handler*"), dflt, env);
-        setvar(intern("*wind-stack*"), 0, env);
-    }
+    if (result == TOK_ERROR && eval_depth == 0)
+        reset_toplevel_dynamic_state(env);
     return result;
 }
 
@@ -254,63 +259,6 @@ static bool load_stdlib(unsigned *env)
 }
 
 // ============================================================================
-// VM Callbacks for Special Primitives
-// ============================================================================
-
-// Callback for (load "filename") in bytecode mode
-static unsigned load_callback(const char *filename, unsigned *env_ptr)
-{
-    FILE *f = fopen(filename, "r");
-    // Try with .scm extension if not found
-    char *with_ext = NULL;
-    if (!f) {
-        size_t len = strlen(filename);
-        // Only add .scm if file doesn't already end with .scm
-        if (len < 4 || strcmp(filename + len - 4, ".scm") != 0) {
-            if (len > SIZE_MAX - 5) {
-                show_error("load: filename too long");
-                return TOK_ERROR;
-            }
-            with_ext = checked_malloc_flex(0, len + 5, 1);
-            if (!with_ext) {
-                show_error("load: out of memory");
-                return TOK_ERROR;
-            }
-            memcpy(with_ext, filename, len);
-            memcpy(with_ext + len, ".scm", 5);
-            f = fopen(with_ext, "r");
-            if (f) filename = with_ext; // use for error reporting
-        }
-    }
-    if (!f) {
-        show_error("load: cannot open file: %s", filename);
-        free(with_ext);
-        return TOK_ERROR;
-    }
-    if (!load_from_port(f, env_ptr, true, filename)) {
-        reader_forget_port(f);
-        if (fclose(f) != 0)
-            show_error("load: close failed");
-        free(with_ext);
-        return TOK_ERROR;
-    }
-    reader_forget_port(f);
-    if (fclose(f) != 0) {
-        show_error("load: close failed");
-        free(with_ext);
-        return TOK_ERROR;
-    }
-    free(with_ext);
-    return 0; // Return nil on success (like the CPS evaluator)
-}
-
-// Callback for (eval expr env) in bytecode mode
-static unsigned eval_callback(unsigned expr, unsigned env)
-{
-    return eval_expr(expr, env);
-}
-
-// ============================================================================
 // Main Entry Point
 // ============================================================================
 
@@ -332,8 +280,6 @@ static void print_usage(const char *prog)
 int main(int argc, char **argv)
 {
     setlocale(LC_CTYPE, "");
-    saved_argc = argc;
-    saved_argv = argv;
 
     // Parse command line options
     int file_arg = 0;
@@ -366,18 +312,28 @@ int main(int argc, char **argv)
         }
     }
 
+    // (command-line) is the program's view of its own invocation: a script
+    // sees its name followed by its own arguments, without vesper's options
+    // or the "--" that ended them. The REPL sees just the command name.
+    if (file_arg > 0) {
+        saved_argc = argc - file_arg;
+        saved_argv = argv + file_arg;
+    } else {
+        saved_argc = argc > 0 ? 1 : 0;
+        saved_argv = argv;
+    }
+
     // Initialize the heap first
     init_heap();
-
-    // Set up VM callbacks for special primitives
-    ctx.load_callback = load_callback;
-    ctx.eval_callback = eval_callback;
 
     // Initialize keywords and special atoms
     init_keywords();
 
-    // Create default environment with primitives
-    unsigned env = default_environment();
+    // Create default environment with primitives. Static rather than
+    // automatic: the REPL assigns it after setjmp and reads it again after a
+    // longjmp, which leaves a non-volatile automatic variable indeterminate.
+    static unsigned env;
+    env = default_environment();
 
     // This implementation detail is needed while bootstrapping the standard
     // library, but does not belong in every freshly-created user environment.
@@ -451,27 +407,55 @@ int main(int argc, char **argv)
     // REPL with error recovery
     reader_set_filename("<stdin>");
     bool interactive = isatty(fileno(stdin));
-    panic_jmp_set = true;
-    if (setjmp(panic_jmp) != 0) {
-        // Recovered from a fatal error - reset and continue. The longjmp
-        // skipped every GC_GUARD cleanup, so drop the dangling shadow-stack
-        // roots before running a collection. It also skipped any restore of
-        // suppress_error_output, so clear it here or a panic raised inside
-        // compile-time constant folding would silence diagnostics for the
-        // rest of the session.
-        ctx.suppress_error_output = false;
-        fprintf(stderr, "Returning to REPL...\n");
-        gc_recover_after_panic();
-        macros_reset_expansion_depth();
-        env = gc(env);
-    }
 
     // Piped/non-interactive input behaves like running a script: report
     // failure via the exit code if any top-level form errored, matching
     // the file-argument path below. An interactive session keeps exiting
     // 0 on EOF regardless (matching common REPL convention - the user has
-    // already seen and moved past any earlier error).
-    bool had_error = false;
+    // already seen and moved past any earlier error). Static for the same
+    // setjmp reason as env: a panic must count as an error.
+    static bool had_error = false;
+    // Set while recovering, so a panic during recovery exits rather than
+    // looping back here.
+    static bool recovering = false;
+
+    panic_jmp_set = true;
+    if (setjmp(panic_jmp) != 0) {
+        if (recovering) {
+            fprintf(stderr, "Fatal error: could not recover; exiting\n");
+            return 1;
+        }
+        recovering = true;
+        had_error = true;
+        // Recovered from a fatal error - reset and continue. The longjmp
+        // skipped every GC_GUARD cleanup and every vm_run exit, so drop the
+        // dangling shadow-stack roots and VM chain before running a
+        // collection, then root env again: its own protection went with the
+        // rest. It also skipped any restore of suppress_error_output, so clear
+        // it here or a panic raised inside compile-time constant folding would
+        // silence diagnostics for the rest of the session.
+        ctx.suppress_error_output = false;
+        fprintf(stderr, "Returning to REPL...\n");
+        gc_recover_after_panic();
+        gc_protect(&env);
+        set_alloc_gc_root(&env);
+        reader_recover_after_panic();
+        macros_reset_expansion_depth();
+        // The abandoned form never got back to eval_expr to decrement this;
+        // left raised, code objects would never be swept again.
+        eval_depth = 0;
+        // Nor did its dynamic-wind and parameterize frames run their after
+        // thunks, so put the console ports back.
+        ctx.current_input = stdin;
+        ctx.current_output = stdout;
+        ctx.current_error = stderr;
+        ctx.current_input_cell = 0;
+        ctx.current_output_cell = 0;
+        ctx.current_error_cell = 0;
+        env = gc(env);
+        reset_toplevel_dynamic_state(env);
+        recovering = false;
+    }
 
     for (;;) {
         if (interactive) {
@@ -479,13 +463,13 @@ int main(int argc, char **argv)
             fflush(stdout);
         }
 
-        reader_reset_labels();
-        reader_reset_position(); // Reset line/col for each REPL input
-        unsigned expr = read_obj();
+        unsigned expr = read_obj_stdin();
         if (is_eof_object(expr))
             break;
         if (expr == TOK_ERROR) {
             had_error = true;
+            if (ferror(stdin))
+                break;
             continue;
         }
         if (expr == TOK_CLOSE || expr == TOK_DOT) {

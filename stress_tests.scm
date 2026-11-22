@@ -549,6 +549,31 @@
               ((> (car l) (cadr l)) #f)
               (else (loop (cdr l))))))
 
+(section "Collector Depth")
+
+;; The collector used to trace vectors (and so records) by recursing in C, so
+;; a long chain of records overflowed the C stack during a full collection.
+(define-record-type <gc-chain-node> (make-gc-chain-node value next)
+  gc-chain-node?
+  (value gc-chain-node-value)
+  (next gc-chain-node-next))
+(test "400K-node record chain survives a full collection" 400000
+      (let loop ((i 0) (node #f))
+        (if (< i 400000)
+            (loop (+ i 1) (make-gc-chain-node i node))
+            (begin
+              (gc-flip)
+              (let count ((n node) (k 0))
+                (if n (count (gc-chain-node-next n) (+ k 1)) k))))))
+(test "300K nested vectors survive a full collection" 300000
+      (let loop ((i 0) (v '#()))
+        (if (< i 300000)
+            (loop (+ i 1) (vector v))
+            (begin
+              (gc-flip)
+              (let depth ((v v) (k 0))
+                (if (= (vector-length v) 0) k (depth (vector-ref v 0) (+ k 1))))))))
+
 ;; ============================================================================
 ;; Summary
 ;; ============================================================================

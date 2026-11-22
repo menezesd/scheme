@@ -306,6 +306,72 @@
                  (begin (set! first answer) (set! phase 1) (saved '(x)))
                  (begin (set! cons original-cons) (list first answer)))))))
 
+;; Both collectors copy a cell first and trace its references later, from
+;; their scan loops, so a structure's nesting depth is bounded by the heap
+;; rather than the C stack. The old recursive walk overflowed on a chain about
+;; 300K deep (a linked list of records - records are vectors); building one is
+;; far too slow under forced collections, so these only check that records,
+;; vectors and hash tables reached through one another still come through both
+;; collectors whole.
+(define-record-type gc-node (make-gc-node val next) gc-node?
+  (val gc-node-val) (next gc-node-next))
+(check "record chain survives collection" 4950
+       (let ((chain (let loop ((i 0) (acc '()))
+                      (if (= i 100) acc (loop (+ i 1) (make-gc-node (list i) acc))))))
+         (gc-flip)
+         (let loop ((l chain) (sum 0))
+           (if (gc-node? l)
+               (loop (gc-node-next l) (+ sum (car (gc-node-val l))))
+               sum))))
+(check "nested vectors survive collection" 50
+       (let ((v (let loop ((i 0) (v '()))
+                  (if (= i 50) v (loop (+ i 1) (vector v (list i)))))))
+         (gc-flip)
+         (let loop ((v v) (d 0))
+           (if (vector? v) (loop (vector-ref v 0) (+ d 1)) d))))
+(check "nested hash tables survive collection" '(49 . 0)
+       (let ((t (let loop ((i 0) (t #f))
+                  (if (= i 50)
+                      t
+                      (let ((h (make-strong-eqv-hash-table)))
+                        (hash-table-set! h 'next t)
+                        (hash-table-set! h 'val (list i))
+                        (loop (+ i 1) h))))))
+         (gc-flip)
+         (cons (car (hash-table-ref/default t 'val #f))
+               (let loop ((t t))
+                 (let ((next (hash-table-ref/default t 'next #f)))
+                   (if next (loop next) (car (hash-table-ref/default t 'val #f))))))))
+;; eqv tables hash a vector key by its cell index, so every table whose keys
+;; moved must be rehashed after the collection; the rehash is now registered
+;; when the scan loop reaches the table rather than when it is copied.
+(check "eqv table keyed by moved vectors still finds them" #t
+       (let* ((keys (let loop ((i 0) (acc '()))
+                      (if (= i 20) acc (loop (+ i 1) (cons (vector i) acc)))))
+              (t (make-strong-eqv-hash-table))
+              (holder (vector t)))
+         (for-each (lambda (k) (hash-table-set! t k (vector-ref k 0))) keys)
+         (gc-flip)
+         (let loop ((ks keys))
+           (or (null? ks)
+               (and (eqv? (hash-table-ref/default (vector-ref holder 0) (car ks) #f)
+                          (vector-ref (car ks) 0))
+                    (loop (cdr ks)))))))
+
+;; (command-line) is the script's own view of its invocation - its name and
+;; arguments - without vesper's options. make test-gcstress runs this file as
+;; `vesper [--interpreter] gc_stress_tests.scm`.
+(check "command-line holds the script, not interpreter options" #t
+       (let* ((line (command-line))
+              (name (car line))
+              (suffix "gc_stress_tests.scm"))
+         (and (not (member "--interpreter" line))
+              (>= (string-length name) (string-length suffix))
+              (string=? suffix
+                        (substring name (- (string-length name)
+                                           (string-length suffix))
+                                   (string-length name))))))
+
 (newline)
 (display "GC stress tests: ")
 (display (if (= failures 0) "all passed" "FAILURES"))

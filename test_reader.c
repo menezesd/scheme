@@ -3,6 +3,7 @@
 #include "context.h"
 #include "reader.h"
 #include "test_framework.h"
+#include "writer.h"
 #include "types.h"
 #include <math.h>
 #include <stdint.h>
@@ -1104,19 +1105,27 @@ TEST(reader_tracks_line)
 
 TEST(reader_preserves_multi_char_pushback_across_port_reads)
 {
-    FILE *f = fmemopen((void *)"-.\n34", 5, "r");
+    // Reading "ab" leaves the peeked delimiter in the port's pushback; an
+    // unread of 'b' (as unread-char does) stacks a second byte on it. Both
+    // must survive into the next read of the same port.
+    FILE *f = fmemopen((void *)"ab cd", 5, "r");
     ASSERT(f != NULL);
 
     unsigned first = read_obj_port(f);
-    ASSERT(CELL_TYPE(first) == BT_ATOM);
-    ASSERT_STR_EQ(ctx.atom_table[CELL_ID(first)], "-");
+    ASSERT(IS_SYMBOL(first));
+    ASSERT_STR_EQ(ctx.atom_table[CELL_ID(first)], "ab");
+    ASSERT_EQ(reader_port_pending_bytes(f), 1);
+
+    ASSERT(reader_port_ungetc(f, 'b'));
+    ASSERT_EQ(reader_port_pending_bytes(f), 2);
 
     unsigned second = read_obj_port(f);
-    ASSERT(second == TOK_DOT);
+    ASSERT(IS_SYMBOL(second));
+    ASSERT_STR_EQ(ctx.atom_table[CELL_ID(second)], "b");
 
     unsigned third = read_obj_port(f);
-    ASSERT(CELL_TYPE(third) == BT_NUM);
-    ASSERT_EQ(CELL_ID(third), 34);
+    ASSERT(IS_SYMBOL(third));
+    ASSERT_STR_EQ(ctx.atom_table[CELL_ID(third)], "cd");
 
     reader_forget_port(f);
     fclose(f);
@@ -1128,6 +1137,287 @@ TEST(read_trailing_dot_decimal)
     unsigned x = read_from_string("12.");
     ASSERT(IS_INEXACT(x));
     ASSERT(to_double(x) == 12.0);
+    PASS();
+}
+
+
+// ============================================================================
+// Regression tests (reader/writer review)
+// ============================================================================
+
+// Read every datum in str, up to max; returns how many were read.
+static unsigned read_all_from_string(const char *str, unsigned *out,
+                                     unsigned max)
+{
+    FILE *f = fmemopen((void *)str, strlen(str), "r");
+    if (!f)
+        return 0;
+    unsigned n = 0;
+    while (n < max) {
+        unsigned x = read_obj_port(f);
+        if (x == TOK_ERROR || is_eof_object(x))
+            break;
+        out[n++] = x;
+    }
+    reader_forget_port(f);
+    fclose(f);
+    return n;
+}
+
+static bool int_value_is(unsigned x, int64_t n)
+{
+    return (IS_FIXNUM(x) && FIXNUM_VALUE(x) == n) ||
+           (IS_NUM(x) && CELL_ID(x) == n);
+}
+
+static bool symbol_named(unsigned x, const char *name)
+{
+    return IS_SYMBOL(x) && strcmp(ctx.atom_table[CELL_ID(x)], name) == 0;
+}
+
+// Render with one of the writer entry points into a malloc'd string.
+static char *render(bool (*writer)(unsigned, FILE *), unsigned x, bool *ok)
+{
+    char *buf = NULL;
+    size_t len = 0;
+    FILE *f = open_memstream(&buf, &len);
+    if (!f)
+        return NULL;
+    bool result = writer(x, f);
+    fclose(f);
+    if (ok)
+        *ok = result;
+    return buf;
+}
+
+TEST(read_labeled_booleans_stay_booleans)
+{
+    unsigned x = read_from_string("#0=#t");
+    ASSERT(x == ctx.atom_true);
+    x = read_from_string("#0=#f");
+    ASSERT(x == ctx.atom_false);
+    x = read_from_string("(#0=#f #0#)");
+    ASSERT(IS_PAIR(x) && car(x) == ctx.atom_false &&
+           car(cdr(x)) == ctx.atom_false);
+    x = read_from_string("(#1=#t #0=#1#)");
+    ASSERT(IS_PAIR(x) && car(x) == ctx.atom_true &&
+           car(cdr(x)) == ctx.atom_true);
+    PASS();
+}
+
+TEST(read_dot_inside_token_is_a_constituent)
+{
+    unsigned x = read_from_string("(-a. b)");
+    ASSERT(IS_PAIR(x) && symbol_named(car(x), "-a."));
+    ASSERT(IS_PAIR(cdr(x)) && symbol_named(car(cdr(x)), "b"));
+    ASSERT(cdr(cdr(x)) == 0);
+    x = read_from_string("(x ->. y)");
+    ASSERT(IS_PAIR(cdr(x)) && symbol_named(car(cdr(x)), "->."));
+    ASSERT(symbol_named(read_from_string("+."), "+."));
+    ASSERT(symbol_named(read_from_string("1+."), "1+."));
+    // Numbers containing '.' and the delimited dot marker are unchanged
+    ASSERT(IS_INEXACT(read_from_string("-5.")));
+    ASSERT(IS_INEXACT(read_from_string("1.e5")));
+    x = read_from_string("(1 . 2)");
+    ASSERT(IS_PAIR(x) && int_value_is(cdr(x), 2));
+    PASS();
+}
+
+TEST(read_dot_initial_identifiers)
+{
+    ASSERT(symbol_named(read_from_string("...x"), "...x"));
+    ASSERT(symbol_named(read_from_string("...."), "...."));
+    unsigned x = read_from_string("(a ...)");
+    ASSERT(IS_PAIR(cdr(x)) && symbol_named(car(cdr(x)), "..."));
+    ASSERT(cdr(cdr(x)) == 0);
+    PASS();
+}
+
+TEST(read_rejected_numeric_spellings_are_symbols)
+{
+    ASSERT(symbol_named(read_from_string("1/-2"), "1/-2"));
+    ASSERT(symbol_named(read_from_string("1/+2"), "1/+2"));
+    ASSERT(symbol_named(read_from_string("1i"), "1i"));
+    ASSERT(read_from_string("1/0") == TOK_ERROR);
+    ASSERT(read_from_string("-3/00") == TOK_ERROR);
+    ASSERT(parse_number_string("1/-2", 10) == ctx.atom_false);
+    ASSERT(parse_number_string("1i", 10) == ctx.atom_false);
+    ASSERT(parse_number_string("1/2i", 10) == ctx.atom_false);
+    ASSERT(parse_number_string("#xai", 10) == ctx.atom_false);
+    ASSERT(IS_COMPLEX(parse_number_string("+1i", 10)));
+    ASSERT(IS_COMPLEX(parse_number_string("-1/2i", 10)));
+    ASSERT(IS_COMPLEX(parse_number_string("#x+ai", 10)));
+    ASSERT(IS_COMPLEX(parse_number_string("+inf.0i", 10)));
+    PASS();
+}
+
+TEST(parse_number_any_radix)
+{
+    unsigned x = parse_number_string("10", 3);
+    ASSERT(int_value_is(x, 3));
+    x = parse_number_string("-zz", 36);
+    ASSERT(int_value_is(x, -1295));
+    x = parse_number_string("1i", 20); // 'i' is a digit in radix 20
+    ASSERT(int_value_is(x, 38));
+    x = parse_number_string("12/21", 3); // 5/7
+    ASSERT(IS_RATIONAL(x));
+    x = parse_number_string("#x10", 3); // prefix overrides the radix
+    ASSERT(int_value_is(x, 16));
+    x = parse_number_string("#i11", 7);
+    ASSERT(IS_INEXACT(x) && to_double(x) == 8.0);
+    ASSERT(parse_number_string("3", 3) == ctx.atom_false);
+    ASSERT(parse_number_string("1.5", 3) == ctx.atom_false);
+    ASSERT(parse_number_string("10", 1) == ctx.atom_false);
+    ASSERT(parse_number_string("10", 37) == ctx.atom_false);
+    PASS();
+}
+
+TEST(parse_exact_polar_is_exact)
+{
+    unsigned x = parse_number_string("#e1e2@1", 10);
+    ASSERT(is_numeric(x) && is_exact(x) && IS_COMPLEX(x));
+    x = parse_number_string("#e2@0", 10);
+    ASSERT(int_value_is(x, 2));
+    x = parse_number_string("1e2@1", 10);
+    ASSERT(IS_COMPLEX(x) && !is_exact(x));
+    PASS();
+}
+
+TEST(read_escaped_identifier_rejects_nul_scalar)
+{
+    ASSERT(read_from_string("|a\\x0;b|") == TOK_ERROR);
+    PASS();
+}
+
+TEST(read_vertical_line_is_a_delimiter)
+{
+    unsigned xs[4];
+    ASSERT_EQ(read_all_from_string("a|b|c", xs, 4), 3);
+    ASSERT(symbol_named(xs[0], "a"));
+    ASSERT(symbol_named(xs[1], "b"));
+    ASSERT(symbol_named(xs[2], "c"));
+    ASSERT_EQ(read_all_from_string("#t|x y|", xs, 4), 2);
+    ASSERT(xs[0] == ctx.atom_true && symbol_named(xs[1], "x y"));
+    PASS();
+}
+
+TEST(read_many_and_large_datum_labels)
+{
+    // Large label numbers bypass the direct index
+    unsigned x = read_from_string("(#300000=(a) #300000# #7=(b) #7#)");
+    ASSERT(IS_PAIR(x) && car(x) == car(cdr(x)));
+    ASSERT(car(cdr(cdr(x))) == car(cdr(cdr(cdr(x)))));
+    // Chained labels share one object
+    x = read_from_string("#0=#1=(#0# #1#)");
+    ASSERT(IS_PAIR(x) && car(x) == x && car(cdr(x)) == x);
+    // Labels do not leak between reads
+    ASSERT(read_from_string("#0#") == TOK_ERROR);
+    PASS();
+}
+
+TEST(write_labels_cycles_only)
+{
+    GC_GUARD;
+    unsigned shared = alloc_cons(MAKE_FIXNUM(1), 0);
+    gc_protect(&shared);
+    unsigned tail = alloc_cons(shared, 0);
+    gc_protect(&tail);
+    unsigned list = alloc_cons(shared, tail);
+    gc_protect(&list);
+
+    bool ok = false;
+    char *s = render(write_obj_port_checked, list, &ok);
+    ASSERT(ok && s && strcmp(s, "((1) (1))") == 0);
+    free(s);
+    s = render(display_obj_port_checked, list, &ok);
+    ASSERT(ok && s && strcmp(s, "((1) (1))") == 0);
+    free(s);
+    s = render(write_shared_obj_port_checked, list, &ok);
+    ASSERT(ok && s && strcmp(s, "(#0=(1) #0#)") == 0);
+    free(s);
+
+    // A cycle still gets a label from write
+    unsigned cyc = alloc_cons(MAKE_FIXNUM(1), 0);
+    gc_protect(&cyc);
+    cell_set_cdr(cyc, cyc);
+    s = render(write_obj_port_checked, cyc, &ok);
+    ASSERT(ok && s && strcmp(s, "#0=(1 . #0#)") == 0);
+    free(s);
+    // Shared but acyclic substructure next to a cycle is printed in full
+    unsigned both = alloc_cons(shared, 0);
+    gc_protect(&both);
+    both = alloc_cons(shared, both);
+    both = alloc_cons(cyc, both);
+    s = render(write_obj_port_checked, both, &ok);
+    ASSERT(ok && s && strcmp(s, "(#0=(1 . #0#) (1) (1))") == 0);
+    free(s);
+    PASS();
+}
+
+TEST(display_does_not_escape_symbols)
+{
+    unsigned sym = read_from_string("|Hello World|");
+    ASSERT(IS_SYMBOL(sym));
+    bool ok = false;
+    char *s = render(display_obj_port_checked, sym, &ok);
+    ASSERT(ok && s && strcmp(s, "Hello World") == 0);
+    free(s);
+    s = render(write_obj_port_checked, sym, &ok);
+    ASSERT(ok && s && strcmp(s, "|Hello World|") == 0);
+    free(s);
+    PASS();
+}
+
+TEST(written_dotted_symbols_read_back)
+{
+    const char *names[] = {"-a.", "+.", "->.", "1+."};
+    for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        unsigned sym = alloc();
+        CELL_TYPE(sym) = BT_ATOM;
+        CELL_ID(sym) = intern(names[i]);
+        bool ok = false;
+        char *s = render(write_obj_port_checked, sym, &ok);
+        ASSERT(ok && s);
+        unsigned back = read_from_string(s);
+        free(s);
+        ASSERT(symbol_named(back, names[i]));
+    }
+    PASS();
+}
+
+TEST(write_reports_nesting_failure)
+{
+    GC_GUARD;
+    unsigned x = 0;
+    gc_protect(&x);
+    for (int i = 0; i < 20000; i++)
+        x = alloc_cons(x, 0);
+    bool ok = true;
+    char *s = render(write_obj_port_checked, x, &ok);
+    ASSERT(!ok);
+    free(s);
+    ok = true;
+    s = render(display_obj_port_checked, x, &ok);
+    ASSERT(!ok);
+    free(s);
+    ok = true;
+    s = render(write_shared_obj_port_checked, x, &ok);
+    ASSERT(!ok);
+    free(s);
+    // The writer recovers for the next call
+    s = render(write_obj_port_checked, MAKE_FIXNUM(7), &ok);
+    ASSERT(ok && s && strcmp(s, "7") == 0);
+    free(s);
+    PASS();
+}
+
+TEST(reader_recovers_after_panic_state)
+{
+    // reader_recover_after_panic must leave a reader that treats EOF at top
+    // level as the EOF object again.
+    reader_recover_after_panic();
+    ASSERT(is_eof_object(read_from_string(" ")));
+    ASSERT(int_value_is(read_from_string("300"), 300));
     PASS();
 }
 
@@ -1269,6 +1559,20 @@ int main(void)
     RUN_TEST(reader_tracks_line);
     RUN_TEST(reader_preserves_multi_char_pushback_across_port_reads);
     RUN_TEST(read_trailing_dot_decimal);
+    RUN_TEST(read_labeled_booleans_stay_booleans);
+    RUN_TEST(read_dot_inside_token_is_a_constituent);
+    RUN_TEST(read_dot_initial_identifiers);
+    RUN_TEST(read_rejected_numeric_spellings_are_symbols);
+    RUN_TEST(parse_number_any_radix);
+    RUN_TEST(parse_exact_polar_is_exact);
+    RUN_TEST(read_escaped_identifier_rejects_nul_scalar);
+    RUN_TEST(read_vertical_line_is_a_delimiter);
+    RUN_TEST(read_many_and_large_datum_labels);
+    RUN_TEST(write_labels_cycles_only);
+    RUN_TEST(display_does_not_escape_symbols);
+    RUN_TEST(written_dotted_symbols_read_back);
+    RUN_TEST(write_reports_nesting_failure);
+    RUN_TEST(reader_recovers_after_panic_state);
 
     TEST_SUMMARY("reader");
 }

@@ -978,8 +978,7 @@ TEST(compiled_named_let)
         "  (let loop ((n 0)) "
         "    (if (= n 0) loop (loop (- n 1)))))",
         env);
-    ASSERT(IS_PAIR(result) && IS_CELL(car(result)) &&
-           CELL_TYPE(car(result)) == BT_CLOSURE);
+    ASSERT(is_bytecode_closure_object(result));
 
     result = compiled_eval_string(
         "(let ((loop (lambda (x) (+ x 1)))) "
@@ -3760,8 +3759,8 @@ TEST(eval_complex_reader_preserves_exact_components)
         "(and (exact? 1+2i) "
         "     (= (real-part 1+2i) 1) "
         "     (= (imag-part 1+2i) 2) "
-        "     (exact? 2i) "
-        "     (= (imag-part 2i) 2) "
+        "     (exact? +2i) "
+        "     (= (imag-part +2i) 2) "
         "     (exact? 1/2+3/4i) "
         "     (= (real-part 1/2+3/4i) 1/2) "
         "     (= (imag-part 1/2+3/4i) 3/4) "
@@ -7703,6 +7702,93 @@ TEST(trmc_builds_beyond_the_frame_ceiling)
     PASS();
 }
 
+// A letrec body is a scope of its own: a later internal definition must
+// already shadow a global macro of the same name when an earlier one builds
+// (and so expands) a procedure that calls it.
+TEST(eval_letrec_body_binds_internal_defines_first)
+{
+    unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
+    ASSERT(eval_string("(define-syntax foo (syntax-rules () ((_) 1)))", env) !=
+           TOK_ERROR);
+    unsigned result = eval_string(
+        "(letrec ((z 2)) (define (bar) (foo)) (define (foo) 3) (bar))", env);
+    ASSERT(is_int(result, 3));
+    result = eval_string(
+        "(letrec () (define (bar) (foo)) (define (foo) 4) (bar))", env);
+    ASSERT(is_int(result, 4));
+    PASS();
+}
+
+// Re-entering a letrec initialiser's continuation puts every earlier binding
+// back to its value at capture time (temporaries-then-assign semantics), and
+// an ordinary pass leaves 3+ bindings in their own slots.
+TEST(eval_letrec_reentry_restores_earlier_bindings)
+{
+    unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
+    unsigned result = eval_string(
+        "(let ((k #f) (n 0))"
+        "  (let ((r (letrec ((a 1) (b 2)"
+        "                    (c (call/cc (lambda (c) (set! k c) 3)))"
+        "                    (d 4))"
+        "             (set! a (+ a 10))"
+        "             (set! b (+ b 10))"
+        "             (list a b c d))))"
+        "    (set! n (+ n 1))"
+        "    (if (< n 3) (k (* n 100)) r)))",
+        env);
+    gc_protect(&result);
+    ASSERT(result != TOK_ERROR && IS_PAIR(result));
+    ASSERT(is_int(car(result), 11));
+    ASSERT(is_int(cadr(result), 12));
+    ASSERT(is_int(caddr(result), 200));
+    ASSERT(is_int(cadddr(result), 4));
+    PASS();
+}
+
+// A handler that fails before control returns to the trampoline - not a
+// procedure, a primitive rejecting the error object, a closure of the wrong
+// arity - used to be re-applied to its own error until the C stack
+// overflowed. Each case must now end the evaluation with an error.
+TEST(eval_failing_exception_handler_does_not_recurse)
+{
+    unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
+    ASSERT(eval_string("(define *current-exception-handler* 5)", env) !=
+           TOK_ERROR);
+    ASSERT(eval_string("(car 1)", env) == TOK_ERROR);
+    ASSERT(eval_string("(set! *current-exception-handler* car)", env) !=
+           TOK_ERROR);
+    ASSERT(eval_string("(car 1)", env) == TOK_ERROR);
+    ASSERT(eval_string("(set! *current-exception-handler* (lambda () 0))",
+                       env) != TOK_ERROR);
+    ASSERT(eval_string("(car 1)", env) == TOK_ERROR);
+    // A working handler still receives errors afterwards.
+    ASSERT(eval_string("(set! *current-exception-handler* (lambda (e) 7))",
+                       env) != TOK_ERROR);
+    ASSERT(eval_string("(car 1)", env) == TOK_ERROR); // returned: terminates
+    unsigned ok = eval_string("(+ 1 2)", env);
+    ASSERT(is_int(ok, 3));
+    PASS();
+}
+
+// An application whose head shadows a special-form keyword uses the binding.
+TEST(eval_shadowed_keyword_head_is_applied)
+{
+    unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
+    unsigned result = eval_string("((lambda (if) (if 1 2 3)) +)", env);
+    ASSERT(is_int(result, 6));
+    result = eval_string("(letrec ((or (lambda (a b) (* a b)))) (or 6 7))", env);
+    ASSERT(is_int(result, 42));
+    PASS();
+}
+
 // ============================================================================
 // Main
 // ============================================================================
@@ -8093,6 +8179,10 @@ int main(void)
     RUN_TEST(trmc_handles_empty_single_and_non_list_base_cases);
     RUN_TEST(trmc_fold_mode_runs_beyond_the_frame_ceiling);
     RUN_TEST(trmc_builds_beyond_the_frame_ceiling);
+    RUN_TEST(eval_letrec_body_binds_internal_defines_first);
+    RUN_TEST(eval_letrec_reentry_restores_earlier_bindings);
+    RUN_TEST(eval_failing_exception_handler_does_not_recurse);
+    RUN_TEST(eval_shadowed_keyword_head_is_applied);
 
     TEST_SUMMARY("evaluator");
 }

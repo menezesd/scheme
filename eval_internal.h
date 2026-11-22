@@ -377,16 +377,13 @@ static inline bool syntax_template_valid_at(unsigned tmpl, unsigned pattern,
         return false;
     }
     if (IS_ATOM(tmpl)) {
-        unsigned pattern_depth = 0;
-        if (syntax_pattern_var_depth(pattern, literals, ellipsis_id,
-                                     CELL_ID(tmpl), &pattern_depth) &&
-            pattern_depth < template_depth) {
-            // A bare use of an ellipsis-bound variable inserts the whole
-            // matched list (R7RS 4.3.2); only a use at deeper template
-            // depth than the pattern bound is an error
-            show_error("%s: invalid ellipsis in template", context);
-            return false;
-        }
+        // A variable may appear under more ellipses than it was matched
+        // under: in ((x y) ...) the depth-0 x is repeated alongside each y,
+        // the commonest syntax-rules idiom there is. An ellipsis whose
+        // subtemplate has no variable deep enough to iterate is rejected
+        // below (syntax_template_has_depth_var). A use under fewer ellipses
+        // than the pattern bound is accepted too and inserts the matched
+        // list, as it always has.
         return true;
     }
     if (IS_PAIR(tmpl)) {
@@ -435,10 +432,12 @@ static inline bool syntax_template_valid_at(unsigned tmpl, unsigned pattern,
     } else if (IS_VECTOR(tmpl)) {
         unsigned len = vector_len(tmpl);
         unsigned *data = vector_data_ptr(tmpl);
-        bool saw_ellipsis = false;
         for (unsigned i = 0; i < len; i++) {
             if (syntax_ellipsis_atom(data[i], ellipsis_id)) {
-                if (i == 0 || saw_ellipsis) {
+                // Like a list template, a vector may hold several
+                // <element> <ellipsis> groups (#(a ... 0 a ...)); each
+                // ellipsis needs an element of its own before it.
+                if (i == 0 || syntax_ellipsis_atom(data[i - 1], ellipsis_id)) {
                     show_error("%s: invalid ellipsis in template", context);
                     return false;
                 }
@@ -448,7 +447,6 @@ static inline bool syntax_template_valid_at(unsigned tmpl, unsigned pattern,
                     show_error("%s: invalid ellipsis in template", context);
                     return false;
                 }
-                saw_ellipsis = true;
                 continue;
             }
             unsigned elem_depth = template_depth;
@@ -693,6 +691,14 @@ static inline unsigned make_syntax_transformer(unsigned transformer_form,
 static inline bool bind_syntax_rules(unsigned bindings, unsigned def_env,
                                      unsigned closure_env, const char *context)
 {
+    // closure_env is a by-value copy: the caller rooting its own variable
+    // does not keep this one current. Every transformer after the first was
+    // built over a stale index once make_syntax_transformer had collected,
+    // so letrec-syntax siblings lost sight of each other under GC pressure.
+    // GC_GUARD also releases everything on the early returns below.
+    GC_GUARD;
+    gc_protect(&def_env);
+    gc_protect(&closure_env);
     unsigned b = bindings;
     gc_protect(&b);
     while (b) {
@@ -702,28 +708,23 @@ static inline bool bind_syntax_rules(unsigned bindings, unsigned def_env,
         if (!syntax_rules_valid(transformer_form,
                                 syntax_default_ellipsis_id(closure_env),
                                 context)) {
-            gc_unprotect(1);
             tramp_error();
             return false;
         }
         gc_protect(&name);
-        gc_protect(&def_env);
         unsigned p = make_syntax_transformer(transformer_form, closure_env);
         if (p == TOK_ERROR) {
-            gc_unprotect(3);
             tramp_error();
             return false;
         }
         gc_protect(&p);
         if (defvar(name, p, def_env) == TOK_ERROR) {
-            gc_unprotect(3);
             tramp_error();
             return false;
         }
-        gc_unprotect(3);
+        gc_unprotect(2); // p, name
         b = cdr(b);
     }
-    gc_unprotect(1);
     return true;
 }
 
@@ -751,9 +752,11 @@ bool handle_let_syntax(unsigned id, unsigned env, unsigned cont);
 bool handle_letrec_syntax(unsigned id, unsigned env, unsigned cont);
 
 // Dispatch to special form handler by keyword ID
-// Returns true if handled, false if not a special form
+// Returns true if handled, false if not a special form. On false,
+// *head_value is the head's ordinary (non-syntax) binding when it has one,
+// so the caller need not look it up again, and TOK_ERROR when it is unbound.
 bool dispatch_special_form(int64_t kw, unsigned id, unsigned env,
-                           unsigned cont);
+                           unsigned cont, unsigned *head_value);
 bool eval_note_macro_expansion(void);
 void eval_reset_macro_expansion_depth(void);
 
@@ -796,6 +799,11 @@ void handle_cont_callwithvalues(unsigned val, unsigned data, unsigned env,
                                 unsigned next);
 void handle_cont_err_return(unsigned val, unsigned data, unsigned env,
                             unsigned next);
+
+// Evaluate the body of a let, let* or letrec: a scope of its own, so its
+// leading internal definitions are bound before any of them is evaluated,
+// as apply_function does for a procedure body (defined in eval_cont.c).
+void eval_scope_body(unsigned body, unsigned env, unsigned cont);
 
 // Continuation handler dispatch table (indexed by cont_type)
 extern const cont_handler_t cont_handlers[CONT_COUNT];

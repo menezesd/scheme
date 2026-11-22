@@ -34,6 +34,7 @@ static void close_string_port(unsigned port)
     sp->source_start = 0;
     sp->source_end = 0;
     sp->source_pos_chars = 0;
+    sp->synced_source = NULL;
 }
 
 static unsigned close_port_arg(unsigned port, bool input)
@@ -54,10 +55,10 @@ static unsigned close_port_arg(unsigned port, bool input)
     file_port *fp = GET_FILE_PORT_PTR(port);
     FILE *f = file_port_well_formed(fp) ? fp->file : NULL;
     bool close_failed = false;
-    if (f)
+    if (f && fp->owns_file) {
         reader_forget_port(f);
-    if (f && fp->owns_file)
         close_failed = fclose(f) != 0;
+    }
     if (file_port_well_formed(fp)) {
         fp->file = NULL;
     }

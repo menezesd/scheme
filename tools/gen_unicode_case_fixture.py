@@ -24,8 +24,6 @@ def merge_ranges(ranges):
 def parse_unicode_data(path):
     props = {
         "decimal": [],
-        "upper": [],
-        "lower": [],
     }
     upper = {}
     lower = {}
@@ -39,10 +37,6 @@ def parse_unicode_data(path):
             category = fields[2]
             if category == "Nd":
                 props["decimal"].append((code, code))
-            elif category == "Lu":
-                props["upper"].append((code, code))
-            elif category == "Ll":
-                props["lower"].append((code, code))
             if fields[12]:
                 upper[code] = [int(fields[12], 16)]
             if fields[13]:
@@ -150,7 +144,9 @@ def main(argv):
     title.update(special_title)
     upper.update(special_upper)
     fold = parse_case_folding(case_folding)
-    core_props = parse_property_file(derived_core, ["Alphabetic"])
+    core_props = parse_property_file(
+        derived_core, ["Alphabetic", "Uppercase", "Lowercase"]
+    )
     prop_props = parse_property_file(prop_list, ["White_Space"])
 
     with open(out_path, "w", encoding="ascii") as out:
@@ -173,8 +169,8 @@ def main(argv):
             emit_property_ranges("unicode_case_alphabetic", core_props["Alphabetic"])
             emit_property_ranges("unicode_case_decimal", category_props["decimal"])
             emit_property_ranges("unicode_case_whitespace", prop_props["White_Space"])
-            emit_property_ranges("unicode_case_uppercase", category_props["upper"])
-            emit_property_ranges("unicode_case_lowercase", category_props["lower"])
+            emit_property_ranges("unicode_case_uppercase", core_props["Uppercase"])
+            emit_property_ranges("unicode_case_lowercase", core_props["Lowercase"])
             print("#endif")
         finally:
             sys.stdout = old_stdout

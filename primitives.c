@@ -683,7 +683,7 @@ static unsigned make_symbol_from_string(unsigned str, const char *name)
 
 static unsigned make_string_from_symbol(unsigned sym, const char *name)
 {
-    if (!atom_is_valid(sym)) {
+    if (!IS_SYMBOL(sym) || !atom_is_valid(sym)) {
         show_error("%s: invalid symbol", name);
         return TOK_ERROR;
     }
@@ -1231,10 +1231,14 @@ static char *object_to_string(unsigned value, const char *name)
         show_error("%s: out of memory", name);
         return NULL;
     }
-    write_obj_port(value, mem);
+    bool ok = write_obj_port_checked(value, mem);
     if (fclose(mem) != 0) {
         free(buf);
         show_error("%s: write failed", name);
+        return NULL;
+    }
+    if (!ok) { // the writer already reported why
+        free(buf);
         return NULL;
     }
     return buf;
@@ -1303,20 +1307,22 @@ static unsigned arithmetic_shift_value(unsigned value_arg,
     }
     int64_t count;
     if (bn_to_int64(count_value, &count) != 0) {
-        if (bn_sign(count_value) > 0) {
-            bn_free(count_value);
-            show_error("%s: count too large", name);
-            return TOK_ERROR;
-        }
-        bignum *value = to_bignum(value_arg);
+        bool left = bn_sign(count_value) > 0;
         bn_free(count_value);
+        bignum *value = to_bignum(value_arg);
         if (!value) {
             show_error("%s: expected exact integer", name);
             return TOK_ERROR;
         }
-        bool negative = bn_sign(value) < 0;
+        int sign = bn_sign(value);
         bn_free(value);
-        return store(negative ? -1 : 0);
+        // Zero shifts to zero in either direction; any other value shifted
+        // left this far has no representation.
+        if (left && sign != 0) {
+            show_error("%s: count too large", name);
+            return TOK_ERROR;
+        }
+        return store(sign < 0 ? -1 : 0);
     }
     bn_free(count_value);
     bignum *value = to_bignum(value_arg);
@@ -1781,6 +1787,10 @@ static unsigned null_environment(unsigned version_arg, const char *name)
 {
     if (!expect_r5rs_environment_version(version_arg, name))
         return TOK_ERROR;
+    // R5RS: the null environment holds every syntactic keyword, including
+    // the derived forms (case, do, delay, ...) that the stdlib defines.
+    if (ctx.r7rs_environment)
+        return syntax_environment(ctx.r7rs_environment);
     return empty_environment();
 }
 
@@ -1829,6 +1839,7 @@ static unsigned delete_file_value(unsigned filename_arg, const char *name)
         return TOK_ERROR;
     if (remove(filename) != 0) {
         show_error("%s: cannot delete %s", name, filename);
+        note_error_kind("file");
         return TOK_ERROR;
     }
     return 0;
@@ -1843,6 +1854,7 @@ static unsigned rename_file_value(unsigned old_arg, unsigned new_arg,
         return TOK_ERROR;
     if (rename(old_name, new_name) != 0) {
         show_error("%s: cannot rename file", name);
+        note_error_kind("file");
         return TOK_ERROR;
     }
     return 0;
@@ -2269,9 +2281,12 @@ void hash_table_gc_register_rehash(hash_table_data *ht)
 {
     if (!ht)
         return;
-    for (size_t i = 0; i < pending_rehash_len; i++)
-        if (pending_rehash[i] == ht)
-            return;
+    // No search for an earlier registration: that made every collection
+    // quadratic in the number of live tables. Each collection scans a table's
+    // cell exactly once, so duplicates only arise if two cells share one
+    // payload, and rehashing a table twice is merely redundant.
+    if (pending_rehash_len && pending_rehash[pending_rehash_len - 1] == ht)
+        return;
     if (pending_rehash_len == pending_rehash_cap) {
         size_t cap = pending_rehash_cap ? pending_rehash_cap * 2 : 16;
         hash_table_data **grown = realloc(pending_rehash, cap * sizeof(*grown));
@@ -2678,9 +2693,26 @@ static unsigned apply_transcript_primitive(unsigned prim_id, unsigned argc,
     }
 }
 
+// The kind is remembered together with the message it was noted for, so a
+// stale kind can never attach to a later, unrelated error.
+static const char *pending_error_kind;
+static char pending_error_message[sizeof(ctx.last_error)];
+
+void note_error_kind(const char *kind)
+{
+    pending_error_kind = kind;
+    snprintf(pending_error_message, sizeof(pending_error_message), "%s",
+             ctx.last_error);
+}
+
 unsigned make_error_object_c(const char *msg, unsigned env)
 {
     GC_GUARD;
+    const char *kind = "error";
+    if (pending_error_kind && msg &&
+        strcmp(msg, pending_error_message) == 0)
+        kind = pending_error_kind;
+    pending_error_kind = NULL;
     unsigned tag = lookup_silent(intern("*error-object-tag*"),
                                  exception_state_env(env));
     if (tag == TOK_ERROR)
@@ -2688,7 +2720,7 @@ unsigned make_error_object_c(const char *msg, unsigned env)
     gc_protect(&tag);
     unsigned error_kind = alloc();
     CELL_TYPE(error_kind) = BT_ATOM;
-    CELL_ID(error_kind) = intern("error");
+    CELL_ID(error_kind) = intern(kind);
     gc_protect(&error_kind);
     unsigned msg_str = make_string_copy(msg ? msg : "unknown error");
     if (msg_str == TOK_ERROR)

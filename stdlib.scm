@@ -465,13 +465,29 @@
               bit-num
               (loop (+ bit-num 1)))))))
 
+; Bit length of a nonnegative exact integer n: the least k with n < 2^k
+; (0 for 0).  Doubling and then bisecting the exponent takes O(log k) big
+; shifts and comparisons; shifting one bit at a time is quadratic in k
+; (0.65s for (expt 10 20000)).
+(define (%exact-nonnegative-bit-length n)
+  (if (= n 0)
+      0
+      (let grow ((hi 1))
+        (if (< n (arithmetic-shift 1 hi))
+            ; Invariant: 2^lo <= n < 2^hi.
+            (let search ((lo (quotient hi 2)) (hi hi))
+              (if (= (+ lo 1) hi)
+                  hi
+                  (let ((mid (quotient (+ lo hi) 2)))
+                    (if (< n (arithmetic-shift 1 mid))
+                        (search lo mid)
+                        (search mid hi)))))
+            (grow (* hi 2))))))
+
 (define (integer-length value)
   (let ((value (%require-bit-integer "integer-length" value)))
-    (let loop ((value (if (< value 0) (bitwise-not value) value))
-               (length 0))
-      (if (= value 0)
-          length
-          (loop (arithmetic-shift value -1) (+ length 1))))))
+    (%exact-nonnegative-bit-length
+     (if (< value 0) (bitwise-not value) value))))
 
 (define (bitwise-andc1 first second)
   (bitwise-and (bitwise-not (%require-bit-integer "bitwise-andc1" first))
@@ -660,19 +676,14 @@
 (define (open-output-bytevector)
   (vector 'bvout '()))
 
-(define (bytevector-chunks? chunks)
-  (and (list? chunks)
-       (let loop ((xs chunks))
-         (if (null? xs)
-             #t
-             (and (bytevector? (car xs))
-                  (loop (cdr xs)))))))
-
 (define (bytevector-output-port? x)
   (and (vector? x) (= (vector-length x) 2)
        (or (eq? (vector-ref x 0) 'bvout)
            (eq? (vector-ref x 0) 'bvout-closed))
-       (bytevector-chunks? (vector-ref x 1))))
+       ; O(1): chunks are only ever consed on by write-u8/write-bytevector.
+       (let ((chunks (vector-ref x 1)))
+         (or (null? chunks)
+             (and (pair? chunks) (bytevector? (car chunks)))))))
 
 (define (bytevector-output-port-open? x)
   (and (bytevector-output-port? x) (eq? (vector-ref x 0) 'bvout)))
@@ -1029,7 +1040,9 @@
   (raise-now obj))
 
 (define (raise-continuable obj)
-  (*current-exception-handler* obj #t))
+  (if (eq? *current-exception-handler* *default-exception-handler*)
+      (raise obj)
+      (*current-exception-handler* obj #t)))
 
 (define (error message . irritants)
   (raise (make-error-object 'error message irritants)))
@@ -1040,23 +1053,57 @@
 (define-syntax guard
   (syntax-rules ()
     ((guard (var clause ...) body ...)
-     (call/cc
-       (lambda (guard-exit)
+     ((call/cc
+       (lambda (guard-k)
          (with-exception-handler
-           (lambda (var)
-             (guard-exit
-               (guard-aux var clause ...)))
-           (lambda ()
-             body ...)))))))
+          (lambda (condition)
+            ((call/cc
+              (lambda (handler-k)
+                (guard-k
+                 (lambda ()
+                   (let ((var condition))
+                     (guard-aux
+                      (handler-k
+                       (lambda ()
+                         (raise-continuable condition)))
+                      clause ...))))))))
+          (lambda ()
+            (call-with-values
+             (lambda () body ...)
+             (lambda args
+               (guard-k
+                (lambda ()
+                  (apply values args)))))))))))))
 
 (define-syntax guard-aux
-  (syntax-rules (else)
-    ((guard-aux var (else result ...))
-     (begin result ...))
-    ((guard-aux var (test result ...))
-     (if test (begin result ...) (raise var)))
-    ((guard-aux var (test result ...) clause ...)
-     (if test (begin result ...) (guard-aux var clause ...)))))
+  (syntax-rules (else =>)
+    ((guard-aux reraise (else result1 result2 ...))
+     (begin result1 result2 ...))
+    ((guard-aux reraise (test => result))
+     (let ((temp test))
+       (if temp
+           (result temp)
+           reraise)))
+    ((guard-aux reraise (test => result) clause1 clause2 ...)
+     (let ((temp test))
+       (if temp
+           (result temp)
+           (guard-aux reraise clause1 clause2 ...))))
+    ((guard-aux reraise (test))
+     (or test reraise))
+    ((guard-aux reraise (test) clause1 clause2 ...)
+     (let ((temp test))
+       (if temp
+           temp
+           (guard-aux reraise clause1 clause2 ...))))
+    ((guard-aux reraise (test result1 result2 ...))
+     (if test
+         (begin result1 result2 ...)
+         reraise))
+    ((guard-aux reraise (test result1 result2 ...) clause1 clause2 ...)
+     (if test
+         (begin result1 result2 ...)
+         (guard-aux reraise clause1 clause2 ...)))))
 
 ;;; ============================================================================
 ;;; Case and Do macros
@@ -1190,28 +1237,6 @@
                  (error (string-append who ": circular list"))
                  (loop slow2 fast2)))))))
 
-; Like %require-proper-lists, but the LAST element of `lists` may be any
-; object (R7RS `append`'s convention: every argument but the last must be
-; a list, and the last is used as-is, becoming the final tail).
-(define (%require-proper-lists-but-last who lists)
-  (if (pair? lists)
-      (let loop ((lists lists))
-        (if (pair? (cdr lists))
-            (begin
-              (%require-proper-list who (car lists))
-              (loop (cdr lists)))
-            lists))
-      lists))
-
-(define (%require-proper-lists who lists)
-  (%require-proper-list who lists)
-  (let loop ((lists lists))
-    (if (not (null? lists))
-        (begin
-          (%require-proper-list who (car lists))
-          (loop (cdr lists)))))
-  lists)
-
 (define (list-ref lst k)
   (%require-nonnegative-integer "list-ref" k)
   (let loop ((lst lst) (k k))
@@ -1315,75 +1340,67 @@
 ; even when the selected operand is the exact one. Selection and exactness
 ; are decided separately - the operand that wins the comparison is kept as
 ; is, then coerced once at the end if any argument was inexact.
-(define (%any-inexact? x rest)
-  (if (inexact? x)
-      #t
-      (if (null? rest)
-          #f
-          (%any-inexact? (car rest) (cdr rest)))))
-
-(define (%minmax-result value x rest)
-  (if (and (exact? value) (%any-inexact? x rest))
-      (exact->inexact value)
-      value))
+;
+; NaN is treated as missing data (IEEE 754 maxNum/minNum), which is what
+; MIT/GNU Scheme does whenever a NaN meets an exact operand.  The result is
+; therefore independent of argument order and is NaN only when every
+; argument is NaN.  (MIT's flonum-only comparisons are order dependent:
+; (max 1.5 +nan.0) => +nan.0 but (max +nan.0 1.5) => 1.5.)  Among equal
+; operands max keeps the last and min the first, preserving MIT's
+; signed-zero selection: (max 0. -0.) => -0. and (min 0. -0.) => 0.
+(define (%min/max who prefer-next? x rest)
+  (define (check value)
+    (if (real? value)
+        value
+        (error (string-append who ": expected real number") value)))
+  (let loop ((best (check x)) (rest rest) (any-inexact? (inexact? x)))
+    (if (null? rest)
+        (if (and any-inexact? (exact? best)) (exact->inexact best) best)
+        (let ((next (check (car rest))))
+          (loop (cond ((nan? next) best)
+                      ((nan? best) next)
+                      ((prefer-next? best next) next)
+                      (else best))
+                (cdr rest)
+                (or any-inexact? (inexact? next)))))))
 
 (define (max x . rest)
-  (define (select x rest)
-    (if (null? rest)
-        x
-        (let ((m (select (car rest) (cdr rest))))
-          (if (> x m) x m))))
-  (%minmax-result (select x rest) x rest))
+  (%min/max "max" (lambda (best next) (not (> best next))) x rest))
 
 (define (min x . rest)
-  (define (select x rest)
-    (if (null? rest)
-        x
-        (let ((m (select (car rest) (cdr rest))))
-          ; Use the reversed comparison so NaNs and signed zeros follow the
-          ; same operand-selection behavior as MIT/GNU Scheme: keep x unless
-          ; the accumulated minimum is strictly greater than it.
-          (if (> x m) m x))))
-  (%minmax-result (select x rest) x rest))
+  (%min/max "min" (lambda (best next) (> best next)) x rest))
 
 ; Inexactness is contagious through gcd/lcm the same way it is through the
 ; other numeric operators, including via the zero short-circuits: gcd2's base
 ; case discards b, and lcm2's returns a fresh 0, so a zero operand would
 ; otherwise silently drop the inexactness of the whole call. Track it across
 ; the argument list and coerce once at the end.
-(define (gcd . args)
-  (define (gcd2 a b)
-    (if (= b 0)
-        (abs a)
-        (gcd2 b (remainder a b))))
-  (if (null? args)
-      0
-      (let loop ((result (car args))
-                 (rest (cdr args))
-                 (any-inexact? (inexact? (car args))))
-        (if (null? rest)
-            (let ((g (abs result)))
-              (if (and any-inexact? (exact? g)) (exact->inexact g) g))
-            (loop (gcd2 result (car rest))
+(define (%gcd2 a b)
+  (if (= b 0)
+      (abs a)
+      (%gcd2 b (remainder a b))))
+
+(define (%fold-exact-integers who combine initial args)
+  (let loop ((result initial) (rest args) (any-inexact? #f))
+    (if (null? rest)
+        (if any-inexact? (exact->inexact result) result)
+        (let ((x (car rest)))
+          (if (not (integer? x))
+              (error who x))
+          (let ((inexact-arg? (inexact? x)))
+            (loop (combine result (if inexact-arg? (inexact->exact x) x))
                   (cdr rest)
-                  (or any-inexact? (inexact? (car rest))))))))
+                  (or any-inexact? inexact-arg?)))))))
+
+(define (gcd . args)
+  (%fold-exact-integers "gcd: expected integer" %gcd2 0 args))
 
 (define (lcm . args)
   (define (lcm2 a b)
     (if (or (= a 0) (= b 0))
         0
-        (abs (quotient (* a b) (gcd a b)))))
-  (if (null? args)
-      1
-      (let loop ((result (car args))
-                 (rest (cdr args))
-                 (any-inexact? (inexact? (car args))))
-        (if (null? rest)
-            (let ((l (abs result)))
-              (if (and any-inexact? (exact? l)) (exact->inexact l) l))
-            (loop (lcm2 result (car rest))
-                  (cdr rest)
-                  (or any-inexact? (inexact? (car rest))))))))
+        (abs (* (quotient a (%gcd2 a b)) b))))
+  (%fold-exact-integers "lcm: expected integer" lcm2 1 args))
 
 ;;; ============================================================================
 ;;; Higher-order functions
@@ -1472,26 +1489,41 @@
     ((delay expr)
      (%make-lazy-promise (lambda () (%make-eager-promise expr))))))
 
+(define (%promise-state promise)
+  (let ((state (vector-ref promise 1)))
+    (if (eq? (car state) 'forward)
+        (let loop ((target (cdr state)))
+          (if (eq? (car target) 'forward)
+              (loop (cdr target))
+              (begin
+                (vector-set! promise 1 target)
+                target)))
+        state)))
+
 (define (force promise)
   (if (not (promise? promise))
       (error "force: not a promise")
-      ; Promises joined by delay-force share a mutable state pair. Updating
-      ; that pair memoizes every alias without retaining a chain of thunks.
       (let loop ()
-        (let ((state (vector-ref promise 1)))
+        (let ((state (%promise-state promise)))
           (if (car state)
               (cdr state)
               (let* ((next ((cdr state)))
                      ; The thunk can recursively force this same promise.
                      ; Re-read its state and preserve any value cached there.
-                     (state (vector-ref promise 1)))
+                     (state (%promise-state promise)))
                 (if (not (car state))
                     (if (not (promise? next))
                         (error "delay-force: expected a promise")
-                        (let ((next-state (vector-ref next 1)))
-                          (set-car! state (car next-state))
-                          (set-cdr! state (cdr next-state))
-                          (vector-set! next 1 state))))
+                        (let ((next-state (%promise-state next)))
+                          (if (not (eq? state next-state))
+                              (begin
+                                ; Redirect the state itself so every existing
+                                ; alias follows it after a retry or re-entry.
+                                (set-car! state (car next-state))
+                                (set-cdr! state (cdr next-state))
+                                (set-car! next-state 'forward)
+                                (set-cdr! next-state state)
+                                (vector-set! next 1 state))))))
                 (loop)))))))
 
 (define-syntax delay-force
@@ -1512,12 +1544,17 @@
     (call-with-port port proc)))
 
 ; with-input-from-file temporarily redirects current-input-port
+; The port to restore is captured each time the extent is entered, so a
+; continuation that re-enters after the outer port changed restores the
+; port that was current at that entry, not the one current at the call.
 (define (with-input-from-file filename thunk)
-  (let* ((new-port (open-input-file filename))
-         (old-port (current-input-port))
-         (returned? #f))
+  (let ((new-port (open-input-file filename))
+        (old-port #f)
+        (returned? #f))
     (dynamic-wind
-      (lambda () (set-current-input-port! new-port))
+      (lambda ()
+        (set! old-port (current-input-port))
+        (set-current-input-port! new-port))
       (lambda ()
         (call-with-values
           thunk
@@ -1531,11 +1568,13 @@
 
 ; with-output-to-file temporarily redirects current-output-port
 (define (with-output-to-file filename thunk)
-  (let* ((new-port (open-output-file filename))
-         (old-port (current-output-port))
-         (returned? #f))
+  (let ((new-port (open-output-file filename))
+        (old-port #f)
+        (returned? #f))
     (dynamic-wind
-      (lambda () (set-current-output-port! new-port))
+      (lambda ()
+        (set! old-port (current-output-port))
+        (set-current-output-port! new-port))
       (lambda ()
         (call-with-values
           thunk
@@ -1564,18 +1603,22 @@
 
 (define (%with-output-to-string thunk)
   (let ((port (open-output-string))
-        (old-port (current-output-port)))
+        (old-port #f))
     (dynamic-wind
-      (lambda () (set-current-output-port! port))
+      (lambda ()
+        (set! old-port (current-output-port))
+        (set-current-output-port! port))
       thunk
       (lambda () (set-current-output-port! old-port)))
     (get-output-string port)))
 
 (define (%with-input-from-string str thunk)
   (let ((port (open-input-string str))
-        (old-port (current-input-port)))
+        (old-port #f))
     (dynamic-wind
-      (lambda () (set-current-input-port! port))
+      (lambda ()
+        (set! old-port (current-input-port))
+        (set-current-input-port! port))
       thunk
       (lambda () (set-current-input-port! old-port)))))
 
@@ -1667,41 +1710,58 @@
         ended?
         (loop (cdr lists) (or (null-list? (car lists)) ended?)))))
 
-(define (any-null? lsts)
-  (if (null? lsts) #f (or (null? (car lsts)) (any-null? (cdr lsts)))))
-
 ; count - count elements satisfying predicate
 (define (count pred lst . more-lists)
   (if (null? lst)
       0
       (begin
         (%require-circular-lists "count" (cons lst more-lists))
-        (let loop ((lists (cons lst more-lists)) (n 0))
-          (if (%search-list-end? lists)
-              n
-              (loop (map cdr lists)
-                    (if (apply pred (map car lists))
-                        (+ n 1)
-                        n)))))))
+        (if (null? more-lists)
+            (let loop ((lst lst) (n 0))
+              (if (null-list? lst)
+                  n
+                  (loop (cdr lst) (if (pred (car lst)) (+ n 1) n))))
+            (let loop ((lists (cons lst more-lists)) (n 0))
+              (if (%search-list-end? lists)
+                  n
+                  (loop (map cdr lists)
+                        (if (apply pred (map car lists))
+                            (+ n 1)
+                            n))))))))
 
 ; fold - left-associative fold over one or more lists (SRFI-1).
 (define (fold proc init lst . more-lists)
   (%require-circular-lists "fold" (cons lst more-lists))
-  (let loop ((lists (cons lst more-lists)) (acc init))
-    (if (%fold-list-end? lists)
-        acc
-        (loop (map cdr lists)
-              (apply proc (append (map car lists) (list acc)))))))
+  (if (null? more-lists)
+      ; Single-list fast path: no per-element map/append/apply.
+      (let loop ((lst lst) (acc init))
+        (if (null-list? lst)
+            acc
+            (loop (cdr lst) (proc (car lst) acc))))
+      (let loop ((lists (cons lst more-lists)) (acc init))
+        (if (%fold-list-end? lists)
+            acc
+            (loop (map cdr lists)
+                  (apply proc (append (map car lists) (list acc))))))))
 
 ; fold-right - right-associative fold over one or more lists (SRFI-1).
 (define (fold-right proc init lst . more-lists)
   (%require-circular-lists "fold-right" (cons lst more-lists))
-  (let loop ((lists (cons lst more-lists)))
-    (if (%fold-list-end? lists)
-        init
-        (apply proc
-               (append (map car lists)
-                       (list (loop (map cdr lists))))))))
+  (if (null? more-lists)
+      ; Single list: fold over the reversed list in constant stack depth
+      ; (the recursive form overflowed the VM stack near 400k elements).
+      ; Every cdr is still read before proc is first called.
+      (let loop ((rev (reverse (%require-proper-list "fold-right" lst)))
+                 (acc init))
+        (if (null? rev)
+            acc
+            (loop (cdr rev) (proc (car rev) acc))))
+      (let loop ((lists (cons lst more-lists)))
+        (if (%fold-list-end? lists)
+            init
+            (apply proc
+                   (append (map car lists)
+                           (list (loop (map cdr lists)))))))))
 
 ; reduce - like fold but uses first element as initial value; returns
 ; ridentity for an empty list (SRFI-1 signature: (reduce f ridentity list))
@@ -1990,17 +2050,13 @@
                   (find-entry (cdr a) (cdr b) (+ prefix 1))))
             (detect slow2 fast2)))))))
 
-; Internal users need the same cycle-safe semantics.
-(define (%pair-count lst)
-  (count-pairs lst))
-
 ; take-right - return last n elements. SRFI-1/MIT permit a possibly
 ; improper (dotted) list, returning the final non-nil cdr along with the
 ; last n elements if n reaches all the way to it.
 (define (take-right lst n)
   (%require-finite-list "take-right" lst)
   (%require-nonnegative-integer "take-right" n)
-  (let ((len (%pair-count lst)))
+  (let ((len (count-pairs lst)))
     (if (> n len)
         (error "take-right: list is shorter than requested count")
         (if (= n len)
@@ -2011,7 +2067,7 @@
 (define (drop-right lst n)
   (%require-finite-list "drop-right" lst)
   (%require-nonnegative-integer "drop-right" n)
-  (let ((len (%pair-count lst)))
+  (let ((len (count-pairs lst)))
     (if (> n len)
         (error "drop-right: list is shorter than requested count")
         (if (= n len)
@@ -2088,22 +2144,36 @@
       init
       (begin
         (%require-circular-lists "pair-fold-right" (cons lst more-lists))
-        (let loop ((lists (cons lst more-lists)))
-          (if (%search-list-end? lists)
-              init
-              (apply proc
-                     (append lists
-                             (list (loop (map cdr lists))))))))))
+        (if (null? more-lists)
+            ; Single list: collect the pairs first (reading every cdr before
+            ; proc runs, as the recursive form did), then fold right-to-left
+            ; in constant stack depth.
+            (let collect ((tail lst) (pairs '()))
+              (if (null-list? tail)
+                  (let loop ((pairs pairs) (acc init))
+                    (if (null? pairs)
+                        acc
+                        (loop (cdr pairs) (proc (car pairs) acc))))
+                  (collect (cdr tail) (cons tail pairs))))
+            (let loop ((lists (cons lst more-lists)))
+              (if (%search-list-end? lists)
+                  init
+                  (apply proc
+                         (append lists
+                                 (list (loop (map cdr lists)))))))))))
 
 ; reduce-right - like reduce but right-associative
 (define (reduce-right proc init lst)
   (%require-proper-list "reduce-right" lst)
   (if (null? lst)
       init
-      (let loop ((rest lst))
-        (if (null? (cdr rest))
-            (car rest)
-            (proc (car rest) (loop (cdr rest)))))))
+      ; Iterate over the reversed list: same call order as the recursive
+      ; definition, in constant stack depth.
+      (let ((rev (reverse lst)))
+        (let loop ((acc (car rev)) (rest (cdr rev)))
+          (if (null? rest)
+              acc
+              (loop (proc (car rest) acc) (cdr rest)))))))
 
 ; unfold - generate list from seed using p, f, g
 (define (unfold p f g seed . maybe-tail-gen)
@@ -2186,12 +2256,17 @@
           (else (loop (cdr lst))))))
 
 ; list-index - return index of first element satisfying pred
-(define (list-index pred lst)
-  (let loop ((lst lst) (i 0))
-    (cond ((null? lst) #f)
-          ((not (pair? lst)) (error "list-index: improper list"))
-          ((pred (car lst)) i)
-          (else (loop (cdr lst) (+ i 1))))))
+(define (list-index pred lst . more-lists)
+  (if (null? more-lists)
+      (let loop ((lst lst) (i 0))
+        (cond ((null? lst) #f)
+              ((not (pair? lst)) (error "list-index: improper list"))
+              ((pred (car lst)) i)
+              (else (loop (cdr lst) (+ i 1)))))
+      (let loop ((lists (cons lst more-lists)) (i 0))
+        (cond ((%search-list-end? lists) #f)
+              ((apply pred (map car lists)) i)
+              (else (loop (map cdr lists) (+ i 1)))))))
 
 ; take-while - return longest prefix satisfying pred
 (define (take-while pred lst)
@@ -2248,7 +2323,7 @@
                    (if (null? maybe-eq) equal? (car maybe-eq)))))
           (let loop ((lst lst) (seen '()))
             (cond ((null? lst) (reverse seen))
-                  ((any (lambda (y) (eq (car lst) y)) seen)
+                  ((any (lambda (y) (eq y (car lst))) seen)
                    (loop (cdr lst) seen))
                   (else (loop (cdr lst) (cons (car lst) seen)))))))))
 
@@ -2284,11 +2359,9 @@
           ((elt= (car lst) elt) #t)
           (else (loop (cdr lst))))))
 
+; (elt= a b) with a from LEFT and b from RIGHT (SRFI-1 lset<=, lset=).
 (define (%lset-subset? left right elt=)
-  (let loop ((left left))
-    (or (null? left)
-        (and (%lset-member? (car left) right elt=)
-             (loop (cdr left))))))
+  (every (lambda (a) (any (lambda (b) (elt= a b)) right)) left))
 
 (define (%lset-require-lists who lists)
   (%require-proper-list who lists)
@@ -2311,7 +2384,8 @@
       (let loop ((lists lists))
         (or (null? (cdr lists))
             (and (%lset-subset? (car lists) (cadr lists) elt=)
-                 (%lset-subset? (cadr lists) (car lists) elt=)
+                 (%lset-subset? (cadr lists) (car lists)
+                                (lambda (b a) (elt= a b)))
                  (loop (cdr lists)))))))
 
 (define (lset-adjoin elt= list . elts)
@@ -2351,7 +2425,7 @@
    (lambda (elt)
      (let loop ((lists rest))
        (or (null? lists)
-           (and (%lset-member? elt (car lists) elt=)
+           (and (any (lambda (b) (elt= elt b)) (car lists))
                 (loop (cdr lists))))))
    first))
 
@@ -2362,7 +2436,7 @@
    (lambda (elt)
      (let loop ((lists rest))
        (or (null? lists)
-           (and (not (%lset-member? elt (car lists) elt=))
+           (and (not (any (lambda (b) (elt= elt b)) (car lists)))
                 (loop (cdr lists))))))
    first))
 
@@ -2411,7 +2485,7 @@
 (define (drop-right! lst n)
   (%require-finite-list "drop-right!" lst)
   (%require-nonnegative-integer "drop-right!" n)
-  (let ((len (%pair-count lst)))
+  (let ((len (count-pairs lst)))
     (if (> n len)
         (error "drop-right!: list is shorter than requested count")
         (take! lst (- len n)))))
@@ -2440,18 +2514,21 @@
               (%require-finite-list "append!" (car rest))
               (validate (cdr rest)))))
       lists)
-  (if (null? lists)
-      '()
-      (let loop ((result '()) (lists lists))
-        (cond ((null? lists) result)
-              ((null? (car lists)) (loop result (cdr lists)))
-              ((null? result) (loop (car lists) (cdr lists)))
-              (else
-               (let attach ((tail result))
-                 (if (pair? (cdr tail))
-                     (attach (cdr tail))
-                     (set-cdr! tail (car lists))))
-               (loop result (cdr lists)))))))
+  ; Remember the last pair of the result so each argument is walked once.
+  (let skip ((lists lists))
+    (cond ((null? lists) '())
+          ((null? (car lists)) (skip (cdr lists)))
+          ((not (pair? (car lists)))
+           (if (null? (cdr lists)) (car lists) (skip (cdr lists))))
+          (else
+           (let ((result (car lists)))
+             (let attach ((last (last-pair result)) (rest (cdr lists)))
+               (cond ((null? rest) result)
+                     ((null? (car rest)) (attach last (cdr rest)))
+                     (else
+                      (set-cdr! last (car rest))
+                      (attach (if (pair? (car rest)) (last-pair (car rest)) last)
+                              (cdr rest))))))))))
 
 ; concatenate! - destructive concatenate
 (define (concatenate! list-of-lists)
@@ -2649,6 +2726,11 @@
         (error "dynamic-wind: circular wind stack")
         (let loop ((l lst) (n 0))
           (if (null? l) n (loop (cdr l) (+ n 1))))))
+  ; Every before/after thunk runs in the dynamic extent OUTSIDE its own
+  ; frame (R7RS 6.10): *wind-stack* is the frame's tail while the thunk
+  ; runs.  Leaving the frame on the stack made a continuation escape from
+  ; an after thunk unwind through that same frame and re-run the thunk.
+  ;
   ; Run after-thunks for the n innermost (head) frames of `from` that have
   ; no counterpart in `to` because `to` is shorter. Innermost-first order
   ; (head to tail) is correct for unwinding.
@@ -2656,7 +2738,7 @@
     (if (= n 0)
         from
         (begin
-          (set! *wind-stack* from)
+          (set! *wind-stack* (cdr from))
           ((cdar from))
           (unwind-extra (cdr from) (- n 1)))))
   ; Run before-thunks for the n innermost (head) frames of `to` that have
@@ -2668,7 +2750,7 @@
     (if (= n 0)
         to
         (let ((rest (rewind-extra (cdr to) (- n 1))))
-          (set! *wind-stack* to)
+          (set! *wind-stack* (cdr to))
           ((caar to))
           rest)))
   ; `from`/`to` now have equal length. Find the common tail: unwind from's
@@ -2678,10 +2760,10 @@
     (if (eq? from to)
         to
         (begin
-          (set! *wind-stack* from)
+          (set! *wind-stack* (cdr from))
           ((cdar from))
           (let ((common (converge (cdr from) (cdr to))))
-            (set! *wind-stack* to)
+            (set! *wind-stack* (cdr to))
             ((caar to))
             common))))
   (unless (eq? from to)
@@ -2700,10 +2782,13 @@
 ; behaves like a non-local exit, so before/after thunks must run).
 ; emergency-exit is the escape hatch that skips them.
 (define (exit . args)
-  (do-wind *wind-stack* '())
-  (if (null? args)
-      (primitive-exit 0)
-      (apply primitive-exit args)))
+  (let ((code (cond ((null? args) 0)
+                    ((eq? (car args) #t) 0)
+                    ((eq? (car args) #f) 1)
+                    ((exact-integer? (car args)) (car args))
+                    (else 1))))
+    (do-wind *wind-stack* '())
+    (primitive-exit code)))
 
 ; dynamic-wind: establish before/after thunks around body
 (define dynamic-wind
@@ -2812,8 +2897,9 @@
 
 (define-syntax parameterize
   (syntax-rules ()
+    ; A parameterize body is a body: internal definitions stay local.
     ((parameterize () body ...)
-     (begin body ...))
+     (let () body ...))
     ((parameterize ((param value) ...) body ...)
      (%call-with-parameterization (list param ...) (list value ...)
                                  (lambda () body ...)))))
@@ -3609,6 +3695,39 @@
   (%make-char-set 'predicate
                   (lambda (code) (not (code-point-in-set? code set)))))
 
+; Set operations whose result is bounded by a finite (range-based) argument
+; enumerate that argument's members and stay range-based.  A predicate
+; result would make every later enumeration (char-set-size, char-set->list,
+; char-set=, ...) test all 0x110000 code points.
+(define (%char-set-finite? set)
+  (eq? (vector-ref set 1) 'ranges))
+
+(define (%char-set-ranges-size ranges)
+  (let loop ((ranges ranges) (n 0))
+    (if (null? ranges)
+        n
+        (loop (cdr ranges) (+ n (- (cdar ranges) (caar ranges)))))))
+
+; The members of the sorted range list RANGES that satisfy KEEP?, as a
+; range-based character set.
+(define (%char-set-filter-ranges ranges keep?)
+  (let loop ((ranges ranges) (out '()) (start #f) (end #f))
+    (if (null? ranges)
+        (%make-char-set 'ranges
+                        (reverse (if start (cons (cons start end) out) out)))
+        (let scan ((code (caar ranges)) (out out) (start start) (end end))
+          (cond ((= code (cdar ranges))
+                 (loop (cdr ranges) out start end))
+                ((not (keep? code))
+                 (scan (+ code 1) out start end))
+                ((and start (= code end))
+                 (scan (+ code 1) out start (+ code 1)))
+                (else
+                 (scan (+ code 1)
+                       (if start (cons (cons start end) out) out)
+                       code
+                       (+ code 1))))))))
+
 (define (char-set-union . sets)
   (%require-proper-list "char-set-union" sets)
   (if (null? sets)
@@ -3616,10 +3735,19 @@
       (begin
         (for-each (lambda (set) (%require-char-set "char-set-union" set))
                   sets)
+        ; A union of finite sets is the merge of their range lists.
+        (if (every %char-set-finite? sets)
+            (%make-char-set
+             'ranges
+             (fold (lambda (set acc)
+                     (fold (lambda (r acc)
+                             (%char-set-range-insert acc (car r) (cdr r)))
+                           acc (vector-ref set 2)))
+                   '() sets))
         (%make-char-set 'predicate
                         (lambda (code)
                           (any (lambda (set) (code-point-in-set? code set))
-                               sets))))))
+                               sets)))))))
 
 (define (char-set-intersection . sets)
   (%require-proper-list "char-set-intersection" sets)
@@ -3628,21 +3756,43 @@
       (begin
         (for-each (lambda (set) (%require-char-set "char-set-intersection" set))
                   sets)
-        (%make-char-set 'predicate
-                        (lambda (code)
-                          (every (lambda (set) (code-point-in-set? code set))
-                                 sets))))))
+        (let ((finite (filter %char-set-finite? sets)))
+          (if (null? finite)
+              (%make-char-set 'predicate
+                              (lambda (code)
+                                (every (lambda (set)
+                                         (code-point-in-set? code set))
+                                       sets)))
+              ; Enumerate the smallest finite argument.
+              (let ((smallest
+                     (fold (lambda (set best)
+                             (if (< (%char-set-ranges-size (vector-ref set 2))
+                                    (%char-set-ranges-size (vector-ref best 2)))
+                                 set
+                                 best))
+                           (car finite)
+                           (cdr finite))))
+                (%char-set-filter-ranges
+                 (vector-ref smallest 2)
+                 (lambda (code)
+                   (every (lambda (set)
+                            (or (eq? set smallest)
+                                (code-point-in-set? code set)))
+                          sets)))))))))
 
 (define (char-set-difference first . rest)
   (%require-char-set "char-set-difference" first)
   (for-each (lambda (set) (%require-char-set "char-set-difference" set))
             rest)
-  (%make-char-set 'predicate
-                  (lambda (code)
-                    (and (code-point-in-set? code first)
-                         (every (lambda (set)
-                                 (not (code-point-in-set? code set)))
-                                rest)))))
+  (let ((keep? (lambda (code)
+                 (every (lambda (set) (not (code-point-in-set? code set)))
+                        rest))))
+    (if (%char-set-finite? first)
+        (%char-set-filter-ranges (vector-ref first 2) keep?)
+        (%make-char-set 'predicate
+                        (lambda (code)
+                          (and (code-point-in-set? code first)
+                               (keep? code)))))))
 
 (define (char-set-union* sets)
   (%require-proper-list "char-set-union*" sets)
@@ -4425,14 +4575,21 @@
 
 (define %hash-table-ref-primitive hash-table-ref)
 
-(define (hash-table-ref table key . maybe-get-default)
-  (if (> (length maybe-get-default) 1)
+; (hash-table-ref table key [fail [succeed]]) - SRFI-69/125 and MIT: fail is
+; a thunk called when key is absent; succeed, if given, receives the value.
+(define (hash-table-ref table key . options)
+  (if (> (length options) 2)
       (error "hash-table-ref: too many arguments"))
-  (if (hash-table-exists? table key)
-      (%hash-table-ref-primitive table key)
-      (if (null? maybe-get-default)
-          (%hash-table-ref-primitive table key)
-          ((car maybe-get-default)))))
+  (let ((fail (if (pair? options) (car options) #f))
+        (succeed (if (and (pair? options) (pair? (cdr options)))
+                     (cadr options)
+                     #f)))
+    (if (hash-table-exists? table key)
+        (let ((value (%hash-table-ref-primitive table key)))
+          (if succeed (succeed value) value))
+        (if fail
+            (fail)
+            (%hash-table-ref-primitive table key)))))
 
 (define (alist->hash-table alist . args)
   (if (not (null? args))
@@ -4813,7 +4970,8 @@
             (not (string? suffix)))
         (error "string-joiner: infix, prefix, and suffix must be strings"))
     (lambda strings
-      (string-join strings infix prefix suffix))))
+      (string-join (map (lambda (s) (string-append prefix s suffix)) strings)
+                   infix))))
 
 (define (string-joiner* . args)
   (let ((joiner (apply string-joiner args)))
@@ -5110,14 +5268,20 @@
 (define (exact-integer-sqrt n)
   (if (not (exact-nonnegative-integer? n))
       (error "exact-integer-sqrt: expected exact nonnegative integer" n)
-      (let loop ((lo 0) (hi (+ n 1)))
-        (if (<= (- hi lo) 1)
-            (values lo (- n (* lo lo)))
-            (let* ((mid (quotient (+ lo hi) 2))
-                   (sq (* mid mid)))
-              (if (<= sq n)
-                  (loop mid hi)
-                  (loop lo mid)))))))
+      (if (< n 2)
+          (values n 0)
+          ; Integer Newton iteration from 2^ceil(bits/2), which is >= sqrt(n).
+          ; From an overestimate the iterates decrease monotonically to
+          ; floor(sqrt(n)); stop at the first one that does not decrease.
+          ; (Bisection over [0, n] needed O(bits) bignum squarings and took
+          ; over a minute for (expt 10 20000).)
+          (let loop ((x (arithmetic-shift
+                         1
+                         (quotient (+ (%exact-nonnegative-bit-length n) 1) 2))))
+            (let ((y (quotient (+ x (quotient n x)) 2)))
+              (if (>= y x)
+                  (values x (- n (* x x)))
+                  (loop y)))))))
 
 (define (exact-nonnegative-integer? x)
   (and (exact-integer? x) (>= x 0)))
@@ -5279,9 +5443,9 @@
 (define (log2p1 z) (/ (log1p z) (log 2)))
 (define (log10p1 z) (/ (log1p z) (log 10)))
 (define (log1mexp x)
-  (if (<= x (- (log 2)))
-      (log1p (- (exp x)))
-      (log (- (expm1 x)))))
+  (cond ((<= x (- (log 2))) (log1p (- (exp x))))
+        ((zero? x) -inf.0)
+        (else (log (- (expm1 x))))))
 
 (define (versin z) (- 1 (cos z)))
 (define (exsec z) (/ (versin z) (cos z)))
@@ -5336,61 +5500,15 @@
 (define (conjugate z)
   (make-rectangular (real-part z) (- (imag-part z))))
 
+;; Unicode Nd digits occur in contiguous runs that start at digit zero, so a
+;; digit's value is its offset from the start of its run, modulo 10 (the
+;; mathematical digits U+1D7CE..U+1D7FF are five adjacent runs).
 (define (digit-value ch)
-  (let ((n (char->integer ch)))
-    (cond
-      ((and (>= n (char->integer #\0)) (<= n (char->integer #\9)))
-       (- n (char->integer #\0)))
-      ((and (>= n 1632) (<= n 1641)) (- n 1632))
-      ((and (>= n 1776) (<= n 1785)) (- n 1776))
-      ((and (>= n 2406) (<= n 2415)) (- n 2406))
-      ((and (>= n 2534) (<= n 2543)) (- n 2534))
-      ((and (>= n 2662) (<= n 2671)) (- n 2662))
-      ((and (>= n 2790) (<= n 2799)) (- n 2790))
-      ((and (>= n 2918) (<= n 2927)) (- n 2918))
-      ((and (>= n 3046) (<= n 3055)) (- n 3046))
-      ((and (>= n 3174) (<= n 3183)) (- n 3174))
-      ((and (>= n 3302) (<= n 3311)) (- n 3302))
-      ((and (>= n 3430) (<= n 3439)) (- n 3430))
-      ((and (>= n 3664) (<= n 3673)) (- n 3664))
-      ((and (>= n 3792) (<= n 3801)) (- n 3792))
-      ((and (>= n 3872) (<= n 3881)) (- n 3872))
-      ((and (>= n 4160) (<= n 4169)) (- n 4160))
-      ((and (>= n 6112) (<= n 6121)) (- n 6112))
-      ((and (>= n 6160) (<= n 6169)) (- n 6160))
-      ((and (>= n 6470) (<= n 6479)) (- n 6470))
-      ((and (>= n 6608) (<= n 6617)) (- n 6608))
-      ((and (>= n 6672) (<= n 6681)) (- n 6672))
-      ((and (>= n 6784) (<= n 6793)) (- n 6784))
-      ((and (>= n 6800) (<= n 6809)) (- n 6800))
-      ((and (>= n 6992) (<= n 7001)) (- n 6992))
-      ((and (>= n 7088) (<= n 7097)) (- n 7088))
-      ((and (>= n 7232) (<= n 7241)) (- n 7232))
-      ((and (>= n 7248) (<= n 7257)) (- n 7248))
-      ((and (>= n 42528) (<= n 42537)) (- n 42528))
-      ((and (>= n 43216) (<= n 43225)) (- n 43216))
-      ((and (>= n 43264) (<= n 43273)) (- n 43264))
-      ((and (>= n 43472) (<= n 43481)) (- n 43472))
-      ((and (>= n 43504) (<= n 43513)) (- n 43504))
-      ((and (>= n 43600) (<= n 43609)) (- n 43600))
-      ((and (>= n 44016) (<= n 44025)) (- n 44016))
-      ((and (>= n 65296) (<= n 65305)) (- n 65296))
-      ;; Keep newer Unicode decimal ranges in sync with char-numeric?.
-      ((and (>= n #x07C0) (<= n #x07C9)) (- n #x07C0))
-      ((and (>= n #x1946) (<= n #x194F)) (- n #x1946))
-      ((and (>= n #x19D0) (<= n #x19D9)) (- n #x19D0))
-      ((and (>= n #x1A80) (<= n #x1A89)) (- n #x1A80))
-      ((and (>= n #x1A90) (<= n #x1A99)) (- n #x1A90))
-      ((and (>= n #x1BB0) (<= n #x1BB9)) (- n #x1BB0))
-      ((and (>= n #x1C40) (<= n #x1C49)) (- n #x1C40))
-      ((and (>= n #x1C50) (<= n #x1C59)) (- n #x1C50))
-      ((and (>= n #x1D7CE) (<= n #x1D7FF)) (- n #x1D7CE))
-      ((and (>= n #x1E140) (<= n #x1E149)) (- n #x1E140))
-      ((and (>= n #x1E2F0) (<= n #x1E2F9)) (- n #x1E2F0))
-      ((and (>= n #x1E4F0) (<= n #x1E4F9)) (- n #x1E4F0))
-      ((and (>= n #x1E950) (<= n #x1E959)) (- n #x1E950))
-      ((and (>= n #x1FBF0) (<= n #x1FBF9)) (- n #x1FBF0))
-      (else #f))))
+  (and (char-numeric? ch)
+       (let loop ((n (char->integer ch)) (k 0))
+         (if (and (> n 0) (< k 50) (char-numeric? (integer->char (- n 1))))
+             (loop (- n 1) (+ k 1))
+             (modulo k 10)))))
 
 (define (char-alphanumeric? ch)
   (if (not (char? ch))
@@ -5431,10 +5549,11 @@
     (if (or (not (integer? digit)) (not (exact? digit))
             (< digit 0) (>= digit radix))
         (error "digit->char: digit out of range"))
+    ; MIT/GNU Scheme produces lower-case letters for digits above 9.
     (integer->char
      (if (< digit 10)
          (+ (char->integer #\0) digit)
-         (+ (char->integer #\A) (- digit 10))))))
+         (+ (char->integer #\a) (- digit 10))))))
 
 (define (char->name ch)
   (if (not (char? ch))
@@ -5688,13 +5807,7 @@
                   (string-length str)
                   (cadr rest))))
     (%require-string-range "string->vector" str start end)
-    (let ((vec (make-vector (- end start))))
-    (let loop ((i start) (j 0))
-      (if (< i end)
-          (begin
-            (vector-set! vec j (string-ref str i))
-            (loop (+ i 1) (+ j 1)))
-          vec)))))
+    (list->vector (string->list str start end))))
 
 (define (symbol=? first second . rest)
   (and (symbol? first)
@@ -5714,13 +5827,7 @@
                   (vector-length vec)
                   (cadr rest))))
     (%require-vector-range "vector->string" vec start end)
-    (let ((str (make-string (- end start))))
-    (let loop ((i start) (j 0))
-      (if (< i end)
-          (begin
-            (string-set! str j (vector-ref vec i))
-            (loop (+ i 1) (+ j 1)))
-          str)))))
+    (string-copy (list->string (vector->list vec start end)))))
 
 ;;; ============================================================================
 ;;; SRFI-2: and-let* (guarded evaluation)

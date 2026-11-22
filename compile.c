@@ -39,17 +39,55 @@ static void emit2(compile_ctx *cctx, unsigned op, unsigned arg);
 static void emit3(compile_ctx *cctx, unsigned op, unsigned arg1,
                   unsigned arg2);
 
+// True if a compile-time environment frame (vars . vals) binds var_id.
+static bool compile_frame_binds(unsigned frame, int64_t var_id)
+{
+    if (!IS_PAIR(frame))
+        return false;
+    unsigned vars = car(frame);
+    for (unsigned guard = 0; vars && guard < 1000000; guard++) {
+        if (IS_ATOM(vars))
+            return CELL_ID(vars) == var_id; // rest parameter
+        if (!IS_PAIR(vars))
+            return false;
+        unsigned var = car(vars);
+        if (IS_ATOM(var) && CELL_ID(var) == var_id)
+            return true;
+        vars = cdr(vars);
+    }
+    return false;
+}
+
 static int find_stack_local_slot(compile_ctx *cctx, int64_t var_id)
 {
     if (cctx->num_locals <= 0)
         return -1;
 
+    int slot = -1;
     for (int i = 0; i < cctx->num_locals; i++) {
-        if (cctx->local_ids[i] == var_id)
-            return i;
+        if (cctx->local_ids[i] == var_id) {
+            slot = i;
+            break;
+        }
     }
+    if (slot < 0)
+        return -1;
 
-    return -1;
+    // Every scope opened inside the body (letrec, internal defines, an
+    // inlined lambda, ...) pushes a compile-env frame above the parameter
+    // frame. A binding of the same name in one of them shadows the
+    // parameter, and its value lives in that runtime frame, not the slot.
+    unsigned len = 0;
+    for (unsigned e = cctx->env; IS_PAIR(e); e = cdr(e))
+        len++;
+    unsigned e = cctx->env;
+    for (unsigned i = 0; len > cctx->locals_env_len &&
+                         i < len - cctx->locals_env_len && IS_PAIR(e);
+         i++, e = cdr(e)) {
+        if (compile_frame_binds(car(e), var_id))
+            return -1;
+    }
+    return slot;
 }
 
 static void emit_local_get_slot(compile_ctx *cctx, int slot)
@@ -75,13 +113,28 @@ static bool builtin_keyword_unbound(int64_t kw, unsigned env)
 // OP_PUSHENV allocates an unrelated fresh frame at runtime (once per
 // invocation), so a cell resolved against the compile-time frame is never
 // the one that execution actually updates.
+static bool binding_cell_in_global_frame(unsigned env, int64_t var_id,
+                                         unsigned target_cell)
+{
+    if (!IS_PAIR(env) || !target_cell)
+        return false;
+    while (IS_PAIR(env) && cdr(env))
+        env = cdr(env);
+    return env_find_binding_cell(var_id, env) == target_cell;
+}
+
+// The interaction and standard-library environments are program-lifetime
+// objects too. A macro defined there (case-lambda, say) and used inside an
+// (environment ...) that lacks its helpers must still reach the helpers it
+// was defined against, not look them up by name in the use-site environment.
 static bool binding_cell_is_stable_global(compile_ctx *cctx, int64_t var_id,
                                           unsigned target_cell)
 {
-    unsigned global_env = cctx->env;
-    while (IS_PAIR(global_env) && cdr(global_env))
-        global_env = cdr(global_env);
-    return env_find_binding_cell(var_id, global_env) == target_cell;
+    return binding_cell_in_global_frame(cctx->env, var_id, target_cell) ||
+           binding_cell_in_global_frame(ctx.global_environment, var_id,
+                                        target_cell) ||
+           binding_cell_in_global_frame(ctx.r7rs_environment, var_id,
+                                        target_cell);
 }
 
 // ============================================================================
@@ -223,6 +276,26 @@ static bool captured_by_inner_lambda(unsigned expr, int64_t var_id, unsigned env
         // outer binding. Check the full lambda form so shadowing parameters
         // are handled by contains_reference.
         if (kw == ctx.kw_lambda && builtin_keyword_unbound(ctx.kw_lambda, env))
+            return contains_reference(expr, var_id);
+        // (define (name . formals) body ...) builds a closure without a
+        // literal lambda; treat it as (lambda formals body ...).
+        if (kw == ctx.kw_define && builtin_keyword_unbound(ctx.kw_define, env) &&
+            IS_PAIR(cdr(expr)) && IS_PAIR(cadr(expr))) {
+            for (unsigned p = cdr(cadr(expr)); p; p = IS_PAIR(p) ? cdr(p) : 0) {
+                if (IS_ATOM(p))
+                    return CELL_ID(p) == var_id ? false
+                                                : contains_reference(cddr(expr), var_id);
+                if (!IS_PAIR(p))
+                    break;
+                if (IS_ATOM(car(p)) && CELL_ID(car(p)) == var_id)
+                    return false; // shadowed by a formal
+            }
+            return contains_reference(cddr(expr), var_id);
+        }
+        // A named let built in (when let is not a macro) compiles its body
+        // as a closure, so any reference in the form counts.
+        if (kw == ctx.kw_let && builtin_keyword_unbound(ctx.kw_let, env) &&
+            IS_PAIR(cdr(expr)) && IS_ATOM(cadr(expr)) && cadr(expr))
             return contains_reference(expr, var_id);
         // let/let*/letrec binding initializers may create closures over this
         // variable, so scan the whole form for nested lambdas. Direct
@@ -833,6 +906,22 @@ static unsigned collect_template_free_vars(unsigned tmpl, unsigned pattern_vars,
                 tmpl, pattern_vars, collected, ellipsis,
                 head_id == ctx.kw_letstar, head_id == ctx.kw_letrec, env);
         }
+        if (template_case_form(tmpl)) {
+            // A case clause's datum list is quoted data: an alias for a
+            // datum such as + would change what the clause matches.
+            collected = collect_template_free_vars(car(tmpl), pattern_vars,
+                                                   collected, ellipsis, env);
+            collected = collect_template_free_vars(cadr(tmpl), pattern_vars,
+                                                   collected, ellipsis, env);
+            unsigned c = cddr(tmpl);
+            gc_protect(&c);
+            for (; c; c = cdr(c)) {
+                if (IS_PAIR(car(c)))
+                    collected = collect_template_free_vars(
+                        cdr(car(c)), pattern_vars, collected, ellipsis, env);
+            }
+            return collected;
+        }
         // Templates may contain very wide flat forms.  Their cdr spine is
         // data, not structural nesting, so do not consume a C stack frame for
         // each element while collecting definition-site bindings.
@@ -851,17 +940,7 @@ static unsigned collect_template_free_vars(unsigned tmpl, unsigned pattern_vars,
         }
     }
 
-    if (IS_VECTOR(tmpl)) {
-        unsigned len = vector_len(tmpl);
-        for (unsigned i = 0; i < len; i++) {
-            // Refresh data pointer each iteration - GC may have moved tmpl
-            unsigned *data = vector_data_ptr(tmpl);
-            collected = collect_template_free_vars(data[i],
-                                                   pattern_vars, collected,
-                                                   ellipsis, env);
-        }
-        return collected;
-    }
+    // A vector is self-evaluating data; nothing in it refers to a binding.
 
     return collected;
 }
@@ -928,7 +1007,10 @@ static unsigned rename_template_vars_quasiquote(unsigned tmpl,
                 gc_unprotect(5);
                 return TOK_ERROR;
             }
-            if (new_car != old_car)
+            // Compare with the cell as it is now, not old_car: a collection
+            // in the call moves the original and can hand its old index to
+            // the renamed copy, which then looked unchanged and was dropped.
+            if (new_car != car(tmpl))
                 changed = true;
             gc_protect(&new_car);
             list_append(&result, &result_tail, new_car);
@@ -942,7 +1024,7 @@ static unsigned rename_template_vars_quasiquote(unsigned tmpl,
                     gc_unprotect(5);
                     return TOK_ERROR;
                 }
-                if (new_tail != next)
+                if (new_tail != cdr(tmpl))
                     changed = true;
                 if (!changed) {
                     gc_unprotect(5);
@@ -964,7 +1046,7 @@ static unsigned rename_template_vars_quasiquote(unsigned tmpl,
                         gc_unprotect(5);
                         return TOK_ERROR;
                     }
-                    if (new_tail != next)
+                    if (new_tail != cdr(tmpl))
                         changed = true;
                     if (!changed) {
                         gc_unprotect(5);
@@ -1348,6 +1430,37 @@ static unsigned rename_template_vars(unsigned tmpl, unsigned rename_map)
                                             head_id == ctx.kw_letstar,
                                             head_id == ctx.kw_letrec);
         }
+        if (template_case_form(tmpl)) {
+            // Rename the key and the clause bodies, never a datum list.
+            GC_GUARD;
+            gc_protect(&tmpl);
+            gc_protect(&rename_map);
+            unsigned out = 0, out_tail = 0;
+            gc_protect(&out);
+            gc_protect(&out_tail);
+            list_append(&out, &out_tail,
+                        rename_template_vars(car(tmpl), rename_map));
+            unsigned key = rename_template_vars(cadr(tmpl), rename_map);
+            if (key == TOK_ERROR)
+                return TOK_ERROR;
+            list_append(&out, &out_tail, key);
+            unsigned c = cddr(tmpl);
+            gc_protect(&c);
+            for (; c; c = cdr(c)) {
+                if (!IS_PAIR(car(c))) {
+                    list_append(&out, &out_tail, car(c));
+                    continue;
+                }
+                unsigned body = rename_template_vars(cdr(car(c)), rename_map);
+                if (body == TOK_ERROR)
+                    return TOK_ERROR;
+                gc_protect(&body);
+                unsigned clause = alloc_cons(car(car(c)), body);
+                gc_unprotect(1);
+                list_append(&out, &out_tail, clause);
+            }
+            return out;
+        }
         unsigned original = tmpl;
         unsigned result = 0, result_tail = 0;
         bool changed = false;
@@ -1363,7 +1476,10 @@ static unsigned rename_template_vars(unsigned tmpl, unsigned rename_map)
                 gc_unprotect(5);
                 return TOK_ERROR;
             }
-            if (new_car != old_car)
+            // Compare with the cell as it is now, not old_car: a collection
+            // in the call moves the original and can hand its old index to
+            // the renamed copy, which then looked unchanged and was dropped.
+            if (new_car != car(tmpl))
                 changed = true;
             gc_protect(&new_car);
             list_append(&result, &result_tail, new_car);
@@ -1376,7 +1492,7 @@ static unsigned rename_template_vars(unsigned tmpl, unsigned rename_map)
                     gc_unprotect(5);
                     return TOK_ERROR;
                 }
-                if (new_tail != next)
+                if (new_tail != cdr(tmpl))
                     changed = true;
                 if (!changed) {
                     gc_unprotect(5);
@@ -1393,7 +1509,7 @@ static unsigned rename_template_vars(unsigned tmpl, unsigned rename_map)
                     gc_unprotect(5);
                     return TOK_ERROR;
                 }
-                if (new_tail != next)
+                if (new_tail != cdr(tmpl))
                     changed = true;
                 if (!changed) {
                     gc_unprotect(5);
@@ -1407,35 +1523,8 @@ static unsigned rename_template_vars(unsigned tmpl, unsigned rename_map)
         }
     }
 
-    if (IS_VECTOR(tmpl)) {
-        unsigned len = vector_len(tmpl);
-        gc_protect(&tmpl);
-        gc_protect(&rename_map);
-        unsigned new_vec = make_vector(len, 0);
-        if (new_vec == TOK_ERROR) {
-            gc_unprotect(2);
-            return TOK_ERROR;
-        }
-        gc_protect(&new_vec);
-        bool changed = false;
-        for (unsigned i = 0; i < len; i++) {
-            // Refresh data pointers each iteration - GC may have moved vectors
-            unsigned old_elem = vector_data_ptr(tmpl)[i];
-            gc_protect(&old_elem);
-            unsigned new_elem = rename_template_vars(old_elem, rename_map);
-            if (new_elem == TOK_ERROR) {
-                gc_unprotect(4);
-                return TOK_ERROR;
-            }
-            vector_set_elem(new_vec, i, new_elem);
-            if (new_elem != old_elem)
-                changed = true;
-            gc_unprotect(1);
-        }
-        gc_unprotect(3);
-        return changed ? new_vec : tmpl;
-    }
-
+    // A vector is self-evaluating data: an alias inside one would be read
+    // back as a gensym, not as the identifier written in the template.
     return tmpl;
 }
 
@@ -1502,7 +1591,10 @@ static unsigned rename_template_vars_shadowed_heads(unsigned tmpl,
                 gc_unprotect(5);
                 return TOK_ERROR;
             }
-            if (new_car != old_car)
+            // Compare with the cell as it is now, not old_car: a collection
+            // in the call moves the original and can hand its old index to
+            // the renamed copy, which then looked unchanged and was dropped.
+            if (new_car != car(tmpl))
                 changed = true;
             gc_protect(&new_car);
             list_append(&result, &result_tail, new_car);
@@ -1516,7 +1608,7 @@ static unsigned rename_template_vars_shadowed_heads(unsigned tmpl,
                     gc_unprotect(5);
                     return TOK_ERROR;
                 }
-                if (new_tail != next)
+                if (new_tail != cdr(tmpl))
                     changed = true;
                 if (!changed) {
                     gc_unprotect(5);
@@ -1538,7 +1630,7 @@ static unsigned rename_template_vars_shadowed_heads(unsigned tmpl,
                         gc_unprotect(5);
                         return TOK_ERROR;
                     }
-                    if (new_tail != next)
+                    if (new_tail != cdr(tmpl))
                         changed = true;
                     if (!changed) {
                         gc_unprotect(5);
@@ -1739,8 +1831,14 @@ static bool compile_macro_binding(unsigned mac, unsigned expr,
     // Macro expansion runs before the ordinary application compiler, so it
     // must enforce the same proper-list invariant itself.  In particular, a
     // legacy macro with a rest parameter would otherwise accept a cyclic form
-    // and expose it to the expander.
-    if (!list_length_checked(cdr(expr), NULL, "macro application")) {
+    // and expose it to the expander. A syntax-rules use may be dotted, though
+    // - (_ a ... . r) exists to match (m 1 2 . 3) - so only a cycle is
+    // rejected there, the way the interpreter's apply_syntax already does.
+    if (IS_SYNTAX(mac) ? pair_chain_is_circular(expr)
+                       : !list_length_checked(cdr(expr), NULL,
+                                              "macro application")) {
+        if (IS_SYNTAX(mac))
+            show_error("macro application: circular form");
         *result = emit_syntax_error(cctx, "macro application: invalid syntax");
         return true;
     }
@@ -1831,6 +1929,52 @@ static bool compile_macro_binding(unsigned mac, unsigned expr,
 // (macros.c), a point that can be arbitrarily far from the definition
 // and inside arbitrarily many intervening shadowing scopes.
 
+// A body's internal defines may follow a define-syntax that refers to them:
+// (define-syntax getx (syntax-rules () ((_) x))) (define x 1) ... (getx).
+// The definition-time alias below cannot be made at the define-syntax - x has
+// no binding yet at that point of the run - so it is deferred until x's own
+// define has run. compile_begin records the body's not-yet-compiled define
+// names, and the deferred aliases, in a record (pending-names . aliases)
+// bound - as (owner . record) - to a private marker in the body's syntax
+// frame: compile-time env frames are GC-managed, and the innermost body's
+// record is the one lookup finds. The owner is the body's scope - its code
+// object and run-time frame depth - so a nested lambda body, or a let body
+// compiled inline under a PUSHENV of its own, does not use (and consume)
+// its enclosing body's record, while a begin spliced into the body does.
+static int64_t pending_defines_marker_id(void)
+{
+    static int64_t marker_id = 0;
+    if (!marker_id)
+        marker_id = CELL_ID(make_uninterned_symbol("##pending-defines##"));
+    return marker_id;
+}
+
+static bool pending_defines_owned_by(unsigned owner, compile_ctx *cctx)
+{
+    return IS_PAIR(owner) && IS_NUM(car(owner)) && IS_NUM(cdr(owner)) &&
+           CELL_ID(car(owner)) == (int64_t)(intptr_t)cctx->code &&
+           CELL_ID(cdr(owner)) == (int64_t)cctx->env_depth;
+}
+
+static unsigned pending_defines_owner(compile_ctx *cctx)
+{
+    GC_GUARD;
+    unsigned code = store((int64_t)(intptr_t)cctx->code);
+    gc_protect(&code);
+    unsigned depth = store((int64_t)cctx->env_depth);
+    gc_protect(&depth);
+    return alloc_cons(code, depth);
+}
+
+static unsigned pending_defines_record(compile_ctx *cctx)
+{
+    unsigned binding = lookup_silent(pending_defines_marker_id(), cctx->env);
+    if (!IS_PAIR(binding) || !pending_defines_owned_by(car(binding), cctx) ||
+        !IS_PAIR(cdr(binding)))
+        return 0;
+    return cdr(binding);
+}
+
 // First pass: collect free identifiers across all rules of a single
 // transformer, building a rename map and the alias bindings needed to
 // install them. Mirrors the let-syntax collection loop but over one
@@ -1886,6 +2030,30 @@ static bool collect_syntax_free_vars(compile_ctx *cctx, unsigned rules,
             if (already_mapped)
                 goto next_free_var;
 
+            unsigned pending = pending_defines_record(cctx);
+            if (pending && atom_list_contains_id(car(pending), var_id)) {
+                // Defined later in this body: rename now, alias once the
+                // define has run (see pending_defines_marker_id).
+                gc_protect(&pending);
+                extern unsigned gensym_counter;
+                char name[32];
+                snprintf(name, sizeof(name), "##gensym##%u",
+                         gensym_counter++);
+                unsigned gensym_atom = make_uninterned_symbol(name);
+                gc_protect(&gensym_atom);
+                macros_note_alias(CELL_ID(gensym_atom), var_id);
+                unsigned entry = alloc_cons(var_atom, gensym_atom);
+                gc_protect(&entry);
+                rename_map = alloc_cons(entry, rename_map);
+                unsigned deferred = alloc_cons(entry, cdr(pending));
+                cell_set_cdr(pending, deferred);
+                // Bound for the compile-time checks of later forms, like the
+                // gensyms extend_env_with_syntax_gensyms adds.
+                defvar(gensym_atom, gensym_atom, cctx->env);
+                gc_unprotect(3);
+                goto next_free_var;
+            }
+
             unsigned val = lookup_silent(var_id, cctx->env);
             if (val != TOK_ERROR) {
                 extern unsigned gensym_counter;
@@ -1897,6 +2065,7 @@ static bool collect_syntax_free_vars(compile_ctx *cctx, unsigned rules,
                 unsigned gensym_atom = make_uninterned_symbol(name);
                 gc_protect(&gensym_atom);
                 gc_protect(&val);
+                macros_note_alias(CELL_ID(gensym_atom), var_id);
 
                 unsigned entry = alloc_cons(var_atom, gensym_atom);
                 gc_protect(&entry);
@@ -2382,6 +2551,8 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
                                 unsigned gensym_atom = make_uninterned_symbol(name);
                                 gc_protect(&gensym_atom);
                                 gc_protect(&val);
+                                // So a renamed case is still seen as case
+                                macros_note_alias(CELL_ID(gensym_atom), var_id);
 
                                 // Add to rename map: (var_atom . gensym_atom)
                                 unsigned entry = alloc_cons(var_atom, gensym_atom);
@@ -2712,7 +2883,7 @@ static compile_result compile_if(unsigned expr, compile_ctx *cctx)
     // Branch folding: if test is constant, only compile one branch
     if (test_result.is_const) {
         // Rewind - don't need the test bytecode
-        cctx->code->code_len = saved_pos;
+        code_truncate(cctx->code, saved_pos, cctx->code->children_len);
         cctx->tail_position = tail;
 
         if (IS_TRUTHY(test_result.value)) {
@@ -3181,6 +3352,114 @@ static bool trmc_code_has_tailcall(const code_object *code, unsigned from)
     return false;
 }
 
+// True if code (a closure compiled inside a stack-local body) or anything
+// nested in it reaches sym through the environment. A stack local has no
+// environment binding, so such a reference would resolve to some outer
+// binding instead. A nested lambda's own parameter of that name shadows it.
+static bool formals_bind(unsigned formals, int64_t sym)
+{
+    for (unsigned guard = 0; formals && guard < 1000000; guard++) {
+        if (IS_ATOM(formals))
+            return CELL_ID(formals) == sym;
+        if (!IS_PAIR(formals))
+            return false;
+        if (IS_ATOM(car(formals)) && CELL_ID(car(formals)) == sym)
+            return true;
+        formals = cdr(formals);
+    }
+    return false;
+}
+
+static bool code_reaches_symbol(const code_object *code, int64_t sym,
+                                int depth)
+{
+    if (!code || depth > 64 || code->code_len > code->code_cap ||
+        code->children_len > code->children_cap || !code->code ||
+        (code->children_len && !code->children))
+        return true; // be conservative
+    if (code->params < code->const_len &&
+        formals_bind(code->constants[code->params], sym))
+        return false;
+    for (unsigned ip = 0; ip < code->code_len;) {
+        unsigned op = code->code[ip];
+        unsigned size = instruction_size(op);
+        if (size == 0 || size > code->code_len - ip)
+            return true;
+        switch (op) {
+        case OP_LOOKUP:
+        case OP_LOOKUP_ADD1:
+        case OP_LOOKUP_SUB1:
+        case OP_SET:
+        case OP_SET_VOID:
+            if ((int64_t)code->code[ip + 1] == sym)
+                return true;
+            break;
+        case OP_GUARD_PRIMITIVE:
+        case OP_DEFINE_ALIAS:
+            if ((int64_t)code->code[ip + 2] == sym)
+                return true;
+            break;
+        default:
+            break;
+        }
+        ip += size;
+    }
+    for (unsigned i = 0; i < code->children_len; i++)
+        if (code_reaches_symbol(code->children[i], sym, depth + 1))
+            return true;
+    return false;
+}
+
+// A stack-local body must not need an environment frame of its own. The
+// decision to use locals is made from the unexpanded source, so check what
+// was actually emitted:
+// - a definition at the body's own scope (no PUSHENV around it) would land
+//   in the closure's environment - for a top-level procedure, the global
+//   one - e.g. from a macro that expands into define or define-values;
+// - a closure created in the body that reaches a parameter by name would
+//   find an outer binding, since the parameter lives only in a stack slot.
+static bool locals_body_needs_environment(const code_object *code,
+                                          unsigned body_start,
+                                          unsigned children_start,
+                                          unsigned params)
+{
+    unsigned depth = 0;
+    for (unsigned ip = body_start; ip < code->code_len;) {
+        unsigned op = code->code[ip];
+        unsigned size = instruction_size(op);
+        if (size == 0 || size > code->code_len - ip)
+            return true;
+        switch (op) {
+        case OP_PUSHENV:
+            depth++;
+            break;
+        case OP_POPENV:
+            if (depth > 0)
+                depth--;
+            break;
+        case OP_DEFINE:
+        case OP_DEFINE_ALIAS:
+        case OP_DEFINE_ALIAS_REF:
+        case OP_DEFSYNTAX:
+            if (depth == 0)
+                return true;
+            break;
+        default:
+            break;
+        }
+        ip += size;
+    }
+    for (unsigned p = params; IS_PAIR(p); p = cdr(p)) {
+        if (!IS_ATOM(car(p)))
+            continue;
+        int64_t sym = CELL_ID(car(p));
+        for (unsigned i = children_start; i < code->children_len; i++)
+            if (code_reaches_symbol(code->children[i], sym, 0))
+                return true;
+    }
+    return false;
+}
+
 static compile_result compile_lambda(unsigned expr, compile_ctx *cctx)
 {
     GC_GUARD;
@@ -3207,6 +3486,7 @@ static compile_result compile_lambda(unsigned expr, compile_ctx *cctx)
 
     // Build a dummy frame with parameters as vars, all bound to 0
     {
+        GC_GUARD;
         unsigned vars = 0, vals = 0;
         gc_protect(&vars);
         gc_protect(&vals);
@@ -3242,6 +3522,7 @@ static compile_result compile_lambda(unsigned expr, compile_ctx *cctx)
             unsigned frame = alloc_cons(vars, vals);
             gc_protect(&frame);
             lambda_env = alloc_cons(frame, lambda_env);
+            gc_unprotect(1);
         }
     }
 
@@ -3303,6 +3584,7 @@ static compile_result compile_lambda(unsigned expr, compile_ctx *cctx)
         if (can_use_locals) {
             lambda_cctx->num_locals = (int)arity;
             lambda_cctx->code->use_locals = true;
+            lambda_cctx->locals_env_len = compile_env_length(lambda_env);
         }
     }
 
@@ -3322,8 +3604,32 @@ static compile_result compile_lambda(unsigned expr, compile_ctx *cctx)
     // stops assuming nothing is ever emitted before the body.
     lambda_cctx->loop_start = lambda_cctx->code->code_len;
 
+    // compile_begin leaves its scope frames on the context's environment, so
+    // a recompile below must start again from the lambda's own environment.
+    unsigned body_env = lambda_cctx->env;
+    gc_protect(&body_env);
+    unsigned children_start = lambda_cctx->code->children_len;
+
     // Compile body
     compile_begin(body, lambda_cctx);
+
+    if (lambda_cctx->code->use_locals &&
+        locals_body_needs_environment(lambda_cctx->code, body_start,
+                                      children_start, params)) {
+        // See locals_body_needs_environment: the pre-pass over the source
+        // chose stack locals, but the expanded body needs the parameters in
+        // an environment frame. Compile it again that way.
+        code_truncate(lambda_cctx->code, body_start, children_start);
+        lambda_cctx->code->use_locals = false;
+        lambda_cctx->num_locals = -1;
+        lambda_cctx->trmc_mode = TRMC_MODE_NONE;
+        lambda_cctx->code->trmc_mode = TRMC_MODE_NONE;
+        lambda_cctx->loop_start = body_start;
+        lambda_cctx->env = body_env;
+        lambda_cctx->env_depth = 0;
+        lambda_cctx->tail_position = true;
+        compile_begin(body, lambda_cctx);
+    }
 
     if (lambda_cctx->trmc_mode != TRMC_MODE_NONE &&
         trmc_code_has_tailcall(lambda_cctx->code, body_start)) {
@@ -3331,10 +3637,13 @@ static compile_result compile_lambda(unsigned expr, compile_ctx *cctx)
         // tail call in this body out of TAILCALL form, so reaching here means
         // some path emitted one anyway. Throw the body away and compile it
         // again plainly rather than return a truncated result.
-        lambda_cctx->code->code_len = body_start;
+        code_truncate(lambda_cctx->code, body_start, children_start);
         lambda_cctx->trmc_mode = TRMC_MODE_NONE;
         lambda_cctx->code->trmc_mode = TRMC_MODE_NONE;
         lambda_cctx->loop_start = body_start;
+        lambda_cctx->env = body_env;
+        lambda_cctx->env_depth = 0;
+        lambda_cctx->tail_position = true;
         compile_begin(body, lambda_cctx);
     }
 
@@ -3413,6 +3722,17 @@ static bool collect_internal_defines(unsigned body, unsigned env,
             }
         }
 
+        // define-syntax is a definition too (R7RS 5.3, 5.4): the defines
+        // after it share the body's scope. Stopping here left them out of
+        // the compile-time frame, so a macro defined first resolved their
+        // names past the body - to a global, or to nothing at all.
+        if (IS_PAIR(expr) && IS_KEYWORD(car(expr), ctx.kw_define_syntax) &&
+            !is_keyword_shadowed(ctx.kw_define_syntax, env)) {
+            body = cdr(body);
+            gc_unprotect(1);
+            continue;
+        }
+
         return false;
     }
     return body == 0;
@@ -3460,6 +3780,77 @@ static unsigned extend_compile_env_with_names(unsigned env, unsigned names)
     return new_env;
 }
 
+// True if a define-syntax appears among a body's forms, spliced begins
+// included. Only such a body needs a pending-defines record (see
+// pending_defines_marker_id).
+static bool body_has_define_syntax(unsigned exprs, unsigned env)
+{
+    if (is_keyword_shadowed(ctx.kw_define_syntax, env))
+        return false;
+    for (unsigned e = exprs; IS_PAIR(e); e = cdr(e)) {
+        unsigned form = car(e);
+        if (!IS_PAIR(form))
+            continue;
+        if (IS_KEYWORD(car(form), ctx.kw_define_syntax))
+            return true;
+        if (IS_KEYWORD(car(form), ctx.kw_begin) &&
+            !is_keyword_shadowed(ctx.kw_begin, env) &&
+            proper_list_silent(cdr(form)) &&
+            body_has_define_syntax(cdr(form), env))
+            return true;
+    }
+    return false;
+}
+
+// expr, one form of a body, has just been compiled. If it defines names a
+// define-syntax earlier in the body was waiting for, the defines have now run
+// at this point of the code, so emit the deferred aliases here and drop the
+// names from the pending list.
+static void emit_pending_define_aliases(compile_ctx *cctx, unsigned pending,
+                                        unsigned expr)
+{
+    GC_GUARD;
+    gc_protect(&pending);
+    unsigned defined = 0;
+    gc_protect(&defined);
+    unsigned name = is_internal_define(expr, cctx->env);
+    if (name && IS_ATOM(name))
+        defined = alloc_cons(name, 0);
+    else if (IS_PAIR(expr) && IS_KEYWORD(car(expr), ctx.kw_begin) &&
+             !is_keyword_shadowed(ctx.kw_begin, cctx->env))
+        defined = scan_internal_defines(cdr(expr), cctx->env);
+    if (!defined)
+        return;
+
+    unsigned kept_names = 0, kept_aliases = 0;
+    gc_protect(&kept_names);
+    gc_protect(&kept_aliases);
+    unsigned p = car(pending);
+    gc_protect(&p);
+    for (; p; p = cdr(p)) {
+        if (!atom_list_contains_id(defined, CELL_ID(car(p))))
+            kept_names = alloc_cons(car(p), kept_names);
+    }
+    for (p = cdr(pending); p; p = cdr(p)) {
+        unsigned entry = car(p); // (var . gensym)
+        int64_t var_id = CELL_ID(car(entry));
+        if (!atom_list_contains_id(defined, var_id)) {
+            kept_aliases = alloc_cons(entry, kept_aliases);
+            continue;
+        }
+        int64_t gensym_id = CELL_ID(cdr(entry));
+        int local_slot = find_stack_local_slot(cctx, var_id);
+        if (local_slot >= 0) {
+            emit_local_get_slot(cctx, local_slot);
+            emit2(cctx, OP_DEFINE, gensym_id);
+        } else {
+            emit3(cctx, OP_DEFINE_ALIAS, gensym_id, var_id);
+        }
+    }
+    cell_set_car(pending, kept_names);
+    cell_set_cdr(pending, kept_aliases);
+}
+
 // Compile sequence of expressions
 static compile_result compile_begin(unsigned exprs, compile_ctx *cctx)
 {
@@ -3483,10 +3874,49 @@ static compile_result compile_begin(unsigned exprs, compile_ctx *cctx)
 
     if (internal_defs) {
         cctx->env = extend_compile_env_with_names(cctx->env, internal_defs);
+        // At top level these placeholders stand for globals the defines
+        // will create (a file's consecutive top-level forms compile as one
+        // such begin). Mark the frame so macro hygiene treats a name bound
+        // only here as the global it becomes, not as a use-site local: a
+        // helper defined after the macro that calls it was renamed to an
+        // unbound gensym, and a literal defined after its macro failed to
+        // match. See macros_toplevel_defines_marker_id.
+        if (!cctx->parent && cctx->env_depth == 0) {
+            unsigned marker = alloc();
+            CELL_TYPE(marker) = BT_ATOM;
+            CELL_ID(marker) = macros_toplevel_defines_marker_id();
+            defvar(marker, ctx.atom_true, cctx->env);
+        }
     }
     unsigned syntax_frame = alloc_cons(0, 0);
     gc_protect(&syntax_frame);
     cctx->env = alloc_cons(syntax_frame, cctx->env);
+
+    // A define-syntax here may refer to defines after it; record their names
+    // in this body's syntax frame (see pending_defines_marker_id). A begin
+    // spliced into a body that has a record adds its names to that one.
+    unsigned pending = pending_defines_record(cctx);
+    gc_protect(&pending);
+    if (pending) {
+        unsigned n = internal_defs;
+        gc_protect(&n);
+        for (; n; n = cdr(n)) {
+            unsigned names = alloc_cons(car(n), car(pending));
+            cell_set_car(pending, names);
+        }
+        gc_unprotect(1);
+    } else if (internal_defs && body_has_define_syntax(exprs, cctx->env)) {
+        pending = alloc_cons(internal_defs, 0);
+        unsigned owner = pending_defines_owner(cctx);
+        gc_protect(&owner);
+        unsigned binding = alloc_cons(owner, pending);
+        gc_protect(&binding);
+        unsigned marker = alloc();
+        CELL_TYPE(marker) = BT_ATOM;
+        CELL_ID(marker) = pending_defines_marker_id();
+        defvar(marker, binding, cctx->env);
+        gc_unprotect(2);
+    }
 
     bool tail = cctx->tail_position;
     compile_result result = dynamic_result();
@@ -3501,6 +3931,11 @@ static compile_result compile_begin(unsigned exprs, compile_ctx *cctx)
         if (!is_last) {
             emit(cctx, OP_POP); // Discard non-final values
             had_prior_expr = true;
+        }
+        if (pending) {
+            if (cdr(pending))
+                had_prior_expr = true; // code may follow the value; no folding
+            emit_pending_define_aliases(cctx, pending, car(exprs));
         }
 
         exprs = cdr(exprs);
@@ -3970,7 +4405,7 @@ static compile_result compile_and(unsigned expr, compile_ctx *cctx)
                 // tests were emitted, the whole form is constant; otherwise
                 // keep the already-emitted code so its effects still happen.
                 if (jump_count == 0) {
-                    cctx->code->code_len = saved_pos;
+                    code_truncate(cctx->code, saved_pos, cctx->code->children_len);
                     emit2(cctx, OP_CONST,
                           code_add_const(cctx->code, ctx.atom_false));
                     free(false_jumps);
@@ -3981,7 +4416,7 @@ static compile_result compile_and(unsigned expr, compile_ctx *cctx)
             // Constant truthy - can skip this expression if not last
             if (!is_last) {
                 // Rewind bytecode for this constant true, continue with rest
-                cctx->code->code_len = expr_saved_pos;
+                code_truncate(cctx->code, expr_saved_pos, cctx->code->children_len);
                 args = cdr(args);
                 continue;
             }
@@ -4061,7 +4496,7 @@ static compile_result compile_or(unsigned expr, compile_ctx *cctx)
                 // tests exist, preserve them because they may have effects or
                 // produce the returned truthy value.
                 if (jump_count == 0) {
-                    cctx->code->code_len = saved_pos;
+                    code_truncate(cctx->code, saved_pos, cctx->code->children_len);
                     emit2(cctx, OP_CONST,
                           code_add_const(cctx->code, result.value));
                     free(true_jumps);
@@ -4072,7 +4507,7 @@ static compile_result compile_or(unsigned expr, compile_ctx *cctx)
             // Constant false - can skip this expression if not last
             if (!is_last) {
                 // Rewind bytecode for this constant false, continue with rest
-                cctx->code->code_len = expr_saved_pos;
+                code_truncate(cctx->code, expr_saved_pos, cctx->code->children_len);
                 args = cdr(args);
                 continue;
             }
@@ -4190,7 +4625,7 @@ static compile_result compile_cond(unsigned expr, compile_ctx *cctx)
         unsigned test_saved_pos = cctx->code->code_len;
         compile_result test_result = compile_expr_internal(test, cctx);
         if (test_result.is_const) {
-            cctx->code->code_len = test_saved_pos;
+            code_truncate(cctx->code, test_saved_pos, cctx->code->children_len);
             if (IS_FALSE(test_result.value)) {
                 clauses = cdr(clauses);
                 gc_unprotect(3);
@@ -4364,15 +4799,12 @@ static compile_result compile_set(unsigned expr, compile_ctx *cctx)
     cctx->tail_position = false;
     compile_expr_internal(val_expr, cctx);
 
-    // Use LOCAL_SET if variable is a stack local
+    // Use LOCAL_SET if variable is a stack local (and not shadowed)
     int64_t var_id = CELL_ID(var);
-    if (cctx->num_locals > 0) {
-        for (int i = 0; i < cctx->num_locals; i++) {
-            if (cctx->local_ids[i] == var_id) {
-                emit2(cctx, OP_LOCAL_SET, i);
-                return dynamic_result();
-            }
-        }
+    int local_slot = find_stack_local_slot(cctx, var_id);
+    if (local_slot >= 0) {
+        emit2(cctx, OP_LOCAL_SET, (unsigned)local_slot);
+        return dynamic_result();
     }
     emit2(cctx, OP_SET, var_id);
 
@@ -4409,7 +4841,8 @@ static void emit_self_call_loop(unsigned fn, unsigned args, compile_ctx *cctx)
 
 // Keep argument evaluation separate from opcode selection: a mutable binding
 // is checked only after all arguments have run, and fallback needs them intact.
-static void emit_primitive_operation(compile_ctx *cctx, int64_t prim, unsigned argc)
+static void emit_primitive_operation(compile_ctx *cctx, int64_t prim, unsigned argc,
+                                     bool tail)
 {
     if (argc == 1) {
         switch (prim) {
@@ -4463,7 +4896,10 @@ static void emit_primitive_operation(compile_ctx *cctx, int64_t prim, unsigned a
         default: break;
         }
     }
-    emit3(cctx, OP_PRIM, prim, argc);
+    // apply and call-with-values call their procedure argument, which R7RS
+    // requires to be a tail call when they are themselves in tail position.
+    bool tail_flag = tail && (prim == PAPPLY || prim == PCALLWITHVALUES);
+    emit3(cctx, OP_PRIM, prim, tail_flag ? argc | PRIM_TAIL_FLAG : argc);
 }
 
 // Discard a known unit/zero operand only after the guard, so a replacement
@@ -4597,7 +5033,7 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
                 folded = constant != TOK_ERROR;
                 if (folded) {
                     if (immutable)
-                        cctx->code->code_len = saved_pos;
+                        code_truncate(cctx->code, saved_pos, cctx->code->children_len);
                     else
                         for (unsigned j = 0; j < argc; j++)
                             emit(cctx, OP_POP);
@@ -4606,9 +5042,9 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
                 gc_unprotect(1);
             }
             if (!folded && !emit_unary_arithmetic(cctx, prim, results, argc))
-                emit_primitive_operation(cctx, prim, argc);
+                emit_primitive_operation(cctx, prim, argc, tail);
             if (!immutable)
-                cctx->code->code[guard + 1] = cctx->code->code_len;
+                code_patch(cctx->code, guard + 1, cctx->code->code_len);
             return immutable && folded ? const_result(constant) : dynamic_result();
         }
     }
@@ -5107,6 +5543,24 @@ static void compile_qq_rec(unsigned x, compile_ctx *cctx, int depth)
 
     if (IS_VECTOR(x)) {
         unsigned len = vector_len(x);
+        bool has_splice = false;
+        for (unsigned i = 0; i < len && depth == 1; i++) {
+            unsigned elem = vector_data_ptr(x)[i];
+            if (IS_PAIR(elem) &&
+                IS_KEYWORD(car(elem), ctx.kw_unquote_splicing) &&
+                !is_keyword_shadowed(ctx.kw_unquote_splicing, cctx->env))
+                has_splice = true;
+        }
+        if (has_splice) {
+            // `#(a ,@b c) is (list->vector `(a ,@b c)) (R7RS 4.2.8)
+            unsigned elems = 0;
+            gc_protect(&elems);
+            for (unsigned i = len; i > 0; i--)
+                elems = alloc_cons(vector_data_ptr(x)[i - 1], elems);
+            compile_qq_rec(elems, cctx, depth);
+            emit3(cctx, OP_PRIM, PLIST2VEC, 1);
+            return;
+        }
         for (unsigned i = 0; i < len; i++) {
             compile_qq_rec(vector_data_ptr(x)[i], cctx, depth);
         }

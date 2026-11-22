@@ -234,8 +234,14 @@ test-repl-exit: $(TARGET)
 		[ $$? -eq 1 ] || { echo "FAIL: piped error should exit 1 (mode=$$mode)"; exit 1; }; \
 		echo '(+ 1 2)' | ./$(TARGET) $$mode >/dev/null 2>&1; \
 		[ $$? -eq 0 ] || { echo "FAIL: piped success should exit 0 (mode=$$mode)"; exit 1; }; \
+		expected=$$(printf '\n;Value: 1\n\n;Value: 5\n'); \
+		for input in '1(+ 2 3)' '1; a comment\n(+ 2 3)' '(read)\n1(+ 2 3)' \
+			'(let ((x (read))) (close-input-port (current-input-port)) x)\n1(+ 2 3)'; do \
+			actual=$$(printf '%b\n' "$$input" | ./$(TARGET) $$mode) && \
+			[ "$$actual" = "$$expected" ] || { echo "FAIL: REPL lost input (mode=$$mode, input=$$input)"; exit 1; }; \
+		done; \
 	done
-	@echo "PASS: REPL exit code reflects piped errors"
+	@echo "PASS: REPL exit codes and input boundaries"
 
 # Compare a stable semantic probe set against MIT/GNU Scheme.
 test-diff: $(TARGET)

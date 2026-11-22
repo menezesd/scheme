@@ -2,6 +2,8 @@
 #define _POSIX_C_SOURCE 200809L
 #include "compiled_pattern.h"
 #include "context.h"
+#include "env.h"
+#include "eval.h"
 #include "eval_internal.h"
 #include "macros.h"
 #include "reader.h"
@@ -374,6 +376,43 @@ TEST(apply_syntax_rejects_unregistered_compiled_pattern)
 // Main
 // ============================================================================
 
+// Evaluate the first datum of src in env with the CPS interpreter.
+static unsigned eval_source(const char *src, unsigned env)
+{
+    GC_GUARD;
+    gc_protect(&env);
+    unsigned expr = read_from_string(src);
+    if (expr == TOK_ERROR)
+        return TOK_ERROR;
+    return eval_obj(expr, env);
+}
+
+TEST(internal_define_body_expands_once)
+{
+    // The static expander left an internal (define (helper x) ...) for
+    // handle_define, so every call of outer re-expanded helper's body and
+    // its lambda binder minted a fresh gensym - an atom-table slot - per
+    // call, until the table filled. Expanded once with the enclosing body,
+    // repeated calls must not grow the table.
+    unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
+    ASSERT(eval_source("(define-syntax my-inc (syntax-rules () "
+                       "((_ v) ((lambda (t) (+ t 1)) v))))",
+                       env) != TOK_ERROR);
+    ASSERT(eval_source("(define (outer n) (define (helper x) (my-inc x)) "
+                       "(helper n))",
+                       env) != TOK_ERROR);
+    ASSERT(eval_source("(outer 1)", env) != TOK_ERROR);
+    unsigned before = ctx.atom_count;
+    for (int i = 0; i < 50; i++) {
+        unsigned r = eval_source("(outer 41)", env);
+        ASSERT(is_fixnum_value(r, 42));
+    }
+    ASSERT(ctx.atom_count - before < 5);
+    PASS();
+}
+
 int main(void)
 {
     // Initialize interpreter infrastructure
@@ -418,6 +457,7 @@ int main(void)
     RUN_TEST(apply_syntax_rejects_malformed_input);
     RUN_TEST(apply_syntax_rejects_malformed_rules);
     RUN_TEST(apply_syntax_rejects_unregistered_compiled_pattern);
+    RUN_TEST(internal_define_body_expands_once);
 
     TEST_SUMMARY("macros");
 }

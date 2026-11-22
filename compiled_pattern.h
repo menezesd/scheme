@@ -72,6 +72,10 @@ enum pat_opcode {
     // Control flow
     PAT_JUMP,            // ip = operand
     PAT_SUCCESS,         // Pattern matched successfully
+
+    // Fail unless input is a chain of exactly operand pairs (ending in any
+    // non-pair). Starts the rest path of a list ellipsis.
+    PAT_CHECK_TAIL_PAIRS,
     PAT_OPCODE_COUNT,
 };
 
@@ -192,6 +196,12 @@ typedef struct {
     struct pat_vec_iter *vec_stack;
     unsigned vec_sp;
     unsigned vec_cap;
+
+    // Literal identifiers match by binding (R7RS 4.3.2), not just by name,
+    // when these are set - see execute_pattern_in_envs. GC roots.
+    bool check_literal_bindings;
+    unsigned literal_closure_env; // The macro's definition environment
+    unsigned literal_use_env;     // The macro use's environment
 } pat_match_state;
 
 // Saved vector iterator (for nested vector ellipses)
@@ -229,8 +239,13 @@ int pattern_find_var(compiled_pattern *pat, unsigned atom);
 compiled_pattern *compile_pattern(unsigned pattern, unsigned literals,
                                   int64_t ellipsis_id);
 
-// Pattern execution
+// Pattern execution. execute_pattern matches literal identifiers by name
+// only; execute_pattern_in_envs also requires each literal to denote the same
+// binding in closure_env (where the macro was defined) as the input
+// identifier does in use_env, as syntax-rules does.
 unsigned execute_pattern(compiled_pattern *pat, unsigned input);
+unsigned execute_pattern_in_envs(compiled_pattern *pat, unsigned input,
+                                 unsigned closure_env, unsigned use_env);
 
 // GC integration
 void pattern_register(compiled_pattern *pat);

@@ -98,6 +98,8 @@ unsigned clone_environment(unsigned env);
 // Build an isolated environment containing only the exports selected by the
 // R7RS import-set list. The source environment is not mutated.
 unsigned environment_with_imports(unsigned source, unsigned specs);
+// Copy only the syntactic keyword bindings of source (R5RS null-environment).
+unsigned syntax_environment(unsigned source);
 
 // Mark an environment root as immutable and query that marker.
 void mark_immutable_environment(unsigned env);

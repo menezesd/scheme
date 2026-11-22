@@ -246,6 +246,12 @@ enum opcode {
     // "handler returned from a non-continuable exception" error.
     OP_ERROR_RETURN,
 
+    // load driver (never emitted by the compiler; lives in a pinned code
+    // object, see vm_handle_load). Stack: [.. remaining-forms last-value].
+    // Compiles the next form and runs it in this VM with a frame returning
+    // here, or returns last-value to load's caller when no forms remain.
+    OP_LOAD_STEP,
+
     OP_COUNT // Number of opcodes (must be last)
 };
 
@@ -267,7 +273,7 @@ enum opcode {
  */
 typedef struct code_object {
     unsigned *code;    // Bytecode instruction array
-    unsigned code_len; // Number of instructions
+    unsigned code_len; // Number of words (opcodes and operands)
     unsigned code_cap; // Allocated capacity
 
     unsigned *constants; // Constant pool (cell indices)
@@ -297,11 +303,10 @@ typedef struct code_object {
 
     // GC integration: linked list of all code objects
     struct code_object *gc_next;
-    // Set once vm_code_is_well_formed has checked this object, cleared by
-    // every routine that changes it. The check walks the whole instruction
-    // array, and it runs on every call into the closure: for a procedure with
-    // a few hundred forms that measured 29us per call against 0.3us for a
-    // small one, on code that never executes.
+    // Verification caches one bit per word so continuation restores can
+    // check saved instruction pointers without decoding the code again.
+    // Runtime specialization and inline-cache writes preserve word widths.
+    unsigned char *instruction_boundaries;
     bool verified;
     bool gc_marked; // True if reachable during current GC
     bool gc_pinned; // Never swept (internal singletons like the
@@ -323,7 +328,8 @@ bool code_object_is_registered(const code_object *needle);
  * Runtime closure representation.
  *
  * A closure pairs a code object with a captured environment.
- * Stored as a cons cell: car = BT_CLOSURE marker cell, cdr = env
+ * Stored as a BT_VMCLOSURE cell laid out like a pair: car = BT_CLOSURE
+ * marker cell, cdr = env
  * The marker cell's id holds the code_object pointer.
  */
 // BT_CLOSURE and BT_VMCONT are defined in enum lisp_type (types.h)
@@ -334,7 +340,7 @@ bool code_object_is_registered(const code_object *needle);
 
 static inline bool is_bytecode_closure_object(unsigned c)
 {
-    return IS_PAIR(c) && IS_CELL(CELL_CAR(c)) &&
+    return IS_CELL(c) && CELL_TYPE(c) == BT_VMCLOSURE && IS_CELL(CELL_CAR(c)) &&
            CELL_TYPE(CELL_CAR(c)) == BT_CLOSURE &&
            code_object_is_registered((const code_object *)CELL_PTR(CELL_CAR(c)));
 }
@@ -412,6 +418,11 @@ typedef enum {
 // and the two run out at roughly the same depth. At 24 bytes per frame the
 // frame array tops out around 24 MB.
 #define VM_MAX_STACK_SIZE (1024 * 1024)
+
+// Set in OP_PRIM's argc operand when the call is in tail position. Only the
+// primitives that call back into Scheme (apply, call-with-values) act on it;
+// R7RS requires them to call their procedure argument as a tail call.
+#define PRIM_TAIL_FLAG 0x80000000u
 #define VM_MAX_FRAMES_SIZE (1024 * 1024)
 
 /**
@@ -496,6 +507,10 @@ typedef struct compile_ctx {
 
     unsigned env_depth;         // Number of PUSHENV frames since lambda entry
     unsigned macro_expansion_depth; // Guard against recursive expansion
+    // Compile-env frame count at which the stack-local parameter frame sits
+    // (the frame count of the lambda's own environment). A name bound in any
+    // frame pushed above it shadows the parameter, so it is not a stack local.
+    unsigned locals_env_len;
 } compile_ctx;
 
 // ============================================================================
@@ -510,6 +525,10 @@ unsigned code_add_const(code_object *code, unsigned val);
 unsigned code_add_child(code_object *code, code_object *child);
 unsigned code_current_pos(code_object *code);
 void code_patch(code_object *code, unsigned pos, unsigned val);
+// Discard instructions from code_len onward (and nested code objects from
+// children_len onward), e.g. to recompile a body. Clears the verified flag.
+void code_truncate(code_object *code, unsigned code_len,
+                   unsigned children_len);
 
 // Compiler
 code_object *compile_toplevel(unsigned expr, unsigned env);
@@ -537,6 +556,7 @@ void gc_update_all_code_objects(
 void minor_gc_update_all_code_objects(void);
 void code_register(code_object *code); // Add code object to GC registry
 void gc_sweep_code_objects(void);      // Free unreachable code objects after GC
+void gc_sweep_code_objects_if_due(void); // Rate-limited sweep at a safe point
 vm_state *get_active_vm(void);         // Get currently running VM (for GC)
 
 // Disassembler

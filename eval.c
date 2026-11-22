@@ -367,18 +367,36 @@ static unsigned qq_transform(unsigned x, unsigned env, int depth)
         gc_protect(&x);
         gc_protect(&env);
         unsigned len = vector_len(x);
+        bool has_splice = false;
+        for (unsigned i = 0; i < len && depth == 1; i++) {
+            unsigned elem = vector_data_ptr(x)[i];
+            if (IS_PAIR(elem) &&
+                IS_KEYWORD(car(elem), ctx.kw_unquote_splicing) &&
+                !is_keyword_shadowed(ctx.kw_unquote_splicing, env))
+                has_splice = true;
+        }
+        if (has_splice) {
+            // `#(a ,@b c) is (list->vector `(a ,@b c)) (R7RS 4.2.8)
+            unsigned elems = 0;
+            gc_protect(&elems);
+            for (unsigned i = len; i > 0; i--)
+                elems = alloc_cons(vector_data_ptr(x)[i - 1], elems);
+            unsigned list_expr = qq_transform(elems, env, depth);
+            if (list_expr == TOK_ERROR)
+                return TOK_ERROR;
+            gc_protect(&list_expr);
+            unsigned args = alloc_cons(list_expr, 0);
+            gc_protect(&args);
+            unsigned op = mk_primop(PLIST2VEC);
+            gc_protect(&op);
+            return alloc_cons(op, args);
+        }
         unsigned args = 0, args_tail = 0;
         gc_protect(&args);
         gc_protect(&args_tail);
         for (unsigned i = 0; i < len; i++) {
             unsigned elem = vector_data_ptr(x)[i];
             gc_protect(&elem);
-            if (depth == 1 && IS_PAIR(elem) &&
-                IS_KEYWORD(car(elem), ctx.kw_unquote_splicing) &&
-                !is_keyword_shadowed(ctx.kw_unquote_splicing, env)) {
-                show_error("unquote-splicing not inside list");
-                return TOK_ERROR;
-            }
             unsigned e = qq_transform(elem, env, depth);
             if (e == TOK_ERROR)
                 return TOK_ERROR;
@@ -441,8 +459,9 @@ static unsigned qq_transform(unsigned x, unsigned env, int depth)
         l = cdr(l);
     }
 
-    unsigned result = IS_PAIR(l) ? qq_transform(l, env, depth)
-                                 : qq_quote_expr(l);
+    // A vector tail, as in `(a . #(,x)), is a template too.
+    unsigned result = (IS_PAIR(l) || IS_VECTOR(l)) ? qq_transform(l, env, depth)
+                                                   : qq_quote_expr(l);
     if (result == TOK_ERROR)
         return TOK_ERROR;
     gc_protect(&result);
@@ -489,10 +508,30 @@ unsigned qq_transform_cps(unsigned x, unsigned env)
 // that jumps to a continuation (guard, call/cc) replaces this continuation
 // via its captured frame chain; one that returns normally lands in
 // handle_cont_err_return and terminates (R7RS raise semantics).
+//
+// True while cps_signal_error is applying a handler synchronously, i.e.
+// before control is back in the trampoline. A closure handler only sets up
+// tramp state and returns, so for the normal case this window is tiny. An
+// error signalled inside it means the handler itself failed on the spot -
+// not a procedure, a primitive that rejects the error object, a closure of
+// the wrong arity - and dispatching that error would apply the same handler
+// again, recursing through apply_function until the C stack overflowed.
+// eval_cps saves and clears it, so a nested evaluation a primitive runs
+// from inside the window still dispatches its own errors normally.
+static bool cps_handler_dispatch_active = false;
+
 static void cps_signal_error(const char *msg, unsigned env, unsigned cont)
 {
     if (!msg)
         msg = "unknown error";
+    if (cps_handler_dispatch_active) {
+        // msg may be ctx.last_error itself, which show_error overwrites.
+        char reason[sizeof(ctx.last_error)];
+        snprintf(reason, sizeof(reason), "%s", msg);
+        show_error("exception handler failed: %s", reason);
+        tramp_error();
+        return;
+    }
     unsigned handler = lookup_silent(intern("*current-exception-handler*"),
                                      exception_state_env(env));
     if (handler == TOK_ERROR) {
@@ -512,7 +551,9 @@ static void cps_signal_error(const char *msg, unsigned env, unsigned cont)
     unsigned args = alloc_cons(error_obj, 0);
     gc_protect(&args);
     unsigned err_cont = make_cont(CONT_ERR_RETURN, handler, env, cont);
+    cps_handler_dispatch_active = true;
     apply_function(handler, args, env, err_cont);
+    cps_handler_dispatch_active = false;
 }
 
 void cps_signal_current_error(unsigned env, unsigned cont)
@@ -582,13 +623,20 @@ static void eval_step(void)
 
     case BT_CONS: {
         unsigned head = car(id);
+        // The head's value when dispatch_special_form already looked the
+        // head identifier up; TOK_ERROR when the head must be evaluated.
+        unsigned head_value = TOK_ERROR;
 
         // Check for special forms
         if (IS_ATOM(head)) {
             int64_t kw = CELL_ID(head);
-            if (dispatch_special_form(kw, id, env, cont)) {
+            if (dispatch_special_form(kw, id, env, cont, &head_value)) {
                 return;
             }
+            // Boolean literals evaluate to themselves, not to a binding;
+            // leave them to eval_step's atom case.
+            if (head == ctx.atom_true || head == ctx.atom_false)
+                head_value = TOK_ERROR;
         }
 
         // Not a special form - evaluate function position first
@@ -601,12 +649,16 @@ static void eval_step(void)
             return;
         }
         gc_protect(&head);
+        gc_protect(&head_value);
         gc_protect(&arg_exprs);
         gc_protect(&env);
         gc_protect(&cont);
         unsigned k =
             make_cont_from_protected(CONT_EVAL_FN, &arg_exprs, &env, &cont);
-        tramp_eval(head, env, k);
+        if (head_value != TOK_ERROR)
+            tramp_apply(head_value, k);
+        else
+            tramp_eval(head, env, k);
         return;
     }
 
@@ -1064,6 +1116,11 @@ unsigned eval_cps(unsigned expr, unsigned env)
     gc_protect(&expr);
     gc_protect(&env);
     eval_reset_macro_expansion_depth();
+    // A nested evaluation (a primitive calling back into the evaluator while
+    // a handler is being applied) is not that handler failing: let its own
+    // errors dispatch, and restore the outer window on the way out.
+    bool outer_dispatch_active = cps_handler_dispatch_active;
+    cps_handler_dispatch_active = false;
     unsigned halt_k = make_halt_cont();
     tramp_eval(expr, env, halt_k);
 
@@ -1074,6 +1131,7 @@ unsigned eval_cps(unsigned expr, unsigned env)
             apply_cont_step();
         }
     }
+    cps_handler_dispatch_active = outer_dispatch_active;
 
     if (tramp.mode == TRAMP_ERROR) {
         return TOK_ERROR;

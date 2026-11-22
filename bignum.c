@@ -26,6 +26,8 @@
 
 #include "bignum.h"
 #include <ctype.h>
+#include <float.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -869,6 +871,114 @@ static int clz_limb(limb_t x)
 #else
     return __builtin_clzll(x);
 #endif
+}
+
+static size_t bn_bit_length(const bignum *a)
+{
+    if (bn_is_zero(a))
+        return 0;
+    return a->len * LIMB_BITS - (size_t)clz_limb(a->limbs[a->len - 1]);
+}
+
+static double round_significand(uint64_t bits, unsigned discarded,
+                                bool sticky, int exponent)
+{
+    uint64_t significand = bits >> discarded;
+    if (discarded) {
+        uint64_t halfway = UINT64_C(1) << (discarded - 1);
+        uint64_t rest = bits & ((halfway << 1) - 1);
+        if (rest > halfway ||
+            (rest == halfway && (sticky || (significand & 1))))
+            significand++;
+    }
+    return scalbn((double)significand, exponent);
+}
+
+double bn_to_double(const bignum *a)
+{
+    size_t length = bn_bit_length(a);
+    if (length == 0)
+        return 0.0;
+    if (length > DBL_MAX_EXP)
+        return a->sign ? -HUGE_VAL : HUGE_VAL;
+
+    size_t drop = length > DBL_MANT_DIG + 1 ? length - DBL_MANT_DIG - 1 : 0;
+    size_t first = drop / LIMB_BITS;
+    unsigned offset = (unsigned)(drop % LIMB_BITS);
+    uint64_t bits = 0;
+    for (size_t i = a->len - 1; i > first; i--)
+        bits = (bits << LIMB_BITS) | a->limbs[i];
+    bits = (bits << (LIMB_BITS - offset)) | (a->limbs[first] >> offset);
+
+    bool sticky = (a->limbs[first] & ((UINT64_C(1) << offset) - 1)) != 0;
+    // The low bits matter only when the guard bit is set at an exact tie.
+    unsigned guard = length > DBL_MANT_DIG;
+    if (guard && (bits & 3) == 1)
+        for (size_t i = first; i > 0 && !sticky; i--)
+            sticky = a->limbs[i - 1] != 0;
+
+    double result = round_significand(bits, guard, sticky, (int)drop + (int)guard);
+    return a->sign ? -result : result;
+}
+
+bool bn_ratio_to_double(const bignum *a, const bignum *b, double *out)
+{
+    size_t a_bits = bn_bit_length(a);
+    size_t b_bits = bn_bit_length(b);
+    if (b_bits == 0)
+        return false;
+    if (a_bits <= DBL_MANT_DIG && b_bits <= DBL_MANT_DIG) {
+        *out = bn_to_double(a) / bn_to_double(b);
+        return true;
+    }
+
+    const int min_exponent = DBL_MIN_EXP - DBL_MANT_DIG;
+    bool negative = a->sign != b->sign;
+    size_t difference = a_bits >= b_bits ? a_bits - b_bits : b_bits - a_bits;
+    if (a_bits >= b_bits && difference > DBL_MAX_EXP) {
+        *out = negative ? -HUGE_VAL : HUGE_VAL;
+        return true;
+    }
+    if (a_bits < b_bits && difference > (size_t)(-min_exponent + 1)) {
+        *out = negative ? -0.0 : 0.0;
+        return true;
+    }
+
+    // The bit lengths bound the true binary exponent to two possibilities.
+    // Divide at the finer scale with one extra bit for rounding. The quotient
+    // indicates whether one or two bits must be discarded, and any remainder
+    // makes an apparent halfway case strictly greater than halfway.
+    int exponent = a_bits >= b_bits ? (int)difference : -(int)difference;
+    int unit = exponent - DBL_MANT_DIG;
+    if (unit < min_exponent)
+        unit = min_exponent;
+    int shift = 1 - unit;
+    bignum *scaled = shift >= 0 ? bn_lshift(a, (size_t)shift)
+                                : bn_lshift(b, (size_t)-shift);
+    if (!scaled)
+        return false;
+    bignum *remainder = NULL;
+    bignum *quotient = shift >= 0 ? bn_div(scaled, b, &remainder)
+                                  : bn_div(a, scaled, &remainder);
+    bn_free(scaled);
+    if (!quotient) {
+        bn_free(remainder);
+        return false;
+    }
+    quotient->sign = 0;
+    uint64_t bits;
+    bool fits = bn_to_uint64(quotient, &bits) == 0;
+    bool sticky = !bn_is_zero(remainder);
+    bn_free(quotient);
+    bn_free(remainder);
+    if (!fits)
+        return false;
+
+    unsigned discarded = bits >= (UINT64_C(1) << (DBL_MANT_DIG + 1)) ? 2 : 1;
+    double result = round_significand(bits, discarded, sticky,
+                                      unit + (int)discarded - 1);
+    *out = negative ? -result : result;
+    return true;
 }
 
 // Long division using Knuth's Algorithm D

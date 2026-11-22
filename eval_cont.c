@@ -257,7 +257,7 @@ void handle_cont_let_vals(unsigned val, unsigned data, unsigned env,
         for (; reversed; reversed = cdr(reversed))
             values = alloc_cons(car(reversed), values);
         unsigned new_env = extend_env(vars, values, env);
-        eval_body(body, new_env, next);
+        eval_scope_body(body, new_env, next);
     } else {
         unsigned expr = cadr(car(remaining));
         gc_protect(&expr);
@@ -268,6 +268,28 @@ void handle_cont_let_vals(unsigned val, unsigned data, unsigned env,
         unsigned k = make_cont(CONT_LET_VALS, new_data, env, next);
         tramp_eval(expr, env, k);
     }
+}
+
+// A let/let*/letrec body is a <body>: its leading internal definitions form
+// one letrec* scope. Bind their names (to placeholders) before evaluating any
+// of them, exactly as apply_function does for a procedure body. Evaluating
+// the body form by form instead meant that when the first definition built a
+// procedure - expanding its body there and then - a later sibling definition
+// was not bound yet, so a sibling that shadows a global macro was expanded as
+// that macro: (letrec () (define (bar) (foo)) (define (foo) 'proc) (bar))
+// called the global macro foo.
+void eval_scope_body(unsigned body, unsigned env, unsigned cont)
+{
+    GC_GUARD;
+    gc_protect(&body);
+    gc_protect(&env);
+    gc_protect(&cont);
+    unsigned scope_env = extend_env_with_internal_defines(env, body);
+    if (scope_env == TOK_ERROR) {
+        cps_signal_current_error(env, cont);
+        return;
+    }
+    eval_body(body, scope_env, cont);
 }
 
 void handle_cont_let_body(unsigned val, unsigned data, unsigned env,
@@ -313,7 +335,7 @@ void handle_cont_letstar_vals(unsigned val, unsigned data, unsigned env,
     gc_unprotect(2);
     unsigned rest = cdr(bindings); // bindings is protected
     if (!rest) {
-        eval_body(body, new_env, next);
+        eval_scope_body(body, new_env, next);
     } else {
         // Extract next value expr before allocations
         unsigned next_val_expr = cadr(car(rest));
@@ -328,51 +350,29 @@ void handle_cont_letstar_vals(unsigned val, unsigned data, unsigned env,
 void handle_cont_letrec_init(unsigned val, unsigned data, unsigned env,
                              unsigned next)
 {
-    // Data structure: (bindings . (vals_ptr . (all_vals . (saved . body))))
-    // saved = list of saved car values for cells from all_vals to vals_ptr,
-    // stored MOST-RECENT-FIRST (each step prepends the value it just
-    // computed - see "Build new saved list" below).
+    // data = (bindings . (vals_ptr . (saved . body)))
+    // bindings: this binding and the ones still to initialise.
+    // vals_ptr: the frame's value cell for this binding.
+    // saved:    one (value-cell . value) entry for every binding initialised
+    //           before this one, most recent first - each step prepends the
+    //           entry for the value it just stored.
     unsigned bindings = car(data);
-    unsigned inner = cdr(data);
-    unsigned vals_ptr = car(inner);
-    unsigned inner2 = cdr(inner);
-    unsigned all_vals = car(inner2);
-    unsigned inner3 = cdr(inner2);
-    unsigned saved = car(inner3);
-    unsigned body = cdr(inner3);
+    unsigned vals_ptr = cadr(data);
+    unsigned saved = car(cddr(data));
+    unsigned body = cdr(cddr(data));
 
-    // Restore all values from the saved state (for reinvoked continuations).
-    // This resets any modifications made by set! after initialization.
-    // `saved` is most-recent-first but `all_vals` walks oldest-first, so a
-    // straight parallel walk pairs each cell with the WRONG saved value
-    // once there are 2+ prior entries (3+ letrec bindings) - silently
-    // swapping bindings on every ordinary (non-reentrant) pass, since this
-    // restore runs unconditionally on every step. Reverse a copy of
-    // `saved` first so the two walk in the same order.
-    if (saved) {
-        GC_GUARD;
-        gc_protect(&val);
-        gc_protect(&bindings);
-        gc_protect(&vals_ptr);
-        gc_protect(&all_vals);
-        gc_protect(&saved);
-        gc_protect(&body);
-        gc_protect(&env);
-        gc_protect(&next);
-        unsigned saved_forward = 0;
-        gc_protect(&saved_forward);
-        // The walk cursor must be protected too (not just its head `saved`)
-        // so its current cell is updated if alloc_cons triggers a GC.
-        unsigned s = saved;
-        gc_protect(&s);
-        for (; s; s = cdr(s))
-            saved_forward = alloc_cons(car(s), saved_forward);
-
-        unsigned v = all_vals;
-        unsigned sf = saved_forward;
-        for (; v && v != vals_ptr && sf; v = cdr(v), sf = cdr(sf)) {
-            cell_set_car(v, car(sf));
-        }
+    // Put every earlier binding back to the value it had when this step's
+    // continuation was created. On an ordinary pass that is a no-op; when a
+    // captured continuation re-enters an initialiser, it undoes whatever the
+    // later initialisers and the body assigned since, which is what binding
+    // the inits to temporaries and assigning them at the end would give.
+    // Each entry names its own cell, so the restore needs neither the frame
+    // nor any allocation (the old layout kept bare values most-recent-first
+    // and had to reverse a copy of them on every step, quadratic in the
+    // number of bindings).
+    for (unsigned s = saved; s; s = cdr(s)) {
+        unsigned entry = car(s);
+        cell_set_car(car(entry), cdr(entry));
     }
 
     // Store the new value
@@ -380,38 +380,32 @@ void handle_cont_letrec_init(unsigned val, unsigned data, unsigned env,
 
     unsigned rest = cdr(bindings);
     if (!rest) {
-        eval_body(body, env, next);
-    } else {
-        GC_GUARD;
-        // Extract next value expr and protect across all allocations
-        unsigned next_val_expr = cadr(car(rest));
-        gc_protect(&next_val_expr);
-        gc_protect(&rest);
-        gc_protect(&body);
-        gc_protect(&all_vals);
-        gc_protect(&saved);
-        gc_protect(&env);
-        gc_protect(&next);
-        gc_protect(&vals_ptr);
-
-        // Build new saved list: prepend current value to saved
-        unsigned new_saved = 0;
-        gc_protect(&new_saved);
-        new_saved = alloc_cons(val, saved);
-
-        // Build new data: (rest . (next_vals_ptr . (all_vals . (new_saved .
-        // body))))
-        unsigned inner1 = 0, inner2_new = 0, inner3_new = 0;
-        gc_protect(&inner1);
-        gc_protect(&inner2_new);
-        gc_protect(&inner3_new);
-        inner1 = alloc_cons(new_saved, body);
-        inner2_new = alloc_cons(all_vals, inner1);
-        inner3_new = alloc_cons(cdr(vals_ptr), inner2_new);
-        unsigned new_data = alloc_cons(rest, inner3_new);
-        unsigned k2 = make_cont(CONT_LETREC_INIT, new_data, env, next);
-        tramp_eval(next_val_expr, env, k2);
+        eval_scope_body(body, env, next);
+        return;
     }
+
+    GC_GUARD;
+    // Extract next value expr and protect across all allocations
+    unsigned next_val_expr = cadr(car(rest));
+    gc_protect(&next_val_expr);
+    gc_protect(&rest);
+    gc_protect(&body);
+    gc_protect(&saved);
+    gc_protect(&env);
+    gc_protect(&next);
+    gc_protect(&vals_ptr);
+    gc_protect(&val);
+
+    unsigned entry = alloc_cons(vals_ptr, val);
+    gc_protect(&entry);
+    unsigned new_saved = alloc_cons(entry, saved);
+    gc_protect(&new_saved);
+    unsigned inner = alloc_cons(new_saved, body);
+    gc_protect(&inner);
+    inner = alloc_cons(cdr(vals_ptr), inner);
+    unsigned new_data = alloc_cons(rest, inner);
+    unsigned k2 = make_cont(CONT_LETREC_INIT, new_data, env, next);
+    tramp_eval(next_val_expr, env, k2);
 }
 
 void handle_cont_eval_fn(unsigned val, unsigned data, unsigned env,

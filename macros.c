@@ -80,7 +80,9 @@
 #include "context.h"
 #include "eval_internal.h"
 #include "env.h"
+#include "prim_internal.h" // make_string_copy
 #include <limits.h>
+#include <stdlib.h>
 #include <string.h>
 
 // External gensym counter
@@ -102,18 +104,6 @@ static bool generated_gensym_atom(unsigned atom)
 // ============================================================================
 // Helper Functions
 // ============================================================================
-
-static bool same_literal_binding(unsigned literal, unsigned input,
-                                unsigned closure_env, unsigned use_env)
-{
-    if (!IS_ATOM(input) || CELL_ID(input) != CELL_ID(literal))
-        return false;
-
-    int64_t id = CELL_ID(literal);
-    unsigned literal_binding = env_find_binding_cell(id, closure_env);
-    unsigned input_binding = env_find_binding_cell(id, use_env);
-    return literal_binding == input_binding;
-}
 
 static void append_bindings_chain(unsigned *dst, unsigned src)
 {
@@ -192,18 +182,10 @@ static unsigned expand_form_list(unsigned list, unsigned syn_env,
     unsigned it = list;
     gc_protect(&it);
     while (IS_PAIR(it)) {
-        unsigned elem = car(it);
-        gc_protect(&elem);
-        unsigned expanded = expand_form(elem, syn_env, bindings_out);
+        unsigned expanded = expand_form(car(it), syn_env, bindings_out);
         if (expanded == TOK_ERROR)
             return TOK_ERROR;
-        unsigned next = alloc_cons(expanded, 0);
-        gc_protect(&next);
-        if (!out)
-            out = next;
-        else
-            cell_set_cdr(out_tail, next);
-        out_tail = next;
+        list_append(&out, &out_tail, expanded);
         it = cdr(it);
     }
 
@@ -238,11 +220,20 @@ static unsigned expand_let_syntax(unsigned form, unsigned syn_env,
         return TOK_ERROR;
     }
 
+    // The keyword is rebuilt into the result after allocations; reading
+    // car(form) inline as an argument to the outer alloc_cons could load it
+    // before the inner one collects.
+    unsigned keyword = car(form);
+    gc_protect(&keyword);
+
     if (!bindings) {
         unsigned expanded_body = expand_form_list(body, syn_env, bindings_out);
         if (expanded_body == TOK_ERROR)
             return TOK_ERROR;
-        return alloc_cons(car(form), alloc_cons(bindings, expanded_body));
+        gc_protect(&expanded_body);
+        unsigned tail = alloc_cons(bindings, expanded_body);
+        gc_protect(&tail);
+        return alloc_cons(keyword, tail);
     }
 
     GC_GUARD;
@@ -266,20 +257,24 @@ static unsigned expand_let_syntax(unsigned form, unsigned syn_env,
             return TOK_ERROR;
         }
 
+        // name is used after make_syntax_transformer allocates.
         unsigned name = car(binding);
+        gc_protect(&name);
         unsigned transformer_form = cadr(binding);
         if (!syntax_rules_valid(transformer_form, ellipsis_id, syn_arity))
             return TOK_ERROR;
 
         unsigned p = make_syntax_transformer(
             transformer_form,
-            (CELL_ID(car(form)) == ctx.kw_let_syntax) ? syn_env :
-                                                        expanded_env);
+            (CELL_ID(keyword) == ctx.kw_let_syntax) ? syn_env :
+                                                      expanded_env);
         if (p == TOK_ERROR)
             return TOK_ERROR;
+        gc_protect(&p);
 
         if (defvar(name, p, expanded_env) == TOK_ERROR)
             return TOK_ERROR;
+        gc_unprotect(2); // p, name
 
         b = cdr(b);
     }
@@ -287,9 +282,16 @@ static unsigned expand_let_syntax(unsigned form, unsigned syn_env,
     unsigned expanded_body = expand_form_list(body, expanded_env, bindings_out);
     if (expanded_body == TOK_ERROR)
         return TOK_ERROR;
-
-    return alloc_cons(car(form), alloc_cons(bindings, expanded_body));
+    gc_protect(&expanded_body);
+    unsigned tail = alloc_cons(bindings, expanded_body);
+    gc_protect(&tail);
+    return alloc_cons(keyword, tail);
 }
+
+// While a nested syntax-rules template is unwrapped, the ellipsis identifier
+// of that transformer: a wrapped occurrence of it must come off too, or an
+// ellipsis handed in by the outer macro is not seen as one. 0 when unset.
+static int64_t unwrap_template_ellipsis_id = 0;
 
 // The static expander recurses through macro outputs; a self-referential
 // macro referenced from inside an explicit lambda body overflows the C
@@ -301,6 +303,7 @@ static int expansion_depth = 0;
 void macros_reset_expansion_depth(void)
 {
     expansion_depth = 0;
+    unwrap_template_ellipsis_id = 0;
 }
 
 static unsigned expand_form_inner(unsigned expr, unsigned syn_env,
@@ -309,8 +312,24 @@ static unsigned expand_form_inner(unsigned expr, unsigned syn_env,
 unsigned expand_form(unsigned expr, unsigned syn_env, unsigned *bindings_out)
 {
     if (expansion_depth >= MAX_STATIC_EXPANSION_DEPTH) {
-        show_error("macro expansion exceeded maximum depth");
-        return TOK_ERROR;
+        // Leave a form that raises when it runs instead of failing the whole
+        // lambda body, as the compiler does (compile_macro_binding): a
+        // self-referential macro in a branch that is never taken, say
+        // (if #f (loop 1) 'ok), is a correct program. Failing here made the
+        // closure raise as soon as it was called. Not the unexpanded form:
+        // re-expanding it at run time would never reach a limit, since the
+        // run-time counter restarts whenever an argument is evaluated.
+        unsigned msg =
+            make_string_copy("macro expansion exceeded maximum depth");
+        if (msg == TOK_ERROR)
+            return TOK_ERROR;
+        GC_GUARD;
+        gc_protect(&msg);
+        unsigned raiser = mk_primop(PERROR);
+        gc_protect(&raiser);
+        unsigned args = alloc_cons(msg, 0);
+        gc_protect(&args);
+        return alloc_cons(raiser, args);
     }
     expansion_depth++;
     unsigned result = expand_form_inner(expr, syn_env, bindings_out);
@@ -349,32 +368,126 @@ unsigned extend_env_with_binder_names(unsigned parent_env, unsigned params)
     return frame_env;
 }
 
-// Return 1 for an all-definition sequence, 0 at the first expression, and
-// -1 on failure. Nested begins splice into the same definition scope.
-static int bind_internal_definitions(unsigned env, unsigned body,
-                                     unsigned *frame)
+static unsigned expand_without_hygiene(unsigned transformer, unsigned form,
+                                       unsigned use_env);
+static unsigned unwrap_protected(unsigned expr, bool preserve_identifiers);
+
+// Macro uses followed while deciding whether a body form is a definition.
+#define MAX_DEFINITION_SCAN_EXPANSIONS 64
+
+// Atom cells of a macro use's form, for telling the identifiers it supplied
+// from ones its expansion introduced: the reader allocates a cell per
+// occurrence, and expansion passes a substituted identifier on as the very
+// same cell, through any number of nested macro uses. False if the form is
+// too large to bother with (the scan then just stops, as before).
+#define MAX_DEFINITION_SCAN_ATOMS 4096
+
+static bool collect_form_atoms(unsigned form, unsigned *atoms, unsigned *count,
+                               unsigned depth)
+{
+    if (depth > 256)
+        return false;
+    for (; IS_PAIR(form); form = cdr(form)) {
+        if (!collect_form_atoms(car(form), atoms, count, depth + 1))
+            return false;
+    }
+    if (!IS_ATOM(form))
+        return true; // (), a vector or other datum: no define target in it
+    if (++*count > MAX_DEFINITION_SCAN_ATOMS)
+        return false;
+    GC_GUARD;
+    gc_protect(&form);
+    *atoms = alloc_cons(form, *atoms);
+    return true;
+}
+
+static bool atom_cell_listed(unsigned atom, unsigned atoms)
+{
+    for (; IS_PAIR(atoms); atoms = cdr(atoms)) {
+        if (car(atoms) == atom)
+            return true;
+    }
+    return false;
+}
+
+// user_atoms: 0 when body is code as written; otherwise body came out of
+// expand_without_hygiene for a use whose own atom cells are listed, and only
+// a define target that is one of them - a name the use supplied - is
+// defined as written. A target the macros introduced is renamed by the real
+// expansion (hygienize_define), so binding it here left a #f placeholder
+// that hid the outer variable of the same name.
+static int bind_internal_definitions_at(unsigned env, unsigned body,
+                                        unsigned *frame, unsigned expansions,
+                                        unsigned user_atoms,
+                                        bool *saw_define_syntax)
 {
     GC_GUARD;
     gc_protect(&env);
     gc_protect(&body);
+    gc_protect(&user_atoms);
     for (; IS_PAIR(body); body = cdr(body)) {
         unsigned form = car(body);
         if (!IS_PAIR(form) || !IS_ATOM(car(form)))
             return 0;
         int64_t kw = CELL_ID(car(form));
-        if (kw == ctx.kw_begin && lookup_silent(kw, env) == TOK_ERROR) {
-            int status = bind_internal_definitions(env, cdr(form), frame);
+        unsigned head_binding = lookup_silent(kw, env);
+        if (head_binding != TOK_ERROR && IS_SYNTAX(head_binding)) {
+            // A macro use may expand into definitions - define-values,
+            // define-record-type, a user macro around define - and those
+            // names must shadow outer macros for the rest of the body just
+            // as a literal define does. Look at its expansion, made without
+            // the hygiene passes (see expand_without_hygiene). Not after a
+            // define-syntax in this body, though: the scan cannot tell
+            // whether the keyword is still the outer macro it finds in env.
+            if (expansions >= MAX_DEFINITION_SCAN_EXPANSIONS ||
+                *saw_define_syntax)
+                return 0;
+            unsigned atoms = user_atoms;
+            gc_protect(&atoms);
+            if (!atoms) {
+                unsigned count = 0;
+                if (!collect_form_atoms(cdr(form), &atoms, &count, 0))
+                    return 0;
+                if (!atoms)
+                    atoms = alloc_cons(0, 0); // nothing supplied; non-empty
+            }
+            unsigned expanded =
+                expand_without_hygiene(head_binding, form, env);
+            if (expanded == TOK_ERROR)
+                return 0; // the real expansion reports it
+            gc_protect(&expanded);
+            unsigned as_body = alloc_cons(expanded, 0);
+            gc_protect(&as_body);
+            int status = bind_internal_definitions_at(
+                env, as_body, frame, expansions + 1, atoms, saw_define_syntax);
+            gc_unprotect(3);
             if (status != 1)
                 return status;
             continue;
         }
-        if (kw != ctx.kw_define || lookup_silent(kw, env) != TOK_ERROR ||
+        if (kw == ctx.kw_begin && head_binding == TOK_ERROR) {
+            int status = bind_internal_definitions_at(
+                env, cdr(form), frame, expansions, user_atoms,
+                saw_define_syntax);
+            if (status != 1)
+                return status;
+            continue;
+        }
+        // define-syntax is a definition too; the defines after it are in
+        // the same scope (compile.c's collect_internal_defines agrees).
+        if (kw == ctx.kw_define_syntax && head_binding == TOK_ERROR) {
+            *saw_define_syntax = true;
+            continue;
+        }
+        if (kw != ctx.kw_define || head_binding != TOK_ERROR ||
             !IS_PAIR(cdr(form)))
             return 0;
         unsigned target = cadr(form);
         unsigned name = IS_PAIR(target) ? car(target) : target;
         if (!IS_ATOM(name))
             return 0;
+        if (user_atoms && !atom_cell_listed(name, user_atoms))
+            continue; // introduced by a template: renamed, not bound
         gc_protect(&name);
         if (!*frame)
             *frame = extend_env_empty(env);
@@ -384,6 +497,16 @@ static int bind_internal_definitions(unsigned env, unsigned body,
         gc_unprotect(1);
     }
     return body == 0;
+}
+
+// Return 1 for an all-definition sequence, 0 at the first expression, and
+// -1 on failure. Nested begins splice into the same definition scope.
+static int bind_internal_definitions(unsigned env, unsigned body,
+                                     unsigned *frame)
+{
+    bool saw_define_syntax = false;
+    return bind_internal_definitions_at(env, body, frame, 0, 0,
+                                        &saw_define_syntax);
 }
 
 // Layer a frame with all leading internal names over env before expansion,
@@ -480,236 +603,146 @@ static unsigned expand_form_inner(unsigned expr, unsigned syn_env,
         // scope instead of the lambda's own.
         if (kw == ctx.kw_lambda)
             return expr;
+
+        // (define (name . formals) body ...) is a lambda in disguise, so its
+        // body must expand in the scope its closure will have: walking it
+        // as a plain list treated (define (inner when) (when 1 2)) as calls
+        // in the enclosing scope, where when is still the macro. Expand it
+        // here, once, against the frames build_lambda_closure would add -
+        // leaving it for handle_define instead re-expanded the body, minting
+        // fresh gensyms, every time the enclosing procedure ran. For
+        // (define name expr) only expr is an expression.
+        if (kw == ctx.kw_define && lookup_silent(kw, syn_env) == TOK_ERROR &&
+            IS_PAIR(cdr(expr))) {
+            if (IS_PAIR(cadr(expr))) {
+                GC_GUARD;
+                gc_protect(&expr); // lambda_params_valid may allocate
+                if (!IS_ATOM(car(cadr(expr))) || !cddr(expr) ||
+                    !proper_list_silent(cddr(expr)) ||
+                    !lambda_params_valid(cdr(cadr(expr))))
+                    return expr; // handle_define reports what is wrong
+                unsigned binder_env =
+                    extend_env_with_binder_names(syn_env, cdr(cadr(expr)));
+                if (binder_env == TOK_ERROR)
+                    return TOK_ERROR;
+                gc_protect(&binder_env);
+                unsigned body_env =
+                    extend_env_with_internal_defines(binder_env, cddr(expr));
+                if (body_env == TOK_ERROR)
+                    return TOK_ERROR;
+                gc_protect(&body_env);
+                unsigned new_body =
+                    expand_form(cddr(expr), body_env, bindings_out);
+                if (new_body == TOK_ERROR)
+                    return TOK_ERROR;
+                if (new_body == cddr(expr))
+                    return expr;
+                gc_protect(&new_body);
+                unsigned target_tail = alloc_cons(cadr(expr), new_body);
+                gc_protect(&target_tail);
+                return alloc_cons(car(expr), target_tail);
+            }
+            if (!IS_ATOM(cadr(expr)))
+                return expr;
+            if (!IS_PAIR(cddr(expr)) || cdr(cddr(expr)))
+                return expr; // malformed; handle_define reports it
+            GC_GUARD;
+            gc_protect(&expr);
+            unsigned value = expand_form(car(cddr(expr)), syn_env,
+                                         bindings_out);
+            if (value == TOK_ERROR)
+                return TOK_ERROR;
+            if (value == car(cddr(expr)))
+                return expr;
+            gc_protect(&value);
+            unsigned value_tail = alloc_cons(value, 0);
+            gc_protect(&value_tail);
+            unsigned target_tail = alloc_cons(cadr(expr), value_tail);
+            gc_protect(&target_tail);
+            return alloc_cons(car(expr), target_tail);
+        }
     }
 
     return expand_form_list(expr, syn_env, bindings_out);
 }
 
-static bool pattern_literals_match(unsigned pattern, unsigned input,
-                                   unsigned literals, int64_t ellipsis_id,
-                                   unsigned closure_env, unsigned use_env);
-
-static bool vector_pattern_literals_match(unsigned pattern, unsigned input,
-                                          unsigned literals,
-                                          int64_t ellipsis_id,
-                                          unsigned closure_env,
-                                          unsigned use_env)
+// What a (##protected## . x) wrapper - one or more deep - holds, or 0 if
+// tmpl is not a wrapper. Allocates nothing.
+static unsigned protected_payload(unsigned tmpl)
 {
-    if (!IS_VECTOR(input))
-        return false;
-
-    unsigned pat_len = vector_len(pattern);
-    unsigned inp_len = vector_len(input);
-    unsigned *pat_data = vector_data_ptr(pattern);
-    unsigned ellipsis_pos = pat_len;
-
-    for (unsigned i = 0; i < pat_len; i++) {
-        if (syntax_is_ellipsis(pat_data[i], ellipsis_id)) {
-            ellipsis_pos = i;
-            break;
-        }
-    }
-
-    if (ellipsis_pos == pat_len) {
-        if (pat_len != inp_len)
-            return false;
-        for (unsigned i = 0; i < pat_len; i++) {
-            pat_data = vector_data_ptr(pattern);
-            unsigned *inp_data = vector_data_ptr(input);
-            if (!pattern_literals_match(pat_data[i], inp_data[i], literals,
-                                        ellipsis_id, closure_env, use_env))
-                return false;
-        }
-        return true;
-    }
-
-    if (ellipsis_pos == 0)
-        return false;
-
-    unsigned pre_count = ellipsis_pos - 1;
-    unsigned post_count = pat_len - ellipsis_pos - 1;
-    if (inp_len < pre_count + post_count)
-        return false;
-
-    for (unsigned i = 0; i < pre_count; i++) {
-        pat_data = vector_data_ptr(pattern);
-        unsigned *inp_data = vector_data_ptr(input);
-        if (!pattern_literals_match(pat_data[i], inp_data[i], literals,
-                                    ellipsis_id, closure_env, use_env))
-            return false;
-    }
-
-    unsigned repeat_count = inp_len - pre_count - post_count;
-    for (unsigned i = 0; i < repeat_count; i++) {
-        pat_data = vector_data_ptr(pattern);
-        unsigned *inp_data = vector_data_ptr(input);
-        if (!pattern_literals_match(pat_data[ellipsis_pos - 1],
-                                    inp_data[pre_count + i], literals,
-                                    ellipsis_id, closure_env, use_env))
-            return false;
-    }
-
-    for (unsigned i = 0; i < post_count; i++) {
-        pat_data = vector_data_ptr(pattern);
-        unsigned *inp_data = vector_data_ptr(input);
-        unsigned pat_idx = ellipsis_pos + 1 + i;
-        unsigned inp_idx = inp_len - post_count + i;
-        if (!pattern_literals_match(pat_data[pat_idx], inp_data[inp_idx],
-                                    literals, ellipsis_id, closure_env,
-                                    use_env))
-            return false;
-    }
-
-    return true;
+    if (!IS_PAIR(tmpl) || !IS_ATOM(car(tmpl)) ||
+        CELL_ID(car(tmpl)) != ctx.kw_protected)
+        return 0;
+    while (IS_PAIR(tmpl) && IS_ATOM(car(tmpl)) &&
+           CELL_ID(car(tmpl)) == ctx.kw_protected)
+        tmpl = cdr(tmpl);
+    return tmpl;
 }
 
-static bool pattern_literals_match(unsigned pattern, unsigned input,
-                                   unsigned literals, int64_t ellipsis_id,
-                                   unsigned closure_env, unsigned use_env)
+// Pattern-variable bindings are (key . value). A variable matched outside
+// any ellipsis has its identifier as key. A variable matched under N >= 1
+// ellipses has key (identifier . N) - see annotate_ellipsis_depths - so the
+// expander can tell an ellipsis sequence from a depth-0 variable that merely
+// matched a list: in ((x y) ...) only y is iterated, x is repeated as is.
+// Bindings built without depth information (the C unit tests) are depth 0.
+static unsigned binding_key_var(unsigned key)
 {
-    if (!pattern)
-        return input == 0;
-
-    if (IS_ATOM(pattern)) {
-        int64_t id = CELL_ID(pattern);
-        if (atom_list_contains_id(literals, id))
-            return same_literal_binding(pattern, input, closure_env, use_env);
-        if (syntax_is_underscore(pattern))
-            return true;
-        if (!identifier_valid(pattern))
-            return IS_ATOM(input) && CELL_ID(input) == id;
-        return true;
-    }
-
-    if (IS_VECTOR(pattern)) {
-        return vector_pattern_literals_match(pattern, input, literals,
-                                             ellipsis_id, closure_env, use_env);
-    }
-
-    if (IS_PAIR(pattern)) {
-        if (IS_PAIR(cdr(pattern)) &&
-            syntax_is_ellipsis(cadr(pattern), ellipsis_id)) {
-            unsigned rest_pattern = cddr(pattern);
-            unsigned elem_pattern = car(pattern);
-            unsigned rest_input = input;
-
-            while (IS_PAIR(rest_input)) {
-                if (pattern_literals_match(rest_pattern, rest_input, literals,
-                                           ellipsis_id, closure_env, use_env))
-                    return true;
-                if (!pattern_literals_match(elem_pattern, car(rest_input),
-                                            literals, ellipsis_id, closure_env,
-                                            use_env))
-                    return false;
-                rest_input = cdr(rest_input);
-            }
-            return pattern_literals_match(rest_pattern, rest_input, literals,
-                                          ellipsis_id, closure_env, use_env);
-        }
-
-        // Fixed-arity patterns can be wide even when they are not nested.
-        // Compare their list spine iteratively rather than recursing through
-        // every cdr.
-        for (;;) {
-            if (!IS_PAIR(input) ||
-                !pattern_literals_match(car(pattern), car(input), literals,
-                                        ellipsis_id, closure_env, use_env))
-                return false;
-            pattern = cdr(pattern);
-            input = cdr(input);
-            if (!IS_PAIR(pattern))
-                return pattern_literals_match(pattern, input, literals,
-                                              ellipsis_id, closure_env,
-                                              use_env);
-            if (IS_PAIR(cdr(pattern)) &&
-                syntax_is_ellipsis(cadr(pattern), ellipsis_id))
-                return pattern_literals_match(pattern, input, literals,
-                                              ellipsis_id, closure_env,
-                                              use_env);
-        }
-    }
-
-    // Self-evaluating literal data in a pattern (strings, bignums,
-    // bytevectors, inexact numbers, ...) must match by content, not by cell
-    // identity: two distinct-but-equal? literal cells (e.g. two separately
-    // read "hello" strings) have unrelated CELL_IDs, so comparing those
-    // directly rejected every such literal pattern.
-    if (!IS_CELL(pattern) || !IS_CELL(input))
-        return pattern == input;
-    return deep_equal(pattern, input);
+    return IS_PAIR(key) ? car(key) : key;
 }
 
-// Check if a pattern contains a variable (for ellipsis expansion)
-static bool pattern_contains_var(unsigned pattern, unsigned var)
+static unsigned binding_key_depth(unsigned key)
 {
-    if (!pattern)
-        return false;
-    if (IS_ATOM(pattern)) {
-        return CELL_ID(pattern) == CELL_ID(var);
-    }
-    if (IS_PAIR(pattern)) {
-        // Spine iteratively, cars recursively, the way pattern_binds_id below
-        // already does: recursing on the cdr cost a C frame per element.
-        while (IS_PAIR(pattern)) {
-            if (pattern_contains_var(car(pattern), var))
-                return true;
-            pattern = cdr(pattern);
-        }
-        return pattern_contains_var(pattern, var);
-    }
-    if (IS_VECTOR(pattern)) {
-        unsigned len = vector_len(pattern);
-        unsigned *data = vector_data_ptr(pattern);
-        for (unsigned i = 0; i < len; i++) {
-            if (pattern_contains_var(data[i], var))
-                return true;
-        }
-    }
-    return false;
+    if (!IS_PAIR(key) || !IS_NUM(cdr(key)) || CELL_ID(cdr(key)) < 1)
+        return 0;
+    return (unsigned)CELL_ID(cdr(key));
 }
 
-// Look up a pattern variable in bindings
+static bool binding_key_is(unsigned key, unsigned var)
+{
+    unsigned key_var = binding_key_var(key);
+    return IS_ATOM(key_var) && IS_ATOM(var) && CELL_ID(key_var) == CELL_ID(var);
+}
+
+// Look up a pattern variable in bindings. The first match wins: ellipsis
+// iteration pushes each element's binding in front of the sequence's.
 static unsigned syntax_lookup(unsigned var, unsigned bindings)
 {
     for (; IS_PAIR(bindings); bindings = cdr(bindings)) {
         unsigned binding = car(bindings);
         if (!IS_PAIR(binding))
             continue;
-        unsigned pvar = car(binding);
-        if (IS_ATOM(pvar) && IS_ATOM(var) && CELL_ID(pvar) == CELL_ID(var)) {
+        if (binding_key_is(car(binding), var))
             return cdr(binding);
-        }
     }
     return TOK_ERROR;
 }
 
-// Find ellipsis binding that contains a given variable in its pattern
+// The binding an ellipsis following a subtemplate iterates for var, or 0 if
+// var is not a pattern variable or is (now) depth 0. Only the innermost
+// binding counts: once an outer iteration has rebound var to one element of
+// its sequence, the older sequence binding behind it must not be iterated.
 static unsigned find_ellipsis_binding(unsigned var, unsigned bindings)
 {
-    unsigned cons_match =
-        0; // Remember first cons pattern match (lower priority)
-
     for (unsigned b = bindings; IS_PAIR(b); b = cdr(b)) {
         unsigned binding = car(b);
-        if (!IS_PAIR(binding))
+        if (!IS_PAIR(binding) || !binding_key_is(car(binding), var))
             continue;
-        unsigned pvar = car(binding);
-        unsigned val = cdr(binding);
-
-        // Check for direct atom binding with list value (higher priority)
-        if (IS_ATOM(pvar) && IS_ATOM(var) && CELL_ID(pvar) == CELL_ID(var) &&
-            (!val || IS_PAIR(val))) {
-            return binding;
-        }
-
-        // Remember first cons pattern match
-        if (!cons_match && IS_PAIR(pvar) && (!val || IS_PAIR(val)) &&
-            pattern_contains_var(pvar, var)) {
-            cons_match = binding;
-        }
+        return binding_key_depth(car(binding)) >= 1 ? binding : 0;
     }
+    return 0;
+}
 
-    return cons_match;
+// Key for one element of an ellipsis variable's sequence: one ellipsis
+// shallower than the sequence's own key.
+static unsigned ellipsis_element_key(unsigned key)
+{
+    unsigned depth = binding_key_depth(key);
+    unsigned var = binding_key_var(key);
+    if (depth <= 1)
+        return var;
+    GC_GUARD;
+    gc_protect(&var);
+    return alloc_cons(var, store((int64_t)depth - 1));
 }
 
 // Collect ALL ellipsis-bound variables from a template into a list
@@ -733,10 +766,8 @@ static unsigned collect_ellipsis_vars(unsigned tmpl, unsigned bindings,
                 unsigned collected_binding = car(c);
                 if (!IS_PAIR(collected_binding))
                     continue;
-                unsigned collected_var = car(collected_binding);
-                unsigned binding_var = car(binding);
-                if (IS_ATOM(collected_var) && IS_ATOM(binding_var) &&
-                    CELL_ID(collected_var) == CELL_ID(binding_var))
+                if (binding_key_is(car(collected_binding),
+                                   binding_key_var(car(binding))))
                     return collected; // Already have it
             }
             gc_protect(&binding);
@@ -806,6 +837,97 @@ static bool ellipsis_vars_iteration_count(unsigned ellipsis_vars,
 
 // Unwrap protected identifiers: (##protected## . x) → x
 // Called after expansion to remove protection markers
+static unsigned unwrap_protected(unsigned expr, bool preserve_identifiers);
+
+// A nested (syntax-rules ...) in an expansion keeps the wrappers on its
+// template identifiers - they keep the inner macro's hygiene passes off what
+// the outer macro substituted - but they must come off wherever syntax-rules
+// requires a bare identifier or datum: the custom ellipsis, the literals and
+// each rule's pattern. Left on, an outer pattern variable used as the inner
+// rule's keyword, a pattern variable, a literal or the ellipsis (R7RS 4.3.2's
+// own be-like-begin example) made the inner transformer malformed.
+// A pattern variable substituted as the dotted tail of a list -
+// (syntax-rules () . rules) - is the wrapper (##protected## . value), which
+// read as a spine continues with the marker as its next element. Step over
+// the marker to the substituted list itself. Allocates nothing.
+static unsigned strip_spine_wrapper(unsigned rest)
+{
+    while (IS_PAIR(rest) && IS_ATOM(car(rest)) &&
+           CELL_ID(car(rest)) == ctx.kw_protected)
+        rest = cdr(rest);
+    return rest;
+}
+
+static unsigned unwrap_syntax_rules_form(unsigned expr)
+{
+    GC_GUARD;
+    gc_protect(&expr);
+    unsigned out = 0, tail = 0;
+    gc_protect(&out);
+    gc_protect(&tail);
+    list_append(&out, &tail, car(expr)); // the syntax-rules keyword
+    unsigned rest = strip_spine_wrapper(cdr(expr));
+    gc_protect(&rest);
+
+    int64_t ellipsis_id = ctx.kw_ellipsis;
+    if (IS_PAIR(rest)) {
+        unsigned first = unwrap_protected(car(rest), false);
+        if (first == TOK_ERROR)
+            return TOK_ERROR;
+        gc_protect(&first); // inspected after list_append allocates
+        list_append(&out, &tail, first);
+        rest = strip_spine_wrapper(cdr(rest));
+        if (IS_ATOM(first) && IS_PAIR(rest)) {
+            ellipsis_id = CELL_ID(first);
+            // first was a custom ellipsis; the literals follow it
+            unsigned literals = unwrap_protected(car(rest), false);
+            if (literals == TOK_ERROR)
+                return TOK_ERROR;
+            list_append(&out, &tail, literals);
+            rest = cdr(rest);
+        }
+    }
+
+    for (;;) {
+        rest = strip_spine_wrapper(rest);
+        if (!IS_PAIR(rest))
+            break;
+        unsigned rule = car(rest);
+        unsigned new_rule;
+        if (IS_PAIR(rule) && IS_PAIR(cdr(rule)) && !cddr(rule)) {
+            unsigned pattern = unwrap_protected(car(rule), false);
+            if (pattern == TOK_ERROR)
+                return TOK_ERROR;
+            gc_protect(&pattern);
+            int64_t saved_ellipsis_id = unwrap_template_ellipsis_id;
+            unwrap_template_ellipsis_id = ellipsis_id;
+            unsigned tmpl = unwrap_protected(cadr(car(rest)), true);
+            unwrap_template_ellipsis_id = saved_ellipsis_id;
+            if (tmpl == TOK_ERROR)
+                return TOK_ERROR;
+            gc_protect(&tmpl);
+            unsigned rule_tail = alloc_cons(tmpl, 0);
+            gc_protect(&rule_tail);
+            new_rule = alloc_cons(pattern, rule_tail);
+            gc_unprotect(3);
+        } else {
+            new_rule = unwrap_protected(rule, true); // malformed: let the
+                                                     // validator report it
+            if (new_rule == TOK_ERROR)
+                return TOK_ERROR;
+        }
+        list_append(&out, &tail, new_rule);
+        rest = cdr(rest);
+    }
+    if (rest) {
+        unsigned dotted = unwrap_protected(rest, true);
+        if (dotted == TOK_ERROR)
+            return TOK_ERROR;
+        cell_set_cdr(tail, dotted);
+    }
+    return out;
+}
+
 static unsigned unwrap_protected(unsigned expr, bool preserve_identifiers)
 {
     if (!expr)
@@ -818,18 +940,26 @@ static unsigned unwrap_protected(unsigned expr, bool preserve_identifiers)
     if (IS_PAIR(expr)) {
         unsigned head = car(expr);
         if (IS_ATOM(head) && CELL_ID(head) == ctx.kw_protected) {
-            // Unwrap: (##protected## . x) → x
-            if (preserve_identifiers && IS_ATOM(cdr(expr)))
-                return expr;
-            return cdr(expr);
+            // Unwrap: (##protected## . x) → x. A template identifier that
+            // was already protected when it was substituted - an outer
+            // macro's argument reused as an inner pattern variable - comes
+            // back wrapped twice; peel to the innermost wrapper, without
+            // looking inside the wrapped datum itself.
+            unsigned wrapper = expr;
+            while (IS_PAIR(cdr(wrapper)) && IS_ATOM(car(cdr(wrapper))) &&
+                   CELL_ID(car(cdr(wrapper))) == ctx.kw_protected)
+                wrapper = cdr(wrapper);
+            if (preserve_identifiers && IS_ATOM(cdr(wrapper)) &&
+                CELL_ID(cdr(wrapper)) != unwrap_template_ellipsis_id)
+                return wrapper;
+            return cdr(wrapper);
         }
 
         // Nested transformers still need identifier protection for hygiene.
         // Compound substitutions, however, must regain their original shape
         // before the nested patterns/templates are processed.
-        if (IS_ATOM(head) && CELL_ID(head) == ctx.kw_syntax_rules) {
-            preserve_identifiers = true;
-        }
+        if (IS_ATOM(head) && CELL_ID(head) == ctx.kw_syntax_rules)
+            return unwrap_syntax_rules_form(expr);
         // Walk the spine iteratively, recursing only into the cars. Recursing
         // on the cdr as well cost one C frame per list element, so a macro
         // whose expansion is a long flat body - (begin e1 ... e100000), which
@@ -947,8 +1077,10 @@ static unsigned unwrap_protected(unsigned expr, bool preserve_identifiers)
                 gc_unprotect(2);
                 return TOK_ERROR;
             }
-            unsigned *new_data = vector_data_ptr(new_vec);
-            new_data[i] = unwrapped;
+            // Through the write barrier: new_vec may have been promoted by a
+            // collection during the recursive call, and a raw store would hide
+            // this nursery element from the next minor GC.
+            vector_set_elem(new_vec, i, unwrapped);
         }
         gc_unprotect(2);
         return new_vec;
@@ -993,6 +1125,143 @@ bool is_special_form(int64_t id)
            id == ctx.kw_unquote_splicing || id == ctx.kw_else ||
            id == ctx.kw_ellipsis || id == ctx.kw_underscore ||
            id == ctx.kw_let || id == ctx.kw_letstar || id == ctx.kw_letrec;
+}
+
+// The identifier a hygiene alias gensym stands for, indexed by the gensym's
+// atom id; 0 for anything else. Only consulted to recognise a form whose head
+// was renamed to a definition alias (see template_case_form).
+static int64_t *alias_origins = NULL;
+static size_t alias_origins_len = 0;
+
+void macros_note_alias(int64_t alias_id, int64_t origin_id)
+{
+    if (alias_id <= 0 || origin_id <= 0)
+        return;
+    if ((size_t)alias_id >= alias_origins_len) {
+        size_t new_len = alias_origins_len ? alias_origins_len : 1024;
+        while (new_len <= (size_t)alias_id)
+            new_len *= 2;
+        int64_t *grown = realloc(alias_origins, new_len * sizeof(int64_t));
+        if (!grown)
+            return; // only a recognition aid; losing an entry is harmless
+        memset(grown + alias_origins_len, 0,
+               (new_len - alias_origins_len) * sizeof(int64_t));
+        alias_origins = grown;
+        alias_origins_len = new_len;
+    }
+    alias_origins[alias_id] = origin_id;
+}
+
+static int64_t identifier_origin(int64_t id)
+{
+    for (int hops = 0; hops < 64 && id > 0 && (size_t)id < alias_origins_len &&
+                       alias_origins[id];
+         hops++)
+        id = alias_origins[id];
+    return id;
+}
+
+int64_t macros_toplevel_defines_marker_id(void)
+{
+    static int64_t marker_id = 0;
+    if (!marker_id)
+        marker_id = CELL_ID(make_uninterned_symbol("##toplevel-defines##"));
+    return marker_id;
+}
+
+// True if env's first frame is a top-level begin's placeholder frame.
+static bool frame_is_toplevel_defines(unsigned env)
+{
+    int64_t marker = macros_toplevel_defines_marker_id();
+    unsigned cell = env_find_binding_cell(marker, env);
+    return cell && IS_PAIR(env) &&
+           cell != env_find_binding_cell(marker, cdr(env));
+}
+
+// id's binding cell for hygiene comparisons. A binding in a top-level
+// placeholder frame is not one: at run time the name is the global the
+// define creates, so look past the frame. Neither lookup allocates.
+static unsigned hygiene_binding_cell(int64_t id, unsigned env)
+{
+    unsigned cell = env_find_binding_cell(id, env);
+    if (!cell ||
+        lookup_silent(macros_toplevel_defines_marker_id(), env) == TOK_ERROR)
+        return cell; // no placeholder frame to look past
+    for (unsigned e = env; IS_PAIR(e) && cell; e = cdr(e)) {
+        unsigned below = env_find_binding_cell(id, cdr(e));
+        if (below == cell)
+            continue; // not bound in this frame
+        if (!frame_is_toplevel_defines(e))
+            return cell;
+        cell = below;
+    }
+    return cell;
+}
+
+// Bound at all, for the use-site-only rename in apply_syntax, with the same
+// view of top-level placeholders as hygiene_binding_cell.
+static bool bound_for_hygiene(int64_t id, unsigned env)
+{
+    if (lookup_silent(id, env) == TOK_ERROR)
+        return false;
+    if (!env_find_binding_cell(id, env))
+        return true;
+    return hygiene_binding_cell(id, env) != 0;
+}
+
+bool macros_same_binding(int64_t id, unsigned env_a, unsigned env_b)
+{
+    return hygiene_binding_cell(id, env_a) == hygiene_binding_cell(id, env_b);
+}
+
+bool template_case_form(unsigned tmpl)
+{
+    static int case_id = -1;
+    if (case_id < 0)
+        case_id = intern("case");
+    return IS_PAIR(tmpl) && IS_ATOM(car(tmpl)) &&
+           identifier_origin(CELL_ID(car(tmpl))) == case_id &&
+           IS_PAIR(cdr(tmpl)) && proper_list_silent(cddr(tmpl));
+}
+
+// Rebuild (case key clause ...) with walk applied to the key and to each
+// clause's expressions, never to a clause's datum list (or else). The
+// datums are quoted by case itself: renaming one changed what it matches -
+// (case v ((+) ...)) stopped matching + once + was a definition alias.
+typedef unsigned (*case_walker)(unsigned form, void *arg);
+
+static unsigned map_case_form(unsigned tmpl, case_walker walk, void *arg)
+{
+    GC_GUARD;
+    gc_protect(&tmpl);
+    unsigned out = 0, tail = 0;
+    gc_protect(&out);
+    gc_protect(&tail);
+    unsigned head = walk(car(tmpl), arg); // case itself may be an alias
+    if (head == TOK_ERROR)
+        return TOK_ERROR;
+    list_append(&out, &tail, head);
+    unsigned key = walk(cadr(tmpl), arg);
+    if (key == TOK_ERROR)
+        return TOK_ERROR;
+    list_append(&out, &tail, key);
+    unsigned c = cddr(tmpl);
+    gc_protect(&c);
+    for (; c; c = cdr(c)) {
+        unsigned clause = car(c);
+        if (!IS_PAIR(clause)) {
+            list_append(&out, &tail, clause);
+            continue;
+        }
+        unsigned body = walk(cdr(clause), arg);
+        if (body == TOK_ERROR)
+            return TOK_ERROR;
+        gc_protect(&body);
+        unsigned new_clause = alloc_cons(car(car(c)), body);
+        gc_unprotect(1);
+        list_append(&out, &tail, new_clause);
+    }
+    return out;
 }
 
 static bool binding_shadows_special(int64_t sym_id, unsigned bindings)
@@ -1285,6 +1554,18 @@ static unsigned collect_free_ids(unsigned tmpl, unsigned bindings,
         if (IS_ATOM(head)) {
             int64_t head_id = CELL_ID(head);
             if (head_id == ctx.kw_protected) {
+                // In a nested macro's template, an identifier the outer
+                // macro substituted is still wrapped. It came from the outer
+                // macro's use site - this macro's definition site - so it is
+                // resolved there like any free identifier: (+ x v) with v
+                // the user's y must not see a y bound where this macro is
+                // used. A wrapped compound is input data, left alone.
+                unsigned payload = protected_payload(tmpl);
+                if (IS_ATOM(payload) && identifier_valid(payload) &&
+                    !is_pattern_var(CELL_ID(payload), bindings) &&
+                    CELL_ID(payload) != ellipsis_id &&
+                    !atom_list_contains_id(collected, CELL_ID(payload)))
+                    return alloc_cons(payload, collected);
                 return collected;
             }
             if (syntax_rules_form_like(tmpl) &&
@@ -1362,6 +1643,22 @@ static unsigned collect_free_ids(unsigned tmpl, unsigned bindings,
                 return collected;
             }
         }
+        if (template_case_form(tmpl)) {
+            // Skip the clauses' datum lists; see map_case_form.
+            collected = collect_free_ids(car(tmpl), bindings, collected,
+                                         ellipsis_id, closure_env);
+            collected = collect_free_ids(cadr(tmpl), bindings, collected,
+                                         ellipsis_id, closure_env);
+            unsigned c = cddr(tmpl);
+            gc_protect(&c);
+            for (; c; c = cdr(c)) {
+                if (IS_PAIR(car(c)))
+                    collected = collect_free_ids(cdr(car(c)), bindings,
+                                                 collected, ellipsis_id,
+                                                 closure_env);
+            }
+            return collected;
+        }
         // Traverse ordinary list spines iteratively.  Macro templates may
         // contain very large flat executable forms (for example a begin with
         // many expressions), for which recursive cdr traversal overflows the
@@ -1384,17 +1681,7 @@ static unsigned collect_free_ids(unsigned tmpl, unsigned bindings,
         }
     }
 
-    if (IS_VECTOR(tmpl)) {
-        unsigned len = vector_len(tmpl);
-        for (unsigned i = 0; i < len; i++) {
-            // Refresh data pointer - GC may have moved tmpl
-            unsigned *data = vector_data_ptr(tmpl);
-            collected =
-                collect_free_ids(data[i], bindings, collected, ellipsis_id,
-                                 closure_env);
-        }
-        return collected;
-    }
+    // A vector is self-evaluating data: nothing in it refers to a binding.
 
     return collected;
 }
@@ -1468,7 +1755,10 @@ static unsigned rename_free_ids_quasiquote(unsigned tmpl, unsigned rename_map,
                 rename_free_ids_quasiquote(old_car, rename_map, depth);
             if (new_car == TOK_ERROR)
                 return TOK_ERROR;
-            if (new_car != old_car)
+            // Compare with the cell as it is now, not old_car: a collection
+            // in the call moves the original and can hand its old index to
+            // the renamed copy, which then looked unchanged and was dropped.
+            if (new_car != car(tmpl))
                 changed = true;
             gc_protect(&new_car);
             list_append(&result, &result_tail, new_car);
@@ -1480,7 +1770,7 @@ static unsigned rename_free_ids_quasiquote(unsigned tmpl, unsigned rename_map,
                     rename_free_ids_quasiquote(next, rename_map, depth);
                 if (new_tail == TOK_ERROR)
                     return TOK_ERROR;
-                if (new_tail != next)
+                if (new_tail != cdr(tmpl))
                     changed = true;
                 if (!changed)
                     return original;
@@ -1497,7 +1787,7 @@ static unsigned rename_free_ids_quasiquote(unsigned tmpl, unsigned rename_map,
                         next, rename_map, depth);
                     if (new_tail == TOK_ERROR)
                         return TOK_ERROR;
-                    if (new_tail != next)
+                    if (new_tail != cdr(tmpl))
                         changed = true;
                     if (!changed)
                         return original;
@@ -1538,8 +1828,10 @@ static unsigned rename_free_ids_quasiquote(unsigned tmpl, unsigned rename_map,
                 rename_free_ids_quasiquote(elem, rename_map, depth);
             if (renamed == TOK_ERROR)
                 return TOK_ERROR;
-            unsigned *new_data = vector_data_ptr(new_vec);
-            new_data[i] = renamed;
+            // Through the write barrier: new_vec may have been promoted by a
+            // collection during the recursive call, and a raw store would hide
+            // this nursery element from the next minor GC.
+            vector_set_elem(new_vec, i, renamed);
         }
         return new_vec;
     }
@@ -1605,6 +1897,19 @@ static unsigned drop_renames_bound_by_binding_list(unsigned rename_map,
     return out;
 }
 
+struct rename_free_ids_arg {
+    unsigned rename_map;
+    bool quote_shadowed;
+    bool quasiquote_shadowed;
+};
+
+static unsigned rename_free_ids_walk(unsigned form, void *arg)
+{
+    struct rename_free_ids_arg *a = arg;
+    return rename_free_ids_inner(form, a->rename_map, a->quote_shadowed,
+                                 a->quasiquote_shadowed);
+}
+
 static unsigned rename_free_ids_inner(unsigned tmpl, unsigned rename_map,
                                       bool quote_shadowed,
                                       bool quasiquote_shadowed)
@@ -1635,10 +1940,21 @@ static unsigned rename_free_ids_inner(unsigned tmpl, unsigned rename_map,
             int64_t head_id = CELL_ID(head);
             bool head_is_definition_alias =
                 id_in_rename_map(head_id, rename_map);
-            if (head_id == ctx.kw_protected ||
-                (syntax_rules_form_like(tmpl) && !head_is_definition_alias)) {
-                return tmpl;
+            if (head_id == ctx.kw_protected) {
+                // A wrapped identifier collected by collect_free_ids: rename
+                // it inside its wrapper, so hygienize still leaves it alone.
+                unsigned payload = protected_payload(tmpl);
+                if (!IS_ATOM(payload) ||
+                    !id_in_rename_map(CELL_ID(payload), rename_map))
+                    return tmpl;
+                unsigned renamed =
+                    rename_free_ids_inner(payload, rename_map, quote_shadowed,
+                                          quasiquote_shadowed);
+                gc_protect(&renamed);
+                return alloc_cons(car(tmpl), renamed);
             }
+            if (syntax_rules_form_like(tmpl) && !head_is_definition_alias)
+                return tmpl;
             if (head_id == ctx.kw_quote && !quote_shadowed &&
                 !head_is_definition_alias) {
                 return tmpl;
@@ -1767,6 +2083,12 @@ static unsigned rename_free_ids_inner(unsigned tmpl, unsigned rename_map,
                 return tmpl;
             }
         }
+        if (template_case_form(tmpl)) {
+            struct rename_free_ids_arg arg = {rename_map, quote_shadowed,
+                                              quasiquote_shadowed};
+            gc_protect(&arg.rename_map);
+            return map_case_form(tmpl, rename_free_ids_walk, &arg);
+        }
         // Ordinary template lists can be very wide.  Walking their cdrs
         // recursively makes an otherwise shallow macro expansion consume one
         // C stack frame per element (notably for a large introduced begin).
@@ -1784,7 +2106,10 @@ static unsigned rename_free_ids_inner(unsigned tmpl, unsigned rename_map,
                 old_car, rename_map, quote_shadowed, quasiquote_shadowed);
             if (new_car == TOK_ERROR)
                 return TOK_ERROR;
-            if (new_car != old_car)
+            // Compare with the cell as it is now, not old_car: a collection
+            // in the call moves the original and can hand its old index to
+            // the renamed copy, which then looked unchanged and was dropped.
+            if (new_car != car(tmpl))
                 changed = true;
             gc_protect(&new_car);
             list_append(&result, &result_tail, new_car);
@@ -1796,7 +2121,7 @@ static unsigned rename_free_ids_inner(unsigned tmpl, unsigned rename_map,
                     next, rename_map, quote_shadowed, quasiquote_shadowed);
                 if (new_tail == TOK_ERROR)
                     return TOK_ERROR;
-                if (new_tail != next)
+                if (new_tail != cdr(tmpl))
                     changed = true;
                 if (!changed)
                     return original;
@@ -1810,7 +2135,7 @@ static unsigned rename_free_ids_inner(unsigned tmpl, unsigned rename_map,
                     next, rename_map, quote_shadowed, quasiquote_shadowed);
                 if (new_tail == TOK_ERROR)
                     return TOK_ERROR;
-                if (new_tail != next)
+                if (new_tail != cdr(tmpl))
                     changed = true;
                 if (!changed)
                     return original;
@@ -1821,45 +2146,7 @@ static unsigned rename_free_ids_inner(unsigned tmpl, unsigned rename_map,
         }
     }
 
-    if (IS_VECTOR(tmpl)) {
-        unsigned len = vector_len(tmpl);
-        bool changed = false;
-        for (unsigned i = 0; i < len && !changed; i++) {
-            // Refresh data pointer - GC may have moved tmpl
-            unsigned *data = vector_data_ptr(tmpl);
-            unsigned orig = data[i];
-            gc_protect(&orig);
-            unsigned renamed =
-                rename_free_ids_inner(orig, rename_map, quote_shadowed,
-                                      quasiquote_shadowed);
-            if (renamed == TOK_ERROR)
-                return TOK_ERROR;
-            if (renamed != orig)
-                changed = true;
-            gc_unprotect(1);
-        }
-        if (!changed) {
-            return tmpl;
-        }
-        unsigned new_vec = make_vector(len, 0);
-        if (new_vec == TOK_ERROR)
-            return TOK_ERROR;
-        gc_protect(&new_vec);
-        for (unsigned i = 0; i < len; i++) {
-            // Refresh data pointers - GC may have moved vectors
-            unsigned *data = vector_data_ptr(tmpl);
-            unsigned elem = data[i];
-            unsigned renamed =
-                rename_free_ids_inner(elem, rename_map, quote_shadowed,
-                                      quasiquote_shadowed);
-            if (renamed == TOK_ERROR)
-                return TOK_ERROR;
-            unsigned *new_data = vector_data_ptr(new_vec);
-            new_data[i] = renamed;
-        }
-        return new_vec;
-    }
-
+    // Vectors are self-evaluating data; see rename_in_template.
     return tmpl;
 }
 
@@ -1970,7 +2257,10 @@ static unsigned rename_in_quasiquote(unsigned tmpl, int64_t old_id,
                 rename_in_quasiquote(old_car, old_id, new_sym, depth);
             if (new_car == TOK_ERROR)
                 return TOK_ERROR;
-            if (new_car != old_car)
+            // Compare with the cell as it is now, not old_car: a collection
+            // in the call moves the original and can hand its old index to
+            // the renamed copy, which then looked unchanged and was dropped.
+            if (new_car != car(tmpl))
                 changed = true;
             gc_protect(&new_car);
             list_append(&result, &result_tail, new_car);
@@ -1982,7 +2272,7 @@ static unsigned rename_in_quasiquote(unsigned tmpl, int64_t old_id,
                     rename_in_quasiquote(next, old_id, new_sym, depth);
                 if (new_tail == TOK_ERROR)
                     return TOK_ERROR;
-                if (new_tail != next)
+                if (new_tail != cdr(tmpl))
                     changed = true;
                 if (!changed)
                     return original;
@@ -1999,7 +2289,7 @@ static unsigned rename_in_quasiquote(unsigned tmpl, int64_t old_id,
                         next, old_id, new_sym, depth);
                     if (new_tail == TOK_ERROR)
                         return TOK_ERROR;
-                    if (new_tail != next)
+                    if (new_tail != cdr(tmpl))
                         changed = true;
                     if (!changed)
                         return original;
@@ -2040,13 +2330,26 @@ static unsigned rename_in_quasiquote(unsigned tmpl, int64_t old_id,
                 rename_in_quasiquote(elem, old_id, new_sym, depth);
             if (renamed == TOK_ERROR)
                 return TOK_ERROR;
-            unsigned *new_data = vector_data_ptr(new_vec);
-            new_data[i] = renamed;
+            // Through the write barrier: new_vec may have been promoted by a
+            // collection during the recursive call, and a raw store would hide
+            // this nursery element from the next minor GC.
+            vector_set_elem(new_vec, i, renamed);
         }
         return new_vec;
     }
 
     return tmpl;
+}
+
+struct rename_in_template_arg {
+    int64_t old_id;
+    unsigned new_sym;
+};
+
+static unsigned rename_in_template_walk(unsigned form, void *arg)
+{
+    struct rename_in_template_arg *a = arg;
+    return rename_in_template(form, a->old_id, a->new_sym);
 }
 
 static unsigned rename_in_template(unsigned tmpl, int64_t old_id,
@@ -2089,6 +2392,12 @@ static unsigned rename_in_template(unsigned tmpl, int64_t old_id,
                 return alloc_cons(head, result_tail);
             }
         }
+        if (template_case_form(tmpl) &&
+            !(IS_ATOM(head) && CELL_ID(head) == old_id)) {
+            struct rename_in_template_arg arg = {old_id, new_sym};
+            gc_protect(&arg.new_sym);
+            return map_case_form(tmpl, rename_in_template_walk, &arg);
+        }
         unsigned original = tmpl;
         unsigned result = 0, result_tail = 0;
         bool changed = false;
@@ -2100,7 +2409,10 @@ static unsigned rename_in_template(unsigned tmpl, int64_t old_id,
             unsigned new_car = rename_in_template(old_car, old_id, new_sym);
             if (new_car == TOK_ERROR)
                 return TOK_ERROR;
-            if (new_car != old_car)
+            // Compare with the cell as it is now, not old_car: a collection
+            // in the call moves the original and can hand its old index to
+            // the renamed copy, which then looked unchanged and was dropped.
+            if (new_car != car(tmpl))
                 changed = true;
             gc_protect(&new_car);
             list_append(&result, &result_tail, new_car);
@@ -2111,7 +2423,7 @@ static unsigned rename_in_template(unsigned tmpl, int64_t old_id,
                 unsigned new_tail = rename_in_template(next, old_id, new_sym);
                 if (new_tail == TOK_ERROR)
                     return TOK_ERROR;
-                if (new_tail != next)
+                if (new_tail != cdr(tmpl))
                     changed = true;
                 if (!changed)
                     return original;
@@ -2128,7 +2440,7 @@ static unsigned rename_in_template(unsigned tmpl, int64_t old_id,
                         rename_in_template(next, old_id, new_sym);
                     if (new_tail == TOK_ERROR)
                         return TOK_ERROR;
-                    if (new_tail != next)
+                    if (new_tail != cdr(tmpl))
                         changed = true;
                     if (!changed)
                         return original;
@@ -2140,46 +2452,9 @@ static unsigned rename_in_template(unsigned tmpl, int64_t old_id,
         }
     }
 
-    if (IS_VECTOR(tmpl)) {
-        unsigned len = vector_len(tmpl);
-        bool changed = false;
-
-        // First pass: check if any element changes
-        for (unsigned i = 0; i < len && !changed; i++) {
-            // Refresh data pointer - GC may have moved tmpl
-            unsigned *data = vector_data_ptr(tmpl);
-            unsigned orig = data[i];
-            gc_protect(&orig);
-            unsigned renamed = rename_in_template(orig, old_id, new_sym);
-            if (renamed == TOK_ERROR)
-                return TOK_ERROR;
-            if (renamed != orig)
-                changed = true;
-            gc_unprotect(1);
-        }
-
-        if (!changed) {
-            return tmpl;
-        }
-
-        // Create new vector with renamed elements
-        unsigned new_vec = make_vector(len, 0);
-        if (new_vec == TOK_ERROR)
-            return TOK_ERROR;
-        gc_protect(&new_vec);
-        for (unsigned i = 0; i < len; i++) {
-            // Refresh data pointers - GC may have moved vectors
-            unsigned *data = vector_data_ptr(tmpl);
-            unsigned elem = data[i];
-            unsigned renamed = rename_in_template(elem, old_id, new_sym);
-            if (renamed == TOK_ERROR)
-                return TOK_ERROR;
-            unsigned *new_data = vector_data_ptr(new_vec);
-            new_data[i] = renamed;
-        }
-        return new_vec;
-    }
-
+    // A vector is self-evaluating: its elements are data, never references
+    // to a binding, so a binder rename must not reach into it - (let ((x 1))
+    // #(x)) is #(x), not a vector holding the gensym.
     return tmpl;
 }
 
@@ -2317,7 +2592,10 @@ static unsigned hygienize_quasiquote(unsigned tmpl, unsigned bindings,
                 hygienize_quasiquote(old_car, bindings, depth);
             if (new_car == TOK_ERROR)
                 return TOK_ERROR;
-            if (new_car != old_car)
+            // Compare with the cell as it is now, not old_car: a collection
+            // in the call moves the original and can hand its old index to
+            // the renamed copy, which then looked unchanged and was dropped.
+            if (new_car != car(tmpl))
                 changed = true;
             gc_protect(&new_car);
             list_append(&result, &result_tail, new_car);
@@ -2329,7 +2607,7 @@ static unsigned hygienize_quasiquote(unsigned tmpl, unsigned bindings,
                     hygienize_quasiquote(next, bindings, depth);
                 if (new_tail == TOK_ERROR)
                     return TOK_ERROR;
-                if (new_tail != next)
+                if (new_tail != cdr(tmpl))
                     changed = true;
                 if (!changed)
                     return original;
@@ -2346,7 +2624,7 @@ static unsigned hygienize_quasiquote(unsigned tmpl, unsigned bindings,
                         hygienize_quasiquote(next, bindings, depth);
                     if (new_tail == TOK_ERROR)
                         return TOK_ERROR;
-                    if (new_tail != next)
+                    if (new_tail != cdr(tmpl))
                         changed = true;
                     if (!changed)
                         return original;
@@ -2385,8 +2663,10 @@ static unsigned hygienize_quasiquote(unsigned tmpl, unsigned bindings,
             unsigned hygienized = hygienize_quasiquote(elem, bindings, depth);
             if (hygienized == TOK_ERROR)
                 return TOK_ERROR;
-            unsigned *new_data = vector_data_ptr(new_vec);
-            new_data[i] = hygienized;
+            // Through the write barrier: new_vec may have been promoted by a
+            // collection during the recursive call, and a raw store would hide
+            // this nursery element from the next minor GC.
+            vector_set_elem(new_vec, i, hygienized);
         }
         return new_vec;
     }
@@ -2596,6 +2876,45 @@ next_intro_binding:
     gc_unprotect(12); // 5 initial + renames + new_binding_list + new_body +
                       // final_bindings + final_tail + final_body + result_tail
     return result;
+}
+
+// (let* (b1 b2 ...) body ...): each binder scopes over the later inits as
+// well as the body, which hygienize_let's let-style renaming does not do - a
+// later init kept the original name and so referred to whatever that name
+// meant at the use site. Peel off the first binding instead:
+//   (let* (b1) (let* (b2 ...) body ...))
+// A one-binding let* scopes exactly like let, and the nested let* is in that
+// let's body, so the recursion renames b1 in b2's init and every later form.
+// The keyword cell is reused, so the nested forms mean whatever this let*
+// meant. A binding list whose second element is not a binding (an ellipsis
+// after a repeated binding template) is left to hygienize_let unsplit.
+static unsigned hygienize_letstar(unsigned tmpl, unsigned bindings)
+{
+    unsigned binding_list = cadr(tmpl);
+    if (!proper_list_silent(binding_list) || !IS_PAIR(binding_list) ||
+        !IS_PAIR(cdr(binding_list)) || !let_binding_has_value(car(binding_list)) ||
+        !let_binding_has_value(cadr(binding_list)))
+        return hygienize_let(tmpl, bindings, false);
+
+    GC_GUARD;
+    gc_protect(&tmpl);
+    gc_protect(&bindings);
+    unsigned keyword = car(tmpl);
+    gc_protect(&keyword);
+
+    unsigned inner_tail = alloc_cons(cdr(binding_list), cddr(tmpl));
+    gc_protect(&inner_tail);
+    unsigned inner = alloc_cons(keyword, inner_tail);
+    gc_protect(&inner);
+    unsigned outer_body = alloc_cons(inner, 0);
+    gc_protect(&outer_body);
+    unsigned first = alloc_cons(car(cadr(tmpl)), 0);
+    gc_protect(&first);
+    unsigned outer_tail = alloc_cons(first, outer_body);
+    gc_protect(&outer_tail);
+    unsigned outer = alloc_cons(keyword, outer_tail);
+    gc_protect(&outer);
+    return hygienize_let(outer, bindings, false);
 }
 
 static unsigned hygienize_named_let(unsigned tmpl, unsigned bindings)
@@ -3079,7 +3398,9 @@ static unsigned hygienize_template(unsigned tmpl, unsigned bindings)
                 if (IS_PAIR(cddr(tmpl)) &&
                     (!second || (IS_PAIR(second) && IS_PAIR(car(second))))) {
                     gc_unprotect(2);
-                    return hygienize_let(tmpl, bindings, false);
+                    return head_id == ctx.kw_letstar
+                               ? hygienize_letstar(tmpl, bindings)
+                               : hygienize_let(tmpl, bindings, false);
                 }
             }
             if (head_id == ctx.kw_letrec) {
@@ -3243,8 +3564,10 @@ static unsigned hygienize_template(unsigned tmpl, unsigned bindings)
                 gc_unprotect(3);
                 return TOK_ERROR;
             }
-            unsigned *new_data = vector_data_ptr(new_vec);
-            new_data[i] = hygienized;
+            // Through the write barrier: new_vec may have been promoted by a
+            // collection during the recursive call, and a raw store would hide
+            // this nursery element from the next minor GC.
+            vector_set_elem(new_vec, i, hygienized);
         }
         gc_unprotect(3);
         return new_vec;
@@ -3257,6 +3580,36 @@ static unsigned hygienize_template(unsigned tmpl, unsigned bindings)
 // ============================================================================
 // Template Expansion
 // ============================================================================
+
+// Fresh list of a vector's elements.
+static unsigned vector_to_list_copy(unsigned vec)
+{
+    GC_GUARD;
+    gc_protect(&vec);
+    unsigned list = 0;
+    gc_protect(&list);
+    for (unsigned i = vector_len(vec); i > 0; i--) {
+        list = alloc_cons(vector_data_ptr(vec)[i - 1], list);
+        if (list == TOK_ERROR)
+            return TOK_ERROR;
+    }
+    return list;
+}
+
+// Fresh vector of a proper list's elements.
+static unsigned list_to_vector_copy(unsigned list)
+{
+    GC_GUARD;
+    gc_protect(&list);
+    unsigned vec = make_vector(list_length(list), 0);
+    if (vec == TOK_ERROR)
+        return TOK_ERROR;
+    gc_protect(&vec);
+    unsigned i = 0;
+    for (unsigned p = list; IS_PAIR(p); p = cdr(p))
+        vector_set_elem(vec, i++, car(p)); // no allocation in this loop
+    return vec;
+}
 
 unsigned syntax_expand(unsigned tmpl, unsigned bindings, unsigned mark,
                        int64_t ellipsis_id)
@@ -3347,7 +3700,6 @@ unsigned syntax_expand(unsigned tmpl, unsigned bindings, unsigned mark,
                 gc_protect(&ev);
                 while (ev) {
                     unsigned binding = car(ev);
-                    unsigned var = car(binding);
                     unsigned values = cdr(binding);
 
                     // Get i-th value
@@ -3357,8 +3709,10 @@ unsigned syntax_expand(unsigned tmpl, unsigned bindings, unsigned mark,
                     if (val)
                         val = car(val);
 
-                    gc_protect(&var);
                     gc_protect(&val);
+                    // The element is one ellipsis shallower than its sequence
+                    unsigned var = ellipsis_element_key(car(binding));
+                    gc_protect(&var);
                     unsigned new_binding = alloc_cons(var, val);
                     gc_protect(&new_binding);
                     iter_bindings = alloc_cons(new_binding, iter_bindings);
@@ -3459,123 +3813,28 @@ unsigned syntax_expand(unsigned tmpl, unsigned bindings, unsigned mark,
         unsigned len = vector_len(tmpl);
         unsigned *data = vector_data_ptr(tmpl);
 
-        // Check for ellipsis in vector template
-        unsigned ellipsis_pos = len;
-        for (unsigned i = 0; i < len; i++) {
-            if (syntax_is_ellipsis(data[i], ellipsis_id)) {
-                ellipsis_pos = i;
-                break;
-            }
-        }
+        bool has_ellipsis = false;
+        for (unsigned i = 0; i < len && !has_ellipsis; i++)
+            has_ellipsis = syntax_is_ellipsis(data[i], ellipsis_id);
 
-        if (ellipsis_pos < len && ellipsis_pos > 0) {
-            // Template has ellipsis - need to expand repeated element
-            unsigned elem_tmpl = data[ellipsis_pos - 1];
-            unsigned pre_count = ellipsis_pos - 1;
-            unsigned post_count = len - ellipsis_pos - 1;
-
-            unsigned ellipsis_vars =
-                collect_ellipsis_vars(elem_tmpl, bindings, 0);
-            gc_protect(&ellipsis_vars);
-
-            // Count expanded elements
-            unsigned expanded_count = pre_count + post_count;
-            unsigned iter_count = 0;
-            if (!ellipsis_vars_iteration_count(ellipsis_vars, &iter_count)) {
-                gc_unprotect(3);
+        if (has_ellipsis) {
+            // #(t ...) is (t ...) as a vector. Expanding the element list
+            // with the list path reuses its handling of any number of
+            // ellipses, each followed by further elements - the old
+            // vector-only path honoured just the first ellipsis. The
+            // validator rejects a leading ellipsis, so the list cannot
+            // read as an escape (... t).
+            unsigned elems = vector_to_list_copy(tmpl);
+            if (elems == TOK_ERROR) {
+                gc_unprotect(2);
                 return TOK_ERROR;
             }
-            expanded_count += iter_count;
-
-            unsigned result = make_vector(expanded_count, 0);
-            if (result == TOK_ERROR) {
-                gc_unprotect(3);
+            unsigned expanded = syntax_expand(elems, bindings, mark,
+                                              ellipsis_id);
+            gc_unprotect(2); // bindings, tmpl
+            if (expanded == TOK_ERROR)
                 return TOK_ERROR;
-            }
-            gc_protect(&result); // Protect result from GC
-            unsigned idx = 0;
-
-            // Expand elements before ellipsis
-            for (unsigned i = 0; i < pre_count; i++) {
-                // Refresh pointers - GC may have moved vectors
-                data = vector_data_ptr(tmpl);
-                unsigned elem = data[i];
-                unsigned expanded =
-                    syntax_expand(elem, bindings, mark, ellipsis_id);
-                if (expanded == TOK_ERROR) {
-                    gc_unprotect(4);
-                    return TOK_ERROR;
-                }
-                unsigned *result_data = vector_data_ptr(result);
-                result_data[idx++] = expanded;
-            }
-
-            // Expand repeated element for each ellipsis value
-            // Refresh data pointer before accessing elem_tmpl
-            data = vector_data_ptr(tmpl);
-            elem_tmpl = data[ellipsis_pos - 1];
-
-            // Protect loop variables across allocations
-            gc_protect(&elem_tmpl);
-            gc_protect(&bindings);
-
-            for (unsigned i = 0; i < iter_count; i++) {
-                unsigned iter_bindings = bindings;
-                gc_protect(&iter_bindings);
-
-                unsigned ev = ellipsis_vars;
-                gc_protect(&ev);
-                while (ev) {
-                    unsigned binding = car(ev);
-                    unsigned var = car(binding);
-                    unsigned values = cdr(binding);
-
-                    unsigned val = values;
-                    for (unsigned j = 0; j < i && val; j++)
-                        val = cdr(val);
-                    if (val)
-                        val = car(val);
-
-                    gc_protect(&var);
-                    gc_protect(&val);
-                    unsigned new_binding = alloc_cons(var, val);
-                    gc_protect(&new_binding);
-                    iter_bindings = alloc_cons(new_binding, iter_bindings);
-                    gc_unprotect(3);
-                    ev = cdr(ev);
-                }
-                gc_unprotect(1);
-
-                // Refresh result_data pointer - GC may have moved result
-                unsigned expanded =
-                    syntax_expand(elem_tmpl, iter_bindings, mark, ellipsis_id);
-                if (expanded == TOK_ERROR) {
-                    gc_unprotect(6);
-                    return TOK_ERROR;
-                }
-                unsigned *result_data = vector_data_ptr(result);
-                result_data[idx++] = expanded;
-                gc_unprotect(1); // iter_bindings
-            }
-            gc_unprotect(2); // bindings, elem_tmpl
-
-            // Expand elements after ellipsis
-            for (unsigned i = 0; i < post_count; i++) {
-                // Refresh pointers - GC may have moved vectors
-                data = vector_data_ptr(tmpl);
-                unsigned elem = data[ellipsis_pos + 1 + i];
-                unsigned expanded =
-                    syntax_expand(elem, bindings, mark, ellipsis_id);
-                if (expanded == TOK_ERROR) {
-                    gc_unprotect(4);
-                    return TOK_ERROR;
-                }
-                unsigned *result_data = vector_data_ptr(result);
-                result_data[idx++] = expanded;
-            }
-
-            gc_unprotect(4); // result, ellipsis_vars, tmpl, bindings
-            return result;
+            return list_to_vector_copy(expanded);
         }
 
         // No ellipsis - expand each element
@@ -3594,8 +3853,8 @@ unsigned syntax_expand(unsigned tmpl, unsigned bindings, unsigned mark,
                 gc_unprotect(3);
                 return TOK_ERROR;
             }
-            unsigned *result_data = vector_data_ptr(result);
-            result_data[i] = expanded;
+            // Write barrier required - see unwrap_protected.
+            vector_set_elem(result, i, expanded);
         }
         gc_unprotect(3); // result, tmpl, bindings
         return result;
@@ -3661,6 +3920,81 @@ static bool syntax_transformer_well_formed(unsigned transformer, unsigned input,
     return true;
 }
 
+// form's expansion by transformer with only matching and substitution: no
+// free-identifier renaming, no binder hygiene, so no gensym is minted. It is
+// only for bind_internal_definitions to see whether a body form is (or
+// expands to) a definition; that scan runs on every closure creation and
+// every call, so it must not consume an atom-table slot each time the way a
+// real expansion's renames do. Errors are not reported: the real expansion
+// of the same form reports them. TOK_ERROR when no rule matches.
+static void annotate_ellipsis_depths(compiled_pattern *cpat, unsigned bindings);
+
+static unsigned expand_without_hygiene(unsigned transformer, unsigned form,
+                                       unsigned use_env)
+{
+    GC_GUARD;
+    gc_protect(&transformer);
+    gc_protect(&form);
+    gc_protect(&use_env);
+    unsigned syn_data = 0, closure_env = 0, literals = 0, rules = 0;
+    int64_t ellipsis_id = 0;
+    if (!syntax_transformer_well_formed(transformer, form, &syn_data,
+                                        &closure_env, &ellipsis_id, &literals,
+                                        &rules))
+        return TOK_ERROR;
+    gc_protect(&closure_env);
+    gc_protect(&rules);
+
+    bool suppress = ctx.suppress_error_output;
+    ctx.suppress_error_output = true;
+    unsigned result = TOK_ERROR;
+    for (; rules; rules = cdr(rules)) {
+        unsigned rule_head = car(car(rules));
+        unsigned cpat_cell = IS_PAIR(rule_head) ? car(rule_head) : rule_head;
+        compiled_pattern *cpat = (compiled_pattern *)CELL_PTR(cpat_cell);
+        unsigned bindings =
+            execute_pattern_in_envs(cpat, cdr(form), closure_env, use_env);
+        if (bindings == TOK_ERROR)
+            continue;
+        gc_protect(&bindings);
+        annotate_ellipsis_depths(cpat, bindings);
+        result = syntax_expand(cdr(car(rules)), bindings, 0, ellipsis_id);
+        if (result != TOK_ERROR)
+            result = unwrap_protected(result, false);
+        break;
+    }
+    ctx.suppress_error_output = suppress;
+    return result;
+}
+
+// execute_pattern returns a plain (identifier . value) alist. Rekey every
+// variable that was matched under an ellipsis as (identifier . depth), taking
+// the depth from the compiled pattern's slots, so syntax_expand can iterate
+// exactly the ellipsis variables (see binding_key_var). The alist is fresh
+// per match, so it is updated in place.
+static void annotate_ellipsis_depths(compiled_pattern *cpat, unsigned bindings)
+{
+    GC_GUARD;
+    unsigned b = bindings;
+    gc_protect(&b);
+    for (; IS_PAIR(b); b = cdr(b)) {
+        unsigned binding = car(b);
+        if (!IS_PAIR(binding) || !IS_ATOM(car(binding)))
+            continue;
+        unsigned depth = 0;
+        for (unsigned i = 0; i < cpat->var_count; i++) {
+            if (CELL_ID(cpat->var_slots[i].atom) == CELL_ID(car(binding))) {
+                depth = cpat->var_slots[i].depth;
+                break;
+            }
+        }
+        if (depth < 1)
+            continue;
+        unsigned key = alloc_cons(car(binding), store((int64_t)depth));
+        cell_set_car(car(b), key); // re-read: the allocation may have moved it
+    }
+}
+
 unsigned apply_syntax(unsigned transformer, unsigned input, unsigned use_env,
                       unsigned *bindings_out)
 {
@@ -3696,9 +4030,7 @@ unsigned apply_syntax(unsigned transformer, unsigned input, unsigned use_env,
 
     unsigned tmpl = 0;
     gc_protect(&tmpl);
-    unsigned pattern = 0;
     unsigned input_args = 0;
-    gc_protect(&pattern);
     gc_protect(&input_args);
 
     unsigned produced_bindings = 0;
@@ -3708,13 +4040,9 @@ unsigned apply_syntax(unsigned transformer, unsigned input, unsigned use_env,
     for (; rules; rules = cdr(rules)) {
         unsigned rule = car(rules);
         unsigned rule_head = car(rule);
-        unsigned cpat_cell;
-        if (IS_PAIR(rule_head)) {
-            cpat_cell = car(rule_head);
-            pattern = cdr(rule_head);
-        } else {
-            cpat_cell = rule_head;
-        }
+        // The source pattern kept beside the compiled one (cdr of a pair
+        // rule head) is no longer consulted here.
+        unsigned cpat_cell = IS_PAIR(rule_head) ? car(rule_head) : rule_head;
         tmpl = cdr(rule);
 
         // Get compiled pattern from cell
@@ -3723,18 +4051,19 @@ unsigned apply_syntax(unsigned transformer, unsigned input, unsigned use_env,
         // Skip the keyword in input
         input_args = cdr(input);
 
-        // Execute compiled pattern
-        unsigned bindings = execute_pattern(cpat, input_args);
+        // Execute compiled pattern. Literals are matched by binding inside
+        // the matcher, so its backtracking never settles on a split whose
+        // literals denote something else at the use site.
+        unsigned bindings =
+            execute_pattern_in_envs(cpat, input_args, closure_env, use_env);
 
-        if (bindings != TOK_ERROR &&
-            (!pattern || pattern_literals_match(pattern, input_args, literals,
-                                                ellipsis_id, closure_env,
-                                                use_env))) {
+        if (bindings != TOK_ERROR) {
             // Generate unique mark for hygiene
             static unsigned syntax_mark = 0;
             unsigned mark = ++syntax_mark;
 
             gc_protect(&bindings);
+            annotate_ellipsis_depths(cpat, bindings);
 
             // Referential transparency: find free identifiers in template
             // and bind them to their definition-time values
@@ -3772,7 +4101,8 @@ unsigned apply_syntax(unsigned transformer, unsigned input, unsigned use_env,
                         env_find_binding_cell(free_id, closure_env);
                     same_binding_at_use_site =
                         def_cell != 0 &&
-                        def_cell == env_find_binding_cell(free_id, use_env);
+                        hygiene_binding_cell(free_id, closure_env) ==
+                            hygiene_binding_cell(free_id, use_env);
                 }
 
                 if (same_binding_at_use_site) {
@@ -3786,6 +4116,7 @@ unsigned apply_syntax(unsigned transformer, unsigned input, unsigned use_env,
                     unsigned gensym = do_gensym();
                     gc_protect(&gensym);
                     gc_protect(&closure_val);
+                    macros_note_alias(CELL_ID(gensym), free_id);
 
                     unsigned target_val_cell =
                         env_find_binding_cell(free_id, closure_env);
@@ -3813,7 +4144,7 @@ unsigned apply_syntax(unsigned transformer, unsigned input, unsigned use_env,
 
                     gc_unprotect(2); // gensym, closure_val
                 } else if (!generated_gensym_atom(free_atom) &&
-                           lookup_silent(free_id, use_env) != TOK_ERROR) {
+                           bound_for_hygiene(free_id, use_env)) {
                     // The identifier was introduced by the transformer, but
                     // is only bound at the expansion site. Rename it to an
                     // unbound gensym so use-site locals cannot capture it.

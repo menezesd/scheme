@@ -378,6 +378,68 @@ static unsigned atan_value(unsigned y_arg, unsigned x_arg, bool has_x,
     return store_inexact(atan(y));
 }
 
+// Decompose a nonzero exact integer or rational as mantissa * 2^scale from
+// its leading digits, so values beyond the double range can still feed log
+// and expt without overflowing to infinity or flushing to zero.
+static bool exact_scaled_double(unsigned arg, double *mantissa, double *scale,
+                                bool *negative)
+{
+    unsigned num = IS_RATIONAL(arg) ? CELL_CAR(arg) : arg;
+    double top;
+    size_t omitted;
+    if (!exact_integer_top_double(num, &top, &omitted, negative) || top == 0.0)
+        return false;
+    double m = top;
+    double e = (double)omitted * LIMB_BITS;
+    if (IS_RATIONAL(arg)) {
+        bool denom_negative;
+        if (!exact_integer_top_double(CELL_CDR(arg), &top, &omitted,
+                                      &denom_negative) ||
+            top == 0.0)
+            return false;
+        m /= top;
+        e -= (double)omitted * LIMB_BITS;
+        *negative = *negative != denom_negative;
+    }
+    *mantissa = m;
+    *scale = e;
+    return true;
+}
+
+// log|x| for an exact x outside the double range.
+static bool exact_log_magnitude(unsigned arg, double *out, bool *negative)
+{
+    double mantissa, scale;
+    if (!exact_scaled_double(arg, &mantissa, &scale, negative))
+        return false;
+    *out = log(mantissa) + scale * M_LN2;
+    return true;
+}
+
+// |x|^y for an exact x outside the double range: (m * 2^s)^y is
+// m^y * 2^(s*y), with s*y split into integer and fractional parts so the
+// power of two stays exact.
+static bool exact_pow_magnitude(unsigned arg, double y, double *out,
+                                bool *negative)
+{
+    double mantissa, scale;
+    if (!exact_scaled_double(arg, &mantissa, &scale, negative))
+        return false;
+    double t = scale * y;
+    double t_error = fma(scale, y, -t);
+    double whole = floor(t);
+    double fraction = (t - whole) + t_error;
+    double magnitude = pow(mantissa, y) * exp2(fraction);
+    if (whole > INT_MAX)
+        magnitude = HUGE_VAL;
+    else if (whole < INT_MIN)
+        magnitude = 0.0;
+    else
+        magnitude = ldexp(magnitude, (int)whole);
+    *out = magnitude;
+    return true;
+}
+
 static unsigned log_value(unsigned arg, const char *name)
 {
     if (!require_number(arg, name))
@@ -391,6 +453,12 @@ static unsigned log_value(unsigned arg, const char *name)
     }
 
     double x = to_double(arg);
+    double magnitude;
+    bool negative;
+    if (!IS_INEXACT(arg) && (isinf(x) || x == 0.0) &&
+        exact_log_magnitude(arg, &magnitude, &negative))
+        return negative ? make_complex_inexact(magnitude, M_PI)
+                        : store_inexact(magnitude);
     if (x < 0 || (x == 0.0 && signbit(x)))
         return make_complex_inexact(log(-x), M_PI);
     return store_inexact(log(x));
@@ -874,6 +942,23 @@ static unsigned inexact_expt_value(unsigned base_arg, unsigned exp_arg)
 
     double base_d = to_double(base_arg);
     double exp_d = to_double(exp_arg);
+
+    // An exact base outside the double range would overflow to infinity (or
+    // flush to zero) before pow() sees it. Work from its logarithm instead.
+    double magnitude;
+    bool negative;
+    if (!base_complex && !exp_complex && !IS_INEXACT(base_arg) &&
+        (isinf(base_d) || base_d == 0.0) &&
+        exact_pow_magnitude(base_arg, exp_d, &magnitude, &negative)) {
+        if (!negative)
+            return store_inexact(magnitude);
+        if (floor(exp_d) == exp_d)
+            return store_inexact(fmod(exp_d, 2.0) != 0.0 ? -magnitude
+                                                         : magnitude);
+        return make_complex_inexact(magnitude * cos(M_PI * exp_d),
+                                    magnitude * sin(M_PI * exp_d));
+    }
+
     bool needs_complex = base_complex || exp_complex ||
                          (base_d < 0 && floor(exp_d) != exp_d);
 
@@ -1035,9 +1120,20 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned argc,
         // Covers integers, rationals, and complex with exact parts
         if (is_exact(base_arg) && IS_EXACT_INT(exp_arg)) {
             int64_t exp_val;
-            if (!exact_expt_int64_exponent(exp_arg, &exp_val))
-                goto inexact_expt;
-            return exact_integer_expt_value(base_arg, exp_val);
+            if (exact_expt_int64_exponent(exp_arg, &exp_val))
+                return exact_integer_expt_value(base_arg, exp_val);
+            // The exponent is a bignum. Only a unit base has a representable
+            // exact power; falling back to pow() would return an inexact
+            // value with the wrong sign for (expt -1 odd-bignum).
+            int64_t base_val;
+            if (exact_int64_value(base_arg, &base_val) &&
+                (base_val == 1 || base_val == -1)) {
+                bignum *bn = get_bignum(exp_arg);
+                bool odd = bn && bn->len > 0 && (bn->limbs[0] & 1) != 0;
+                return store(base_val == -1 && odd ? -1 : 1);
+            }
+            show_error("expt: exponent too large for an exact result");
+            return TOK_ERROR;
         }
 
         // Exact integer or rational base with exact rational exponent p/q
@@ -1113,8 +1209,22 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned argc,
                           "atan");
     }
     case PLOG: {
-        REQUIRE_ARGC(argc, 1, 1, "log");
-        return log_value(argv[0], "log");
+        REQUIRE_ARGC(argc, 1, 2, "log");
+        if (argc == 1)
+            return log_value(argv[0], "log");
+        // R7RS (log z1 z2) is the logarithm of z1 to base z2.
+        GC_GUARD;
+        unsigned base = argv[1];
+        gc_protect(&base);
+        unsigned numerator = log_value(argv[0], "log");
+        if (numerator == TOK_ERROR)
+            return TOK_ERROR;
+        gc_protect(&numerator);
+        unsigned denominator = log_value(base, "log");
+        if (denominator == TOK_ERROR)
+            return TOK_ERROR;
+        gc_protect(&denominator);
+        return binary_div(numerator, denominator);
     }
     case PLOG1P: {
         REQUIRE_ARGC(argc, 1, 1, "log1p");

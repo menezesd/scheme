@@ -6,6 +6,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "compiled_pattern.h"
 #include "context.h"
+#include "env.h"
 #include "test_framework.h"
 #include "types.h"
 #include "writer.h"
@@ -637,6 +638,71 @@ TEST(disassemble_vector_pattern_names_vecref)
     PASS();
 }
 
+TEST(execute_ellipsis_dotted_tail_takes_only_final_cdr)
+{
+    // Pattern: ((a) ... . r). R7RS: r matches only the final cdr, so a list
+    // whose second element does not match (a) fails, rather than letting r
+    // absorb (2) after backtracking out of the ellipsis.
+    unsigned a = atom("a");
+    unsigned r = atom("r");
+    unsigned ellipsis = atom("...");
+    gc_protect(&a);
+    gc_protect(&r);
+    gc_protect(&ellipsis);
+    unsigned elem = alloc_cons(a, 0);
+    gc_protect(&elem);
+    unsigned pat = alloc_cons(ellipsis, r);
+    pat = alloc_cons(elem, pat);
+    gc_protect(&pat);
+    compiled_pattern *cpat = compile_pattern(pat, 0, ctx.kw_ellipsis);
+
+    // ((1) 2) - the 2 cannot match (a)
+    unsigned one = alloc_cons(store(1), 0);
+    gc_protect(&one);
+    unsigned bad = list2(one, store(2));
+    gc_protect(&bad);
+    ASSERT(execute_pattern(cpat, bad) == TOK_ERROR);
+
+    // ((1) . 3) - r takes the non-pair tail
+    unsigned good = alloc_cons(one, store(3));
+    gc_protect(&good);
+    unsigned bindings = execute_pattern(cpat, good);
+    ASSERT(bindings != TOK_ERROR);
+    ASSERT_EQ(CELL_ID(binding_value(bindings, "r")), 3);
+    gc_unprotect(8);
+    PASS();
+}
+
+TEST(execute_literal_matches_by_binding)
+{
+    // Pattern: (else x) with else a literal. With environments supplied, an
+    // input else bound differently at the use site is not the literal.
+    unsigned else_atom = atom("else");
+    unsigned x = atom("x");
+    gc_protect(&else_atom);
+    gc_protect(&x);
+    unsigned pat = list2(else_atom, x);
+    gc_protect(&pat);
+    unsigned literals = alloc_cons(else_atom, 0);
+    gc_protect(&literals);
+    compiled_pattern *cpat = compile_pattern(pat, literals, ctx.kw_ellipsis);
+    unsigned input = list2(atom("else"), store(1));
+    gc_protect(&input);
+
+    // Unbound in both environments: matches
+    ASSERT(execute_pattern_in_envs(cpat, input, 0, 0) != TOK_ERROR);
+
+    // Bound at the use site only: no match
+    unsigned use_env = extend_env_empty(0);
+    gc_protect(&use_env);
+    defvar(atom("else"), store(5), use_env);
+    ASSERT(execute_pattern_in_envs(cpat, input, 0, use_env) == TOK_ERROR);
+    // Name-only matching still accepts it
+    ASSERT(execute_pattern(cpat, input) != TOK_ERROR);
+    gc_unprotect(6);
+    PASS();
+}
+
 // ============================================================================
 // Main
 // ============================================================================
@@ -673,6 +739,8 @@ int main(void)
     RUN_TEST(execute_ellipsis_simple);
     RUN_TEST(execute_ellipsis_empty);
     RUN_TEST(execute_ellipsis_with_tail_binding);
+    RUN_TEST(execute_ellipsis_dotted_tail_takes_only_final_cdr);
+    RUN_TEST(execute_literal_matches_by_binding);
 
     // Vector tests
     printf("\nVector:\n");

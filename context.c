@@ -312,6 +312,14 @@ bool bignum_is_registered(const bignum *bn)
     return ptr_registry_contains(&bignum_registry, bn);
 }
 
+// Bumped whenever a string buffer is unregistered. Strings are never
+// modified in place: every mutation installs a fresh buffer and retires the
+// old one through string_unregister, and a buffer address can only be reused
+// after its unregistration. So an unchanged epoch and buffer pointer mean the
+// contents are unchanged. String input ports use this to skip re-deriving
+// their byte offsets on every access.
+uint64_t string_buffer_epoch;
+
 void string_register(char *string)
 {
     if (!string)
@@ -322,6 +330,7 @@ void string_register(char *string)
 
 void string_unregister(char *string)
 {
+    string_buffer_epoch++;
     ptr_registry_unregister(&string_registry, string);
 }
 
@@ -532,9 +541,20 @@ void init_heap(void)
     ctx.major_gc_count = 0;
 }
 
+// True while gc() or minor_gc() is running.
+static bool collection_in_progress = false;
+
 void lisp_panic(const char *msg)
 {
     fprintf(stderr, "Fatal error: %s\n", msg);
+    // A collection that stops partway leaves the heap half copied: some cells
+    // forwarded and some not, some roots updated and others still pointing at
+    // the old copies. Nothing can resume from that, so a panic raised inside a
+    // collection exits even when a recovery point is set.
+    if (collection_in_progress) {
+        fprintf(stderr, "Fatal error: garbage collection could not complete\n");
+        exit(EXIT_FAILURE);
+    }
     if (panic_jmp_set) {
         longjmp(panic_jmp, 1);
     } else {
@@ -713,13 +733,21 @@ int get_shadow_stack_top(void)
 }
 
 // After a lisp_panic longjmp the C frames that registered shadow-stack
-// entries are gone, and a panic inside gc() can leave GC mode latched.
-// Drop the dangling roots and reset collector state before resuming.
+// entries are gone, and so are the vm_run frames whose vm_state the active-VM
+// chain points at. Drop both, along with the allocation root, before
+// resuming; the caller re-registers whatever roots it still holds. (A panic
+// inside a collection exits instead, so the collector state is already idle.)
 void gc_recover_after_panic(void)
 {
     shadow_stack_top = 0;
     in_gc_mode = false;
+    collection_in_progress = false;
     alloc_gc_root = NULL;
+    // The CPS trampoline registers are GC roots and still describe the
+    // abandoned computation; keeping them would retain everything it built.
+    tramp.expr = tramp.env = tramp.cont = tramp.value = 0;
+    vm_reset_after_panic();
+    pattern_reset_after_panic();
 }
 
 void gc_release(int mark)
@@ -756,48 +784,26 @@ static void maybe_major_after_minor(void)
     }
 }
 
+// Collect the nursery on behalf of alloc(), then run a full collection if
+// promotion left the old generation nearly full. minor_gc() falls back to a
+// full collection itself when the old generation could not take the nursery;
+// a second one straight after it would find nothing more to reclaim.
+static void collect_nursery_for_alloc(void)
+{
+    unsigned major_count = ctx.major_gc_count;
+    if (alloc_gc_root && *alloc_gc_root)
+        *alloc_gc_root = minor_gc(*alloc_gc_root);
+    else
+        (void)minor_gc(0);
+    if (ctx.major_gc_count == major_count)
+        maybe_major_after_minor();
+}
+
 unsigned alloc(void)
 {
-    // Check if generational GC is disabled (no card table)
-    if (!ctx.card_table) {
-        // Simple semispace allocation without generational GC
-        unsigned limit =
-            (ctx.hptr < SEMISPACE_SIZE) ? SEMISPACE_SIZE : 2 * SEMISPACE_SIZE;
-
-        // During GC, don't trigger nested GC
-        if (in_gc_mode) {
-            if (ctx.hptr >= limit) {
-                lisp_panic("out of memory (heap full during GC)");
-            }
-            unsigned cell = ctx.hptr++;
-            LISP_ASSERT_FMT(cell >= HEAP_RESERVED && cell < limit,
-                            "alloc: cell %u outside valid range [%u, %u)",
-                            cell, HEAP_RESERVED, limit);
-            return cell;
-        }
-
-        // Check if we're at 90% capacity - trigger major GC
-        if (ctx.hptr >= limit * 9 / 10) {
-            if (alloc_gc_root && *alloc_gc_root)
-                *alloc_gc_root = gc(*alloc_gc_root);
-            else
-                (void)gc(0);
-            // Recalculate limit after GC (we may have switched semispaces)
-            limit = (ctx.hptr < SEMISPACE_SIZE) ? SEMISPACE_SIZE
-                                                : 2 * SEMISPACE_SIZE;
-        }
-
-        if (ctx.hptr >= limit) {
-            lisp_panic("out of memory (heap exhausted)");
-        }
-        unsigned cell = ctx.hptr++;
-        LISP_ASSERT_FMT(cell >= HEAP_RESERVED && cell < limit,
-                        "alloc: cell %u outside valid range [%u, %u)",
-                        cell, HEAP_RESERVED, limit);
-        return cell;
-    }
-
-    // Generational GC enabled - during GC, allocate directly to old generation
+    // init_heap always allocates the card table (it exits otherwise), so the
+    // heap is always generational.
+    // During a major GC, allocate directly to the to-space old generation
     if (in_gc_mode) {
         if (ctx.hptr >= ctx.nursery_start) {
             lisp_panic("out of memory (old gen full during GC)");
@@ -822,23 +828,15 @@ unsigned alloc(void)
         nursery_end =
             (ctx.mmin < SEMISPACE_SIZE) ? SEMISPACE_SIZE : 2 * SEMISPACE_SIZE;
     } else if (gc_stress_due()) {
-        *alloc_gc_root = minor_gc(*alloc_gc_root);
-        maybe_major_after_minor();
+        collect_nursery_for_alloc();
         nursery_end =
             (ctx.mmin < SEMISPACE_SIZE) ? SEMISPACE_SIZE : 2 * SEMISPACE_SIZE;
     }
 
     // Check if nursery is full
     if (ctx.nursery_ptr >= nursery_end) {
-        // Nursery full - run minor GC to promote survivors
-        if (alloc_gc_root && *alloc_gc_root) {
-            *alloc_gc_root = minor_gc(*alloc_gc_root);
-        } else {
-            minor_gc(0);
-        }
-
-        // Check if old gen is getting full (> 80%) - trigger major GC
-        maybe_major_after_minor();
+        // Nursery full - promote survivors (and collect old gen if needed)
+        collect_nursery_for_alloc();
 
         // After GC, nursery should be reset
         nursery_end =
@@ -1404,8 +1402,8 @@ bool exact_integer_top_double(unsigned value, double *top,
     return true;
 }
 
-static double exact_rational_to_double(unsigned numerator,
-                                       unsigned denominator)
+static double approximate_rational_double(unsigned numerator,
+                                          unsigned denominator)
 {
     double num_top, denom_top;
     size_t num_omitted, denom_omitted;
@@ -1435,6 +1433,40 @@ static double exact_rational_to_double(unsigned numerator,
     return negative ? -ratio : ratio;
 }
 
+static const bignum *exact_integer_view(unsigned value, bignum *view,
+                                       limb_t limbs[2])
+{
+    if (IS_BIGNUM(value))
+        return get_bignum(value);
+
+    int64_t small = IS_FIXNUM(value) ? FIXNUM_VALUE(value) : CELL_ID(value);
+    uint64_t magnitude = small < 0 ? -(uint64_t)small : (uint64_t)small;
+    limbs[0] = (limb_t)magnitude;
+    limbs[1] = (limb_t)(magnitude >> LIMB_BITS);
+    *view = (bignum){
+        .limbs = limbs,
+        .len = limbs[1] ? 2 : (limbs[0] != 0),
+        .cap = 2,
+        .sign = small < 0,
+    };
+    return view;
+}
+
+static double exact_rational_to_double(unsigned numerator, unsigned denominator)
+{
+    bignum numerator_view, denominator_view;
+    limb_t numerator_limbs[2], denominator_limbs[2];
+    const bignum *a = exact_integer_view(numerator, &numerator_view, numerator_limbs);
+    const bignum *b = exact_integer_view(denominator, &denominator_view,
+                                        denominator_limbs);
+    double result;
+    if (a && b && bn_ratio_to_double(a, b, &result))
+        return result;
+    // Conversion callers lack an allocation failure result. On allocation
+    // failure keep the previous scaled approximation instead.
+    return approximate_rational_double(numerator, denominator);
+}
+
 double to_double(unsigned x)
 {
     if (x == 0)
@@ -1447,19 +1479,8 @@ double to_double(unsigned x)
     case BT_NUM:
         return (double)CELL_ID(x);
     case BT_BIGNUM: {
-        // Convert bignum to double (may lose precision for large numbers)
         bignum *bn = get_bignum(x);
-        if (!bn)
-            return 0.0;
-        // Build double from most significant limb down.  Accumulating a
-        // low-to-high multiplier can overflow it to infinity while later
-        // zero limbs remain; 0.0 * infinity then produces NaN instead of
-        // the expected signed infinity.
-        double result = 0.0;
-        double base = (double)((uint64_t)1 << LIMB_BITS);
-        for (size_t i = bn->len; i > 0; i--)
-            result = result * base + bn->limbs[i - 1];
-        return bn->sign ? -result : result;
+        return bn ? bn_to_double(bn) : 0.0;
     }
     case BT_INEXACT: {
         union {
@@ -1784,7 +1805,10 @@ unsigned make_uninterned_symbol(const char *name)
 
 bool atom_is_uninterned(unsigned atom)
 {
-    return atom_is_valid(atom) && ctx.atom_uninterned[CELL_ID(atom)];
+    // The booleans occupy private slots but are not generated symbols.
+    return atom_is_valid(atom) && CELL_ID(atom) != CELL_ID(CELL_ATOM_TRUE) &&
+           CELL_ID(atom) != CELL_ID(CELL_ATOM_FALSE) &&
+           ctx.atom_uninterned[CELL_ID(atom)];
 }
 
 // Helper: check if string could be start of a number
@@ -2253,7 +2277,7 @@ bool syntax_arity_checked(unsigned form, unsigned min_args, unsigned max_args,
 
 bool identifier_valid(unsigned x)
 {
-    return IS_ATOM(x) && x != ctx.atom_true && x != ctx.atom_false;
+    return IS_SYMBOL(x);
 }
 
 static bool pair_chain_acyclic(unsigned list)
@@ -2805,6 +2829,83 @@ bool deep_equal(unsigned a, unsigned b)
 // Garbage Collection
 // ============================================================================
 
+// Both collectors copy and trace in separate steps. collect() and
+// collect_to_old() only move one cell and leave a forwarding pointer behind;
+// the copy's references are traced later, when the collector's Cheney scan
+// loop reaches it (gc_scan_cell). Tracing a vector's elements, a hash table's
+// entries or a continuation's stack at copy time instead recursed once per
+// level of nesting, so a long enough chain overflowed the C stack inside the
+// collector - a 300K-node linked list of records (records are vectors) was
+// enough. Every copied cell is scanned exactly once, so the walk is bounded by
+// the to-space, not by the C stack.
+
+// Move x to dest and leave a forwarding pointer. Pointer-bearing cells share
+// their malloc'd payload with the copy; the sweep frees only payloads whose
+// cell was never forwarded.
+static inline unsigned forward_cell(unsigned x, unsigned dest)
+{
+    ctx.cons_cells[dest] = ctx.cons_cells[x];
+    CELL_TYPE(x) = BT_BROKENHEART;
+    CELL_CAR(x) = dest;
+    return dest;
+}
+
+// Replace every reference held by cell with collector(reference). Called for
+// each cell a collection copies, and by a minor collection for each old cell
+// on a dirty card.
+static void gc_scan_cell(unsigned cell, unsigned (*collector)(unsigned))
+{
+    enum lisp_type t = CELL_TYPE(cell);
+    if (cell_type_has_children(t)) {
+        CELL_CAR(cell) = collector(CELL_CAR(cell));
+        CELL_CDR(cell) = collector(CELL_CDR(cell));
+        return;
+    }
+    switch (t) {
+    case BT_VECTOR: {
+        vector_data *vd = (vector_data *)CELL_PTR(cell);
+        if (!vector_data_well_formed(vd))
+            return;
+        for (unsigned i = 0; i < vd->len; i++)
+            vd->data[i] = collector(vd->data[i]);
+        return;
+    }
+    case BT_HASHTABLE: {
+        hash_table_data *ht = (hash_table_data *)CELL_PTR(cell);
+        if (!hash_table_data_well_formed(ht))
+            return;
+        for (unsigned i = 0; i < ht->capacity; i++) {
+            for (hash_entry *entry = ht->buckets[i]; entry;
+                 entry = entry->next) {
+                entry->key = collector(entry->key);
+                entry->value = collector(entry->value);
+            }
+        }
+        // eq/eqv tables hash compound keys by cell index, so moved keys now
+        // belong in other buckets. Rehash once the heap is consistent again.
+        hash_table_gc_register_rehash(ht);
+        return;
+    }
+    case BT_STRING:
+        // A string view keeps its parent string alive and in sync.
+        if (string_cell_is_view(cell)) {
+            string_view_data *view = (string_view_data *)CELL_PTR(cell);
+            view->parent = collector(view->parent);
+        }
+        return;
+    case BT_VMCONT:
+        if (is_vm_continuation_object(cell))
+            collect_vm_continuation_roots((vm_continuation *)CELL_PTR(cell),
+                                          collector);
+        return;
+    default:
+        // String ports' source strings are forwarded for every registered
+        // port by update_all_string_port_sources. Other types hold no cell
+        // references.
+        return;
+    }
+}
+
 unsigned collect(unsigned x)
 {
     // Reserved cells (< HEAP_RESERVED) are permanent and never collected
@@ -2839,114 +2940,9 @@ unsigned collect(unsigned x)
     case BT_FREE:
         return 0;
 
-    case BT_STRING:
-    case BT_BYTEVEC:
-    case BT_HASHTABLE: {
-        // Pointer-based types: share the malloc'd data between old and new cells.
-        // The old region is swept after collection, freeing unreachable data.
-        unsigned xx = alloc();
-        CELL_TYPE(xx) = CELL_TYPE(x);
-        CELL_ID(xx) = CELL_ID(x);
-        CELL_TYPE(x) = BT_BROKENHEART;
-        CELL_CAR(x) = xx;
-        if (string_cell_is_view(xx)) {
-            string_view_data *view = (string_view_data *)CELL_PTR(xx);
-            view->parent = collect(view->parent);
-        }
-        if (CELL_TYPE(xx) == BT_HASHTABLE) {
-            hash_table_data *ht = (hash_table_data *)CELL_PTR(xx);
-            if (!hash_table_data_well_formed(ht))
-                return xx;
-            for (unsigned i = 0; i < ht->capacity; i++) {
-                for (hash_entry *entry = ht->buckets[i]; entry;
-                     entry = entry->next) {
-                    entry->key = collect(entry->key);
-                    entry->value = collect(entry->value);
-                }
-            }
-            // Moved keys hash to new buckets; rehash after the GC finishes
-            hash_table_gc_register_rehash(ht);
-        }
-        return xx;
-    }
-
-    case BT_BIGNUM: {
-        // Bignum GC follows the same invariant as strings: the pointer is
-        // shared, not copied. This is safe because bignums are immutable after
-        // storage - to_bignum() always returns a fresh copy for mutation.
-        unsigned xx = alloc();
-        CELL_TYPE(xx) = BT_BIGNUM;
-        CELL_ID(xx) = CELL_ID(x);
-        CELL_TYPE(x) = BT_BROKENHEART;
-        CELL_CAR(x) = xx;
-        return xx;
-    }
-
-    case BT_VECTOR: {
-        // Vector GC: share the vector_data pointer and update element
-        // references in-place. Must set BROKENHEART before collecting elements
-        // to handle cyclic references (vector → cons → same vector).
-        unsigned xx = alloc();
-        CELL_TYPE(xx) = BT_VECTOR;
-        CELL_ID(xx) = CELL_ID(x);
-        CELL_TYPE(x) = BT_BROKENHEART;
-        CELL_CAR(x) = xx;
-        // Now safe to collect elements - cycles will see BROKENHEART
-        vector_data *vd = (vector_data *)CELL_PTR(xx);
-        if (!vector_data_well_formed(vd))
-            return xx;
-        for (unsigned i = 0; i < vd->len; i++) {
-            vd->data[i] = collect(vd->data[i]);
-        }
-        return xx;
-    }
-
-    case BT_STRINPORT:
-    case BT_STROUTPORT: {
-        // String port GC follows the same invariant as strings above.
-        // The string_port struct and its data buffer are shared during
-        // collection; only unreachable ports in the old region are freed.
-        unsigned xx = alloc();
-        CELL_TYPE(xx) = CELL_TYPE(x);
-        CELL_PTR(xx) = CELL_PTR(x);
-        CELL_TYPE(x) = BT_BROKENHEART;
-        CELL_CAR(x) = xx;
-        string_port *sp = (string_port *)CELL_PTR(xx);
-        if (sp->source_string != ctx.atom_false)
-            sp->source_string = collect(sp->source_string);
-        return xx;
-    }
-
-    case BT_INPORT:
-    case BT_OUTPORT: {
-        unsigned xx = alloc();
-        CELL_TYPE(xx) = CELL_TYPE(x);
-        CELL_PTR(xx) = CELL_PTR(x);
-        CELL_TYPE(x) = BT_BROKENHEART;
-        CELL_CAR(x) = xx;
-        return xx;
-    }
-
-    case BT_VMCONT: {
-        // VM continuation contains cell references that must be updated.
-        unsigned xx = alloc();
-        CELL_TYPE(xx) = BT_VMCONT;
-        CELL_PTR(xx) = CELL_PTR(x);
-        CELL_TYPE(x) = BT_BROKENHEART;
-        CELL_CAR(x) = xx;
-        if (is_vm_continuation_object(xx))
-            collect_vm_continuation_roots((vm_continuation *)CELL_PTR(xx),
-                                          collect);
-        return xx;
-    }
-
-    default: {
-        unsigned xx = alloc();
-        ctx.cons_cells[xx] = ctx.cons_cells[x];
-        CELL_TYPE(x) = BT_BROKENHEART;
-        CELL_CAR(x) = xx;
-        return xx;
-    }
+    default:
+        // Copy only; the scan loop in gc() traces the copy's references.
+        return forward_cell(x, alloc());
     }
 }
 
@@ -2983,6 +2979,7 @@ static void update_all_string_port_sources(unsigned (*collector)(unsigned))
 unsigned gc(unsigned root)
 {
     ctx.major_gc_count++;
+    collection_in_progress = true;
 
     // Enter GC mode - alloc() will use old gen instead of nursery
     in_gc_mode = true;
@@ -3006,6 +3003,12 @@ unsigned gc(unsigned root)
     // Copy initial root to new space using the same type-aware path as all
     // other roots. Direct roots may be pointer-bearing cells such as vectors.
     root = collect(root);
+    // The allocation root is a root like any other and must be copied before
+    // the scan loop below, or what only it reaches is never traced. (It
+    // usually equals root - callers pass *alloc_gc_root - in which case this
+    // just reads the forwarding pointer.)
+    if (saved_gc_root && *saved_gc_root >= HEAP_RESERVED)
+        *saved_gc_root = collect(*saved_gc_root);
 
     // Collect trampoline state (global evaluator state)
     tramp.expr = collect(tramp.expr);
@@ -3039,16 +3042,8 @@ unsigned gc(unsigned root)
     update_all_string_port_sources(collect);
     env_index_gc_update(collect);
 
-    while (scan != ctx.hptr) {
-        enum lisp_type t = CELL_TYPE(scan);
-        if (t == BT_CONS || t == BT_FUNCTION || t == BT_MACRO ||
-            t == BT_SYNTAX || t == BT_CONT || t == BT_RATIONAL ||
-            t == BT_COMPLEX || t == BT_BINDING_REF || t == BT_MULTIVAL) {
-            CELL_CAR(scan) = collect(CELL_CAR(scan));
-            CELL_CDR(scan) = collect(CELL_CDR(scan));
-        }
-        scan++;
-    }
+    while (scan != ctx.hptr)
+        gc_scan_cell(scan++, collect);
 
     unsigned tmp = ctx.nmin;
     ctx.nmin = ctx.mmin;
@@ -3057,11 +3052,7 @@ unsigned gc(unsigned root)
     // Note: ctx.atom_* are in reserved space (< HEAP_RESERVED) and don't need
     // collection
 
-    // Update alloc_gc_root before freeing old space (broken hearts still valid)
     alloc_gc_root = saved_gc_root;
-    if (alloc_gc_root && *alloc_gc_root >= HEAP_RESERVED) {
-        *alloc_gc_root = collect(*alloc_gc_root);
-    }
 
     // Note: gc_sweep_code_objects() is NOT called here because the VM may
     // still be executing code objects that have no closures in the heap
@@ -3091,13 +3082,6 @@ unsigned gc(unsigned root)
     }
     ctx.nursery_ptr = ctx.nursery_start;
 
-    // If live data reaches into the nursery region, allocation would
-    // silently overwrite it - fail loudly instead
-    if (ctx.hptr > ctx.nursery_start) {
-        in_gc_mode = false;
-        lisp_panic("heap exhausted: live data overlaps nursery after GC");
-    }
-
     // Clear card table for the new semispace (if generational GC is enabled)
     if (ctx.card_table) {
         size_t num_cards = (2 * SEMISPACE_SIZE) / CARD_SIZE;
@@ -3112,6 +3096,16 @@ unsigned gc(unsigned root)
 
     // Invalidate environment lookup cache (cell references are now stale)
     env_invalidate_cache();
+    collection_in_progress = false;
+
+    // If live data reaches into the nursery region, the next allocation would
+    // silently overwrite it - fail loudly instead. The collection itself has
+    // finished and the heap is consistent, so unlike a failure partway through
+    // copying this panic is recoverable: the REPL's recovery runs a full
+    // collection before anything allocates, and by then the data of the
+    // abandoned computation is unreachable.
+    if (ctx.hptr > ctx.nursery_start)
+        lisp_panic("heap exhausted: live data overlaps nursery after GC");
 
     return root;
 }
@@ -3179,135 +3173,37 @@ unsigned collect_to_old(unsigned x)
     case BT_FREE:
         return 0;
 
-    case BT_STRING:
-    case BT_BYTEVEC:
-    case BT_HASHTABLE: {
-        // Copy pointer-based cell to old gen (share malloc'd data)
-        if (ctx.hptr >= ctx.nursery_start) {
+    default:
+        // minor_gc() checks before it starts that the old generation can
+        // take every nursery cell, so this is only a backstop.
+        if (ctx.hptr >= ctx.nursery_start)
             lisp_panic("old generation full during minor GC");
-        }
-        unsigned xx = ctx.hptr++;
-        CELL_TYPE(xx) = CELL_TYPE(x);
-        CELL_ID(xx) = CELL_ID(x);
-        CELL_TYPE(x) = BT_BROKENHEART;
-        CELL_CAR(x) = xx;
-        if (string_cell_is_view(xx)) {
-            string_view_data *view = (string_view_data *)CELL_PTR(xx);
-            view->parent = collect_to_old(view->parent);
-        }
-        if (CELL_TYPE(xx) == BT_HASHTABLE) {
-            hash_table_data *ht = (hash_table_data *)CELL_PTR(xx);
-            if (!hash_table_data_well_formed(ht))
-                return xx;
-            for (unsigned i = 0; i < ht->capacity; i++) {
-                for (hash_entry *entry = ht->buckets[i]; entry;
-                     entry = entry->next) {
-                    entry->key = collect_to_old(entry->key);
-                    entry->value = collect_to_old(entry->value);
-                }
-            }
-            // Moved keys hash to new buckets; rehash after the GC finishes
-            hash_table_gc_register_rehash(ht);
-        }
-        return xx;
-    }
-
-    case BT_BIGNUM: {
-        if (ctx.hptr >= ctx.nursery_start) {
-            lisp_panic("old generation full during minor GC");
-        }
-        unsigned xx = ctx.hptr++;
-        CELL_TYPE(xx) = BT_BIGNUM;
-        CELL_ID(xx) = CELL_ID(x);
-        CELL_TYPE(x) = BT_BROKENHEART;
-        CELL_CAR(x) = xx;
-        return xx;
-    }
-
-    case BT_VECTOR: {
-        if (ctx.hptr >= ctx.nursery_start) {
-            lisp_panic("old generation full during minor GC");
-        }
-        unsigned xx = ctx.hptr++;
-        CELL_TYPE(xx) = BT_VECTOR;
-        CELL_PTR(xx) = CELL_PTR(x);
-        CELL_TYPE(x) = BT_BROKENHEART;
-        CELL_CAR(x) = xx;
-        // Collect vector elements
-        vector_data *vd = (vector_data *)CELL_PTR(xx);
-        if (!vector_data_well_formed(vd))
-            return xx;
-        for (unsigned i = 0; i < vd->len; i++) {
-            vd->data[i] = collect_to_old(vd->data[i]);
-        }
-        return xx;
-    }
-
-    case BT_STRINPORT:
-    case BT_STROUTPORT: {
-        if (ctx.hptr >= ctx.nursery_start) {
-            lisp_panic("old generation full during minor GC");
-        }
-        unsigned xx = ctx.hptr++;
-        CELL_TYPE(xx) = CELL_TYPE(x);
-        CELL_PTR(xx) = CELL_PTR(x);
-        CELL_TYPE(x) = BT_BROKENHEART;
-        CELL_CAR(x) = xx;
-        string_port *sp = (string_port *)CELL_PTR(xx);
-        if (sp->source_string != ctx.atom_false)
-            sp->source_string = collect_to_old(sp->source_string);
-        return xx;
-    }
-
-    case BT_INPORT:
-    case BT_OUTPORT: {
-        if (ctx.hptr >= ctx.nursery_start) {
-            lisp_panic("old generation full during minor GC");
-        }
-        unsigned xx = ctx.hptr++;
-        CELL_TYPE(xx) = CELL_TYPE(x);
-        CELL_PTR(xx) = CELL_PTR(x);
-        CELL_TYPE(x) = BT_BROKENHEART;
-        CELL_CAR(x) = xx;
-        return xx;
-    }
-
-    case BT_VMCONT: {
-        // VM continuation contains cell references that must be updated.
-        if (ctx.hptr >= ctx.nursery_start) {
-            lisp_panic("old generation full during minor GC");
-        }
-        unsigned xx = ctx.hptr++;
-        CELL_TYPE(xx) = BT_VMCONT;
-        CELL_PTR(xx) = CELL_PTR(x);
-        CELL_TYPE(x) = BT_BROKENHEART;
-        CELL_CAR(x) = xx;
-        if (is_vm_continuation_object(xx))
-            collect_vm_continuation_roots((vm_continuation *)CELL_PTR(xx),
-                                          collect_to_old);
-        return xx;
-    }
-
-    default: {
-        if (ctx.hptr >= ctx.nursery_start) {
-            lisp_panic("old generation full during minor GC");
-        }
-        unsigned xx = ctx.hptr++;
-        ctx.cons_cells[xx] = ctx.cons_cells[x];
-        CELL_TYPE(x) = BT_BROKENHEART;
-        CELL_CAR(x) = xx;
-        return xx;
-    }
+        // Copy only; minor_gc()'s scan loop traces the copy's references.
+        return forward_cell(x, ctx.hptr++);
     }
 }
 
 unsigned minor_gc(unsigned root)
 {
+    // Every nursery cell might survive. When the old generation cannot take
+    // them all, promotion would run out of room partway through, with some of
+    // the nursery forwarded and some not - a heap nothing can recover. A full
+    // collection copies into the whole other semispace instead, so use one.
+    unsigned nursery_used = ctx.nursery_ptr - ctx.nursery_start;
+    if (ctx.hptr > ctx.nursery_start ||
+        ctx.nursery_start - ctx.hptr < nursery_used)
+        return gc(root);
+
     ctx.minor_gc_count++;
+    collection_in_progress = true;
     unsigned scan = ctx.hptr; // Start of newly promoted objects
 
     // Collect root
     root = collect_to_old(root);
+    // Callers pass *alloc_gc_root as root; promote it explicitly anyway so a
+    // different root cannot leave it pointing into the reclaimed nursery.
+    if (alloc_gc_root && *alloc_gc_root)
+        *alloc_gc_root = collect_to_old(*alloc_gc_root);
 
     // Collect trampoline state
     tramp.expr = collect_to_old(tramp.expr);
@@ -3357,61 +3253,16 @@ unsigned minor_gc(unsigned root)
                 cell_start = ctx.mmin;
             if (cell_end > scan)
                 cell_end = scan; // Only scan cells that existed before this GC
-            for (unsigned cell = cell_start; cell < cell_end; cell++) {
-                enum lisp_type t = CELL_TYPE(cell);
-                if (t == BT_CONS || t == BT_FUNCTION || t == BT_MACRO ||
-                    t == BT_SYNTAX || t == BT_CONT || t == BT_RATIONAL ||
-                    t == BT_COMPLEX || t == BT_BINDING_REF ||
-                    t == BT_MULTIVAL) {
-                    // CPS continuations (BT_CONT) use CAR/CDR for structure
-                    CELL_CAR(cell) = collect_to_old(CELL_CAR(cell));
-                    CELL_CDR(cell) = collect_to_old(CELL_CDR(cell));
-                } else if (t == BT_VECTOR) {
-                    vector_data *vd = (vector_data *)CELL_PTR(cell);
-                    if (!vector_data_well_formed(vd))
-                        continue;
-                    for (unsigned j = 0; j < vd->len; j++) {
-                        vd->data[j] = collect_to_old(vd->data[j]);
-                    }
-                } else if (t == BT_HASHTABLE) {
-                    hash_table_data *ht = (hash_table_data *)CELL_PTR(cell);
-                    if (!hash_table_data_well_formed(ht))
-                        continue;
-                    for (unsigned j = 0; j < ht->capacity; j++) {
-                        for (hash_entry *entry = ht->buckets[j]; entry;
-                             entry = entry->next) {
-                            entry->key = collect_to_old(entry->key);
-                            entry->value = collect_to_old(entry->value);
-                        }
-                    }
-                    // Promoted keys hash to new buckets; rehash post-GC
-                    hash_table_gc_register_rehash(ht);
-                } else if (t == BT_VMCONT) {
-                    // VM continuation: update cell references inside struct
-                    collect_vm_continuation_roots(
-                        (vm_continuation *)CELL_PTR(cell), collect_to_old);
-                }
-            }
+            for (unsigned cell = cell_start; cell < cell_end; cell++)
+                gc_scan_cell(cell, collect_to_old);
             // Clear the card
             CARD_CLEAR(ctx.card_table, card);
         }
     } // end if (ctx.card_table)
 
     // Scan newly promoted objects in old gen
-    while (scan != ctx.hptr) {
-        enum lisp_type t = CELL_TYPE(scan);
-        if (t == BT_CONS || t == BT_FUNCTION || t == BT_MACRO ||
-            t == BT_SYNTAX || t == BT_CONT || t == BT_RATIONAL ||
-            t == BT_COMPLEX || t == BT_BINDING_REF || t == BT_MULTIVAL) {
-            // CPS continuations (BT_CONT) use CAR/CDR for structure
-            CELL_CAR(scan) = collect_to_old(CELL_CAR(scan));
-            CELL_CDR(scan) = collect_to_old(CELL_CDR(scan));
-        } else if (t == BT_VMCONT) {
-            // VM continuation's internal values were already collected when
-            // the cell was promoted - no need to scan again
-        }
-        scan++;
-    }
+    while (scan != ctx.hptr)
+        gc_scan_cell(scan++, collect_to_old);
 
     // Free external data for unreachable nursery cells. Promoted cells were
     // rewritten as BT_BROKENHEART, so they are skipped here.
@@ -3436,6 +3287,7 @@ unsigned minor_gc(unsigned root)
 
     // Invalidate environment lookup cache (cell references may have moved)
     env_invalidate_cache();
+    collection_in_progress = false;
 
     return root;
 }
@@ -3457,6 +3309,18 @@ static void init_permanent_atom(unsigned cell_id, const char *name)
 {
     CELL_TYPE(cell_id) = BT_ATOM;
     CELL_ID(cell_id) = intern(name);
+}
+
+// #t and #f are atoms so the evaluator and writer treat them as constants,
+// but they must not share an atom id with any symbol: eq?, case, memq,
+// hashing and macro pattern variables all compare atoms by id, so interning
+// them as "true"/"false" made (eq? 'true #t) true and let a pattern variable
+// named true substitute into a literal #t. A private uninterned slot cannot be
+// reached by intern or string->symbol.
+static void init_boolean_atom(unsigned cell_id, const char *name)
+{
+    CELL_TYPE(cell_id) = BT_ATOM;
+    CELL_ID(cell_id) = atom_slot(name, true);
 }
 
 void init_keywords(void)
@@ -3483,8 +3347,8 @@ void init_keywords(void)
     CELL_ID(CELL_EOF_OBJECT) = 0;
 
     // Initialize permanent atoms in reserved cells (never GC'd)
-    init_permanent_atom(CELL_ATOM_FALSE, "false");
-    init_permanent_atom(CELL_ATOM_TRUE, "true");
+    init_boolean_atom(CELL_ATOM_FALSE, "#f");
+    init_boolean_atom(CELL_ATOM_TRUE, "#t");
     init_permanent_atom(CELL_ATOM_QUOTE, "quote");
     init_permanent_atom(CELL_ATOM_QUASIQUOTE, "quasiquote");
     init_permanent_atom(CELL_ATOM_UNQUOTE, "unquote");

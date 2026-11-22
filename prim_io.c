@@ -49,8 +49,26 @@ static bool count_utf8_chars_in_bytes(const char *data, size_t len,
     return true;
 }
 
+// Writers used by the output primitives. Each reports its own failure (for
+// example data nested too deeply) and returns false, so the primitive can
+// raise instead of silently producing partial output.
+typedef bool (*object_writer)(unsigned, FILE *);
+
+static bool display_checked(unsigned arg, FILE *fp)
+{
+    if (IS_STRING(arg)) {
+        char *s = require_string_ptr(arg, "display");
+        if (!s)
+            return false;
+        fputs(s, fp);
+        return true;
+    }
+    return display_obj_port_checked(arg, fp);
+}
+
 static unsigned write_arg_to_string_port(unsigned arg, string_port *sport,
-                                         const char *name, bool display)
+                                         const char *name,
+                                         object_writer writer)
 {
     char *buf = NULL;
     size_t buflen = 0;
@@ -60,23 +78,23 @@ static unsigned write_arg_to_string_port(unsigned arg, string_port *sport,
         return TOK_ERROR;
     }
 
-    if (display && IS_STRING(arg)) {
-        char *s = require_string_ptr(arg, name);
-        if (!s) {
-            fclose(memfp);
-            free(buf);
-            return TOK_ERROR;
-        }
-        fprintf(memfp, "%s", s);
-    } else if (display) {
-        display_obj_port(arg, memfp);
-    } else {
-        write_obj_port(arg, memfp);
-    }
+    bool ok = writer(arg, memfp);
 
     if (fclose(memfp) != 0) {
         free(buf);
         show_error("%s: write failed", name);
+        return TOK_ERROR;
+    }
+    if (!ok) {
+        free(buf);
+        return TOK_ERROR;
+    }
+    // Strings, and so string ports, cannot hold U+0000 (displaying the
+    // character #\null writes one). Refuse it rather than silently
+    // truncating the output at the NUL byte.
+    if (memchr(buf, 0, buflen)) {
+        free(buf);
+        show_error("%s: null character cannot be stored in a string", name);
         return TOK_ERROR;
     }
     if (!strport_puts(sport, buf)) {
@@ -99,114 +117,15 @@ static bool flush_output_and_transcript(FILE *fport, const char *name)
 }
 
 static bool write_arg_to_file_port(unsigned arg, FILE *fport, const char *name,
-                                   bool display)
-{
-    if (!require_textual_file_port(fport, name))
-        return false;
-    if (display && IS_STRING(arg)) {
-        char *s = require_string_ptr(arg, name);
-        if (!s)
-            return false;
-        fprintf(fport, "%s", s);
-        if (ctx.transcript && fport == ctx.current_output)
-            fprintf(ctx.transcript, "%s", s);
-    } else if (display) {
-        display_obj_port(arg, fport);
-        if (ctx.transcript && fport == ctx.current_output)
-            display_obj_port(arg, ctx.transcript);
-    } else {
-        write_obj_port(arg, fport);
-        if (ctx.transcript && fport == ctx.current_output)
-            write_obj_port(arg, ctx.transcript);
-    }
-
-    return flush_output_and_transcript(fport, name);
-}
-
-static unsigned write_arg_to_string_port_mode(unsigned arg, string_port *sport,
-                                              const char *name,
-                                              void (*writer)(unsigned, FILE *))
-{
-    char *buf = NULL;
-    size_t buflen = 0;
-    FILE *memfp = open_memstream(&buf, &buflen);
-    if (!memfp) {
-        show_error("%s: out of memory", name);
-        return TOK_ERROR;
-    }
-
-    writer(arg, memfp);
-
-    if (fclose(memfp) != 0) {
-        free(buf);
-        show_error("%s: write failed", name);
-        return TOK_ERROR;
-    }
-    if (!strport_puts(sport, buf)) {
-        free(buf);
-        show_error("%s: string port write failed", name);
-        return TOK_ERROR;
-    }
-    free(buf);
-    return arg;
-}
-
-static unsigned write_arg_to_string_port_checked(
-    unsigned arg, string_port *sport, const char *name,
-    bool (*writer)(unsigned, FILE *))
-{
-    char *buf = NULL;
-    size_t buflen = 0;
-    FILE *memfp = open_memstream(&buf, &buflen);
-    if (!memfp) {
-        show_error("%s: out of memory", name);
-        return TOK_ERROR;
-    }
-
-    bool ok = writer(arg, memfp);
-
-    if (fclose(memfp) != 0) {
-        free(buf);
-        show_error("%s: write failed", name);
-        return TOK_ERROR;
-    }
-    if (!ok) {
-        free(buf);
-        return TOK_ERROR;
-    }
-    if (!strport_puts(sport, buf)) {
-        free(buf);
-        show_error("%s: string port write failed", name);
-        return TOK_ERROR;
-    }
-    free(buf);
-    return arg;
-}
-
-static bool write_arg_to_file_port_mode(unsigned arg, FILE *fport,
-                                        const char *name,
-                                        void (*writer)(unsigned, FILE *))
-{
-    if (!require_textual_file_port(fport, name))
-        return false;
-    writer(arg, fport);
-    if (ctx.transcript && fport == ctx.current_output)
-        writer(arg, ctx.transcript);
-    return flush_output_and_transcript(fport, name);
-}
-
-static bool write_arg_to_file_port_checked(unsigned arg, FILE *fport,
-                                           const char *name,
-                                           bool (*writer)(unsigned, FILE *))
+                                   object_writer writer)
 {
     if (!require_textual_file_port(fport, name))
         return false;
     if (!writer(arg, fport))
         return false;
-    if (ctx.transcript && fport == ctx.current_output) {
-        if (!writer(arg, ctx.transcript))
-            return false;
-    }
+    if (ctx.transcript && fport == ctx.current_output &&
+        !writer(arg, ctx.transcript))
+        return false;
     return flush_output_and_transcript(fport, name);
 }
 
@@ -256,9 +175,11 @@ static bool write_char_to_file_port(FILE *fport, int c, const char *name)
 {
     if (!require_textual_file_port(fport, name))
         return false;
-    char encoded[4];
-    size_t encoded_len;
-    if (!encode_char_utf8(c, encoded, &encoded_len, name))
+    char encoded[4] = {0};
+    size_t encoded_len = 1;
+    // U+0000 is a valid character on a file port; the UTF-8 encoder rejects
+    // it only because strings cannot hold it.
+    if (c != 0 && !encode_char_utf8(c, encoded, &encoded_len, name))
         return false;
     if (fwrite(encoded, 1, encoded_len, fport) != encoded_len ||
         (ctx.transcript && fport == ctx.current_output &&
@@ -304,7 +225,8 @@ static int extract_optional_port(unsigned argc, unsigned *argv,
 }
 
 static unsigned write_object_with_optional_port(unsigned argc, unsigned *argv,
-                                                const char *name, bool display)
+                                                const char *name,
+                                                object_writer writer)
 {
     unsigned arg = argv[0];
     FILE *fport;
@@ -314,44 +236,8 @@ static unsigned write_object_with_optional_port(unsigned argc, unsigned *argv,
     if (ptype == -1)
         return TOK_ERROR;
     if (ptype == 1)
-        return write_arg_to_string_port(arg, sport, name, display);
-    if (!write_arg_to_file_port(arg, fport, name, display))
-        return TOK_ERROR;
-    return arg;
-}
-
-static unsigned write_object_mode_with_optional_port(
-    unsigned argc, unsigned *argv, const char *name,
-    void (*writer)(unsigned, FILE *))
-{
-    unsigned arg = argv[0];
-    FILE *fport;
-    string_port *sport;
-    int ptype = extract_optional_port(argc, argv, 2, PORT_OUTPUT, &fport,
-                                      &sport, name);
-    if (ptype == -1)
-        return TOK_ERROR;
-    if (ptype == 1)
-        return write_arg_to_string_port_mode(arg, sport, name, writer);
-    if (!write_arg_to_file_port_mode(arg, fport, name, writer))
-        return TOK_ERROR;
-    return arg;
-}
-
-static unsigned write_object_checked_with_optional_port(
-    unsigned argc, unsigned *argv, const char *name,
-    bool (*writer)(unsigned, FILE *))
-{
-    unsigned arg = argv[0];
-    FILE *fport;
-    string_port *sport;
-    int ptype = extract_optional_port(argc, argv, 2, PORT_OUTPUT, &fport,
-                                      &sport, name);
-    if (ptype == -1)
-        return TOK_ERROR;
-    if (ptype == 1)
-        return write_arg_to_string_port_checked(arg, sport, name, writer);
-    if (!write_arg_to_file_port_checked(arg, fport, name, writer))
+        return write_arg_to_string_port(arg, sport, name, writer);
+    if (!write_arg_to_file_port(arg, fport, name, writer))
         return TOK_ERROR;
     return arg;
 }
@@ -360,8 +246,12 @@ static bool reject_reader_token(unsigned result, const char *name)
 {
     if (result == TOK_CLOSE || result == TOK_DOT) {
         show_error("%s: unexpected reader token", name);
+        note_error_kind("read");
         return false;
     }
+    // Malformed input surfaces as a read-error? condition.
+    if (result == TOK_ERROR)
+        note_error_kind("read");
     return true;
 }
 
@@ -417,9 +307,14 @@ static int read_or_peek_utf8_char(FILE *fport, string_port *sport, int ptype,
         bytes[i] = (char)c;
     }
     size_t offset = 0;
-    if (!scheme_utf8_decode_next(bytes, *byte_len, &offset, codepoint,
-                                 error_msg))
+    if (ptype != 1 && *byte_len == 1 && bytes[0] == 0) {
+        // U+0000 is a valid character on a file port even though strings
+        // (and so string ports) cannot hold it.
+        *codepoint = 0;
+    } else if (!scheme_utf8_decode_next(bytes, *byte_len, &offset, codepoint,
+                                        error_msg)) {
         goto restore_input_pos;
+    }
 
     if (!peek)
         return 1;
@@ -666,21 +561,23 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
     switch (prim_id) {
     case PDISPLAY: {
         REQUIRE_ARGC(argc, 1, 2, "display");
-        return write_object_with_optional_port(argc, argv, "display", true);
+        return write_object_with_optional_port(argc, argv, "display",
+                                               display_checked);
     }
     case PWRITE: {
         REQUIRE_ARGC(argc, 1, 2, "write");
-        return write_object_with_optional_port(argc, argv, "write", false);
+        return write_object_with_optional_port(argc, argv, "write",
+                                               write_obj_port_checked);
     }
     case PWRITESHARED: {
         REQUIRE_ARGC(argc, 1, 2, "write-shared");
-        return write_object_mode_with_optional_port(argc, argv, "write-shared",
-                                                    write_shared_obj_port);
+        return write_object_with_optional_port(argc, argv, "write-shared",
+                                               write_shared_obj_port_checked);
     }
     case PWRITESIMPLE: {
         REQUIRE_ARGC(argc, 1, 2, "write-simple");
-        return write_object_checked_with_optional_port(
-            argc, argv, "write-simple", write_simple_obj_port_checked);
+        return write_object_with_optional_port(argc, argv, "write-simple",
+                                               write_simple_obj_port_checked);
     }
     case PNEWLINE: {
         REQUIRE_ARGC(argc, 0, 1, "newline");
@@ -718,7 +615,8 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
                 show_error("read: failed to create memory stream");
                 return TOK_ERROR;
             }
-            unsigned result = read_obj_port(mem);
+            unsigned result =
+                read_obj_string_port(mem, &sport->reader_no_fold_case);
             // Update string port position based on how much was consumed
             long consumed = ftell(mem);
             if (consumed < 0) {

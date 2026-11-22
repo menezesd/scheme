@@ -100,8 +100,13 @@ static unsigned build_lambda_closure(unsigned params, unsigned body,
         gc_protect(&call);
         unsigned bad_body = alloc_cons(call, 0);
         gc_protect(&bad_body);
-        return make_typed_cell(BT_FUNCTION, params,
-                               alloc_cons(bad_body, closure_env));
+        // Allocate the (body . env) pair into a rooted local first: written
+        // as a nested argument, the compiler loaded params before that
+        // alloc_cons ran, so a collection there left the closure holding
+        // the formals' pre-move cell index.
+        unsigned bad_body_env = alloc_cons(bad_body, closure_env);
+        gc_protect(&bad_body_env);
+        return make_typed_cell(BT_FUNCTION, params, bad_body_env);
     }
     if (macro_bindings)
         closure_env = extend_env_empty(env);
@@ -571,7 +576,7 @@ bool handle_let(unsigned id, unsigned env, unsigned cont)
         gc_protect(&env);
         gc_protect(&cont);
         unsigned new_env = extend_env_empty(env);
-        eval_body(body, new_env, cont);
+        eval_scope_body(body, new_env, cont);
         return true;
     }
     GC_GUARD;
@@ -631,7 +636,7 @@ bool handle_letstar(unsigned id, unsigned env, unsigned cont)
         gc_protect(&env);
         gc_protect(&cont);
         unsigned new_env = extend_env_empty(env);
-        eval_body(body, new_env, cont);
+        eval_scope_body(body, new_env, cont);
         return true;
     }
     GC_GUARD;
@@ -673,7 +678,7 @@ bool handle_letrec(unsigned id, unsigned env, unsigned cont)
         gc_protect(&env);
         gc_protect(&cont);
         unsigned new_env = extend_env_empty(env);
-        eval_body(body, new_env, cont);
+        eval_scope_body(body, new_env, cont);
         return true;
     }
 
@@ -720,19 +725,14 @@ bool handle_letrec(unsigned id, unsigned env, unsigned cont)
     unsigned first_val_expr = cadr(car(bindings)); // bindings is protected
     gc_protect(&first_val_expr);
 
-    // Build data structure for CONT_LETREC_INIT:
-    // data = (bindings . (vals_ptr . (all_vals . (saved . body))))
-    // all_vals is the head of vals list, saved starts empty (0)
-    // When continuation is reinvoked, saved values are restored
-    unsigned inner1 = 0, inner2 = 0, inner3 = 0;
-    gc_protect(&inner1);
-    gc_protect(&inner2);
-    gc_protect(&inner3);
-    inner1 = alloc_cons(0, body);      // (saved . body) - saved starts empty
-    inner2 = alloc_cons(vals, inner1); // (all_vals . (saved . body))
-    inner3 =
-        alloc_cons(vals, inner2); // (vals_ptr . (all_vals . (saved . body)))
-    unsigned data = alloc_cons(bindings, inner3);
+    // Build data structure for CONT_LETREC_INIT (see handle_cont_letrec_init):
+    // data = (bindings . (vals_ptr . (saved . body))), vals_ptr starting at
+    // the first value cell and saved starting empty.
+    unsigned inner = 0;
+    gc_protect(&inner);
+    inner = alloc_cons(0, body);    // (saved . body)
+    inner = alloc_cons(vals, inner); // (vals_ptr . (saved . body))
+    unsigned data = alloc_cons(bindings, inner);
     unsigned k = make_cont(CONT_LETREC_INIT, data, new_env, cont);
     tramp_eval(first_val_expr, new_env, k);
     return true;
@@ -905,20 +905,14 @@ bool handle_letrec_syntax(unsigned id, unsigned env, unsigned cont)
 }
 
 // ============================================================================
-// Special Form Dispatch Table
+// Special Form Dispatch
 // ============================================================================
 
-typedef struct {
-    int64_t *kw_ptr; // Pointer to keyword ID in ctx
-    special_form_handler handler;
-} special_form_entry;
-
-// Get keyword pointer by offset in lisp_context
-#define KW_ENTRY(name, handler_fn) {&ctx.kw_##name, handler_fn}
-
-bool dispatch_special_form(int64_t kw, unsigned id, unsigned env, unsigned cont)
+bool dispatch_special_form(int64_t kw, unsigned id, unsigned env, unsigned cont,
+                           unsigned *head_value)
 {
     unsigned binding = lookup_silent(kw, env);
+    *head_value = TOK_ERROR;
     if (binding != TOK_ERROR) {
         if (IS_SYNTAX(binding)) {
             GC_GUARD;
@@ -943,6 +937,10 @@ bool dispatch_special_form(int64_t kw, unsigned id, unsigned env, unsigned cont)
             tramp_eval(expanded, env, cont);
             return true;
         }
+        // An ordinary binding shadows the keyword: hand the value back so
+        // the application does not walk the environment chain a second time
+        // to evaluate its head.
+        *head_value = binding;
         return false;
     }
 

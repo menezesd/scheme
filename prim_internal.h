@@ -645,12 +645,17 @@ static inline unsigned make_file_port_cell(FILE *file, bool binary, bool input,
     return make_pointer_cell(type, port);
 }
 
+// Tag the error just reported with show_error as an R7RS file or read error,
+// so the error object built for it satisfies file-error? or read-error?.
+void note_error_kind(const char *kind);
+
 static inline unsigned open_file_port(const char *filename, const char *mode,
                                       enum lisp_type type, const char *name)
 {
     FILE *f = fopen(filename, mode);
     if (!f) {
         show_error("%s: cannot open %s", name, filename);
+        note_error_kind("file");
         return TOK_ERROR;
     }
     return make_file_port_cell(f, strchr(mode, 'b') != NULL,
@@ -1005,21 +1010,12 @@ static inline string_port *strport_alloc_with_data(char *data, size_t len,
         free(data);
         return NULL;
     }
-    sp->data = data;
-    sp->len = len;
-    sp->cap = cap;
-    sp->pos = 0;
-    sp->last_read_pos = 0;
-    sp->last_read_len = 0;
-    sp->last_read_source_pos = 0;
-    sp->last_read_char = 0;
-    sp->last_read_valid = false;
-    sp->closed = false;
-    sp->source_string = ctx.atom_false;
-    sp->source_start = 0;
-    sp->source_end = 0;
-    sp->source_pos_chars = 0;
-    sp->borrowed_data = false;
+    *sp = (string_port){
+        .data = data,
+        .len = len,
+        .cap = cap,
+        .source_string = ctx.atom_false,
+    };
     string_port_register(sp);
     return sp;
 }
@@ -1062,21 +1058,15 @@ static inline string_port *strport_from_string_cell(unsigned source,
     string_port *sp = checked_malloc_size(sizeof(string_port));
     if (!sp)
         return NULL;
-    sp->data = s + start_byte;
-    sp->len = end_byte - start_byte;
-    sp->cap = sp->len + 1;
-    sp->pos = 0;
-    sp->last_read_pos = 0;
-    sp->last_read_len = 0;
-    sp->last_read_source_pos = 0;
-    sp->last_read_char = 0;
-    sp->last_read_valid = false;
-    sp->closed = false;
-    sp->source_string = source;
-    sp->source_start = start;
-    sp->source_end = end;
-    sp->source_pos_chars = 0;
-    sp->borrowed_data = true;
+    *sp = (string_port){
+        .data = s + start_byte,
+        .len = end_byte - start_byte,
+        .cap = end_byte - start_byte + 1,
+        .source_string = source,
+        .source_start = start,
+        .source_end = end,
+        .borrowed_data = true,
+    };
     string_port_register(sp);
     return sp;
 }
@@ -1088,6 +1078,10 @@ static inline bool strport_sync_source(string_port *sp)
     if (!IS_STRING(sp->source_string))
         return false;
     char *s = GET_STRING_PTR(sp->source_string);
+    // Re-deriving the offsets scans the source from its start, which made
+    // every read O(n). Skip it while the source buffer is unchanged.
+    if (s && s == sp->synced_source && sp->synced_epoch == string_buffer_epoch)
+        return true;
     // The type tag alone is not enough: corrupted string cells can contain
     // arbitrary pointers, and the UTF-8 helpers dereference the buffer.
     if (!s || !string_is_registered(s))
@@ -1114,6 +1108,8 @@ static inline bool strport_sync_source(string_port *sp)
     if (pos_byte < start_byte || pos_byte > end_byte)
         return false;
     sp->pos = pos_byte - start_byte;
+    sp->synced_source = s;
+    sp->synced_epoch = string_buffer_epoch;
     return true;
 }
 
@@ -1272,31 +1268,6 @@ static inline int extract_explicit_port_cell(unsigned p, port_dir dir,
     return 0;
 }
 
-// Unified port extraction - handles both file and string ports
-// Returns: 0 = file port, 1 = string port, -1 = error
-static inline int extract_port(unsigned args, port_dir dir, bool use_second_arg,
-                               FILE **file_out, string_port **strport_out,
-                               const char *fn_name)
-{
-    *file_out = (dir == PORT_INPUT) ? ctx.current_input : ctx.current_output;
-    *strport_out = NULL;
-
-    // Determine which arg contains the port
-    unsigned port_arg = use_second_arg ? cdr(args) : args;
-    if (!port_arg) {
-        unsigned current_cell = (dir == PORT_INPUT) ? ctx.current_input_cell
-                                                    : ctx.current_output_cell;
-        if (current_cell != 0) {
-            return extract_current_port_cell(current_cell, dir, file_out,
-                                             strport_out, fn_name);
-        }
-        return 0; // Use default file port
-    }
-
-    unsigned p = car(port_arg);
-    return extract_explicit_port_cell(p, dir, file_out, strport_out, fn_name);
-}
-
 // Unified port extraction for argv-based primitives
 // port_index < 0 means use current port
 static inline int extract_port_argv(unsigned *argv, int port_index,
@@ -1319,43 +1290,6 @@ static inline int extract_port_argv(unsigned *argv, int port_index,
 
     unsigned p = argv[port_index];
     return extract_explicit_port_cell(p, dir, file_out, strport_out, fn_name);
-}
-
-// Convenience wrappers
-static inline int extract_output_port_ex(unsigned args, FILE **file_out,
-                                         string_port **strport_out,
-                                         const char *fn_name)
-{
-    return extract_port(args, PORT_OUTPUT, true, file_out, strport_out,
-                        fn_name);
-}
-
-static inline int extract_input_port_ex(unsigned args, FILE **file_out,
-                                        string_port **strport_out,
-                                        const char *fn_name)
-{
-    return extract_port(args, PORT_INPUT, false, file_out, strport_out,
-                        fn_name);
-}
-
-// Extract input port (file ports only, simpler interface)
-static inline bool extract_input_port(unsigned args, FILE **port_out,
-                                      const char *fn_name)
-{
-    *port_out = ctx.current_input;
-    if (args) {
-        unsigned p = car(args);
-        if (!IS_INPORT(p)) {
-            show_error("%s: argument must be input port", fn_name);
-            return false;
-        }
-        *port_out = file_port_file(p);
-        if (!*port_out) {
-            show_error("%s: port is closed", fn_name);
-            return false;
-        }
-    }
-    return true;
 }
 
 // ============================================================================

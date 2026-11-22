@@ -58,6 +58,8 @@ bool is_jump_opcode(unsigned op)
 // Get the size of an instruction (opcode + operands)
 unsigned instruction_size(unsigned op)
 {
+    if (op >= OP_COUNT)
+        return 0;
     switch (op) {
     case OP_GUARD_PRIMITIVE:
         return 8;
@@ -129,22 +131,6 @@ static bool code_is_well_formed(const unsigned *code, unsigned len)
         i += size;
     }
     return true;
-}
-
-static bool instruction_starts_at(const unsigned *code, unsigned len,
-                                  unsigned target)
-{
-    for (unsigned i = 0; i < len;) {
-        if (i == target)
-            return true;
-        unsigned size;
-        if (!instruction_fits(code, len, i, &size))
-            return false;
-        if (i > target || size > len - i)
-            return false;
-        i += size;
-    }
-    return target == len;
 }
 
 static void mark_jump_targets(const unsigned *code, unsigned len,
@@ -427,7 +413,7 @@ void peephole_optimize(code_object *code)
 
     // First pass: identify which bytes to remove and build offset map
     // offset_map[old] = new offset after compaction
-    unsigned *offset_map = checked_malloc_array(len, sizeof(unsigned));
+    unsigned *offset_map = checked_calloc_array(len, sizeof(unsigned));
     if (!offset_map) {
         free(is_jump_target);
         code->optimizing = false;
@@ -441,6 +427,14 @@ void peephole_optimize(code_object *code)
         code->optimizing = false;
         return;
     }
+
+    // Reuse the relocation table as an instruction-boundary map until
+    // compaction. Peephole replacements preserve widths until then.
+    // (The code was checked well formed above and cse_pass preserves that,
+    // so a zero size cannot occur; stop rather than spin if it ever does.)
+    for (unsigned i = 0, size; i < len && (size = instruction_size(c[i])) != 0;
+         i += size)
+        offset_map[i] = 1;
 
     // Mark patterns to remove
     for (unsigned i = 0; i < len;) {
@@ -620,6 +614,10 @@ void peephole_optimize(code_object *code)
             continue;
         }
 
+        // Only two-instruction cxr fusions exist. The compiler never emits a
+        // composite accessor itself and a fused instruction is not examined
+        // again, so patterns starting from CDDR/CADR (or three-op chains,
+        // shadowed by the pairs below) could never fire.
         // Pattern: CDR, CDR -> CDDR (if not jump target)
         if (op == OP_CDR && i + 1 < len && c[i + 1] == OP_CDR &&
             !is_jump_target[i + 1]) {
@@ -656,52 +654,6 @@ void peephole_optimize(code_object *code)
             continue;
         }
 
-        // Pattern: CDR, CDR, CDR -> CDDDR
-        if (op == OP_CDR && i + 2 < len && c[i + 1] == OP_CDR &&
-            c[i + 2] == OP_CDR && !is_jump_target[i + 1] &&
-            !is_jump_target[i + 2]) {
-            c[i] = OP_CDDDR;
-            remove[i + 1] = remove[i + 2] = true;
-            i += 2;
-            continue;
-        }
-
-        // Pattern: CDDR, CDR -> CDDDR
-        if (op == OP_CDDR && i + 1 < len && c[i + 1] == OP_CDR &&
-            !is_jump_target[i + 1]) {
-            c[i] = OP_CDDDR;
-            remove[i + 1] = true;
-            i += 1;
-            continue;
-        }
-
-        // Pattern: CDR, CDDR -> CDDDR
-        if (op == OP_CDR && i + 1 < len && c[i + 1] == OP_CDDR &&
-            !is_jump_target[i + 1]) {
-            c[i] = OP_CDDDR;
-            remove[i + 1] = true;
-            i += 1;
-            continue;
-        }
-
-        // Pattern: CADR, CDR -> CADDR
-        if (op == OP_CADR && i + 1 < len && c[i + 1] == OP_CDR &&
-            !is_jump_target[i + 1]) {
-            c[i] = OP_CADDR;
-            remove[i + 1] = true;
-            i += 1;
-            continue;
-        }
-
-        // Pattern: CDDR, CAR -> CADDR
-        if (op == OP_CDDR && i + 1 < len && c[i + 1] == OP_CAR &&
-            !is_jump_target[i + 1]) {
-            c[i] = OP_CADDR;
-            remove[i + 1] = true;
-            i += 1;
-            continue;
-        }
-
         // NOTE: CONST x, CONST x -> CONST x, DUP is handled in cse_pass()
         // which properly rebuilds the code array to handle size changes.
 
@@ -723,9 +675,8 @@ void peephole_optimize(code_object *code)
             const unsigned max_chain = 10; // Prevent infinite loops
 
             // Follow chain of unconditional JUMPs
-            while (target < len && instruction_starts_at(c, len, target) &&
-                   instruction_fits(c, len, target, NULL) &&
-                   c[target] == OP_JUMP && visited_count < max_chain) {
+            while (visited_count < max_chain && target < len &&
+                   offset_map[target] && c[target] == OP_JUMP) {
                 target = c[target + 1];
                 visited_count++;
             }
@@ -910,6 +861,7 @@ static const char *opcode_names[] = {
     [OP_TRMC_PUSH] = "TRMC_PUSH",
     [OP_TAILCALL_TRMC] = "TAILCALL_TRMC",
     [OP_ERROR_RETURN] = "ERROR_RETURN",
+    [OP_LOAD_STEP] = "LOAD_STEP",
 };
 
 static const char *disassemble_atom_name(unsigned atom_id)
@@ -1049,8 +1001,9 @@ void disassemble(code_object *code, const char *name)
             printf(" -> %u", code->code[start + 1]);
             break;
         case OP_PRIM:
-            printf(" %u argc=%u", code->code[start + 1],
-                   code->code[start + 2]);
+            printf(" %u argc=%u%s", code->code[start + 1],
+                   code->code[start + 2] & ~PRIM_TAIL_FLAG,
+                   (code->code[start + 2] & PRIM_TAIL_FLAG) ? " tail" : "");
             break;
         default:
             // No operands

@@ -44,4 +44,20 @@ unsigned extend_env_with_internal_defines(unsigned env, unsigned body);
 // Check if an identifier is a special form keyword
 bool is_special_form(int64_t id);
 
+// True for (case <key> <clause> ...). Its clauses' datum lists are quoted
+// data, so template walkers that rename identifiers must leave them alone.
+bool template_case_form(unsigned tmpl);
+
+// Record that hygiene gensym alias_id renames origin_id, so a renamed case
+// keyword is still recognised by template_case_form.
+void macros_note_alias(int64_t alias_id, int64_t origin_id);
+
+// Private identifier the compiler binds in a top-level begin's placeholder
+// frame: the names there are globals-to-be (see compile_begin).
+int64_t macros_toplevel_defines_marker_id(void);
+
+// True if id denotes the same binding in both environments, for matching a
+// syntax-rules literal; a top-level placeholder counts as the global.
+bool macros_same_binding(int64_t id, unsigned env_a, unsigned env_b);
+
 #endif // MACROS_H

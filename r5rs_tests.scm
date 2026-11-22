@@ -812,6 +812,16 @@
         (let ((result (force r)))
           (gc-flip)
           (list result (force q) (force p) count)))))
+(test "delay-force aliases share the cache after a retry" '(2 2 2 2)
+    (let ((count 0))
+      (let* ((p (delay (begin
+                        (set! count (+ count 1))
+                        (if (= count 1) (error "retry") count))))
+             (q (delay-force p))
+             (r (delay-force q)))
+        (guard (ex (else #f)) (force q))
+        (let* ((rv (force r)) (qv (force q)) (pv (force p)))
+          (list rv qv pv count)))))
 (test "delay-force preserves an already cached promise-valued result" #t
     (let* ((inner (delay 42))
            (p (delay inner)))
@@ -1681,6 +1691,23 @@ b")
     (string->symbol
      (string-append (symbol->string (string->symbol "+inf.0")) "-sym")))
 (test "infinity literal" #t (> +inf.0 0))
+(test "abs normalizes inexact negative zero" #t
+    (let ((absolute (lambda (x) (abs x))))
+      (eqv? (absolute -0.0) 0.0)))
+(test "exact->inexact rounds bignums using the low limbs" #t
+    (let ((base (expt 2 96)) (half (expt 2 43)))
+      (and (= (inexact->exact (exact->inexact (+ base half))) base)
+           (= (inexact->exact (exact->inexact (+ base half 1)))
+              (+ base (* 2 half))))))
+(test "exact->inexact rounds just above a rational halfway point" #t
+    (let ((divisor (expt 2 100)))
+      (= (inexact->exact
+           (exact->inexact (/ (+ divisor (expt 2 47) 1) divisor)))
+         (+ 1 (/ 1 (expt 2 52))))))
+(test "exact->inexact rounds subnormal ties and preserves the sign" #t
+    (let ((half (/ 1 (expt 2 1075))))
+      (and (eqv? (exact->inexact (- half)) -0.0)
+           (= (inexact->exact (exact->inexact (* 3 half))) (* 4 half)))))
 
 (test-section "Inexactness contagion in min/max/gcd/lcm")
 ;; R7RS 6.2.6: if any argument is inexact the result is inexact, even when
@@ -1699,6 +1726,20 @@ b")
 (test "lcm propagates inexactness through its zero result" 0.0 (lcm 0.0 1))
 (test "lcm propagates inexactness generally" 12.0 (lcm 4.0 6))
 (test "lcm over exact arguments stays exact" #t (exact? (lcm 4 6)))
+(test "gcd rejects fractional operands before zero shortcut" #t
+    (guard (ex (else (error-object? ex))) (gcd 2.5 0) #f))
+(test "lcm rejects fractional operands after zero" #t
+    (guard (ex (else (error-object? ex))) (lcm 0 2.5) #f))
+(test "gcd validates singleton operands" #t
+    (guard (ex (else (error-object? ex))) (gcd 1/2) #f))
+(test "lcm validates singleton operands" #t
+    (guard (ex (else (error-object? ex))) (lcm 1/2) #f))
+(test "lcm keeps a representable result when the product overflows" 1e200
+    (lcm 1e200 1e200))
+(test "log1mexp of either zero is real negative infinity" '(#t #t #t)
+    (list (eqv? (log1mexp 0) -inf.0)
+          (eqv? (log1mexp 0.0) -inf.0)
+          (eqv? (log1mexp -0.0) -inf.0)))
 (test "contagion survives downstream rounding" #f
     (exact-integer? (round (max 1e-10 1.5 7/2))))
 
@@ -2128,6 +2169,209 @@ b")
   (syntax-rules () ((_) (runaway-probe-macro))))
 (test "infinite macro expansion is still caught" 'caught
     (guard (e (#t 'caught)) (runaway-probe-macro)))
+
+;;; ============================================================================
+;;; syntax-rules regressions
+;;; ============================================================================
+
+(test-section "syntax-rules regressions")
+
+;; A pattern variable matched outside any ellipsis may be used inside one:
+;; it is repeated alongside the ellipsis variable. Its value being a list must
+;; not make it iterate.
+(test "depth-0 variable repeated under an ellipsis" '(((a b) 1) ((a b) 2))
+    (guard (e (#t 'error))
+      (let-syntax ((m (syntax-rules () ((_ x (y ...)) '((x y) ...)))))
+        (m (a b) (1 2)))))
+
+;; A let* in a template: each binder scopes over the later inits too.
+(test "template let* binders reach later inits" '(2 2)
+    (guard (e (#t 'error))
+      (let-syntax ((m (syntax-rules () ((_) (let* ((x 1) (y (+ x 1))) y)))))
+        (list (m) (let ((x 100)) (m))))))
+
+;; The forms after a define-syntax in a file are compiled together; a global
+;; the macro calls that is defined in that same stretch is not a local.
+(define-syntax regress-call-helper
+  (syntax-rules () ((_) (regress-helper 20))))
+(define (regress-helper n) (+ n 1))
+(test "macro may call a global defined after it in the same file" 21
+    (guard (e (#t 'error)) (regress-call-helper)))
+(define-syntax regress-for
+  (syntax-rules (regress-in)
+    ((_ x regress-in lst body) (map (lambda (x) body) lst))))
+(define (regress-in) 'a-literal-defined-after-its-macro)
+(test "literal defined after its macro still matches" '(2 3)
+    (guard (e (#t 'error)) (regress-for y regress-in '(1 2) (+ y 1))))
+
+;; Vector templates expand through the write barrier (a raw store lost
+;; elements once the result vector was promoted) and may hold several
+;; ellipses.
+(test "vector template with nested ellipsis" '#((1 2) (3) ())
+    (let-syntax ((m (syntax-rules () ((_ (a ...) ...) '#((a ...) ...)))))
+      (m (1 2) (3) ())))
+(test "vector template with two ellipses" '#(1 2 0 1 2)
+    (guard (e (#t 'error))
+      (let-syntax ((m (syntax-rules () ((_ a ...) '#(a ... 0 a ...)))))
+        (m 1 2))))
+
+;; letrec-syntax siblings see each other (the closure env of every binding
+;; after the first used to go stale across a collection).
+(test "letrec-syntax mutual recursion" '(#t #t #f)
+    (letrec-syntax ((ev? (syntax-rules () ((_) #t) ((_ x . r) (od? . r))))
+                    (od? (syntax-rules () ((_) #f) ((_ x . r) (ev? . r)))))
+      (list (ev? 1 2 3 4) (od? 1 2 3) (ev? 1))))
+
+;; R7RS 4.3.2's own example: an outer pattern variable as the inner rule's
+;; keyword, and others as inner pattern variable, literal and ellipsis.
+(define-syntax regress-be-like-begin
+  (syntax-rules ()
+    ((regress-be-like-begin name)
+     (define-syntax name
+       (syntax-rules ()
+         ((name expr (... ...))
+          (begin expr (... ...))))))))
+(regress-be-like-begin regress-sequence)
+(test "be-like-begin" 4 (regress-sequence 1 2 3 4))
+(test "outer pattern variables in an inner syntax-rules" '((7 7) (matched other) (1 2 3))
+    (guard (e (#t 'error))
+      (let ()
+        (define-syntax def-id
+          (syntax-rules () ((_ name v) (define-syntax name (syntax-rules () ((_ v) (list v v)))))))
+        (define-syntax def-lit
+          (syntax-rules ()
+            ((_ name lit) (define-syntax name (syntax-rules (lit) ((_ lit) 'matched) ((_ z) 'other))))))
+        (define-syntax def-ell
+          (syntax-rules () ((_ name e) (define-syntax name (syntax-rules e () ((_ x e) (list x e)))))))
+        (def-id twice q)
+        (def-lit kw bar)
+        (def-ell mylist :::)
+        (list (twice 7) (list (kw bar) (kw baz)) (mylist 1 2 3)))))
+
+;; Renamed binders must not leak into data: case datums and vector literals.
+(test "case datum named like a template binder" 'yes
+    (let-syntax ((m (syntax-rules () ((_) (let ((x 1)) (case 'x ((x) 'yes) (else 'no)))))))
+      (m)))
+(test "vector literal naming a template binder" '#(x)
+    (let-syntax ((m (syntax-rules () ((_) (let ((x "s")) #(x))))))
+      (m)))
+(define-syntax regress-op-name
+  (syntax-rules () ((_ v) (case v ((+) 'plus) ((-) 'minus) (else 'other)))))
+(test "case datum naming a global procedure" '(plus minus other)
+    (list (regress-op-name '+) (regress-op-name '-) (regress-op-name 'x)))
+
+;; An internal define-syntax may refer to a define that follows it.
+(test "internal define-syntax refers to a later define" '(1 local)
+    (guard (e (#t 'error))
+      (list ((lambda ()
+               (define-syntax getx (syntax-rules () ((_) x)))
+               (define x 1)
+               (let ((x 2)) (getx))))
+            ((lambda ()
+               (define-syntax gety (syntax-rules () ((_) car)))
+               (define car 'local)
+               (let ((car 'inner)) (gety)))))))
+
+;; A dotted macro use matches a dotted pattern in both engines.
+(test "dotted macro use" '((1 2) 3)
+    (guard (e (#t 'error))
+      (let-syntax ((m (syntax-rules () ((_ a ... . r) '((a ...) r)))))
+        (m 1 2 . 3))))
+
+;; A literal is matched by binding even when an ellipsis is followed by a
+;; dotted tail; a locally bound else is not the literal else.
+(test "literal binding checked before a dotted tail" 'no-match
+    (guard (e (#t 'no-match))
+      (let-syntax ((m (syntax-rules (else) ((_ else ... . r) 'r))))
+        (let ((else 1)) (m else else)))))
+
+;; A runaway macro in a branch that never runs is not an error.
+(define-syntax regress-runaway (syntax-rules () ((_ x) (list (regress-runaway x)))))
+(test "runaway macro in an untaken branch" 'ok
+    (guard (e (#t 'error))
+      ((lambda () (if #f (regress-runaway 1) 'ok)))))
+
+;; Static expansion of a body: an internal (define (f when) ...) binds when,
+;; and a macro that expands to a definition shadows an outer macro.
+(define-syntax regress-foo (syntax-rules () ((_) 'macro)))
+(test "internal procedure parameter shadows a macro" '(1 2)
+    (guard (e (#t 'error))
+      ((lambda () (define (inner when) (when 1 2)) (inner list)))))
+(test "define-values shadows an outer macro" 'proc
+    (guard (e (#t 'error))
+      ((lambda ()
+         (define-values (regress-foo) (values (lambda () 'proc)))
+         (regress-foo)))))
+
+;; A nested syntax-rules whose rules (or literals) arrive as a dotted tail.
+(define-syntax regress-defrules
+  (syntax-rules ()
+    ((_ name . rules) (define-syntax name (syntax-rules () . rules)))))
+(regress-defrules regress-two ((_ a) (list 'one a)) ((_ a b) (list 'two a b)))
+(define-syntax regress-defrules2
+  (syntax-rules ()
+    ((_ name lits . rules) (define-syntax name (syntax-rules lits . rules)))))
+(regress-defrules2 regress-kw (go) ((_ go) 'went) ((_ x) 'stay))
+(test "nested syntax-rules with dotted-tail rules" '((one 1) (two 1 2) went stay)
+    (list (regress-two 1) (regress-two 1 2) (regress-kw go) (regress-kw 1)))
+
+;; A define a macro introduces is renamed; the body scan must not bind the
+;; plain name and so hide the outer variable.
+(define regress-tmp 'outer)
+(define-syntax regress-def-tmp
+  (syntax-rules () ((_ v) (define regress-tmp v))))
+(test "introduced define does not hide the outer variable" '(outer outer outer)
+    (list (letrec () (regress-def-tmp 5) regress-tmp)
+          (let () (regress-def-tmp 5) regress-tmp)
+          ((lambda () (regress-def-tmp 5) regress-tmp))))
+(define regress-gy 'global-y)
+(define-syntax regress-foo2 (syntax-rules () ((_ a b) (define a b))))
+(test "body define-syntax shadows a defining macro" 'global-y
+    (letrec ()
+      (define-syntax regress-foo2 (syntax-rules () ((_ a b) b)))
+      (regress-foo2 regress-gy 5)
+      regress-gy))
+
+;; A macro defined by a macro in the same stretch of a file still closes
+;; over the global, and so do internal macros of a procedure defined there.
+(define-syntax regress-def-adder
+  (syntax-rules ()
+    ((_ name v) (define-syntax name (syntax-rules () ((_ x) (+ x v)))))))
+(define regress-y 10)
+(regress-def-adder regress-add-y regress-y)
+(test "macro-defined macro refers to a global from the same batch" 15
+    (let ((regress-y 1)) (regress-add-y 5)))
+;; (A define-syntax starts a new batch: names defined after an expression in
+;; the same batch are not pre-scanned, a separate, older limitation.)
+(define-syntax regress-batch-start (syntax-rules () ((_) #f)))
+(define regress-g 'global-g)
+(define (regress-fg)
+  (define-syntax getg (syntax-rules () ((_) regress-g)))
+  (let ((regress-g 'local-g)) (getg)))
+(define (regress-fg2)
+  (let-syntax ((getg (syntax-rules () ((_) regress-g))))
+    (let ((regress-g 'local-g)) (getg))))
+(test "internal macros refer to a global from the same batch" '(global-g global-g)
+    (guard (e (#t 'error)) (list (regress-fg) (regress-fg2))))
+
+;; A let body nested in a body is its own scope: its define does not
+;; consume an alias the enclosing body's define-syntax is waiting for.
+(test "deferred define-syntax alias is not taken by a nested let body" '(inner outer)
+    (guard (e (#t 'error))
+      ((lambda ()
+         (define-syntax getx (syntax-rules () ((_) x)))
+         (define y (let () (define x 'inner) x))
+         (define x 'outer)
+         (list y (getx))))))
+
+;; guard's handler parameter must be renamed throughout its body.
+(test "guard through eval" "car: not a pair"
+    (let loop ((i 0) (r #f))
+      (if (= i 20)
+          r
+          (loop (+ i 1)
+                (eval '(guard (e (#t (error-object-message e))) (car 5))
+                      (interaction-environment))))))
 
 ;;; ============================================================================
 ;;; Summary

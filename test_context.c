@@ -1903,6 +1903,23 @@ TEST(peephole_optimize_does_not_thread_into_operand)
     PASS();
 }
 
+TEST(peephole_optimize_keeps_cdr_of_cadr)
+{
+    code_object *code = code_new();
+    ASSERT(code != NULL);
+    code_emit(code, OP_CADR);
+    code_emit(code, OP_CDR);
+    code_emit(code, OP_HALT);
+
+    peephole_optimize(code);
+
+    ASSERT_EQ(code->code_len, 3);
+    ASSERT_EQ(code->code[0], OP_CADR);
+    ASSERT_EQ(code->code[1], OP_CDR);
+    code_free(code);
+    PASS();
+}
+
 TEST(vm_run_rejects_truncated_bytecode)
 {
     code_object *code = code_new();
@@ -3710,6 +3727,51 @@ TEST(gc_maybe_gc_threshold)
     PASS();
 }
 
+TEST(code_truncate_clears_verification_and_children)
+{
+    code_object *parent = code_new();
+    code_object *child = code_new();
+    ASSERT(parent != NULL && child != NULL);
+    code_emit(child, OP_HALT);
+    code_add_child(parent, child);
+    code_emit(parent, OP_CLOSURE);
+    code_emit(parent, 0);
+    code_emit(parent, OP_HALT);
+    parent->verified = true;
+
+    code_truncate(parent, 1, 0);
+
+    ASSERT_EQ(parent->code_len, 1);
+    ASSERT_EQ(parent->children_len, 0);
+    ASSERT(!parent->verified);
+    code_free(parent);
+    code_free(child);
+    PASS();
+}
+
+TEST(peephole_optimize_prim_tail_flag_survives)
+{
+    // The tail flag lives in OP_PRIM's argc operand; it is data, not a jump
+    // target, and compaction must copy it unchanged.
+    code_object *code = code_new();
+    ASSERT(code != NULL);
+    code_emit(code, OP_CONST);
+    code_emit(code, 0);
+    code_emit(code, OP_POP);
+    code_emit(code, OP_PRIM);
+    code_emit(code, 18);
+    code_emit(code, 2u | PRIM_TAIL_FLAG);
+    code_emit(code, OP_RETURN);
+
+    peephole_optimize(code);
+
+    ASSERT_EQ(code->code_len, 4);
+    ASSERT_EQ(code->code[0], OP_PRIM);
+    ASSERT_EQ(code->code[2], 2u | PRIM_TAIL_FLAG);
+    code_free(code);
+    PASS();
+}
+
 // ============================================================================
 // Main
 // ============================================================================
@@ -3847,6 +3909,7 @@ int main(void)
     RUN_TEST(peephole_optimize_preserves_recursive_call_operands);
     RUN_TEST(peephole_optimize_preserves_primitive_guard_operands);
     RUN_TEST(peephole_optimize_does_not_thread_into_operand);
+    RUN_TEST(peephole_optimize_keeps_cdr_of_cadr);
     RUN_TEST(vm_run_rejects_truncated_bytecode);
     RUN_TEST(vm_memq_rejects_circular_list);
     RUN_TEST(vm_run_rejects_inconsistent_code_storage_metadata);
@@ -3941,6 +4004,8 @@ int main(void)
     RUN_TEST(gc_preserves_permanent_atoms);
     RUN_TEST(gc_heap_usage_percent);
     RUN_TEST(gc_maybe_gc_threshold);
+    RUN_TEST(code_truncate_clears_verification_and_children);
+    RUN_TEST(peephole_optimize_prim_tail_flag_survives);
 
     TEST_SUMMARY("context & env");
 }

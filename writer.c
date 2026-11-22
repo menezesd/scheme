@@ -57,8 +57,13 @@ void format_double_repr(char *buf, size_t size, double d)
     for (int prec = 1; prec <= 17; prec++) {
         snprintf(buf, size, "%.*g", prec, d);
         if (strtod(buf, NULL) == d)
-            return;
+            break;
     }
+    // Integers beyond 1e15 can come out of %g in fixed notation with no
+    // point or exponent, which would read back as an exact integer.
+    size_t len = strlen(buf);
+    if (!strpbrk(buf, ".e") && len + 2 < size)
+        memcpy(buf + len, ".0", 3);
 }
 
 // ============================================================================
@@ -77,7 +82,7 @@ const char *type_name(unsigned cell)
     case BT_FREE:
         return "free-cell";
     case BT_ATOM:
-        return "symbol";
+        return IS_BOOLEAN(cell) ? "boolean" : "symbol";
     case BT_NUM:
         return "integer";
     case BT_BIGNUM:
@@ -124,6 +129,8 @@ const char *type_name(unsigned cell)
         return "eof-object";
     case BT_CLOSURE:
         return "bytecode-closure";
+    case BT_VMCLOSURE:
+        return "procedure";
     case BT_VMCONT:
         return "vm-continuation";
     case BT_COMPILED_PATTERN:
@@ -146,7 +153,8 @@ typedef struct {
     unsigned cell; // Cell address (0 = empty slot)
     int label;     // -1 = visited once, >= 0 = assigned label
     bool printed;  // true if we've printed #n= prefix
-    bool active;   // true while simple writer is printing this object
+    bool active;   // on the current marking path (cycles-only mode),
+                   // or being printed by the simple writer
 } visited_entry;
 
 static visited_entry *visited_table;
@@ -207,6 +215,14 @@ static bool ensure_visited_capacity(void)
 
 static bool reset_visited(void)
 {
+    // One huge write must not make every later write pay to clear a huge
+    // table; drop back to the initial size instead.
+    if (visited_cap > VISITED_INITIAL_CAP) {
+        free(visited_table);
+        visited_table = NULL;
+        visited_cap = 0;
+        visited_count = 0;
+    }
     if (!ensure_visited_capacity())
         return false;
     memset(visited_table, 0, visited_cap * sizeof(*visited_table));
@@ -303,32 +319,56 @@ static void mark_shared(unsigned s)
     writer_depth--;
 }
 
+// write and display label only cells that are part of a cycle (R7RS: "Datum
+// labels must not be used if there are no cycles"); write-shared labels
+// every pair and vector that occurs more than once.
+static bool writer_label_cycles_only = false;
+
+// Cells on the current marking path, for cycles-only mode. A revisit of a
+// cell that is still on the path closes a cycle; a revisit of a finished cell
+// is plain sharing. Every cycle contains such a back edge, so labeling its
+// target is enough for the printer to terminate.
+static unsigned *mark_path = NULL;
+static size_t mark_path_len = 0, mark_path_cap = 0;
+
 static void mark_shared_inner(unsigned s)
 {
     // Follow the cdr spine iteratively.  This keeps large flat lists from
     // consuming C stack space while nested cars and vectors retain the normal
     // recursive traversal.
+    size_t path_base = mark_path_len;
     for (;;) {
         if (writer_error || s == 0 || s == TOK_ERROR || IS_FIXNUM(s) ||
             !IS_CELL(s) || is_bytecode_closure_object(s))
-            return;
+            break;
 
         // Only track cons cells and vectors (things that can have sharing).
         enum lisp_type type = CELL_TYPE(s);
         if (type != BT_CONS && type != BT_VECTOR)
-            return;
+            break;
 
         visited_entry *entry = find_visited(s);
         if (entry) {
             // Seen before - assign a label if not already assigned.
-            if (entry->label < 0)
+            if (entry->label < 0 &&
+                (!writer_label_cycles_only || entry->active))
                 entry->label = next_label++;
-            return;
+            break;
         }
 
         // First visit - add to hash table.
-        if (!insert_visited(s))
-            return;
+        entry = insert_visited(s);
+        if (!entry)
+            break;
+        if (writer_label_cycles_only) {
+            if (!active_cell_push(&mark_path, &mark_path_len, &mark_path_cap,
+                                  s)) {
+                show_error("write: out of memory");
+                writer_error = true;
+                break;
+            }
+            entry->active = true;
+        }
 
         if (type == BT_CONS) {
             mark_shared(car(s));
@@ -339,14 +379,19 @@ static void mark_shared_inner(unsigned s)
         unsigned len = vector_len(s);
         unsigned *data = vector_data_ptr(s);
         if (len != 0 && !data)
-            return;
-        for (unsigned i = 0; i < len; i++) {
+            break;
+        for (unsigned i = 0; i < len && !writer_error; i++)
             mark_shared(data[i]);
-            if (writer_error)
-                return;
-        }
-        return;
+        break;
     }
+    // Leaving this spine: its cells are finished. Re-look-up each entry,
+    // since inserts above may have resized the table.
+    for (size_t i = path_base; i < mark_path_len; i++) {
+        visited_entry *entry = find_visited(mark_path[i]);
+        if (entry)
+            entry->active = false;
+    }
+    mark_path_len = path_base;
 }
 
 // Forward declaration
@@ -746,7 +791,8 @@ static void write_obj_fp_inner(unsigned s, bool with_quotes, FILE *fp)
             fprintf(fp, "[invalid-symbol]");
         } else {
             const char *name = ctx.atom_table[CELL_ID(s)];
-            if (symbol_needs_escape(name))
+            // R7RS display: "Symbols are not escaped."
+            if (with_quotes && symbol_needs_escape(name))
                 write_escaped_symbol(fp, name);
             else
                 fprintf(fp, "%s", name);
@@ -947,11 +993,20 @@ static void write_obj_fp_inner(unsigned s, bool with_quotes, FILE *fp)
     }
 }
 
-static bool begin_writer(bool emit_shared_labels)
+static bool begin_writer(bool emit_shared_labels, bool label_cycles_only)
 {
     writer_error = false;
     writer_depth = 0;
     writer_emit_shared_labels = emit_shared_labels;
+    writer_label_cycles_only = label_cycles_only;
+    mark_path_len = 0;
+    // Like the visited table, do not keep a huge path buffer alive after
+    // one large write.
+    if (mark_path_cap > VISITED_INITIAL_CAP) {
+        free(mark_path);
+        mark_path = NULL;
+        mark_path_cap = 0;
+    }
     if (reset_visited())
         return true;
     show_error("writer: out of memory");
@@ -959,36 +1014,53 @@ static bool begin_writer(bool emit_shared_labels)
     return false;
 }
 
+// Labeled writers. All share one path: mark (cycles only for write/display,
+// all sharing for write-shared), then print. They return false after a
+// reported failure (nesting too deep, out of memory), in which case the
+// output may be partial.
+static bool write_labeled(unsigned s, FILE *port, bool with_quotes,
+                          bool label_cycles_only)
+{
+    if (!begin_writer(true, label_cycles_only))
+        return false;
+    mark_shared(s);
+    write_obj_fp(s, with_quotes, port);
+    return !writer_error;
+}
+
+bool write_obj_port_checked(unsigned s, FILE *port)
+{
+    return write_labeled(s, port, true, true);
+}
+
+bool display_obj_port_checked(unsigned s, FILE *port)
+{
+    return write_labeled(s, port, false, true);
+}
+
+bool write_shared_obj_port_checked(unsigned s, FILE *port)
+{
+    return write_labeled(s, port, true, false);
+}
+
 void write_obj(unsigned s)
 {
-    if (!begin_writer(true))
-        return;
-    mark_shared(s);
-    write_obj_fp(s, true, stdout);
+    (void)write_obj_port_checked(s, stdout);
 }
 
 void display_obj(unsigned s)
 {
-    if (!begin_writer(true))
-        return;
-    mark_shared(s);
-    write_obj_fp(s, false, stdout);
+    (void)display_obj_port_checked(s, stdout);
 }
 
 void write_obj_port(unsigned s, FILE *port)
 {
-    if (!begin_writer(true))
-        return;
-    mark_shared(s);
-    write_obj_fp(s, true, port);
+    (void)write_obj_port_checked(s, port);
 }
 
 void write_shared_obj_port(unsigned s, FILE *port)
 {
-    if (!begin_writer(true))
-        return;
-    mark_shared(s);
-    write_obj_fp(s, true, port);
+    (void)write_shared_obj_port_checked(s, port);
 }
 
 void write_simple_obj_port(unsigned s, FILE *port)
@@ -998,7 +1070,7 @@ void write_simple_obj_port(unsigned s, FILE *port)
 
 bool write_simple_obj_port_checked(unsigned s, FILE *port)
 {
-    if (!begin_writer(false)) {
+    if (!begin_writer(false, false)) {
         writer_emit_shared_labels = true;
         return false;
     }
@@ -1009,8 +1081,5 @@ bool write_simple_obj_port_checked(unsigned s, FILE *port)
 
 void display_obj_port(unsigned s, FILE *port)
 {
-    if (!begin_writer(true))
-        return;
-    mark_shared(s);
-    write_obj_fp(s, false, port);
+    (void)display_obj_port_checked(s, port);
 }

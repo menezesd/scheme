@@ -57,12 +57,13 @@ typedef struct string_view_data {
 // Compile-time rather than a runtime flag because car/cdr are the hottest
 // functions in the interpreter and this must cost nothing in a normal build.
 // Note it only catches dereferences - a stale value read as an atom id or a
-// vector handle slips past it.
+// vector handle slips past it. Reserved cells are exempt: cell 0 is the empty
+// list, typed BT_FREE, and car/cdr of it are ordinary reads.
 #ifdef VESPER_GC_TRAP_FREE_CELLS
 void gc_report_free_cell_access(unsigned id, const char *accessor);
 #define VESPER_CHECK_FREE_CELL(id, what)                                       \
     do {                                                                       \
-        if (CELL_TYPE(id) == BT_FREE)                                          \
+        if ((id) >= HEAP_RESERVED && CELL_TYPE(id) == BT_FREE)                 \
             gc_report_free_cell_access((id), (what));                          \
     } while (0)
 #else
@@ -131,8 +132,18 @@ void gc_protect(unsigned *ptr);
 void gc_unprotect(int count);
 int get_shadow_stack_top(void);
 
-// Reset GC roots and collector mode after recovering from lisp_panic
+// Reset GC roots, collector mode and the active-VM chain after recovering from
+// lisp_panic. Empties the shadow stack and clears the allocation root; the
+// caller must re-register any roots it still holds.
 void gc_recover_after_panic(void);
+
+// Forget the active-VM chain, whose vm_state frames a lisp_panic longjmp has
+// unwound (defined in vm.c; called by gc_recover_after_panic).
+void vm_reset_after_panic(void);
+
+// Forget the in-progress pattern match state for the same reason (defined in
+// compiled_pattern.c).
+void pattern_reset_after_panic(void);
 
 // Allocate a typed cell with given car and cdr
 static inline unsigned make_typed_cell(enum lisp_type type, unsigned car_val,
@@ -415,6 +426,7 @@ bool hash_table_is_registered(const hash_table_data *table);
 void bignum_register(bignum *bn);
 void bignum_unregister(bignum *bn);
 bool bignum_is_registered(const bignum *bn);
+extern uint64_t string_buffer_epoch;
 void string_register(char *string);
 void string_unregister(char *string);
 bool string_is_registered(const char *string);

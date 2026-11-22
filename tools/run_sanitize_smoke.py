@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Run bounded sanitizer smoke tests for the Vesper executable."""
 
+import os
 import subprocess
 import sys
 import platform
 
 
-def run_case(name, cmd, input_text=None, timeout=20):
+def run_case(name, cmd, input_text=None, timeout=20, env=None):
     try:
         result = subprocess.run(
             cmd,
@@ -16,6 +17,7 @@ def run_case(name, cmd, input_text=None, timeout=20):
             stderr=subprocess.PIPE,
             timeout=timeout,
             check=False,
+            env=env,
         )
     except subprocess.TimeoutExpired:
         print(f"TIMEOUT: {name}: timed out after {timeout}s", flush=True)
@@ -67,6 +69,10 @@ def main():
         ("bytecode expression", [exe], "(+ 1 2 3)\n"),
         ("interpreter expression", [exe, "--interpreter"], "(+ 1 2 3)\n"),
         ("unicode string", [exe], '(string-foldcase "Straße")\n'),
+        ("string port reader state", [exe],
+         '(let ((p (open-input-string "#!no-fold-case FOO BAR"))'
+         '      (q (open-input-string "BAZ")))'
+         '  (list (read p) (read q) (read p)))\n'),
         ("continuation", [exe], "(call/cc (lambda (k) (k 42)))\n"),
         # capture_continuation packs a vm_continuation's stack and frames
         # arrays into one malloc'd block; frames requires pointer alignment
@@ -86,6 +92,13 @@ def main():
     ok = True
     for name, cmd, input_text in cases:
         result = run_case(name, cmd, input_text)
+        ok = (result is True) and ok
+    stress_env = dict(os.environ, VESPER_GC_STRESS="17")
+    for engine, args in (("bytecode", []), ("interpreter", ["--interpreter"])):
+        result = run_case(
+            f"{engine} with frequent collections", [exe, *args], "(+ 1 2 3)\n",
+            env=stress_env,
+        )
         ok = (result is True) and ok
     return 0 if ok else 1
 

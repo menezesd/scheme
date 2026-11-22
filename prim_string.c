@@ -449,6 +449,37 @@ static void compose_codepoints(codepoint_buffer *buf)
     buf->length = out_len;
 }
 
+static unsigned make_string_from_codepoints(const codepoint_buffer *codepoints,
+                                            const char *name)
+{
+    codepoint_buffer bytes;
+    cp_buffer_init(&bytes);
+    for (size_t i = 0; i < codepoints->length; i++) {
+        if (!utf8_encode_codepoint_string(codepoints->data[i], &bytes)) {
+            cp_buffer_free(&bytes);
+            show_error("%s: invalid Unicode scalar value", name);
+            return TOK_ERROR;
+        }
+    }
+    if (!cp_buffer_append(&bytes, 0)) {
+        cp_buffer_free(&bytes);
+        show_error("%s: out of memory", name);
+        return TOK_ERROR;
+    }
+
+    char *result = checked_malloc_size(bytes.length);
+    if (!result) {
+        cp_buffer_free(&bytes);
+        show_error("%s: out of memory", name);
+        return TOK_ERROR;
+    }
+    for (size_t i = 0; i < bytes.length; i++)
+        result[i] = (char)bytes.data[i];
+
+    cp_buffer_free(&bytes);
+    return make_string_immutable_owned(result);
+}
+
 static unsigned normalized_string_value(unsigned arg, bool compatibility,
                                         bool compose, const char *name)
 {
@@ -478,36 +509,9 @@ static unsigned normalized_string_value(unsigned arg, bool compatibility,
     if (compose)
         compose_codepoints(&decomposed);
 
-    codepoint_buffer bytes;
-    cp_buffer_init(&bytes);
-    for (size_t i = 0; i < decomposed.length; i++) {
-        if (!utf8_encode_codepoint_string(decomposed.data[i], &bytes)) {
-            cp_buffer_free(&bytes);
-            cp_buffer_free(&decomposed);
-            show_error("%s: invalid Unicode scalar value", name);
-            return TOK_ERROR;
-        }
-    }
-    if (!cp_buffer_append(&bytes, 0)) {
-        cp_buffer_free(&bytes);
-        cp_buffer_free(&decomposed);
-        show_error("%s: out of memory", name);
-        return TOK_ERROR;
-    }
-
-    char *result = checked_malloc_size(bytes.length);
-    if (!result) {
-        cp_buffer_free(&bytes);
-        cp_buffer_free(&decomposed);
-        show_error("%s: out of memory", name);
-        return TOK_ERROR;
-    }
-    for (size_t i = 0; i < bytes.length; i++)
-        result[i] = (char)bytes.data[i];
-
-    cp_buffer_free(&bytes);
+    unsigned result = make_string_from_codepoints(&decomposed, name);
     cp_buffer_free(&decomposed);
-    return make_string_immutable_owned(result);
+    return result;
 }
 
 static unsigned folded_string_value(unsigned arg, const char *name)
@@ -544,36 +548,9 @@ static unsigned folded_string_value(unsigned arg, const char *name)
         }
     }
 
-    codepoint_buffer bytes;
-    cp_buffer_init(&bytes);
-    for (size_t i = 0; i < folded.length; i++) {
-        if (!utf8_encode_codepoint_string(folded.data[i], &bytes)) {
-            cp_buffer_free(&bytes);
-            cp_buffer_free(&folded);
-            show_error("%s: invalid Unicode scalar value", name);
-            return TOK_ERROR;
-        }
-    }
-    if (!cp_buffer_append(&bytes, 0)) {
-        cp_buffer_free(&bytes);
-        cp_buffer_free(&folded);
-        show_error("%s: out of memory", name);
-        return TOK_ERROR;
-    }
-
-    char *result = checked_malloc_size(bytes.length);
-    if (!result) {
-        cp_buffer_free(&bytes);
-        cp_buffer_free(&folded);
-        show_error("%s: out of memory", name);
-        return TOK_ERROR;
-    }
-    for (size_t i = 0; i < bytes.length; i++)
-        result[i] = (char)bytes.data[i];
-
-    cp_buffer_free(&bytes);
+    unsigned result = make_string_from_codepoints(&folded, name);
     cp_buffer_free(&folded);
-    return make_string_immutable_owned(result);
+    return result;
 }
 
 typedef enum {
@@ -655,36 +632,6 @@ static bool decode_string_to_codepoints(const char *s, codepoint_buffer *out,
     return true;
 }
 
-static unsigned make_string_from_codepoints(const codepoint_buffer *codepoints,
-                                            const char *name)
-{
-    codepoint_buffer bytes;
-    cp_buffer_init(&bytes);
-    for (size_t i = 0; i < codepoints->length; i++) {
-        if (!utf8_encode_codepoint_string(codepoints->data[i], &bytes)) {
-            cp_buffer_free(&bytes);
-            show_error("%s: invalid Unicode scalar value", name);
-            return TOK_ERROR;
-        }
-    }
-    if (!cp_buffer_append(&bytes, 0)) {
-        cp_buffer_free(&bytes);
-        show_error("%s: out of memory", name);
-        return TOK_ERROR;
-    }
-
-    char *result = checked_malloc_size(bytes.length);
-    if (!result) {
-        cp_buffer_free(&bytes);
-        show_error("%s: out of memory", name);
-        return TOK_ERROR;
-    }
-    for (size_t i = 0; i < bytes.length; i++)
-        result[i] = (char)bytes.data[i];
-
-    cp_buffer_free(&bytes);
-    return make_string_immutable_owned(result);
-}
 
 static unsigned cased_string_value(unsigned arg, string_case_mode mode,
                                    const char *name)

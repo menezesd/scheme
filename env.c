@@ -982,7 +982,7 @@ static const char *const r7rs_base_exports[] = {
     "quasiquote", "quote", "quotient", "raise", "raise-continuable", "rational?",
     "rationalize", "read-bytevector", "read-bytevector!", "read-char", "read-error?",
     "read-line", "read-string", "read-u8", "real?", "remainder", "reverse", "round",
-    "set-car!", "set-cdr!", "string", "string->list", "string->number", "string->symbol",
+    "set!", "set-car!", "set-cdr!", "square", "string", "string->list", "string->number", "string->symbol",
     "string->utf8", "string->vector", "string-append", "string-copy", "string-copy!",
     "string-fill!", "string-for-each", "string-length", "string-map", "string-ref",
     "string-set!", "string<=?", "string<?", "string=?", "string>=?", "string>?", "string?",
@@ -1431,23 +1431,21 @@ unsigned environment_with_imports(unsigned source, unsigned specs)
                     vals = cdr(vals);
                     continue;
                 }
-                bool selected = false;
-                for (unsigned sets = specs; IS_PAIR(sets); sets = cdr(sets)) {
-                    if (r7rs_import_name(var, car(sets), &target)) {
-                        selected = true;
-                        break;
-                    }
-                }
-                if (selected) {
+                // One source binding can be imported under several names
+                // (e.g. both renamed and plain), so bind it for every import
+                // set that selects it rather than only the first.
+                unsigned sets = specs;
+                gc_protect(&sets);
+                for (; IS_PAIR(sets); sets = cdr(sets)) {
+                    if (!r7rs_import_name(var, car(sets), &target))
+                        continue;
                     unsigned value = lookup_silent(CELL_ID(var), source);
                     gc_protect(&value);
-                    if (defvar(target, value, result) == TOK_ERROR) {
-                        gc_unprotect(1);
-                        gc_unprotect(4);
+                    if (defvar(target, value, result) == TOK_ERROR)
                         return TOK_ERROR;
-                    }
                     gc_unprotect(1);
                 }
+                gc_unprotect(1);
             }
             vars = cdr(vars);
             vals = cdr(vals);
@@ -1460,6 +1458,55 @@ unsigned environment_with_imports(unsigned source, unsigned specs)
     }
     mark_immutable_environment(result);
     gc_unprotect(4);
+    return result;
+}
+
+// R5RS null-environment: only the syntactic keywords visible in source.
+// Macro templates keep definition-time uninterned aliases for their helper
+// procedures, so copy those private bindings too or derived forms such as
+// case and do could not expand.
+unsigned syntax_environment(unsigned source)
+{
+    GC_GUARD;
+    gc_protect(&source);
+    if (!env_chain_acyclic(source)) {
+        show_error("null-environment: invalid source environment");
+        return TOK_ERROR;
+    }
+    unsigned result = empty_environment();
+    gc_protect(&result);
+    unsigned env = 0, vars = 0, vals = 0;
+    gc_protect(&env);
+    gc_protect(&vars);
+    gc_protect(&vals);
+    for (env = source; IS_PAIR(env); env = cdr(env)) {
+        unsigned frame = car(env);
+        if (!IS_PAIR(frame) || !proper_finite_list(car(frame)) ||
+            !proper_finite_list(cdr(frame))) {
+            show_error("null-environment: invalid source environment");
+            return TOK_ERROR;
+        }
+        for (vars = car(frame), vals = cdr(frame);
+             IS_PAIR(vars) && IS_PAIR(vals);
+             vars = cdr(vars), vals = cdr(vals)) {
+            unsigned var = car(vars);
+            if (!IS_SYMBOL(var) ||
+                env_find_binding_cell(CELL_ID(var), source) != vals)
+                continue; // shadowed by an inner frame
+            unsigned value = car(vals);
+            bool syntax = IS_CELL(value) && (CELL_TYPE(value) == BT_SYNTAX ||
+                                             CELL_TYPE(value) == BT_MACRO);
+            if (!syntax && !atom_is_uninterned(var))
+                continue;
+            unsigned value_copy = value;
+            gc_protect(&var);
+            gc_protect(&value_copy);
+            if (defvar(var, value_copy, result) == TOK_ERROR)
+                return TOK_ERROR;
+            gc_unprotect(2);
+        }
+    }
+    mark_immutable_environment(result);
     return result;
 }
 
@@ -1481,13 +1528,20 @@ unsigned default_environment(void)
         gc_unprotect(2);
     }
 
-    // Register special atoms
-    defvar(ctx.atom_true, ctx.atom_true, env);
-    defvar(ctx.atom_false, ctx.atom_false, env);
-    // Make 't' an alias for true
-    unsigned t = atom_from_string("t");
-    gc_protect(&t);
-    defvar(t, ctx.atom_true, env);
+    // MIT-style variables bound to the booleans. The booleans themselves are
+    // not symbols, so bind the ordinary symbols true, false and t.
+    static const struct {
+        const char *name;
+        bool value;
+    } boolean_names[] = {{"true", true}, {"false", false}, {"t", true}};
+    for (size_t i = 0; i < sizeof(boolean_names) / sizeof(boolean_names[0]);
+         i++) {
+        unsigned name = atom_from_string(boolean_names[i].name);
+        gc_protect(&name);
+        defvar(name, boolean_names[i].value ? ctx.atom_true : ctx.atom_false,
+               env);
+        gc_unprotect(1);
+    }
 
     return env;
 }

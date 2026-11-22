@@ -32,8 +32,6 @@ def parse_unicode_data(path):
     props = {
         "assigned": [],
         "decimal": [],
-        "upper": [],
-        "lower": [],
         "title": [],
         "punctuation": [],
         "symbol": [],
@@ -65,10 +63,6 @@ def parse_unicode_data(path):
                 add_range(props["assigned"], code, code)
             if category == "Nd":
                 add_range(props["decimal"], code, code)
-            elif category == "Lu":
-                add_range(props["upper"], code, code)
-            elif category == "Ll":
-                add_range(props["lower"], code, code)
             elif category == "Lt":
                 add_range(props["title"], code, code)
             if category in ("Pc", "Pd", "Pe", "Pf", "Pi", "Po", "Ps"):
@@ -187,7 +181,8 @@ def main(argv):
     unicode_data, derived_core, prop_list, case_folding, special_casing, out_path = argv[1:]
     category_props, upper_map, lower_map, title_map = parse_unicode_data(unicode_data)
     core_props = parse_property_file(
-        derived_core, ["Alphabetic", "Cased", "Case_Ignorable"]
+        derived_core,
+        ["Alphabetic", "Cased", "Case_Ignorable", "Uppercase", "Lowercase"],
     )
     prop_props = parse_property_file(prop_list, ["White_Space"])
     simple_fold, full_fold = parse_case_folding(case_folding)
@@ -222,8 +217,11 @@ def main(argv):
             emit_ranges("unicode_case_ignorable_ranges", core_props["Case_Ignorable"])
             emit_ranges("unicode_decimal_ranges", category_props["decimal"])
             emit_ranges("unicode_whitespace_ranges", prop_props["White_Space"])
-            emit_ranges("unicode_uppercase_ranges", category_props["upper"])
-            emit_ranges("unicode_lowercase_ranges", category_props["lower"])
+            # R7RS char-upper-case?/char-lower-case? use the Uppercase and
+            # Lowercase properties, which include Other_Uppercase/Lowercase
+            # (e.g. circled letters, Roman numerals) beyond categories Lu/Ll.
+            emit_ranges("unicode_uppercase_ranges", core_props["Uppercase"])
+            emit_ranges("unicode_lowercase_ranges", core_props["Lowercase"])
             emit_ranges("unicode_titlecase_ranges", category_props["title"])
             emit_ranges("unicode_punctuation_ranges", category_props["punctuation"])
             emit_ranges("unicode_symbol_ranges", category_props["symbol"])

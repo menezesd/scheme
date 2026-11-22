@@ -145,6 +145,13 @@ static void code_set_remove(const code_object *code)
 }
 
 // Register a code object with the GC registry
+// Registrations since the last sweep, how many objects survived it, and the
+// full-collection count it ran at. gc_sweep_code_objects_if_due uses them to
+// rate-limit sweeps from inside a run.
+static size_t code_objects_since_sweep;
+static size_t code_objects_live_after_sweep;
+static unsigned major_collections_at_last_sweep;
+
 void code_register(code_object *code)
 {
     if (!code || code_object_is_registered(code))
@@ -152,6 +159,7 @@ void code_register(code_object *code)
     code->gc_next = code_object_registry;
     code_object_registry = code;
     code_set_add(code);
+    code_objects_since_sweep++;
 }
 
 static void code_unregister(code_object *code)
@@ -206,6 +214,7 @@ static void code_destroy_shallow(code_object *code)
     free(code->code);
     free(code->constants);
     free(code->children);
+    free(code->instruction_boundaries);
     free(code);
 }
 
@@ -341,6 +350,18 @@ void code_patch(code_object *code, unsigned pos, unsigned val)
     code->code[pos] = val;
 }
 
+void code_truncate(code_object *code, unsigned code_len, unsigned children_len)
+{
+    if (!code || code_len > code->code_len ||
+        children_len > code->children_len)
+        lisp_panic("code_truncate: length out of bounds");
+    code->verified = false;
+    code->code_len = code_len;
+    // Dropped children are unreferenced from here on; the top-level code
+    // sweep reclaims them like any other unreachable code object.
+    code->children_len = children_len;
+}
+
 // ============================================================================
 // GC Integration
 // ============================================================================
@@ -450,14 +471,36 @@ static void mark_vm_continuation_code(vm_continuation *cont)
     }
 }
 
-// Sweep unreachable code objects after GC
-// Call this after the heap GC is complete
+// Code reachable from a running VM: its current code object and the code
+// every saved frame returns into. Neither needs a closure on the heap: a
+// top-level form or an eval'd expression is executed without one.
+static void mark_active_vm_code(void)
+{
+    for (vm_state *vm = get_active_vm(); vm; vm = vm->parent) {
+        mark_registered_code_object(vm->code);
+        if (!vm->frames || vm->fp > vm->frames_cap)
+            continue;
+        for (unsigned i = 0; i < vm->fp; i++)
+            mark_registered_code_object(vm->frames[i].code);
+    }
+}
+
+// Sweep unreachable code objects.
+//
+// Reachability is the pinned objects, the code of every closure and VM
+// continuation cell in the allocated heap (live or not yet collected, so the
+// scan is conservative), and the code of every active VM frame. That set is
+// complete only where no C caller holds a code object outside those places,
+// such as a freshly compiled unit not yet installed in a frame. The callers
+// are main.c between top-level forms, and gc_sweep_code_objects_if_due at the
+// start of an in-VM eval or load step, before compiling anything.
 void gc_sweep_code_objects(void)
 {
     // First, clear all marks (pinned objects stay marked forever)
     for (code_object *code = code_object_registry; code; code = code->gc_next) {
         code->gc_marked = code->gc_pinned;
     }
+    mark_active_vm_code();
 
     // Walk the heap and mark code objects referenced by closures
     // Scan old generation: [mmin, hptr)
@@ -482,6 +525,7 @@ void gc_sweep_code_objects(void)
     }
 
     // Sweep: remove unreachable code objects from registry
+    size_t live = 0;
     code_object **prev = &code_object_registry;
     while (*prev) {
         code_object *code = *prev;
@@ -497,6 +541,29 @@ void gc_sweep_code_objects(void)
             code_destroy_shallow(code);
         } else {
             prev = &code->gc_next;
+            live++;
         }
     }
+    code_objects_since_sweep = 0;
+    code_objects_live_after_sweep = live;
+    major_collections_at_last_sweep = ctx.major_gc_count;
+}
+
+// A long-running form that calls eval or load in a loop never returns to
+// main.c's between-forms sweep, so its compiled units would accumulate, and
+// keep their constants alive as GC roots, until the form finished. Sweep from
+// inside the run once new code exists and either a full collection has run
+// since the last sweep (the sweep's heap scan is no more work than that
+// collection was; minor collections are too frequent to pay for it) or the
+// registry has grown enough to amortise the scan on its own.
+void gc_sweep_code_objects_if_due(void)
+{
+    if (code_objects_since_sweep == 0)
+        return;
+    size_t threshold = code_objects_live_after_sweep;
+    if (threshold < 4096)
+        threshold = 4096;
+    if (ctx.major_gc_count != major_collections_at_last_sweep ||
+        code_objects_since_sweep >= threshold)
+        gc_sweep_code_objects();
 }
