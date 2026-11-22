@@ -195,36 +195,14 @@ static unsigned set_current_port(unsigned port, unsigned prim_id)
         return port;
     }
 
-    /* Bytevector ports are represented by vectors in the standard library.
-       The Scheme-level binary I/O wrappers use the current-port cell, so the
-       setters must accept these ports even though they have no FILE *. */
-    unsigned expected_bv_len = input ? 3 : 2;
-    if (IS_VECTOR(port) && vector_data_well_formed(GET_VECTOR_PTR(port)) &&
-        vector_len(port) == expected_bv_len) {
-        unsigned *data = vector_data_ptr(port);
-        unsigned tag = data[0];
-        bool tag_matches = IS_ATOM(tag) &&
-                           ((input && (CELL_ID(tag) == (unsigned)intern("bvin") ||
-                                       CELL_ID(tag) == (unsigned)intern("bvin-closed"))) ||
-                            (!input && (CELL_ID(tag) == (unsigned)intern("bvout") ||
-                                        CELL_ID(tag) == (unsigned)intern("bvout-closed"))));
-        bool payload_ok = input ? IS_BYTEVEC(data[1])
-                                : (IS_PAIR(data[1]) || IS_NIL(data[1]));
-        bool input_state_ok = false;
-        if (input && payload_ok && IS_PAIR(data[2])) {
-            int64_t start;
-            int64_t end;
-            bytevec_data *bv = (bytevec_data *)CELL_PTR(data[1]);
-            input_state_ok = bytevec_data_well_formed(bv) &&
-                             exact_int64_value(CELL_CAR(data[2]), &start) &&
-                             exact_int64_value(CELL_CDR(data[2]), &end) &&
-                             start >= 0 && end >= start &&
-                             (uint64_t)end <= bv->len;
-        }
-        if (tag_matches && payload_ok && (!input || input_state_ok)) {
-            *current_cell = port;
-            return port;
-        }
+    /* Bytevector ports are records of the standard library's binary port
+       types. The Scheme-level binary I/O wrappers use the current-port cell,
+       so the setters must accept these ports even though they have no
+       FILE *. */
+    if (record_is_builtin(port, input ? BRT_BINARY_INPUT_PORT
+                                      : BRT_BINARY_OUTPUT_PORT)) {
+        *current_cell = port;
+        return port;
     }
 
     show_error("%s: not an %s port, got %s", name, direction, type_name(port));

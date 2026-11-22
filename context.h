@@ -252,6 +252,26 @@ bool vector_data_well_formed(const vector_data *vd);
 bool bytevec_data_well_formed(const bytevec_data *bv);
 bool atom_is_valid(unsigned atom);
 
+// Records (layout in types.h). make_record_type takes a name symbol and a
+// proper list of field-name symbols (validated by the caller); make_record
+// returns an instance of rtd with every field #f. Both may trigger GC; the
+// result is in the nursery, so set fields with vector_set_elem after any
+// further allocation.
+unsigned make_record_type(unsigned name, unsigned field_names, unsigned flags);
+unsigned make_record(unsigned rtd);
+bool record_type_well_formed(unsigned rtd);
+// These three require record_type_well_formed(rtd).
+unsigned record_type_field_count(unsigned rtd);
+unsigned record_type_flags(unsigned rtd);
+const char *record_type_name_string(unsigned rtd);
+// The type of a well-formed record instance, else 0.
+unsigned record_rtd(unsigned rec);
+bool record_is_builtin(unsigned rec, enum builtin_record_type which);
+// MIT-style object-hash number of a record or record type: assigned on first
+// request from one global counter, stable for the object's lifetime. 0 for
+// any other object.
+unsigned object_hash_number(unsigned obj);
+
 // ============================================================================
 // Continuation Helpers
 // ============================================================================

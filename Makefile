@@ -8,7 +8,7 @@ UNICODE_VERSION = 15.1.0
 # Source files
 SRCS = main.c context.c reader.c writer.c env.c primitive_table.c feature_table.c utf8.c primitives.c macros.c eval.c bignum.c \
        prim_numeric.c prim_compare.c prim_list.c prim_string.c prim_type.c \
-       prim_char.c prim_vector.c prim_math.c prim_io.c prim_port.c prim_numtower.c \
+       prim_char.c prim_vector.c prim_record.c prim_math.c prim_io.c prim_port.c prim_numtower.c \
        eval_forms.c eval_cont.c compile.c code_object.c optimize.c vm.c compiled_pattern.c
 OBJS = $(SRCS:.c=.o)
 DEBUG_OBJS = $(SRCS:.c=.debug.o)
@@ -82,6 +82,7 @@ prim_string.o: prim_string.c prim_internal.h utf8.h context.h types.h unicode_no
 prim_type.o: prim_type.c prim_internal.h context.h types.h
 prim_char.o: prim_char.c prim_internal.h context.h types.h unicode_char_tables.h
 prim_vector.o: prim_vector.c prim_internal.h context.h types.h
+prim_record.o: prim_record.c prim_internal.h context.h types.h
 prim_math.o: prim_math.c prim_internal.h context.h types.h
 prim_io.o: prim_io.c prim_internal.h context.h reader.h writer.h types.h
 prim_port.o: prim_port.c prim_internal.h context.h types.h
@@ -158,7 +159,7 @@ TEST_BINS = $(TEST_SRCS:.c=)
 # Object files needed for interpreter tests (excludes main.o)
 INTERP_OBJS = context.o reader.o writer.o env.o primitive_table.o feature_table.o utf8.o primitives.o macros.o eval.o bignum.o \
               prim_numeric.o prim_compare.o prim_list.o prim_string.o prim_type.o \
-              prim_char.o prim_vector.o prim_math.o prim_io.o prim_port.o prim_numtower.o \
+              prim_char.o prim_vector.o prim_record.o prim_math.o prim_io.o prim_port.o prim_numtower.o \
               eval_forms.o eval_cont.o compile.o code_object.o optimize.o vm.o compiled_pattern.o
 
 test-c: $(TEST_BINS)
@@ -240,8 +241,13 @@ test-repl-exit: $(TARGET)
 			actual=$$(printf '%b\n' "$$input" | ./$(TARGET) $$mode) && \
 			[ "$$actual" = "$$expected" ] || { echo "FAIL: REPL lost input (mode=$$mode, input=$$input)"; exit 1; }; \
 		done; \
+		report=$$(printf '%s\n' '(error "boom" 1 "two")' '(car 5)' | \
+			./$(TARGET) $$mode 2>/dev/null | grep '^Unhandled exception:'); \
+		expected_report=$$(printf '%s\n' 'Unhandled exception: boom 1 "two"' \
+			'Unhandled exception: car: not a pair'); \
+		[ "$$report" = "$$expected_report" ] || { echo "FAIL: unhandled error report (mode=$$mode): $$report"; exit 1; }; \
 	done
-	@echo "PASS: REPL exit codes and input boundaries"
+	@echo "PASS: REPL exit codes, input boundaries and error reports"
 
 # Compare a stable semantic probe set against MIT/GNU Scheme.
 test-diff: $(TARGET)

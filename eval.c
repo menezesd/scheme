@@ -542,7 +542,7 @@ static void cps_signal_error(const char *msg, unsigned env, unsigned cont)
     gc_protect(&handler);
     gc_protect(&env);
     gc_protect(&cont);
-    unsigned error_obj = make_error_object_c(msg, env);
+    unsigned error_obj = make_error_object_c(msg);
     if (error_obj == TOK_ERROR) {
         tramp_error();
         return;

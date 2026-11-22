@@ -1193,7 +1193,7 @@ static bool vm_signal_error(vm_state *vm, const char *msg)
     }
     GC_GUARD;
     gc_protect(&handler);
-    unsigned error_obj = make_error_object_c(msg, vm->env);
+    unsigned error_obj = make_error_object_c(msg);
     if (error_obj == TOK_ERROR) {
         VM_ERROR(vm, msg);
         return false;
@@ -3589,6 +3589,29 @@ static unsigned vm_dispatch(vm_state *vm)
             gc_unprotect(1);
             vector_set_elem(vec, (unsigned)i, val);
             vm_push(vm, val);
+            break;
+        }
+
+        // Record operations, as prim_record.c's %record-of? and %record-ref
+        case OP_RECORDOF: {
+            unsigned rtd = vm_pop(vm);
+            unsigned obj = vm_pop(vm);
+            vm_push(vm, record_of_type(obj, rtd) ? ctx.atom_true
+                                                 : ctx.atom_false);
+            break;
+        }
+
+        case OP_RECORDREF: {
+            unsigned who = vm_pop(vm);
+            unsigned idx = vm_pop(vm);
+            unsigned rtd = vm_pop(vm);
+            unsigned rec = vm_pop(vm);
+            unsigned *slot = record_field_slot(rec, rtd, idx, who);
+            if (!slot) {
+                vm_signal_error(vm, ctx.last_error);
+                break;
+            }
+            vm_push(vm, *slot);
             break;
         }
 

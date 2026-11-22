@@ -95,6 +95,10 @@ static ptr_registry immutable_string_registry;
 static ptr_registry string_view_registry;
 static ptr_registry vector_registry;
 static ptr_registry bytevec_registry;
+// Object-hash numbers of printed records, keyed by payload (node->len holds
+// the number). Keying by payload rather than cell keeps a number stable while
+// the collector moves the cell, and the entry dies with the payload.
+static ptr_registry object_hash_registry;
 
 // Error recovery for fatal errors
 jmp_buf panic_jmp;
@@ -987,10 +991,13 @@ static void free_external_cell_data(unsigned x)
             }
         }
         CELL_PTR(x) = NULL;
-    } else if (CELL_TYPE(x) == BT_VECTOR) {
+    } else if (CELL_TYPE(x) == BT_VECTOR || CELL_TYPE(x) == BT_RECORD ||
+               CELL_TYPE(x) == BT_RECORD_TYPE) {
         vector_data *vd = (vector_data *)CELL_PTR(x);
         if (vector_is_registered(vd)) {
             vector_unregister(vd);
+            if (CELL_TYPE(x) != BT_VECTOR && object_hash_registry.count)
+                ptr_registry_unregister(&object_hash_registry, vd);
             free(vd);
         }
         CELL_PTR(x) = NULL;
@@ -1600,6 +1607,149 @@ unsigned make_vector(unsigned len, unsigned fill)
         vd->data[i] = fill;
     }
     return p;
+}
+
+// ============================================================================
+// Records
+// ============================================================================
+
+// Allocate a vector_data payload of len slots, every one #f, and a cell of
+// the given type for it.
+static unsigned make_vector_like(enum lisp_type type, unsigned len,
+                                 const char *who)
+{
+    if (!checked_flex_size(sizeof(vector_data), len, sizeof(unsigned), NULL)) {
+        show_error("%s: too many fields", who);
+        return TOK_ERROR;
+    }
+    vector_data *vd =
+        checked_malloc_flex(sizeof(vector_data), len, sizeof(unsigned));
+    if (!vd) {
+        show_error("%s: out of memory", who);
+        return TOK_ERROR;
+    }
+    vd->len = len;
+    // Registered before alloc(): a collection there must not mistake the
+    // payload for garbage, and no cell refers to it yet, so nothing scans its
+    // uninitialized slots.
+    vector_register(vd);
+    unsigned p = alloc();
+    CELL_TYPE(p) = type;
+    CELL_PTR(p) = vd;
+    for (unsigned i = 0; i < len; i++)
+        vd->data[i] = ctx.atom_false;
+    return p;
+}
+
+unsigned make_record_type(unsigned name, unsigned field_names, unsigned flags)
+{
+    GC_GUARD;
+    gc_protect(&name);
+    gc_protect(&field_names);
+    unsigned nfields = 0;
+    if (!list_length_checked(field_names, &nfields, "make-record-type"))
+        return TOK_ERROR;
+    if (nfields > UINT_MAX - RECORD_TYPE_FIELDS_START) {
+        show_error("make-record-type: too many fields");
+        return TOK_ERROR;
+    }
+    unsigned rtd = make_vector_like(BT_RECORD_TYPE,
+                                    nfields + RECORD_TYPE_FIELDS_START,
+                                    "make-record-type");
+    if (rtd == TOK_ERROR)
+        return TOK_ERROR;
+    // Still in the nursery and nothing has allocated since: plain stores.
+    unsigned *data = GET_VECTOR_PTR(rtd)->data;
+    data[RECORD_TYPE_NAME_SLOT] = name;
+    data[RECORD_TYPE_FLAGS_SLOT] = INT_CACHE_START + (flags & INT_CACHE_MAX);
+    unsigned i = RECORD_TYPE_FIELDS_START;
+    FORLIST(f, field_names)
+    data[i++] = car(f);
+    return rtd;
+}
+
+unsigned make_record(unsigned rtd)
+{
+    GC_GUARD;
+    gc_protect(&rtd);
+    if (!record_type_well_formed(rtd)) {
+        show_error("make-record: not a record type");
+        return TOK_ERROR;
+    }
+    unsigned rec = make_vector_like(
+        BT_RECORD, record_type_field_count(rtd) + RECORD_FIELDS_START,
+        "make-record");
+    if (rec == TOK_ERROR)
+        return TOK_ERROR;
+    // rtd is the protected local, so this is its post-collection location.
+    GET_VECTOR_PTR(rec)->data[RECORD_TYPE_SLOT] = rtd;
+    return rec;
+}
+
+bool record_type_well_formed(unsigned rtd)
+{
+    if (!IS_RECORD_TYPE(rtd))
+        return false;
+    vector_data *vd = GET_VECTOR_PTR(rtd);
+    return vector_data_well_formed(vd) && vd->len >= RECORD_TYPE_FIELDS_START &&
+           IS_ATOM(vd->data[RECORD_TYPE_NAME_SLOT]);
+}
+
+unsigned record_type_field_count(unsigned rtd)
+{
+    return vector_len(rtd) - RECORD_TYPE_FIELDS_START;
+}
+
+unsigned record_type_flags(unsigned rtd)
+{
+    unsigned flags = vector_data_ptr(rtd)[RECORD_TYPE_FLAGS_SLOT];
+    return IS_NUM(flags) ? (unsigned)CELL_ID(flags) : 0;
+}
+
+const char *record_type_name_string(unsigned rtd)
+{
+    unsigned name = vector_data_ptr(rtd)[RECORD_TYPE_NAME_SLOT];
+    return atom_is_valid(name) ? ctx.atom_table[CELL_ID(name)] : "record";
+}
+
+unsigned record_rtd(unsigned rec)
+{
+    if (!IS_RECORD(rec))
+        return 0;
+    vector_data *vd = GET_VECTOR_PTR(rec);
+    if (!vector_data_well_formed(vd) || vd->len < RECORD_FIELDS_START)
+        return 0;
+    unsigned rtd = vd->data[RECORD_TYPE_SLOT];
+    // A record's length is fixed by its type, so a type of matching length
+    // makes every field index the type accepts valid for the record too.
+    if (!record_type_well_formed(rtd) ||
+        record_type_field_count(rtd) + RECORD_FIELDS_START != vd->len)
+        return 0;
+    return rtd;
+}
+
+bool record_is_builtin(unsigned rec, enum builtin_record_type which)
+{
+    unsigned rtd = ctx.builtin_record_types[which];
+    return rtd != 0 && IS_RECORD(rec) && record_rtd(rec) == rtd;
+}
+
+unsigned object_hash_number(unsigned obj)
+{
+    static unsigned next_object_hash = 1;
+    if (!IS_RECORD(obj) && !IS_RECORD_TYPE(obj))
+        return 0;
+    vector_data *vd = GET_VECTOR_PTR(obj);
+    if (!vector_data_well_formed(vd))
+        return 0;
+    const ptr_registry_node *node =
+        ptr_registry_find(&object_hash_registry, vd);
+    if (node)
+        return node->len;
+    unsigned number = next_object_hash++;
+    ptr_registry_register(&object_hash_registry, vd, number,
+                          "object_hash_number: malloc failed");
+    return number;
 }
 
 unsigned vector_len(unsigned vec)
@@ -2872,6 +3022,13 @@ static void gc_scan_cell(unsigned cell, unsigned (*collector)(unsigned))
         return;
     }
     switch (t) {
+    // Records keep their fields (and an instance its type) in a vector
+    // payload. These cases matter beyond tracing a copy: the minor
+    // collection's dirty-card scan comes through here too, and without them an
+    // old record mutated to point at a nursery object would keep a dangling
+    // reference after the nursery is reclaimed.
+    case BT_RECORD:
+    case BT_RECORD_TYPE:
     case BT_VECTOR: {
         vector_data *vd = (vector_data *)CELL_PTR(cell);
         if (!vector_data_well_formed(vd))
@@ -3030,6 +3187,8 @@ unsigned gc(unsigned root)
     ctx.current_error_cell = collect(ctx.current_error_cell);
     ctx.r7rs_environment = collect(ctx.r7rs_environment);
     ctx.global_environment = collect(ctx.global_environment);
+    for (int i = 0; i < BRT_COUNT; i++)
+        ctx.builtin_record_types[i] = collect(ctx.builtin_record_types[i]);
     reader_update_datum_labels(collect);
 
     // Collect shadow stack entries - these are pointers to local C variables
@@ -3225,6 +3384,9 @@ unsigned minor_gc(unsigned root)
     ctx.current_error_cell = collect_to_old(ctx.current_error_cell);
     ctx.r7rs_environment = collect_to_old(ctx.r7rs_environment);
     ctx.global_environment = collect_to_old(ctx.global_environment);
+    for (int i = 0; i < BRT_COUNT; i++)
+        ctx.builtin_record_types[i] =
+            collect_to_old(ctx.builtin_record_types[i]);
     reader_update_datum_labels(collect_to_old);
 
     // Collect shadow stack entries

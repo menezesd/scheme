@@ -545,6 +545,42 @@
 (define random random-integer)
 
 ;; R7RS binary I/O
+
+;; Bytevector ports are records of these two types, so they are disjoint from
+;; vectors and every other type, and only this file can make or change one.
+;; The C port setters recognize them through the registration.
+(define %binary-input-port-type
+  (%make-record-type 'binary-input-port '(open? bytevector position end)
+                     '(sealed)))
+(define %binary-output-port-type
+  (%make-record-type 'binary-output-port '(open? chunks) '(sealed)))
+(%register-builtin-record-type! 'binary-input-port %binary-input-port-type)
+(%register-builtin-record-type! 'binary-output-port %binary-output-port-type)
+
+(define (bytevector-input-port? x)
+  (%record-of? x %binary-input-port-type))
+(define (bytevector-output-port? x)
+  (%record-of? x %binary-output-port-type))
+(define (bytevector-input-port-open? x)
+  (and (bytevector-input-port? x)
+       (%record-ref x %binary-input-port-type 0 'input-port-open?)))
+(define (bytevector-output-port-open? x)
+  (and (bytevector-output-port? x)
+       (%record-ref x %binary-output-port-type 0 'output-port-open?)))
+(define (%bvin-bytevector port)
+  (%record-ref port %binary-input-port-type 1 'binary-input-port))
+(define (%bvin-position port)
+  (%record-ref port %binary-input-port-type 2 'binary-input-port))
+(define (%bvin-end port)
+  (%record-ref port %binary-input-port-type 3 'binary-input-port))
+(define (%bvin-set-position! port position)
+  (%record-set! port %binary-input-port-type 2 position 'binary-input-port))
+(define (%bvout-chunks port)
+  (%record-ref port %binary-output-port-type 1 'binary-output-port))
+(define (%bvout-add-chunk! port chunk)
+  (%record-set! port %binary-output-port-type 1
+                (cons chunk (%bvout-chunks port)) 'binary-output-port))
+
 (define (write-u8 byte . opt-port)
   (if (> (length opt-port) 1)
       (error "write-u8: expected at most one port"))
@@ -553,7 +589,7 @@
   (let ((port (if (pair? opt-port) (car opt-port) (current-output-port))))
     (cond
       ((bytevector-output-port-open? port)
-       (vector-set! port 1 (cons (bytevector byte) (vector-ref port 1))))
+       (%bvout-add-chunk! port (bytevector byte)))
       ((bytevector-output-port? port)
        (error "write-u8: port is closed"))
       ((binary-port? port)
@@ -567,15 +603,12 @@
   (let ((port (if (pair? opt-port) (car opt-port) (current-input-port))))
     (cond
       ((bytevector-input-port-open? port)
-       (let* ((bv (vector-ref port 1))
-              (state (vector-ref port 2))
-              (pos (car state))
-              (end (cdr state)))
-         (if (>= pos end)
+       (let ((pos (%bvin-position port)))
+         (if (>= pos (%bvin-end port))
              (eof-object)
              (begin
-               (vector-set! port 2 (cons (+ pos 1) end))
-               (bytevector-u8-ref bv pos)))))
+               (%bvin-set-position! port (+ pos 1))
+               (bytevector-u8-ref (%bvin-bytevector port) pos)))))
       ((bytevector-input-port? port)
        (error "read-u8: port is closed"))
       ((binary-port? port)
@@ -587,7 +620,7 @@
        (error "read-u8: not a binary input port")))))
 
 ;; The C text-output primitives understand file and string ports.  Bytevector
-;; ports are represented here as vectors, so route implicit and explicit
+;; ports are stdlib records, so route implicit and explicit
 ;; bytevector output through the binary wrappers after rendering objects into
 ;; a temporary string port.
 (let ((primitive-display display)
@@ -672,31 +705,18 @@
 ;;; Bytevector ports (in-memory I/O using bytevectors)
 ;;; ============================================================================
 
-;; Bytevector output port: vector #(tag chunks)
+;; A bytevector output port collects the chunks written to it, newest first.
 (define (open-output-bytevector)
-  (vector 'bvout '()))
-
-(define (bytevector-output-port? x)
-  (and (vector? x) (= (vector-length x) 2)
-       (or (eq? (vector-ref x 0) 'bvout)
-           (eq? (vector-ref x 0) 'bvout-closed))
-       ; O(1): chunks are only ever consed on by write-u8/write-bytevector.
-       (let ((chunks (vector-ref x 1)))
-         (or (null? chunks)
-             (and (pair? chunks) (bytevector? (car chunks)))))))
-
-(define (bytevector-output-port-open? x)
-  (and (bytevector-output-port? x) (eq? (vector-ref x 0) 'bvout)))
+  (%make-record %binary-output-port-type #f #t '()))
 
 (define (get-output-bytevector port)
   (if (bytevector-output-port? port)
-      (apply bytevector-append (reverse (vector-ref port 1)))
+      (apply bytevector-append (reverse (%bvout-chunks port)))
       (error "get-output-bytevector: not an output bytevector port")))
 
-;; Bytevector input port: vector #(tag bv (position . end)).  Keep the
-;; original bytevector, as MIT's bytevector input ports observe mutations to
-;; the source after the port is opened.  The pair stores the half-open range
-;; without requiring a copied slice.
+;; A bytevector input port reads the half-open range [position, end) of the
+;; original bytevector, not a copied slice: MIT's bytevector input ports
+;; observe mutations to the source after the port is opened.
 (define (open-input-bytevector bv . args)
   (if (not (bytevector? bv))
       (error "open-input-bytevector: expected a bytevector"))
@@ -711,28 +731,12 @@
     (%require-nonnegative-integer "open-input-bytevector" end)
     (if (or (> start end) (> end (bytevector-length bv)))
         (error "open-input-bytevector: invalid bytevector range"))
-    (vector 'bvin bv (cons start end))))
+    (%make-record %binary-input-port-type #f #t bv start end)))
 
 (define (call-with-output-bytevector proc)
   (let ((port (open-output-bytevector)))
     (proc port)
     (get-output-bytevector port)))
-
-(define (bytevector-input-port? x)
-  (and (vector? x) (= (vector-length x) 3)
-       (or (eq? (vector-ref x 0) 'bvin)
-           (eq? (vector-ref x 0) 'bvin-closed))
-       (bytevector? (vector-ref x 1))
-       (pair? (vector-ref x 2))
-       (exact-nonnegative-integer? (car (vector-ref x 2)))
-       (exact-nonnegative-integer? (cdr (vector-ref x 2)))
-       (<= (car (vector-ref x 2))
-           (cdr (vector-ref x 2)))
-       (<= (cdr (vector-ref x 2))
-           (bytevector-length (vector-ref x 1)))))
-
-(define (bytevector-input-port-open? x)
-  (and (bytevector-input-port? x) (eq? (vector-ref x 0) 'bvin)))
 
 ;; write-bytevector: write all or part of a bytevector to a port
 (define primitive-write-bytevector write-bytevector)
@@ -747,7 +751,7 @@
          (end (if (pair? rest2) (car rest2) (bytevector-length bv))))
     (cond
       ((bytevector-output-port-open? port)
-       (vector-set! port 1 (cons (bytevector-copy bv start end) (vector-ref port 1))))
+       (%bvout-add-chunk! port (bytevector-copy bv start end)))
       ((bytevector-output-port? port)
        (error "write-bytevector: port is closed"))
       (else
@@ -763,18 +767,16 @@
      (let ((port (if (pair? args) (car args) (current-input-port))))
       (cond
         ((bytevector-input-port-open? port)
-         (let* ((bv (vector-ref port 1))
-                (state (vector-ref port 2))
-                (pos (car state))
-                (end (cdr state))
-                (available (- end pos)))
+         (let* ((pos (%bvin-position port))
+                (available (- (%bvin-end port) pos)))
            (if (= k 0)
                (bytevector)
                (if (<= available 0)
                (eof-object)
                (let* ((n (min k available))
-                      (result (bytevector-copy bv pos (+ pos n))))
-                 (vector-set! port 2 (cons (+ pos n) end))
+                      (result (bytevector-copy (%bvin-bytevector port)
+                                               pos (+ pos n))))
+                 (%bvin-set-position! port (+ pos n))
                  result)))))
         ((bytevector-input-port? port)
          (error "read-bytevector: port is closed"))
@@ -802,11 +804,9 @@
             (error "read-bytevector!: invalid bytevector range"))
         (cond
           ((bytevector-input-port-open? port)
-           (let* ((bv (vector-ref port 1))
-                  (state (vector-ref port 2))
-                  (pos (car state))
-                  (port-end (cdr state))
-                  (available (- port-end pos))
+           (let* ((bv (%bvin-bytevector port))
+                  (pos (%bvin-position port))
+                  (available (- (%bvin-end port) pos))
                   (count (- end start)))
              (if (= count 0)
                  0
@@ -821,7 +821,7 @@
                                 target (+ start i)
                                 (bytevector-u8-ref bv (+ pos i)))
                                (loop (+ i 1)))))
-                       (vector-set! port 2 (cons (+ pos n) port-end))
+                       (%bvin-set-position! port (+ pos n))
                        n)))))
           ((bytevector-input-port? port)
            (error "read-bytevector!: port is closed"))
@@ -830,7 +830,7 @@
 
 ;; peek-u8/u8-ready? are C primitives that only understand real ports;
 ;; wrap them the same way read-u8/read-bytevector are wrapped above so
-;; they also accept the vector-based bytevector input ports.
+;; they also accept bytevector input ports.
 (let ((primitive-peek-u8 peek-u8)
       (primitive-u8-ready? u8-ready?))
   (set! peek-u8
@@ -840,13 +840,10 @@
       (let ((port (if (pair? opt-port) (car opt-port) (current-input-port))))
         (cond
           ((bytevector-input-port-open? port)
-           (let* ((bv (vector-ref port 1))
-                  (state (vector-ref port 2))
-                  (pos (car state))
-                  (end (cdr state)))
-             (if (>= pos end)
+           (let ((pos (%bvin-position port)))
+             (if (>= pos (%bvin-end port))
                  (eof-object)
-                 (bytevector-u8-ref bv pos))))
+                 (bytevector-u8-ref (%bvin-bytevector port) pos))))
           ((bytevector-input-port? port)
            (error "peek-u8: port is closed"))
           ((not (binary-port? port))
@@ -920,14 +917,14 @@
   (set! close-input-port
     (lambda (port)
       (if (bytevector-input-port-open? port)
-          (vector-set! port 0 'bvin-closed)
+          (%record-set! port %binary-input-port-type 0 #f 'close-input-port)
           (if (bytevector-input-port? port)
               #f
               (primitive-close-input-port port)))))
   (set! close-output-port
     (lambda (port)
       (if (bytevector-output-port-open? port)
-          (vector-set! port 0 'bvout-closed)
+          (%record-set! port %binary-output-port-type 0 #f 'close-output-port)
           (if (bytevector-output-port? port)
               #f
               (primitive-close-output-port port))))))
@@ -951,31 +948,52 @@
 ;;; ============================================================================
 
 (define primitive-error error)
-(define *error-object-tag* (list 'error-object))
+
+;; Error objects are records of this type (MIT calls them conditions, and
+;; prints one as #[condition 12 simple-error]). kind is error, file or read;
+;; the C runtime builds them too (make_error_object_c), so the field order is
+;; fixed.
+(define %condition-type
+  (%make-record-type 'condition '(kind message irritants) '(sealed)))
+(%register-builtin-record-type! 'condition %condition-type)
 
 (define (make-error-object kind message irritants)
-  (vector *error-object-tag* kind message irritants))
+  (%make-record %condition-type #f kind message irritants))
 
 (define (error-object? obj)
-  (and (vector? obj)
-       (= (vector-length obj) 4)
-       (eq? (vector-ref obj 0) *error-object-tag*)))
+  (%record-of? obj %condition-type))
+
+(define (%error-object-kind obj)
+  (%record-ref obj %condition-type 0 'error-object-kind))
 
 (define (error-object-message obj)
   (if (error-object? obj)
-      (vector-ref obj 2)
+      (%record-ref obj %condition-type 1 'error-object-message)
       (primitive-error "error-object-message: not an error object")))
 
 (define (error-object-irritants obj)
   (if (error-object? obj)
-      (vector-ref obj 3)
+      (%record-ref obj %condition-type 2 'error-object-irritants)
       (primitive-error "error-object-irritants: not an error object")))
 
 (define (read-error? obj)
-  (and (error-object? obj) (eq? (vector-ref obj 1) 'read)))
+  (and (error-object? obj) (eq? (%error-object-kind obj) 'read)))
 
 (define (file-error? obj)
-  (and (error-object? obj) (eq? (vector-ref obj 1) 'file)))
+  (and (error-object? obj) (eq? (%error-object-kind obj) 'file)))
+
+;; MIT's report of a condition: the message, then each irritant as write
+;; shows it.
+(define (condition/report-string condition)
+  (if (not (error-object? condition))
+      (primitive-error "condition/report-string: not a condition"))
+  (let ((port (open-output-string)))
+    (display (error-object-message condition) port)
+    (for-each (lambda (irritant)
+                (display " " port)
+                (write irritant port))
+              (error-object-irritants condition))
+    (get-output-string port)))
 
 ;; Simple exception system using continuations
 ;; The default handler prints and returns. It deliberately does not exit:
@@ -988,7 +1006,8 @@
 ;; raise-continuable passes the flag.
 (define (*default-exception-handler* exn . continuable)
   (display "Unhandled exception: ")
-  (display exn)
+  ;; An error object is reported by its contents, not printed as a record.
+  (display (if (error-object? exn) (condition/report-string exn) exn))
   (newline)
   (set! *wind-stack* '())
   #f)
@@ -1465,13 +1484,19 @@
 ; not is already a primitive, but define it for completeness
 ; (define (not x) (if x #f #t))
 
-(define *promise-tag* (list 'promise))
+;; A promise is a record with one field, its state: (#t . value) once forced,
+;; (#f . thunk) before, or (forward . state) after force has merged it into
+;; another promise's state. MIT does not count promises as records (record?
+;; is #f for them), hence opaque; the writer reads the state to print
+;; #[promise 12 (evaluated) 5].
+(define %promise-type (%make-record-type 'promise '(state) '(opaque sealed)))
+(%register-builtin-record-type! 'promise %promise-type)
 
 (define (%make-lazy-promise thunk)
-  (vector *promise-tag* (cons #f thunk)))
+  (%make-record %promise-type #f (cons #f thunk)))
 
 (define (%make-eager-promise value)
-  (vector *promise-tag* (cons #t value)))
+  (%make-record %promise-type #f (cons #t value)))
 
 (define (make-promise obj)
   (if (promise? obj)
@@ -1479,9 +1504,10 @@
       (%make-eager-promise obj)))
 
 (define (promise? obj)
-  (and (vector? obj)
-       (= (vector-length obj) 2)
-       (eq? (vector-ref obj 0) *promise-tag*)))
+  (%record-of? obj %promise-type))
+
+(define (%promise-set-state! promise state)
+  (%record-set! promise %promise-type 0 state 'force))
 
 ; Force/delay
 (define-syntax delay
@@ -1490,13 +1516,13 @@
      (%make-lazy-promise (lambda () (%make-eager-promise expr))))))
 
 (define (%promise-state promise)
-  (let ((state (vector-ref promise 1)))
+  (let ((state (%record-ref promise %promise-type 0 'force)))
     (if (eq? (car state) 'forward)
         (let loop ((target (cdr state)))
           (if (eq? (car target) 'forward)
               (loop (cdr target))
               (begin
-                (vector-set! promise 1 target)
+                (%promise-set-state! promise target)
                 target)))
         state)))
 
@@ -1523,7 +1549,7 @@
                                 (set-cdr! state (cdr next-state))
                                 (set-car! next-state 'forward)
                                 (set-cdr! next-state state)
-                                (vector-set! next 1 state))))))
+                                (%promise-set-state! next state))))))
                 (loop)))))))
 
 (define-syntax delay-force
@@ -2913,11 +2939,10 @@
 ;;   (<field-name> <accessor-name> <mutator-name>)
 ;;   ...)
 ;;
-;; Implementation uses vectors: #(<type-tag> <field1> <field2> ...)
-
-(define (record-constructor-field-ref field bindings)
-  (cond ((assq field bindings) => cdr)
-        (else #f)))
+;; As in MIT Scheme, <type-name> is bound to the record type, the constructor
+;; may also be a bare name (taking every field, in order) or #f (none), and
+;; instances are opaque records (see prim_record.c): not vectors, printed as
+;; #[point 12].
 
 (define (record-any pred lst)
   (cond ((null? lst) #f)
@@ -2953,11 +2978,12 @@
         ((car lst) (cons (car lst) (record-remove-false (cdr lst))))
         (else (record-remove-false (cdr lst)))))
 
+;; A constructor-name of #f means the form defines no constructor.
 (define (validate-record-type-spec type-name constructor-name constructor-fields
                                    predicate-name field-specs)
   (if (not (symbol? type-name))
       (error "define-record-type: type name must be a symbol" type-name))
-  (if (not (symbol? constructor-name))
+  (if (not (or (symbol? constructor-name) (not constructor-name)))
       (error "define-record-type: constructor name must be a symbol" constructor-name))
   (if (not (symbol? predicate-name))
       (error "define-record-type: predicate name must be a symbol" predicate-name))
@@ -2979,13 +3005,23 @@
     (let* ((accessors (map record-field-spec-accessor field-specs))
            (mutators (record-remove-false
                       (map record-field-spec-mutator field-specs)))
-           (bindings (append (list type-name constructor-name predicate-name)
+           (bindings (append (list type-name)
+                             (if constructor-name (list constructor-name) '())
+                             (list predicate-name)
                              accessors
                              mutators)))
       (if (record-duplicates? bindings)
           (error "define-record-type: duplicate generated binding" bindings))))
   #t)
 
+;; Every procedure closes over the record type itself, captured when it is
+;; defined, never over the public names: rebinding the type name, the
+;; constructor or the predicate later cannot change what the others accept,
+;; and a field or constructor argument named like any of them cannot capture
+;; it. Field indexes are resolved once, at definition time, and each
+;; procedure's captured values share one frame (a plain let, not let*), which
+;; keeps their lookups short. The expansion is nothing but definitions, so it
+;; can open a body.
 (define-syntax define-record-type
   (syntax-rules ()
     ((define-record-type type-name
@@ -2993,102 +3029,142 @@
        predicate-name
        field-spec ...)
      (begin
-       (validate-record-type-spec 'type-name
-                                  'constructor-name
-                                  '(constructor-field ...)
-                                  'predicate-name
-                                  '(field-spec ...))
-       ;; The constructor closure itself is a unique, stable type tag.  Avoid
-       ;; an introduced top-level helper binding here: repeated macro uses
-       ;; would otherwise share that binding and overwrite an earlier tag.
-       (define-record-constructor constructor-name
-         (constructor-field ...)
-         field-spec ...)
-
-       ;; Predicate: checks if value is a vector with matching type tag
+       (define type-name
+         (begin
+           (validate-record-type-spec 'type-name
+                                      'constructor-name
+                                      '(constructor-field ...)
+                                      'predicate-name
+                                      '(field-spec ...))
+           (%make-record-type 'type-name
+                              (map record-field-spec-name '(field-spec ...)))))
+       (define constructor-name
+         (let ((rtd type-name)
+               (layout (%record-layout type-name '(constructor-field ...)
+                                       'constructor-name)))
+           (lambda (constructor-field ...)
+             (%make-record rtd layout constructor-field ...))))
        (define predicate-name
-         (let ((record-type-tag constructor-name))
-           (lambda (obj)
-             (and (vector? obj)
-                  (> (vector-length obj) 0)
-                  (eq? (vector-ref obj 0) record-type-tag)))))
-
-       ;; Generate field accessors and mutators
-       (define-record-fields type-name predicate-name 1 field-spec ...)))))
-
-(define-syntax define-record-constructor
-  (syntax-rules ()
-    ((define-record-constructor constructor-name
-       (constructor-field ...)
-       field-spec ...)
-     ;; The private self-binding remains the tag even if the public
-     ;; constructor name is rebound or is also a constructor field name.
-     (define constructor-name
-       (letrec ((construct
-                 (lambda (constructor-field ...)
-                   (list->vector
-                     (cons construct
-                           (define-record-constructor-values
-                             (list (cons 'constructor-field constructor-field) ...)
-                             field-spec ...))))))
-         construct)))))
-
-(define-syntax define-record-constructor-values
-  (syntax-rules ()
-    ((define-record-constructor-values bindings)
-     '())
-    ((define-record-constructor-values bindings
-       (field-name accessor-name)
-       rest ...)
-     (cons (record-constructor-field-ref 'field-name bindings)
-           (define-record-constructor-values bindings rest ...)))
-    ((define-record-constructor-values bindings
-       (field-name accessor-name mutator-name)
-       rest ...)
-     (cons (record-constructor-field-ref 'field-name bindings)
-           (define-record-constructor-values bindings rest ...)))))
-
-;; Helper macro to define field accessors/mutators
-;; Index starts at 1 because position 0 is the type tag
-;; Capture the predicate so rebinding its public name cannot change a field
-;; procedure's record type or bypass its type check.
-(define-syntax define-record-fields
-  (syntax-rules ()
-    ;; Base case: no more fields
-    ((define-record-fields type-name predicate-name index)
-     (begin))
-
-    ;; Field with accessor only
-    ((define-record-fields type-name predicate-name index
-       (field-name accessor-name)
-       rest ...)
+         (let ((rtd type-name))
+           (lambda (obj) (%record-of? obj rtd))))
+       (%define-record-field type-name field-spec) ...))
+    ((define-record-type type-name #f predicate-name field-spec ...)
      (begin
-       (define accessor-name
-         (let ((record-predicate predicate-name))
-           (lambda (obj)
-             (if (record-predicate obj)
-                 (vector-ref obj index)
-                 (error "record accessor: wrong record type" obj)))))
-       (define-record-fields type-name predicate-name (+ index 1) rest ...)))
+       (define type-name
+         (begin
+           (validate-record-type-spec 'type-name #f '() 'predicate-name
+                                      '(field-spec ...))
+           (%make-record-type 'type-name
+                              (map record-field-spec-name '(field-spec ...)))))
+       (define predicate-name
+         (let ((rtd type-name))
+           (lambda (obj) (%record-of? obj rtd))))
+       (%define-record-field type-name field-spec) ...))
+    ;; A bare constructor name takes every field, in order.
+    ((define-record-type type-name constructor-name predicate-name
+       (field-name . field-procedures) ...)
+     (define-record-type type-name
+       (constructor-name field-name ...)
+       predicate-name
+       (field-name . field-procedures) ...))))
 
-    ;; Field with accessor and mutator
-    ((define-record-fields type-name predicate-name index
-       (field-name accessor-name mutator-name)
-       rest ...)
+(define-syntax %define-record-field
+  (syntax-rules ()
+    ((_ type-name (field-name accessor-name))
+     (define accessor-name
+       (let ((rtd type-name)
+             (index (%record-type-field-index type-name 'field-name
+                                              'accessor-name)))
+         (lambda (obj) (%record-ref obj rtd index 'accessor-name)))))
+    ((_ type-name (field-name accessor-name mutator-name))
      (begin
-       (define accessor-name
-         (let ((record-predicate predicate-name))
-           (lambda (obj)
-             (if (record-predicate obj)
-                 (vector-ref obj index)
-                 (error "record accessor: wrong record type" obj)))))
+       (%define-record-field type-name (field-name accessor-name))
        (define mutator-name
-         (let ((record-predicate predicate-name))
-           (lambda (obj val)
-             (if (record-predicate obj)
-                 (vector-set! obj index val)
-                 (error "record mutator: wrong record type" obj)))))
-       (define-record-fields type-name predicate-name (+ index 1) rest ...)))))
+         (let ((rtd type-name)
+               (index (%record-type-field-index type-name 'field-name
+                                                'mutator-name)))
+           (lambda (obj value)
+             (%record-set! obj rtd index value 'mutator-name))))))))
+
+;;; ============================================================================
+;;; MIT Scheme record procedures
+;;; ============================================================================
+
+;; record? is true of record instances, error objects (conditions), char-sets
+;; and bytevector ports, as in MIT, but not of record types or promises.
+(define record? %record?)
+(define record-type? %record-type?)
+(define record-type-descriptor %record-type-descriptor)
+(define record-type-field-names %record-type-field-names)
+
+;; MIT returns the name as a string, brackets included: "<point>".
+(define (record-type-name record-type)
+  (symbol->string (%record-type-name record-type)))
+
+(define (make-record-type type-name field-names . options)
+  (%make-record-type (if (string? type-name)
+                         (string->symbol type-name)
+                         type-name)
+                     field-names))
+
+;; The runtime's own record types can be inspected, but not built or changed
+;; behind the stdlib's back.
+(define (%require-open-record-type who record-type)
+  (if (not (%record-type? record-type))
+      (error (string-append who ": not a record type") record-type))
+  (if (%record-type-sealed? record-type)
+      (error (string-append who ": record type is not user-defined")
+             record-type)))
+
+;; A field procedure's name in MIT's style, for error messages: point-x for
+;; field x of <point>, with a prefix and suffix for modifiers.
+(define (%record-procedure-name prefix record-type field suffix)
+  (let* ((name (symbol->string (%record-type-name record-type)))
+         (n (string-length name))
+         (bare (if (and (> n 2)
+                        (char=? (string-ref name 0) #\<)
+                        (char=? (string-ref name (- n 1)) #\>))
+                   (substring name 1 (- n 1))
+                   name)))
+    (string->symbol
+     (string-append prefix bare "-"
+                    (if (symbol? field) (symbol->string field) "field")
+                    suffix))))
+
+;; Fields the constructor does not take are initialized to #f.
+(define (record-constructor record-type . field-names)
+  (%require-open-record-type "record-constructor" record-type)
+  (if (> (length field-names) 1)
+      (error "record-constructor: too many arguments"))
+  (let* ((fields (if (pair? field-names)
+                     (car field-names)
+                     (%record-type-field-names record-type)))
+         (layout (%record-layout record-type fields 'record-constructor)))
+    ;; The common arities avoid apply.
+    (case (length fields)
+      ((0) (lambda () (%make-record record-type layout)))
+      ((1) (lambda (a) (%make-record record-type layout a)))
+      ((2) (lambda (a b) (%make-record record-type layout a b)))
+      ((3) (lambda (a b c) (%make-record record-type layout a b c)))
+      (else
+       (lambda values
+         (apply %make-record record-type layout values))))))
+
+(define (record-predicate record-type)
+  (if (not (%record-type? record-type))
+      (error "record-predicate: not a record type" record-type))
+  (lambda (obj) (%record-of? obj record-type)))
+
+(define (record-accessor record-type field)
+  (let* ((who (%record-procedure-name "" record-type field ""))
+         (index (%record-type-field-index record-type field who)))
+    (lambda (obj) (%record-ref obj record-type index who))))
+
+(define (record-modifier record-type field)
+  (%require-open-record-type "record-modifier" record-type)
+  (let* ((who (%record-procedure-name "set-" record-type field "!"))
+         (index (%record-type-field-index record-type field who)))
+    (lambda (obj value) (%record-set! obj record-type index value who))))
 
 ;;; ============================================================================
 ;;; SRFI-26: Notation for Specializing Parameters (cut/cute)
@@ -3414,14 +3490,25 @@
 ;;; Character sets (MIT/GNU Scheme character-set operations)
 ;;; ============================================================================
 
-; Character sets are represented as a tagged vector.  Finite sets built from
-; characters, strings, and ranges use a sorted, disjoint range list.  Unicode
-; property sets and set combinations use a predicate payload so construction
-; does not eagerly allocate a million-code-point table.
+; Character sets are records with a kind and a payload.  Finite sets built
+; from characters, strings, and ranges (kind ranges) use a sorted, disjoint
+; range list.  Unicode property sets and set combinations (kind predicate) use
+; a predicate payload so construction does not eagerly allocate a
+; million-code-point table.  Only this file builds them, so a char-set is
+; well-formed by construction.
 (define %char-code-limit #x110000)
 
+(define %char-set-type
+  (%make-record-type 'char-set '(kind payload) '(sealed)))
+
 (define (%make-char-set kind payload)
-  (vector 'char-set kind payload))
+  (%make-record %char-set-type #f kind payload))
+
+(define (%char-set-kind set)
+  (%record-ref set %char-set-type 0 'char-set))
+
+(define (%char-set-payload set)
+  (%record-ref set %char-set-type 1 'char-set))
 
 (define (%char-set-range-well-formed? element)
   (and (pair? element)
@@ -3434,23 +3521,8 @@
        (<= (car element) (cdr element))
        (<= (cdr element) %char-code-limit)))
 
-(define (%char-set-ranges-well-formed? ranges)
-  (and (proper-list? ranges)
-       (let loop ((ranges ranges))
-         (or (null? ranges)
-             (and (%char-set-range-well-formed? (car ranges))
-                  (loop (cdr ranges)))))))
-
 (define (char-set? obj)
-  (and (vector? obj)
-       (= (vector-length obj) 3)
-       (eq? (vector-ref obj 0) 'char-set)
-       (cond
-         ((eq? (vector-ref obj 1) 'ranges)
-          (%char-set-ranges-well-formed? (vector-ref obj 2)))
-         ((eq? (vector-ref obj 1) 'predicate)
-          (procedure? (vector-ref obj 2)))
-         (else #f))))
+  (%record-of? obj %char-set-type))
 
 (define (%require-char-set who obj)
   (if (char-set? obj)
@@ -3559,8 +3631,8 @@
              (loop (+ i 1)
                    (%char-set-range-insert ranges code (+ code 1)))))))
     ((char-set? element)
-     (if (eq? (vector-ref element 1) 'ranges)
-         (vector-ref element 2)
+     (if (eq? (%char-set-kind element) 'ranges)
+         (%char-set-payload element)
          #f))
     (else #f)))
 
@@ -3585,7 +3657,7 @@
                           out (car (car rs)) (cdr (car rs))))))))
         (if (or (symbol? (car xs))
                 (and (char-set? (car xs))
-                     (eq? (vector-ref (car xs) 1) 'predicate)))
+                     (eq? (%char-set-kind (car xs)) 'predicate)))
             (%make-char-set
              'predicate
              (lambda (code)
@@ -3604,9 +3676,9 @@
   (if (or (not (integer? code)) (not (exact? code))
           (< code 0) (>= code %char-code-limit))
       (error "code-point-in-set?: expected Unicode code point"))
-  (if (eq? (vector-ref set 1) 'predicate)
-      ((vector-ref set 2) code)
-      (let loop ((ranges (vector-ref set 2)))
+  (if (eq? (%char-set-kind set) 'predicate)
+      ((%char-set-payload set) code)
+      (let loop ((ranges (%char-set-payload set)))
         (and (pair? ranges)
              (let ((range (car ranges)))
                (if (< code (car range))
@@ -3654,11 +3726,11 @@
 
 (define (char-set->code-points set)
   (%require-char-set "char-set->code-points" set)
-  (if (eq? (vector-ref set 1) 'predicate)
+  (if (eq? (%char-set-kind set) 'predicate)
       (char-set->code-points
-       (compute-char-set (lambda (char) ((vector-ref set 2)
+       (compute-char-set (lambda (char) ((%char-set-payload set)
                                          (char->integer char)))))
-      (let loop ((ranges (vector-ref set 2)) (out '()))
+      (let loop ((ranges (%char-set-payload set)) (out '()))
         (if (null? ranges)
             (reverse out)
             (let ((range (car ranges)))
@@ -3692,7 +3764,7 @@
 ; result would make every later enumeration (char-set-size, char-set->list,
 ; char-set=, ...) test all 0x110000 code points.
 (define (%char-set-finite? set)
-  (eq? (vector-ref set 1) 'ranges))
+  (eq? (%char-set-kind set) 'ranges))
 
 (define (%char-set-ranges-size ranges)
   (let loop ((ranges ranges) (n 0))
@@ -3734,7 +3806,7 @@
              (fold (lambda (set acc)
                      (fold (lambda (r acc)
                              (%char-set-range-insert acc (car r) (cdr r)))
-                           acc (vector-ref set 2)))
+                           acc (%char-set-payload set)))
                    '() sets))
         (%make-char-set 'predicate
                         (lambda (code)
@@ -3758,14 +3830,16 @@
               ; Enumerate the smallest finite argument.
               (let ((smallest
                      (fold (lambda (set best)
-                             (if (< (%char-set-ranges-size (vector-ref set 2))
-                                    (%char-set-ranges-size (vector-ref best 2)))
+                             (if (< (%char-set-ranges-size
+                                     (%char-set-payload set))
+                                    (%char-set-ranges-size
+                                     (%char-set-payload best)))
                                  set
                                  best))
                            (car finite)
                            (cdr finite))))
                 (%char-set-filter-ranges
-                 (vector-ref smallest 2)
+                 (%char-set-payload smallest)
                  (lambda (code)
                    (every (lambda (set)
                             (or (eq? set smallest)
@@ -3780,7 +3854,7 @@
                  (every (lambda (set) (not (code-point-in-set? code set)))
                         rest))))
     (if (%char-set-finite? first)
-        (%char-set-filter-ranges (vector-ref first 2) keep?)
+        (%char-set-filter-ranges (%char-set-payload first) keep?)
         (%make-char-set 'predicate
                         (lambda (code)
                           (and (code-point-in-set? code first)
@@ -3875,8 +3949,8 @@
                         (and (>= code 127) (< code 160))))))
 
 (define (%char-set-next-code set code)
-  (if (eq? (vector-ref set 1) 'ranges)
-      (let loop ((ranges (vector-ref set 2)))
+  (if (eq? (%char-set-kind set) 'ranges)
+      (let loop ((ranges (%char-set-payload set)))
         (if (null? ranges)
             #f
             (let ((range (car ranges)))
@@ -3890,26 +3964,29 @@
                 code
                 (loop (+ code 1)))))))
 
+;; A cursor is the set it walks and the code point it is at; #f past the end.
+(define %char-set-cursor-type
+  (%make-record-type 'char-set-cursor '(set code) '(sealed)))
+
+(define (%make-char-set-cursor set code)
+  (%make-record %char-set-cursor-type #f set code))
+
+(define (%char-set-cursor-set cursor)
+  (%record-ref cursor %char-set-cursor-type 0 'char-set-cursor))
+
+(define (%char-set-cursor-code cursor)
+  (%record-ref cursor %char-set-cursor-type 1 'char-set-cursor))
+
 (define (char-set-cursor set)
   (%require-char-set "char-set-cursor" set)
-  (let ((code (%char-set-next-code set 0)))
-    (if code
-        (vector 'char-set-cursor set code)
-        (vector 'char-set-cursor-end set))))
+  (%make-char-set-cursor set (%char-set-next-code set 0)))
 
 (define (end-of-char-set? cursor)
-  (and (vector? cursor)
-       (= (vector-length cursor) 2)
-       (eq? (vector-ref cursor 0) 'char-set-cursor-end)))
+  (and (%record-of? cursor %char-set-cursor-type)
+       (not (%char-set-cursor-code cursor))))
 
 (define (%require-char-set-cursor who cursor)
-  (if (or (not (vector? cursor))
-          (not (or (= (vector-length cursor) 2)
-                   (= (vector-length cursor) 3)))
-          (not (eq? (vector-ref cursor 0)
-                    (if (= (vector-length cursor) 2)
-                        'char-set-cursor-end
-                        'char-set-cursor))))
+  (if (not (%record-of? cursor %char-set-cursor-type))
       (error (string-append who ": expected character-set cursor")))
   cursor)
 
@@ -3918,21 +3995,19 @@
   (%require-char-set-cursor "char-set-ref" cursor)
   (if (end-of-char-set? cursor)
       (error "char-set-ref: cursor is at end of character set"))
-  (if (not (eq? set (vector-ref cursor 1)))
+  (if (not (eq? set (%char-set-cursor-set cursor)))
       (error "char-set-ref: cursor belongs to another character set"))
-  (integer->char (vector-ref cursor 2)))
+  (integer->char (%char-set-cursor-code cursor)))
 
 (define (char-set-cursor-next set cursor)
   (%require-char-set "char-set-cursor-next" set)
   (%require-char-set-cursor "char-set-cursor-next" cursor)
   (if (end-of-char-set? cursor)
       (error "char-set-cursor-next: cursor is at end of character set"))
-  (if (not (eq? set (vector-ref cursor 1)))
+  (if (not (eq? set (%char-set-cursor-set cursor)))
       (error "char-set-cursor-next: cursor belongs to another character set"))
-  (let ((code (%char-set-next-code set (+ (vector-ref cursor 2) 1))))
-    (if code
-        (vector 'char-set-cursor set code)
-        (vector 'char-set-cursor-end set))))
+  (%make-char-set-cursor
+   set (%char-set-next-code set (+ (%char-set-cursor-code cursor) 1))))
 
 (define (char-set-fold kons knil set)
   (%require-char-set "char-set-fold" set)
@@ -4067,7 +4142,7 @@
 
 (define (char-set-copy set)
   (%require-char-set "char-set-copy" set)
-  (%make-char-set (vector-ref set 1) (vector-ref set 2)))
+  (%make-char-set (%char-set-kind set) (%char-set-payload set)))
 
 (define (char-set-for-each procedure set)
   (%require-char-set "char-set-for-each" set)
@@ -4156,8 +4231,8 @@
               (if (not (char? char))
                   (error "char-set-adjoin: expected character")))
             chars)
-  (if (eq? (vector-ref set 1) 'ranges)
-      (let loop ((chars chars) (ranges (vector-ref set 2)))
+  (if (eq? (%char-set-kind set) 'ranges)
+      (let loop ((chars chars) (ranges (%char-set-payload set)))
         (if (null? chars)
             (%make-char-set 'ranges ranges)
             (let ((code (char->integer (car chars))))

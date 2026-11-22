@@ -4886,6 +4886,7 @@ static void emit_primitive_operation(compile_ctx *cctx, int64_t prim, unsigned a
         case PLIST: emit(cctx, OP_LIST2); return;
         case PAPPEND: emit(cctx, OP_APPEND); return;
         case PVECREF: emit(cctx, OP_VECTORREF); return;
+        case PRECORDOFP: emit(cctx, OP_RECORDOF); return;
         default: break;
         }
     }
@@ -4895,6 +4896,10 @@ static void emit_primitive_operation(compile_ctx *cctx, int64_t prim, unsigned a
         case PVECSET: emit(cctx, OP_VECTORSET); return;
         default: break;
         }
+    }
+    if (argc == 4 && prim == PRECORDREF) {
+        emit(cctx, OP_RECORDREF);
+        return;
     }
     // apply and call-with-values call their procedure argument, which R7RS
     // requires to be a tail call when they are themselves in tail position.

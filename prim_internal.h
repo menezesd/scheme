@@ -1385,6 +1385,17 @@ bool unicode_full_titlecase(uint32_t code, const uint32_t **mapping,
 unsigned apply_vector_primitive(unsigned prim_id, unsigned argc,
                                 unsigned *argv);
 
+// Record operations (prim_record.c)
+unsigned apply_record_primitive(unsigned prim_id, unsigned argc,
+                                unsigned *argv);
+// %record-of? and the checks behind %record-ref/%record-set!, shared with the
+// VM's inline record opcodes. record_field_slot reports the error (naming
+// who, the accessor) and returns NULL unless rec is an instance of rtd and
+// index (a fixnum or integer cell) one of its fields.
+bool record_of_type(unsigned obj, unsigned rtd);
+unsigned *record_field_slot(unsigned rec, unsigned rtd, unsigned index,
+                            unsigned who);
+
 // Math operations (prim_math.c)
 unsigned apply_math_primitive(unsigned prim_id, unsigned argc,
                               unsigned *argv);

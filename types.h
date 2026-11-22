@@ -83,6 +83,9 @@ enum lisp_type {
     BT_HASHTABLE = 105,        // Hash table: ptr = hash_table_data*
     BT_VMCLOSURE = 106, // VM closure: car = BT_CLOSURE code cell, cdr = env.
                         // A distinct type so pair operations reject it.
+    BT_RECORD = 107,      // Record instance: ptr = vector_data* [rtd, field...]
+    BT_RECORD_TYPE = 108, // Record type: ptr = vector_data*
+                          // [name, flags, field-name...]
     BT_BROKENHEART = -1 // GC forwarding pointer: car = new location
 };
 
@@ -197,6 +200,40 @@ typedef struct {
     unsigned len;
     unsigned data[]; // Flexible array member
 } vector_data;
+
+// Records and record types share vector_data, the vector registry and the
+// vector GC paths; only the cell type differs, which is what keeps them out of
+// vector?, vector-ref and every other vector operation. A record type's
+// payload is [name-symbol, flags, field-name...] (flags is a cached small
+// integer cell, so it never needs collecting); an instance's payload is
+// [record-type, field...].
+#define RECORD_TYPE_NAME_SLOT 0
+#define RECORD_TYPE_FLAGS_SLOT 1
+#define RECORD_TYPE_FIELDS_START 2
+#define RECORD_TYPE_SLOT 0
+#define RECORD_FIELDS_START 1
+
+// Record type flags.
+enum {
+    // record? is #f for instances, as MIT's is for promises, and
+    // record-type-descriptor rejects them.
+    RECORD_TYPE_OPAQUE = 1,
+    // An implementation type (promise, condition, char-set, binary port):
+    // record-constructor and record-modifier refuse it, so the procedural
+    // record API cannot forge or corrupt one.
+    RECORD_TYPE_SEALED = 2,
+};
+
+// Record types the C runtime needs to recognize. The stdlib creates them and
+// registers each with %register-builtin-record-type!; until then (the C test
+// harnesses run without the stdlib) the slot is 0.
+enum builtin_record_type {
+    BRT_CONDITION,
+    BRT_PROMISE,
+    BRT_BINARY_INPUT_PORT,
+    BRT_BINARY_OUTPUT_PORT,
+    BRT_COUNT
+};
 
 // Bytevector data structure (stored in ptr field)
 typedef struct {
@@ -367,6 +404,8 @@ typedef struct {
     FILE *transcript;             // NULL if not recording
     // Last error message for better error reporting
     char last_error[256];
+    // Registered builtin record types (see enum builtin_record_type); GC roots.
+    unsigned builtin_record_types[BRT_COUNT];
     // When true, show_error/show_warning record the message in last_error but
     // print nothing. Used for speculative work whose failure is not a user
     // error, such as compile-time constant folding. Must be saved and
@@ -675,6 +714,21 @@ enum primitive_id {
     PUNICODEASSIGNED,
     PUNICODEPUNCTUATION,
     PUNICODESYMBOL,
+    // Records (prim_record.c)
+    PMAKERECORDTYPE,
+    PRECORDTYPEP,
+    PRECORDTYPENAME,
+    PRECORDTYPEFIELDNAMES,
+    PRECORDTYPEFIELDINDEX,
+    PRECORDTYPESEALEDP,
+    PRECORDLAYOUT,
+    PMAKERECORD,
+    PRECORDP,
+    PRECORDOFP,
+    PRECORDTYPEDESCRIPTOR,
+    PRECORDREF,
+    PRECORDSET,
+    PREGISTERBUILTINRECORDTYPE,
     PRIM_COUNT // Total number of primitives
 };
 
@@ -807,6 +861,8 @@ static inline bool exact_integer_equals(unsigned c, int64_t v)
 #define IS_BYTEVEC(c) (IS_CELL(c) && CELL_TYPE(c) == BT_BYTEVEC)
 #define IS_BINDING_REF(c) (IS_CELL(c) && CELL_TYPE(c) == BT_BINDING_REF)
 #define IS_HASHTABLE(c) (IS_CELL(c) && CELL_TYPE(c) == BT_HASHTABLE)
+#define IS_RECORD(c) (IS_CELL(c) && CELL_TYPE(c) == BT_RECORD)
+#define IS_RECORD_TYPE(c) (IS_CELL(c) && CELL_TYPE(c) == BT_RECORD_TYPE)
 
 // Types whose car and cdr fields hold cell references the collector traces.
 static inline bool cell_type_has_children(int t)

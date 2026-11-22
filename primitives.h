@@ -8,10 +8,11 @@ unsigned apply_primitive(unsigned prim_id, unsigned args);
 unsigned apply_primitive_argv(unsigned prim_id, unsigned argc,
                               unsigned *argv);
 
-// Build a Scheme error object (vector tagged with the stdlib *error-object-tag*,
-// kind 'error, message = msg, irritants = '()) — mirrors stdlib's
-// make-error-object. Returns TOK_ERROR on failure. May trigger GC.
-unsigned make_error_object_c(const char *msg, unsigned env);
+// Build a Scheme error object (a record of the stdlib's condition type with
+// kind 'error, or the kind note_error_kind recorded for msg; message = msg,
+// irritants = '()) - mirrors stdlib's make-error-object. Returns TOK_ERROR on
+// failure, and when no condition type is registered. May trigger GC.
+unsigned make_error_object_c(const char *msg);
 
 // GC support: queue a hash table whose keys moved, then rebuild the queued
 // tables' buckets once the heap is consistent (called at the end of a GC)

@@ -358,6 +358,52 @@
                           (vector-ref (car ks) 0))
                     (loop (cdr ks)))))))
 
+;; Records are vector payloads under their own cell type. An old record
+;; mutated to point at a fresh object is only found by the minor collection's
+;; dirty-card scan; error objects, promises, bytevector ports and char-sets
+;; are records too, and the C runtime builds error objects itself.
+(check "an old record's field set to fresh data survives collections"
+       '(0 1 2 3 4 5 6 7 8 9)
+       (let ()
+         (define-record-type box (make-box value) box?
+           (value box-value set-box-value!))
+         (let ((b (make-box #f)))
+           (gc-flip)
+           (set-box-value! b (iota 10))
+           (let churn ((i 0))
+             (if (< i 2000) (begin (cons i i) (churn (+ i 1)))))
+           (box-value b))))
+(check "the procedural record API survives collections" '(#f 9 (1 #f 3))
+       (let* ((q (make-record-type 'q '(a b c)))
+              (make-q2 (record-constructor q '(b)))
+              (make-q3 (record-constructor q '(c a))))
+         (gc-flip)
+         (let ((r (make-q2 9)) (s (make-q3 3 1)))
+           (gc-flip)
+           (list ((record-accessor q 'a) r) ((record-accessor q 'b) r)
+                 (map (lambda (f) ((record-accessor q f) s)) '(a b c))))))
+(check "error objects survive collections"
+       '(("boom" (1 (2 3))) ("car: not a pair" ()) #t)
+       (let ((user (guard (e (#t e)) (error "boom" 1 (list 2 3))))
+             (runtime (guard (e (#t e)) (car (list-tail (list 1) 1)))))
+         (gc-flip)
+         (list (list (error-object-message user) (error-object-irritants user))
+               (list (error-object-message runtime)
+                     (error-object-irritants runtime))
+               (and (error-object? user) (error-object? runtime)))))
+(check "bytevector ports survive collections" '(1 2 eof #u8(9 8))
+       (let ((in (open-input-bytevector (bytevector 1 2)))
+             (out (open-output-bytevector)))
+         (write-u8 9 out)
+         (gc-flip)
+         (let* ((a (read-u8 in)) (b (read-u8 in)) (c (read-u8 in)))
+           (write-u8 8 out)
+           (list a b (if (eof-object? c) 'eof c) (get-output-bytevector out)))))
+(check "promises and char-sets survive collections" '(3 #t #f)
+       (let ((p (delay (+ 1 2))) (set (char-set "abc")))
+         (gc-flip)
+         (list (force p) (char-in-set? #\b set) (char-in-set? #\z set))))
+
 ;; (command-line) is the script's own view of its invocation - its name and
 ;; arguments - without vesper's options. make test-gcstress runs this file as
 ;; `vesper [--interpreter] gc_stress_tests.scm`.

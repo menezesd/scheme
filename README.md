@@ -227,7 +227,22 @@ nested macros with shadowing:
 (point-x p)        ; => 3
 (point-set-x! p 5)
 (point-x p)        ; => 5
+p                  ; => #[point 12]
+(vector? p)        ; => #f
+point              ; => #[record-type 13 point]
 ```
+
+Records are a type of their own, as R7RS requires: no vector operation
+accepts one, and `equal?` compares them by identity. As in MIT Scheme, the
+type name is bound to the record type, instances print as `#[point 12]` (the
+number is the object's hash, assigned when it is first printed), and MIT's
+procedural interface is available: `record?`, `record-type-descriptor`,
+`record-type-name`, `record-type-field-names`, `make-record-type`,
+`record-constructor`, `record-predicate`, `record-accessor` and
+`record-modifier`. The runtime's other opaque objects - error objects
+(conditions), promises, character sets and bytevector ports - are records
+too, printed like MIT's: `#[condition 7 simple-error]`,
+`#[promise 8 (evaluated) 5]`, `#[char-set 9]`, `#[binary-input-port 10]`.
 
 ### Partial Application (SRFI-26)
 

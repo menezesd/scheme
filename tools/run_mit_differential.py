@@ -251,6 +251,40 @@ PROBES = [
     "(let () (define-record-type thing (make-thing x) thing? (x thing-x)) (let ((ctor make-thing)) (set! make-thing (lambda (x) x)) (thing? (ctor 2))))",
     "(let () (define-record-type thing (make-thing x) thing? (x thing-x set-thing-x!)) (let ((obj (make-thing 1))) (set! thing? (lambda (x) #f)) (set-thing-x! obj 2) (thing-x obj)))",
     "(let () (define-record-type thing (make-thing make-thing) thing? (make-thing thing-x)) (let ((obj (make-thing 1))) (list (thing? obj) (thing-x obj))))",
+    # Records are opaque and disjoint from every other type. Probes compare
+    # predicates and field values only: printed forms carry object-hash
+    # numbers, which depend on everything printed before.
+    "(let () (define-record-type point (make-point x y) point? (x point-x set-point-x!) (y point-y)) (let ((p (make-point 1 2))) (list (vector? p) (procedure? p) (record? p) (point? p) (point? (vector 1 2)) (eq? (record-type-descriptor p) point) (record-type? point) (record-type? p) (record? point) (pair? p) (string? p) (symbol? p) (number? p) (char? p) (boolean? p) (null? p) (bytevector? p) (port? p))))",
+    "(let () (define-record-type point (make-point x y) point? (x point-x) (y point-y)) (list (equal? (make-point 1 2) (make-point 1 2)) (let ((p (make-point 1 2))) (list (eqv? p p) (equal? p p) (eq? p p)))))",
+    "(let () (define-record-type point (make-point x y) point? (x point-x) (y point-y)) (point-x 5))",
+    "(let () (define-record-type point (make-point x y) point? (x point-x) (y point-y)) (vector-ref (make-point 1 2) 0))",
+    "(let () (define-record-type point (make-point x y) point? (x point-x) (y point-y)) (vector-length (make-point 1 2)))",
+    "(let () (define-record-type point (make-point x y) point? (x point-x) (y point-y)) (length (make-point 1 2)))",
+    "(let () (define-record-type point (make-point x y) point? (x point-x) (y point-y set-point-y!)) (let ((p (make-point 1 2))) (set-point-y! p 10) (list (point-x p) (point-y p))))",
+    "(let () (define-record-type point #f point? (x point-x)) (list (point? 5) (record-type? point)))",
+    "(let () (define-record-type point make-point point? (x point-x) (y point-y)) (let ((p (make-point 1 2))) (list (point-x p) (point-y p))))",
+    "(let () (define-record-type <pt> (make-pt a) pt? (a pt-a)) (list (record-type-name <pt>) (record-type-field-names <pt>) (record-type? <pt>) (record? <pt>)))",
+    "(let () (define-record-type point (make-point point) point? (point point-x)) (list (point-x (make-point 7)) (record-type? point)))",
+    "(let () (define-record-type node (make-node rtd layout index obj value) node? (rtd node-rtd) (layout node-layout) (index node-index) (obj node-obj) (value node-value set-node-value!)) (let ((n (make-node 1 2 3 4 5))) (set-node-value! n 50) (list (node-rtd n) (node-layout n) (node-index n) (node-obj n) (node-value n) (node? n))))",
+    "(let () (define-record-type k (make-k) k?) (let ((t (make-equal-hash-table)) (a (make-k)) (b (make-k))) (hash-table-set! t a 1) (hash-table-set! t b 2) (list (hash-table-ref/default t a #f) (hash-table-ref/default t b #f) (hash-table-ref/default t (make-k) 'none))))",
+    # MIT's procedural record interface.
+    "(let* ((q (make-record-type 'q '(a b))) (make-q (record-constructor q)) (q? (record-predicate q)) (q-a (record-accessor q 'a)) (set-q-b! (record-modifier q 'b)) (qq (make-q 1 2))) (set-q-b! qq 5) (list (record-type-name q) (q? qq) (q-a qq) ((record-accessor q 'b) qq) (q? 5) (record? qq) (record-type-field-names q)))",
+    "(let* ((q (make-record-type 'q '(a b))) (make-q2 (record-constructor q '(b))) (r (make-q2 9))) (list ((record-accessor q 'a) r) ((record-accessor q 'b) r)))",
+    "(let* ((q (make-record-type 'q '(a b))) (make-q (record-constructor q))) (make-q 1))",
+    "(let* ((q (make-record-type 'q '(a b)))) ((record-accessor q 'c) 1))",
+    "(let* ((q (make-record-type 'q '(a b)))) ((record-accessor q 'a) 1))",
+    "(let* ((q (make-record-type \"q\" '(a b)))) (record-type-name q))",
+    "(record-type-descriptor (delay 1))",
+    # The runtime's other opaque objects: conditions, promises, char-sets and
+    # bytevector ports are not vectors; MIT's record? is true of all but
+    # promises.
+    "(list (record? 5) (record? (vector 1)) (record? (delay 1)) (record? (make-promise 1)) (record? (char-set #\\a)) (record? (open-input-bytevector (bytevector 1))) (record? (open-output-bytevector)) (record? 'a) (record? \"s\") (record? car) (record? (lambda () 1)))",
+    "(list (vector? (delay 1)) (vector? (char-set #\\a)) (vector? (open-input-bytevector (bytevector 1))) (vector? (open-output-bytevector)))",
+    "(list (promise? (delay 1)) (promise? (make-promise 1)) (promise? (vector 1)) (char-set? (char-set #\\a)) (char-set? (vector 'char-set 'ranges '())))",
+    "(let ((p (open-input-bytevector (bytevector 1 2)))) (list (port? p) (input-port? p) (binary-port? p) (textual-port? p) (vector? p) (record? p)))",
+    "(let ((p (open-output-bytevector))) (list (port? p) (output-port? p) (binary-port? p) (vector? p)))",
+    "(call-with-current-continuation (lambda (k) (with-exception-handler (lambda (e) (k (list (vector? e) (record? e) (error-object-message e) (error-object-irritants e) (procedure? e)))) (lambda () (error \"boom\" 1 2)))))",
+    "(call-with-current-continuation (lambda (k) (with-exception-handler (lambda (e) (k (condition/report-string e))) (lambda () (error \"boom\" 1 \"two\" 'three)))))",
 
     # --- control, macros, exceptions ---
     "(let loop ((i 0) (a 0)) (if (= i 10) a (loop (+ i 1) (+ a i))))",

@@ -103,6 +103,12 @@ const char *type_name(unsigned cell)
         return "bytevector";
     case BT_HASHTABLE:
         return "hash-table";
+    case BT_RECORD: {
+        unsigned rtd = record_rtd(cell);
+        return rtd ? record_type_name_string(rtd) : "record";
+    }
+    case BT_RECORD_TYPE:
+        return "record-type";
     case BT_CONS:
         return "pair";
     case BT_FUNCTION:
@@ -140,6 +146,66 @@ const char *type_name(unsigned cell)
     default:
         return "unknown";
     }
+}
+
+// ============================================================================
+// Records
+// ============================================================================
+
+// A promise's state is (#t . value), (#f . thunk) or ('forward . state), see
+// stdlib.scm. True, with *value set, if the promise has been forced.
+static bool promise_forced_value(unsigned promise, unsigned *value)
+{
+    // The registered type is the stdlib's, but nothing forces it to have
+    // the field.
+    if (vector_len(promise) <= RECORD_FIELDS_START)
+        return false;
+    unsigned state = vector_data_ptr(promise)[RECORD_FIELDS_START];
+    unsigned forward = (unsigned)intern("forward");
+    // force shortens these chains as it walks them; the bound only keeps a
+    // corrupted one from hanging the printer.
+    for (unsigned hops = 0; IS_PAIR(state) && hops < 1000000; hops++) {
+        unsigned tag = car(state);
+        if (IS_ATOM(tag) && (unsigned)CELL_ID(tag) == forward) {
+            state = cdr(state);
+            continue;
+        }
+        if (tag != ctx.atom_true)
+            return false;
+        *value = cdr(state);
+        return true;
+    }
+    return false;
+}
+
+// The printed form of a record type's name: MIT drops the brackets of the
+// conventional <name>.
+static void write_record_type_name(FILE *fp, unsigned rtd)
+{
+    const char *name = record_type_name_string(rtd);
+    size_t len = strlen(name);
+    if (len > 2 && name[0] == '<' && name[len - 1] == '>')
+        fprintf(fp, "%.*s", (int)(len - 2), name + 1);
+    else
+        fprintf(fp, "%s", name);
+}
+
+// MIT's condition-type names for the kinds of error object.
+static const char *condition_type_name(unsigned condition)
+{
+    unsigned kind = vector_len(condition) > RECORD_FIELDS_START
+                        ? vector_data_ptr(condition)[RECORD_FIELDS_START]
+                        : 0;
+    if (!atom_is_valid(kind))
+        return "simple-error";
+    const char *name = ctx.atom_table[CELL_ID(kind)];
+    if (strcmp(name, "error") == 0)
+        return "simple-error";
+    if (strcmp(name, "file") == 0)
+        return "file-error";
+    if (strcmp(name, "read") == 0)
+        return "read-error";
+    return name;
 }
 
 // ============================================================================
@@ -342,9 +408,14 @@ static void mark_shared_inner(unsigned s)
             !IS_CELL(s) || is_bytecode_closure_object(s))
             break;
 
-        // Only track cons cells and vectors (things that can have sharing).
+        // Only track cons cells and vectors (things that can have sharing),
+        // and forced promises, which print their value.
         enum lisp_type type = CELL_TYPE(s);
-        if (type != BT_CONS && type != BT_VECTOR)
+        unsigned promise_value = 0;
+        bool is_promise = type == BT_RECORD &&
+                          record_is_builtin(s, BRT_PROMISE) &&
+                          promise_forced_value(s, &promise_value);
+        if (type != BT_CONS && type != BT_VECTOR && !is_promise)
             break;
 
         visited_entry *entry = find_visited(s);
@@ -373,6 +444,10 @@ static void mark_shared_inner(unsigned s)
         if (type == BT_CONS) {
             mark_shared(car(s));
             s = cdr(s);
+            continue;
+        }
+        if (is_promise) {
+            s = promise_value;
             continue;
         }
 
@@ -749,7 +824,8 @@ static void write_obj_fp_inner(unsigned s, bool with_quotes, FILE *fp)
     bool simple_tracking = false;
     visited_entry *simple_entry = NULL;
     if (!writer_emit_shared_labels &&
-        (type == BT_CONS || type == BT_VECTOR)) {
+        (type == BT_CONS || type == BT_VECTOR ||
+         (type == BT_RECORD && record_is_builtin(s, BRT_PROMISE)))) {
         simple_entry = find_visited(s);
         if (simple_entry && simple_entry->active) {
             show_error("write-simple: circular structure");
@@ -920,6 +996,46 @@ static void write_obj_fp_inner(unsigned s, bool with_quotes, FILE *fp)
     }
     case BT_HASHTABLE:
         fprintf(fp, "#<hash-table>");
+        break;
+    // Records print like MIT's: #[point 12], numbered by object hash. The
+    // runtime's own record types have the forms MIT gives them.
+    case BT_RECORD: {
+        unsigned rtd = record_rtd(s);
+        if (!rtd) {
+            fprintf(fp, "[invalid-record]");
+            break;
+        }
+        unsigned number = object_hash_number(s);
+        if (rtd == ctx.builtin_record_types[BRT_PROMISE]) {
+            unsigned value = 0;
+            if (promise_forced_value(s, &value)) {
+                fprintf(fp, "#[promise %u (evaluated) ", number);
+                write_obj_fp(value, with_quotes, fp);
+                fprintf(fp, "]");
+            } else {
+                fprintf(fp, "#[promise %u (unevaluated)]", number);
+            }
+        } else if (rtd == ctx.builtin_record_types[BRT_CONDITION]) {
+            const char *name = condition_type_name(s);
+            if (with_quotes)
+                fprintf(fp, "#[condition %u \"%s\"]", number, name);
+            else
+                fprintf(fp, "#[condition %u %s]", number, name);
+        } else {
+            fprintf(fp, "#[");
+            write_record_type_name(fp, rtd);
+            fprintf(fp, " %u]", number);
+        }
+        break;
+    }
+    case BT_RECORD_TYPE:
+        if (!record_type_well_formed(s)) {
+            fprintf(fp, "[invalid-record-type]");
+            break;
+        }
+        fprintf(fp, "#[record-type %u ", object_hash_number(s));
+        write_record_type_name(fp, s);
+        fprintf(fp, "]");
         break;
     case BT_CONS:
         fprintf(fp, "(");

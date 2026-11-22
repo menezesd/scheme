@@ -107,8 +107,8 @@ bool environment_is_immutable(unsigned env);
 bool env_binding_is_immutable(int64_t var, unsigned env);
 
 // The environment to consult for the exception machinery's state:
-// *current-exception-handler*, *default-exception-handler* and
-// *error-object-tag*. That state is dynamic, but it is stored in ordinary
+// *current-exception-handler* and *default-exception-handler*. That state is
+// dynamic, but it is stored in ordinary
 // variables of the environment the stdlib was loaded into, and
 // with-exception-handler is a stdlib closure that set!s them there. So
 // reading them from wherever the error happened is wrong whenever that is a

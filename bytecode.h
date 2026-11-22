@@ -166,6 +166,11 @@ enum opcode {
     OP_VECTORSET, // Vector set: pop val, pop idx, pop vec, vector-set!
     OP_VECTORLEN, // Vector length: pop vec, push (vector-length vec)
 
+    // Record operations: the record predicates and accessors that
+    // define-record-type generates, inlined (see prim_record.c)
+    OP_RECORDOF,  // pop rtd, pop obj, push (%record-of? obj rtd)
+    OP_RECORDREF, // pop who, idx, rtd, rec; push (%record-ref rec rtd idx who)
+
     // Numeric operations
     OP_NEG,     // Unary negation: pop n, push (- n)
     OP_ABS,     // Absolute value: pop n, push (abs n)

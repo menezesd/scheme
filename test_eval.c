@@ -7749,6 +7749,189 @@ TEST(eval_letrec_reentry_restores_earlier_bindings)
     PASS();
 }
 
+// ============================================================================
+// Records (the stdlib's define-record-type is built on these primitives)
+// ============================================================================
+
+// Evaluate src with the CPS interpreter or the compiler and VM, in a fresh
+// environment.
+static unsigned eval_in_engine(const char *src, bool compiled)
+{
+    GC_GUARD;
+    unsigned env = default_environment();
+    gc_protect(&env);
+    return compiled ? compiled_eval_string(src, env) : eval_string(src, env);
+}
+
+// True if result is a proper list of the integers in expected, with #t and
+// #f written as the sentinel values below.
+#define REC_TRUE 1000001
+#define REC_FALSE 1000000
+static bool record_result_is(unsigned result, const int64_t *expected,
+                             size_t count)
+{
+    for (size_t i = 0; i < count; i++, result = cdr(result)) {
+        if (!IS_PAIR(result))
+            return false;
+        unsigned item = car(result);
+        if (expected[i] == REC_TRUE ? item != ctx.atom_true
+            : expected[i] == REC_FALSE ? item != ctx.atom_false
+                                       : !is_int(item, expected[i]))
+            return false;
+    }
+    return result == 0;
+}
+
+TEST(eval_record_primitives_construct_and_access)
+{
+    static const char *src =
+        "(let* ((rt (%make-record-type 'point '(x y)))"
+        "       (r (%make-record rt #f 1 2)))"
+        "  (%record-set! r rt 1 20 'set-point-y!)"
+        "  (list (%record-ref r rt 0 'point-x) (%record-ref r rt 1 'point-y)"
+        "        (%record-of? r rt) (%record? r) (%record-type? rt)"
+        "        (%record? rt) (%record-of? (vector rt 1 2) rt)"
+        "        (vector? r) (vector? rt)"
+        "        (eq? (%record-type-descriptor r) rt)))";
+    static const int64_t expected[] = {1,        20,       REC_TRUE, REC_TRUE,
+                                       REC_TRUE, REC_FALSE, REC_FALSE,
+                                       REC_FALSE, REC_FALSE, REC_TRUE};
+    for (int compiled = 0; compiled < 2; compiled++) {
+        unsigned result = eval_in_engine(src, compiled);
+        ASSERT(record_result_is(result, expected,
+                                sizeof(expected) / sizeof(expected[0])));
+    }
+    PASS();
+}
+
+// A constructor that names fields out of order, or not all of them, gets a
+// layout vector; one that takes every field in order gets #f.
+TEST(eval_record_layouts)
+{
+    static const char *src =
+        "(let* ((rt (%make-record-type 'q '(a b c)))"
+        "       (full (%record-layout rt '(a b c) 'make-q))"
+        "       (layout (%record-layout rt '(c a) 'make-q))"
+        "       (r (%make-record rt layout 3 1)))"
+        "  (list (eq? full #f) (vector? layout)"
+        "        (%record-ref r rt 0 'q-a) (%record-ref r rt 2 'q-c)"
+        "        (eq? (%record-ref r rt 1 'q-b) #f)"
+        "        (%record-type-field-index rt 'c 'q-c)))";
+    static const int64_t expected[] = {REC_TRUE, REC_TRUE, 1, 3, REC_TRUE, 2};
+    for (int compiled = 0; compiled < 2; compiled++) {
+        unsigned result = eval_in_engine(src, compiled);
+        ASSERT(record_result_is(result, expected,
+                                sizeof(expected) / sizeof(expected[0])));
+    }
+    PASS();
+}
+
+TEST(eval_record_primitives_check_their_arguments)
+{
+    static const char *const bad[] = {
+        "(let ((rt (%make-record-type 'point '(x)))) (%record-ref 5 rt 0 'point-x))",
+        "(let* ((rt (%make-record-type 'point '(x))) (r (%make-record rt #f 1)))"
+        "  (%record-ref r rt 1 'point-x))",
+        "(let* ((rt (%make-record-type 'point '(x))) (r (%make-record rt #f 1)))"
+        "  (%record-ref r rt -1 'point-x))",
+        "(let* ((rt (%make-record-type 'point '(x))) (other (%make-record-type 'point '(x)))"
+        "       (r (%make-record rt #f 1)))"
+        "  (%record-ref r other 0 'point-x))",
+        "(let* ((rt (%make-record-type 'point '(x))) (r (%make-record rt #f 1)))"
+        "  (%record-set! (vector rt 1) rt 0 2 'set-point-x!))",
+        "(let ((rt (%make-record-type 'point '(x y)))) (%make-record rt #f 1))",
+        "(let ((rt (%make-record-type 'point '(x y)))) (%make-record rt (vector 7) 1))",
+        "(let ((rt (%make-record-type 'point '(x y)))) (%make-record rt (vector 0) 1 2))",
+        "(let ((rt (%make-record-type 'point '(x y)))) (%record-layout rt '(x x) 'mk))",
+        "(let ((rt (%make-record-type 'point '(x y)))) (%record-layout rt '(z) 'mk))",
+        "(let ((rt (%make-record-type 'point '(x y)))) (%record-type-field-index rt 'z 'p))",
+        "(%make-record-type 'point '(x x))",
+        "(%make-record-type \"point\" '(x))",
+        "(%make-record-type 'point '(x . y))",
+        "(%make-record-type 'point '(x) '(bogus))",
+        "(%make-record (vector 'point) #f)",
+        "(%record-type-descriptor (vector 1))",
+        "(%record-type-descriptor (%make-record (%make-record-type 'p '() '(opaque)) #f))",
+    };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        for (int compiled = 0; compiled < 2; compiled++)
+            ASSERT_EQ(eval_in_engine(bad[i], compiled), TOK_ERROR);
+    }
+    // The accessor's own name and the type's, brackets dropped. (The VM
+    // rewrites last_error on its way out, so read the interpreter's.)
+    ASSERT_EQ(eval_in_engine("(let ((rt (%make-record-type '<pt> '(a))))"
+                             "  (%record-ref 5 rt 0 'pt-a))",
+                             false),
+              TOK_ERROR);
+    ASSERT_STR_EQ(ctx.last_error, "pt-a: not a pt record");
+    PASS();
+}
+
+// The predicate and accessor every define-record-type generates compile to
+// inline opcodes; rebinding the primitive still takes effect through the
+// guard in front of them.
+TEST(compile_inlines_record_predicate_and_accessor)
+{
+    unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
+    unsigned expr = read_expr_from_string(
+        "(lambda (r t) (if (%record-of? r t) (%record-ref r t 0 'f) #f))");
+    ASSERT(expr != TOK_ERROR);
+    gc_protect(&expr);
+    code_object *code = compile_toplevel(expr, env);
+    ASSERT(code != NULL);
+    ASSERT(code_contains_opcode(code, OP_RECORDOF));
+    ASSERT(code_contains_opcode(code, OP_RECORDREF));
+    ASSERT(!code_contains_opcode(code, OP_PRIM));
+
+    static const char *src =
+        "(let* ((rt (%make-record-type 'point '(x)))"
+        "       (r (%make-record rt #f 5))"
+        "       (get (lambda (r) (%record-ref r rt 0 'point-x)))"
+        "       (is? (lambda (r) (%record-of? r rt))))"
+        "  (list (is? r) (is? 5) (is? (vector rt 5)) (get r)))";
+    static const int64_t expected[] = {REC_TRUE, REC_FALSE, REC_FALSE, 5};
+    unsigned result = eval_in_engine(src, true);
+    ASSERT(record_result_is(result, expected, 4));
+    ASSERT_EQ(eval_in_engine("(let* ((rt (%make-record-type 'point '(x)))"
+                             "       (get (lambda (r) (%record-ref r rt 0 'p))))"
+                             "  (get 5))",
+                             true),
+              TOK_ERROR);
+    PASS();
+}
+
+// The VM's inline vector opcodes and the vector primitives both reject a
+// record; inside a lambda the compiler emits the opcodes.
+TEST(eval_vector_operations_reject_records)
+{
+    static const char *const ops[] = {
+        "(vector-ref r 0)", "(vector-set! r 0 1)", "(vector-length r)",
+        "(vector->list r)", "(length r)", "(car r)",
+    };
+    for (size_t i = 0; i < sizeof(ops) / sizeof(ops[0]); i++) {
+        char src[256];
+        snprintf(src, sizeof(src),
+                 "(let* ((rt (%%make-record-type 'point '(x)))"
+                 "       (r (%%make-record rt #f 1)))"
+                 "  ((lambda (r) %s) r))",
+                 ops[i]);
+        for (int compiled = 0; compiled < 2; compiled++)
+            ASSERT_EQ(eval_in_engine(src, compiled), TOK_ERROR);
+    }
+    static const char *src =
+        "(let* ((rt (%make-record-type 'point '(x)))"
+        "       (r (%make-record rt #f 1)))"
+        "  ((lambda (r) (list (vector? r) (pair? r) (procedure? r))) r))";
+    static const int64_t expected[] = {REC_FALSE, REC_FALSE, REC_FALSE};
+    for (int compiled = 0; compiled < 2; compiled++) {
+        unsigned result = eval_in_engine(src, compiled);
+        ASSERT(record_result_is(result, expected, 3));
+    }
+    PASS();
+}
+
 // A handler that fails before control returns to the trampoline - not a
 // procedure, a primitive rejecting the error object, a closure of the wrong
 // arity - used to be re-applied to its own error until the C stack
@@ -8182,6 +8365,11 @@ int main(void)
     RUN_TEST(eval_letrec_body_binds_internal_defines_first);
     RUN_TEST(eval_letrec_reentry_restores_earlier_bindings);
     RUN_TEST(eval_failing_exception_handler_does_not_recurse);
+    RUN_TEST(eval_record_primitives_construct_and_access);
+    RUN_TEST(eval_record_layouts);
+    RUN_TEST(eval_record_primitives_check_their_arguments);
+    RUN_TEST(compile_inlines_record_predicate_and_accessor);
+    RUN_TEST(eval_vector_operations_reject_records);
     RUN_TEST(eval_shadowed_keyword_head_is_applied);
 
     TEST_SUMMARY("evaluator");

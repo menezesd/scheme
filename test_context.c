@@ -3639,6 +3639,258 @@ TEST(gc_ignores_malformed_vector_payload)
     PASS();
 }
 
+// ============================================================================
+// Records
+// ============================================================================
+
+static unsigned test_symbol(const char *name)
+{
+    unsigned sym = alloc();
+    CELL_TYPE(sym) = BT_ATOM;
+    CELL_ID(sym) = intern(name);
+    return sym;
+}
+
+// A record type named name with the given fields, as %make-record-type makes.
+static unsigned test_record_type(const char *name, const char *first_field,
+                                 const char *second_field)
+{
+    GC_GUARD;
+    unsigned fields = 0;
+    gc_protect(&fields);
+    // Each symbol is made before fields is read: argument evaluation order
+    // is unspecified, and the allocation can move the list.
+    if (second_field) {
+        unsigned field = test_symbol(second_field);
+        fields = alloc_cons(field, fields);
+    }
+    if (first_field) {
+        unsigned field = test_symbol(first_field);
+        fields = alloc_cons(field, fields);
+    }
+    unsigned name_symbol = test_symbol(name);
+    return make_record_type(name_symbol, fields, 0);
+}
+
+static char *test_write_to_string(unsigned obj, bool display)
+{
+    char *buf = NULL;
+    size_t len = 0;
+    FILE *mem = open_memstream(&buf, &len);
+    if (!mem)
+        return NULL;
+    if (display)
+        display_obj_port(obj, mem);
+    else
+        write_obj_port(obj, mem);
+    fclose(mem);
+    return buf;
+}
+
+TEST(gc_preserves_record_and_its_type)
+{
+    GC_GUARD;
+    unsigned rtd = test_record_type("point", "x", "y");
+    ASSERT(record_type_well_formed(rtd));
+    gc_protect(&rtd);
+    unsigned rec = make_record(rtd);
+    ASSERT(IS_RECORD(rec));
+    gc_protect(&rec);
+    unsigned number = store(1000);
+    vector_set_elem(rec, RECORD_FIELDS_START, number);
+    unsigned text = make_string_copy("field");
+    vector_set_elem(rec, RECORD_FIELDS_START + 1, text);
+    // Only a list reaches the record; the type only through the record.
+    unsigned root = alloc_cons(rec, 0);
+    gc_unprotect(2);
+    root = gc(root);
+    rec = car(root);
+    ASSERT(IS_RECORD(rec));
+    rtd = record_rtd(rec);
+    ASSERT(rtd != 0 && IS_RECORD_TYPE(rtd));
+    ASSERT_STR_EQ(record_type_name_string(rtd), "point");
+    ASSERT_EQ(record_type_field_count(rtd), 2);
+    unsigned *fields = vector_data_ptr(rec);
+    ASSERT(IS_NUM(fields[RECORD_FIELDS_START]));
+    ASSERT_EQ(CELL_ID(fields[RECORD_FIELDS_START]), 1000);
+    ASSERT(IS_STRING(fields[RECORD_FIELDS_START + 1]));
+    ASSERT_STR_EQ(GET_STRING_PTR(fields[RECORD_FIELDS_START + 1]), "field");
+    unsigned names[1] = {rtd};
+    unsigned list = apply_primitive_argv(PRECORDTYPEFIELDNAMES, 1, names);
+    ASSERT_EQ(list_length(list), 2);
+    ASSERT(IS_ATOM(car(list)) && CELL_ID(car(list)) == intern("x"));
+    PASS();
+}
+
+// The minor collection finds old-to-young references through the dirty-card
+// scan, which goes through gc_scan_cell. A record left out of it keeps its
+// nursery referent's index after the nursery is reclaimed.
+TEST(old_record_set_to_nursery_object_survives_minor_gc)
+{
+    GC_GUARD;
+    unsigned rtd = test_record_type("box", "value", NULL);
+    gc_protect(&rtd);
+    unsigned rec = make_record(rtd);
+    gc_protect(&rec);
+    minor_gc(0);
+    ASSERT(is_in_old_gen(rec));
+    ASSERT(is_in_old_gen(rtd));
+
+    unsigned who = test_symbol("set-box!");
+    gc_protect(&who);
+    unsigned head = store(12345);
+    gc_protect(&head);
+    unsigned tail = store(67890);
+    gc_protect(&tail);
+    unsigned fresh = alloc_cons(head, tail);
+    gc_unprotect(2);
+    ASSERT(is_in_nursery(fresh));
+    // store(0) is a cached cell: nothing here allocates.
+    unsigned args[5] = {rec, rtd, store(0), fresh, who};
+    ASSERT(apply_primitive_argv(PRECORDSET, 5, args) == fresh);
+    // Nothing else refers to the pair now: no root, only the old record.
+    unsigned majors = ctx.major_gc_count;
+    unsigned minors = ctx.minor_gc_count;
+    minor_gc(0);
+    ASSERT_EQ(ctx.major_gc_count, majors);
+    ASSERT_EQ(ctx.minor_gc_count, minors + 1);
+
+    unsigned value = vector_data_ptr(rec)[RECORD_FIELDS_START];
+    ASSERT(!is_in_nursery(value));
+    ASSERT(IS_PAIR(value));
+    ASSERT(IS_NUM(car(value)) && CELL_ID(car(value)) == 12345);
+    ASSERT(IS_NUM(cdr(value)) && CELL_ID(cdr(value)) == 67890);
+    unsigned ref_args[4] = {rec, rtd, store(0), who};
+    ASSERT_EQ(apply_primitive_argv(PRECORDREF, 4, ref_args), value);
+    PASS();
+}
+
+// Records are a type of their own: no vector operation accepts one, and
+// equal? compares them by identity.
+TEST(records_are_disjoint_from_vectors)
+{
+    GC_GUARD;
+    unsigned rtd = test_record_type("point", "x", "y");
+    gc_protect(&rtd);
+    unsigned rec = make_record(rtd);
+    gc_protect(&rec);
+    unsigned twin = make_record(rtd);
+    gc_protect(&twin);
+    unsigned one[1] = {rec};
+    ASSERT_EQ(apply_primitive_argv(PVECTORP, 1, one), ctx.atom_false);
+    ASSERT_EQ(apply_primitive_argv(PVECLEN, 1, one), TOK_ERROR);
+    unsigned ref[2] = {rec, store(0)};
+    ASSERT_EQ(apply_primitive_argv(PVECREF, 2, ref), TOK_ERROR);
+    one[0] = rtd;
+    ASSERT_EQ(apply_primitive_argv(PVECTORP, 1, one), ctx.atom_false);
+    ASSERT(deep_equal(rec, rec));
+    ASSERT(!deep_equal(rec, twin));
+    ASSERT_STR_EQ(type_name(rec), "point");
+    ASSERT_STR_EQ(type_name(rtd), "record-type");
+    // A record whose payload is not a registered vector is rejected.
+    unsigned bad = alloc();
+    CELL_TYPE(bad) = BT_RECORD;
+    CELL_PTR(bad) = NULL;
+    ASSERT_EQ(record_rtd(bad), 0);
+    unsigned of[2] = {bad, rtd};
+    ASSERT_EQ(apply_primitive_argv(PRECORDOFP, 2, of), ctx.atom_false);
+    char *text = test_write_to_string(bad, false);
+    ASSERT(text != NULL);
+    ASSERT_STR_EQ(text, "[invalid-record]");
+    free(text);
+    unsigned preserved = gc(bad);
+    ASSERT(CELL_TYPE(preserved) == BT_RECORD);
+    CELL_TYPE(preserved) = BT_FREE;
+    PASS();
+}
+
+TEST(writer_prints_records_with_stable_hash_numbers)
+{
+    GC_GUARD;
+    unsigned rtd = test_record_type("<pt>", "a", NULL);
+    gc_protect(&rtd);
+    unsigned rec = make_record(rtd);
+    gc_protect(&rec);
+    char *first = test_write_to_string(rec, false);
+    ASSERT(first != NULL);
+    ASSERT(strncmp(first, "#[pt ", 5) == 0);
+    unsigned number = object_hash_number(rec);
+    ASSERT(number > 0);
+    char expected[64];
+    snprintf(expected, sizeof(expected), "#[pt %u]", number);
+    ASSERT_STR_EQ(first, expected);
+    free(first);
+    // The number follows the object through a collection.
+    gc(0);
+    char *again = test_write_to_string(rec, true);
+    ASSERT(again != NULL);
+    ASSERT_STR_EQ(again, expected);
+    free(again);
+    char *type_text = test_write_to_string(rtd, false);
+    ASSERT(type_text != NULL);
+    snprintf(expected, sizeof(expected), "#[record-type %u pt]",
+             object_hash_number(rtd));
+    ASSERT_STR_EQ(type_text, expected);
+    ASSERT(object_hash_number(rtd) == number + 1);
+    free(type_text);
+    PASS();
+}
+
+// The sweep frees an unreachable record's payload together with its
+// object-hash entry, so a later payload at the same address starts fresh.
+TEST(gc_sweep_frees_record_payload_and_hash_number)
+{
+    GC_GUARD;
+    unsigned rtd = test_record_type("temp", "a", NULL);
+    gc_protect(&rtd);
+    unsigned rec = make_record(rtd);
+    vector_data *payload = GET_VECTOR_PTR(rec);
+    unsigned number = object_hash_number(rec);
+    ASSERT(number > 0);
+    rec = 0;
+    gc(0);
+    ASSERT(!vector_is_registered(payload));
+    for (int i = 0; i < 64; i++) {
+        unsigned other = make_record(rtd);
+        ASSERT(object_hash_number(other) > number);
+    }
+    PASS();
+}
+
+TEST(make_error_object_needs_a_condition_type)
+{
+    GC_GUARD;
+    ASSERT_EQ(ctx.builtin_record_types[BRT_CONDITION], 0);
+    ASSERT_EQ(make_error_object_c("boom"), TOK_ERROR);
+    unsigned fields = 0;
+    gc_protect(&fields);
+    const char *names[3] = {"irritants", "message", "kind"};
+    for (int i = 0; i < 3; i++) {
+        unsigned field = test_symbol(names[i]);
+        fields = alloc_cons(field, fields);
+    }
+    unsigned name = test_symbol("condition");
+    unsigned rtd = make_record_type(name, fields, 0);
+    ctx.builtin_record_types[BRT_CONDITION] = rtd;
+    unsigned condition = make_error_object_c("boom");
+    ASSERT(IS_RECORD(condition));
+    ASSERT(record_rtd(condition) == ctx.builtin_record_types[BRT_CONDITION]);
+    unsigned *data = vector_data_ptr(condition);
+    ASSERT(IS_ATOM(data[RECORD_FIELDS_START]) &&
+           CELL_ID(data[RECORD_FIELDS_START]) == intern("error"));
+    ASSERT_STR_EQ(GET_STRING_PTR(data[RECORD_FIELDS_START + 1]), "boom");
+    ASSERT_EQ(data[RECORD_FIELDS_START + 2], 0);
+    char *text = test_write_to_string(condition, false);
+    ASSERT(text != NULL);
+    char expected[64];
+    snprintf(expected, sizeof(expected), "#[condition %u \"simple-error\"]",
+             object_hash_number(condition));
+    ASSERT_STR_EQ(text, expected);
+    free(text);
+    ctx.builtin_record_types[BRT_CONDITION] = 0;
+    PASS();
+}
+
 TEST(gc_stress_many_allocations)
 {
     // Allocate a long list of numbers
@@ -3998,6 +4250,12 @@ int main(void)
     RUN_TEST(gc_preserves_direct_vector_root);
     RUN_TEST(gc_ignores_malformed_hash_table_payload);
     RUN_TEST(gc_ignores_malformed_vector_payload);
+    RUN_TEST(gc_preserves_record_and_its_type);
+    RUN_TEST(old_record_set_to_nursery_object_survives_minor_gc);
+    RUN_TEST(records_are_disjoint_from_vectors);
+    RUN_TEST(writer_prints_records_with_stable_hash_numbers);
+    RUN_TEST(gc_sweep_frees_record_payload_and_hash_number);
+    RUN_TEST(make_error_object_needs_a_condition_type);
     RUN_TEST(gc_stress_many_allocations);
     RUN_TEST(gc_stress_deep_nesting);
     RUN_TEST(gc_stress_multiple_collections);

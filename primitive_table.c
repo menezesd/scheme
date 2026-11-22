@@ -325,6 +325,23 @@ static const primitive_binding builtins[] = {
     {"hash", PHASH},
     {"hash-by-identity", PHASHBYIDENTITY},
 
+    // Records: internal, wrapped by define-record-type and the MIT record
+    // procedures in stdlib.scm
+    {"%make-record-type", PMAKERECORDTYPE},
+    {"%record-type?", PRECORDTYPEP},
+    {"%record-type-name", PRECORDTYPENAME},
+    {"%record-type-field-names", PRECORDTYPEFIELDNAMES},
+    {"%record-type-field-index", PRECORDTYPEFIELDINDEX},
+    {"%record-type-sealed?", PRECORDTYPESEALEDP},
+    {"%record-layout", PRECORDLAYOUT},
+    {"%make-record", PMAKERECORD},
+    {"%record?", PRECORDP},
+    {"%record-of?", PRECORDOFP},
+    {"%record-type-descriptor", PRECORDTYPEDESCRIPTOR},
+    {"%record-ref", PRECORDREF},
+    {"%record-set!", PRECORDSET},
+    {"%register-builtin-record-type!", PREGISTERBUILTINRECORDTYPE},
+
     // R7RS-ish port predicates
     {"port-open?", PPORTOPENP},
     {"input-port-open?", PINPUTPORTOPENP},

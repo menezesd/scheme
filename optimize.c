@@ -827,6 +827,8 @@ static const char *opcode_names[] = {
     [OP_VECTORREF] = "VECTORREF",
     [OP_VECTORSET] = "VECTORSET",
     [OP_VECTORLEN] = "VECTORLEN",
+    [OP_RECORDOF] = "RECORDOF",
+    [OP_RECORDREF] = "RECORDREF",
     // Numeric operations
     [OP_NEG] = "NEG",
     [OP_ABS] = "ABS",

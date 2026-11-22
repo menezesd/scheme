@@ -2179,6 +2179,12 @@ static uint64_t scheme_hash(unsigned key)
         return string_is_registered(s) ? hash_string_bytes(s)
                                        : PRIM_FNV_OFFSET_BASIS;
     }
+    case BT_RECORD:
+    case BT_RECORD_TYPE:
+        // equal? compares records by identity. Hash the payload, which never
+        // moves, rather than the cell, so a record's hash survives a
+        // collection.
+        return (uint64_t)(uintptr_t)CELL_PTR(key) * PRIM_FNV_PRIME;
     default:
         return (uint64_t)key * PRIM_FNV_PRIME;
     }
@@ -2718,7 +2724,7 @@ void note_error_kind(const char *kind)
              ctx.last_error);
 }
 
-unsigned make_error_object_c(const char *msg, unsigned env)
+unsigned make_error_object_c(const char *msg)
 {
     GC_GUARD;
     const char *kind = "error";
@@ -2726,11 +2732,10 @@ unsigned make_error_object_c(const char *msg, unsigned env)
         strcmp(msg, pending_error_message) == 0)
         kind = pending_error_kind;
     pending_error_kind = NULL;
-    unsigned tag = lookup_silent(intern("*error-object-tag*"),
-                                 exception_state_env(env));
-    if (tag == TOK_ERROR)
+    // Without the stdlib (the C test harnesses) there is no condition type,
+    // and errors stay engine-level.
+    if (!ctx.builtin_record_types[BRT_CONDITION])
         return TOK_ERROR;
-    gc_protect(&tag);
     unsigned error_kind = alloc();
     CELL_TYPE(error_kind) = BT_ATOM;
     CELL_ID(error_kind) = intern(kind);
@@ -2739,13 +2744,19 @@ unsigned make_error_object_c(const char *msg, unsigned env)
     if (msg_str == TOK_ERROR)
         return TOK_ERROR;
     gc_protect(&msg_str);
-    unsigned vec = make_vector(4, 0);
-    if (vec == TOK_ERROR)
+    // Fields as in stdlib.scm's %condition-type: kind, message, irritants.
+    // make_record leaves irritants #f; they are '().
+    unsigned condition = make_record(ctx.builtin_record_types[BRT_CONDITION]);
+    if (condition == TOK_ERROR)
         return TOK_ERROR;
-    vector_set_elem(vec, 0, tag);
-    vector_set_elem(vec, 1, error_kind);
-    vector_set_elem(vec, 2, msg_str);
-    return vec;
+    if (record_type_field_count(record_rtd(condition)) != 3) {
+        show_error("error: malformed condition type");
+        return TOK_ERROR;
+    }
+    vector_set_elem(condition, RECORD_FIELDS_START, error_kind);
+    vector_set_elem(condition, RECORD_FIELDS_START + 1, msg_str);
+    vector_set_elem(condition, RECORD_FIELDS_START + 2, 0);
+    return condition;
 }
 
 static unsigned report_error_primitive(unsigned argc, unsigned *argv)
@@ -3219,6 +3230,23 @@ unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
     case PLIST2VEC:
     case PVEC2LIST:
         return apply_vector_primitive(prim_id, argc, argv);
+
+    // Records - delegated to prim_record.c
+    case PMAKERECORDTYPE:
+    case PRECORDTYPEP:
+    case PRECORDTYPENAME:
+    case PRECORDTYPEFIELDNAMES:
+    case PRECORDTYPEFIELDINDEX:
+    case PRECORDTYPESEALEDP:
+    case PRECORDLAYOUT:
+    case PMAKERECORD:
+    case PRECORDP:
+    case PRECORDOFP:
+    case PRECORDTYPEDESCRIPTOR:
+    case PRECORDREF:
+    case PRECORDSET:
+    case PREGISTERBUILTINRECORDTYPE:
+        return apply_record_primitive(prim_id, argc, argv);
 
     // Math functions - delegated to prim_math.c
     case PSQRT:
