@@ -324,12 +324,49 @@ typedef struct {
 #define CELL_ATOM_UNQUOTE 14
 #define CELL_ATOM_UNQUOTE_SPLICING 15
 
+// Core special-form keywords. Besides its interned name, each has one
+// permanent "core alias" atom (cell CELL_CORE_ALIAS_BASE + form) that prints
+// as the name but is never interned. A core alias always means the core form,
+// whatever its name is bound to where it appears: macro expansion puts one in
+// place of a template keyword that the use site has rebound (apply_syntax).
+enum core_form {
+    CF_NONE,
+    CF_QUOTE,
+    CF_QUASIQUOTE,
+    CF_UNQUOTE,
+    CF_UNQUOTE_SPLICING,
+    CF_LAMBDA,
+    CF_IF,
+    CF_DEFINE,
+    CF_SET,
+    CF_BEGIN,
+    CF_LET,
+    CF_LETSTAR,
+    CF_LETREC,
+    CF_COND,
+    CF_AND,
+    CF_OR,
+    CF_COND_EXPAND,
+    CF_DEFINE_SYNTAX,
+    CF_LET_SYNTAX,
+    CF_LETREC_SYNTAX,
+    CF_SYNTAX_RULES,
+    CF_DEFINE_MACRO,
+    CF_ELSE,
+    CF_ARROW,
+    CF_COUNT
+};
+
 // Small integer cache: cells 16-271 hold integers 0-255
 #define INT_CACHE_MIN 0
 #define INT_CACHE_MAX 255
 #define INT_CACHE_START 16    // First cell for cached integers
 #define CELL_EOF_OBJECT 272   // The unique end-of-file object
-#define HEAP_RESERVED 273     // Reserved cells (0-272)
+#define CELL_CORE_ALIAS_BASE 273 // Core aliases: 273 + enum core_form
+// A second core alias of lambda, heading a lambda whose body the expander
+// has already expanded (see expand_procedure in macros.c).
+#define CELL_EXPANDED_LAMBDA (CELL_CORE_ALIAS_BASE + CF_COUNT)
+#define HEAP_RESERVED (CELL_EXPANDED_LAMBDA + 1) // Reserved cells
 #define NUMBER_BUF_SIZE 128   // Buffer size for number->string conversion
 #define CHAR_NAME_BUF_SIZE 16 // Buffer size for character name parsing
 
@@ -891,8 +928,10 @@ static inline bool cell_type_has_children(int t)
 #define IS_OUTPUT_PORT(c) (IS_OUTPORT(c) || IS_STROUTPORT(c))
 #define IS_MULTIVAL(c) (IS_CELL(c) && CELL_TYPE(c) == BT_MULTIVAL)
 
-// Keyword checking macro (for special forms)
-#define IS_KEYWORD(c, kw) (IS_ATOM(c) && CELL_ID(c) == (kw))
+// Keyword checking macro (for special forms). True for kw's core alias too
+// (see enum core_form); a caller that goes on to ask whether the keyword is
+// shadowed must look up CELL_ID(c), which a core alias never is, not kw.
+#define IS_KEYWORD(c, kw) (IS_ATOM(c) && kw_canon(CELL_ID(c)) == (kw))
 
 // ============================================================================
 // Pointer Accessor Macros (for type-safe access to pointer-based cells)

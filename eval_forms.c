@@ -38,7 +38,13 @@ bool handle_quote(unsigned id, unsigned env, unsigned cont)
         cps_signal_current_error(env, cont);
         return true;
     }
-    tramp_apply(cadr(id), cont);
+    // Quoted lists were stripped of core aliases when their procedure was
+    // expanded; a quoted alias that a macro use evaluated here produced is
+    // cheap to catch (see macros_strip_core_aliases).
+    unsigned datum = cadr(id);
+    if (IS_ATOM(datum) && atom_is_core_alias(CELL_ID(datum)))
+        datum = macros_strip_core_aliases(datum);
+    tramp_apply(datum, cont);
     return true;
 }
 
@@ -54,14 +60,21 @@ bool handle_quote(unsigned id, unsigned env, unsigned cont)
 // frames) and build the closure cell. Returns TOK_ERROR when the formals
 // are invalid or an allocation fails mid-build; a macro-expansion failure
 // inside the body is NOT returned as an error - it becomes a closure that
-// raises the stored message at call time.
+// raises the stored message at call time. expanded: the body was expanded
+// with the code around it (see expand_procedure) and is used as it is.
 static unsigned build_lambda_closure(unsigned params, unsigned body,
-                                     unsigned env)
+                                     unsigned env, bool expanded)
 {
     GC_GUARD;
     gc_protect(&params);
     gc_protect(&body);
     gc_protect(&env);
+
+    if (expanded) {
+        unsigned body_env = alloc_cons(body, env);
+        gc_protect(&body_env);
+        return make_typed_cell(BT_FUNCTION, params, body_env);
+    }
 
     // Expansion must see parameters and leading internal defines: hygiene
     // decisions (binding-cell comparisons, literal matching, ellipsis
@@ -75,7 +88,8 @@ static unsigned build_lambda_closure(unsigned params, unsigned body,
 
     unsigned macro_bindings = 0;
     gc_protect(&macro_bindings);
-    unsigned expanded_body = expand_form(body, expansion_env, &macro_bindings);
+    unsigned expanded_body =
+        expand_body(body, expansion_env, env, &macro_bindings);
     gc_protect(&expanded_body);
 
     unsigned closure_env = env;
@@ -142,7 +156,8 @@ bool handle_lambda(unsigned id, unsigned env, unsigned cont)
         cps_signal_current_error(env, cont);
         return true;
     }
-    unsigned p = build_lambda_closure(params, body, env);
+    unsigned p = build_lambda_closure(params, body, env,
+                                      car(id) == CELL_EXPANDED_LAMBDA);
     if (p == TOK_ERROR) {
         cps_signal_current_error(env, cont);
         return true;
@@ -280,7 +295,7 @@ bool handle_define(unsigned id, unsigned env, unsigned cont)
         // Build through the same path as lambda so the body is
         // macro-expanded here, against this environment - a later
         // redefinition of an used syntax binding must not leak into calls.
-        unsigned p = build_lambda_closure(params, body, env);
+        unsigned p = build_lambda_closure(params, body, env, false);
         if (p == TOK_ERROR) {
             cps_signal_current_error(env, cont);
             return true;
@@ -399,7 +414,7 @@ bool handle_cond(unsigned id, unsigned env, unsigned cont)
     unsigned rest_clauses = cdr(clauses);
 
     if (IS_KEYWORD(test, ctx.kw_else) &&
-        env_find_binding_cell(ctx.kw_else, env) == 0) {
+        env_find_binding_cell(CELL_ID(test), env) == 0) {
         unsigned conseq = cdr(clause);
         if (!conseq) {
             tramp_apply(ctx.atom_true, cont);
@@ -454,7 +469,7 @@ bool handle_cond_expand(unsigned id, unsigned env, unsigned cont)
             return true;
         }
         bool is_else = IS_KEYWORD(requirement, ctx.kw_else) &&
-                       env_find_binding_cell(ctx.kw_else, env) == 0;
+                       env_find_binding_cell(CELL_ID(requirement), env) == 0;
         if (is_else || cond_expand_requirement_satisfied(requirement)) {
             if (!body) {
                 tramp_apply(0, cont);
@@ -911,8 +926,11 @@ bool handle_letrec_syntax(unsigned id, unsigned env, unsigned cont)
 bool dispatch_special_form(int64_t kw, unsigned id, unsigned env, unsigned cont,
                            unsigned *head_value)
 {
-    unsigned binding = lookup_silent(kw, env);
     *head_value = TOK_ERROR;
+    // A core alias is its core form wherever its name is rebound; unless one
+    // has ever been bound it needs no lookup at all.
+    unsigned binding =
+        core_alias_unbound_fast(kw) ? TOK_ERROR : lookup_silent(kw, env);
     if (binding != TOK_ERROR) {
         if (IS_SYNTAX(binding)) {
             GC_GUARD;
@@ -944,43 +962,44 @@ bool dispatch_special_form(int64_t kw, unsigned id, unsigned env, unsigned cont,
         return false;
     }
 
-    // Check each special form
-    if (kw == ctx.kw_quote)
+    switch (atom_core_form(kw)) {
+    case CF_QUOTE:
         return handle_quote(id, env, cont);
-    if (kw == ctx.kw_lambda)
+    case CF_LAMBDA:
         return handle_lambda(id, env, cont);
-    if (kw == ctx.kw_if)
+    case CF_IF:
         return handle_if(id, env, cont);
-    if (kw == ctx.kw_begin)
+    case CF_BEGIN:
         return handle_begin(id, env, cont);
-    if (kw == ctx.kw_set)
+    case CF_SET:
         return handle_set(id, env, cont);
-    if (kw == ctx.kw_define)
+    case CF_DEFINE:
         return handle_define(id, env, cont);
-    if (kw == ctx.kw_and)
+    case CF_AND:
         return handle_and(id, env, cont);
-    if (kw == ctx.kw_or)
+    case CF_OR:
         return handle_or(id, env, cont);
-    if (kw == ctx.kw_cond)
+    case CF_COND:
         return handle_cond(id, env, cont);
-    if (kw == ctx.kw_cond_expand)
+    case CF_COND_EXPAND:
         return handle_cond_expand(id, env, cont);
-    if (kw == ctx.kw_let)
+    case CF_LET:
         return handle_let(id, env, cont);
-    if (kw == ctx.kw_letstar)
+    case CF_LETSTAR:
         return handle_letstar(id, env, cont);
-    if (kw == ctx.kw_letrec)
+    case CF_LETREC:
         return handle_letrec(id, env, cont);
-    if (kw == ctx.kw_quasiquote)
+    case CF_QUASIQUOTE:
         return handle_quasiquote(id, env, cont);
-    if (kw == ctx.kw_define_macro)
+    case CF_DEFINE_MACRO:
         return handle_define_macro(id, env, cont);
-    if (kw == ctx.kw_define_syntax)
+    case CF_DEFINE_SYNTAX:
         return handle_define_syntax(id, env, cont);
-    if (kw == ctx.kw_let_syntax)
+    case CF_LET_SYNTAX:
         return handle_let_syntax(id, env, cont);
-    if (kw == ctx.kw_letrec_syntax)
+    case CF_LETREC_SYNTAX:
         return handle_letrec_syntax(id, env, cont);
-
-    return false; // Not a special form
+    default:
+        return false; // Not a special form
+    }
 }

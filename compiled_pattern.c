@@ -1089,6 +1089,31 @@ static unsigned build_bindings_alist(pat_match_state *state)
     return result;
 }
 
+// Does input match the literal identifier literal? It must also mean the
+// same thing at the use site as in the macro's definition environment - an
+// else the user bound locally is not the literal else. A core alias means
+// its keyword's core form wherever it is, so where one side is the alias
+// of the other they match when both mean the core keyword: a template's
+// else, renamed past a use site that binds else, is still case's else, and
+// the stdlib's literals are aliases (macros_freeze_core_keywords).
+static bool literal_matches(const pat_match_state *state, unsigned input,
+                            int64_t literal)
+{
+    if (!IS_ATOM(input))
+        return false;
+    int64_t id = CELL_ID(input);
+    if (id == literal)
+        return !state->check_literal_bindings || !IS_SYMBOL(input) ||
+               macros_same_binding(id, state->literal_closure_env,
+                                   state->literal_use_env);
+    if (kw_canon(id) != kw_canon(literal) ||
+        !(atom_is_core_alias(id) || atom_is_core_alias(literal)))
+        return false;
+    return !state->check_literal_bindings ||
+           (macros_binding_is_core(literal, state->literal_closure_env) &&
+            macros_binding_is_core(id, state->literal_use_env));
+}
+
 static unsigned execute_pattern_impl(compiled_pattern *pat, unsigned input,
                                      bool check_literal_bindings,
                                      unsigned closure_env, unsigned use_env)
@@ -1215,12 +1240,8 @@ static unsigned execute_pattern_impl(compiled_pattern *pat, unsigned input,
             // locally is not the literal else. Checking it here rather than
             // after the match keeps backtracking consistent: a split of an
             // ellipsis the binding check rejects is never the one chosen.
-            if (!IS_ATOM(state.input) ||
-                CELL_ID(state.input) != (int64_t)instr->operand ||
-                (state.check_literal_bindings && IS_SYMBOL(state.input) &&
-                 !macros_same_binding(CELL_ID(state.input),
-                                      state.literal_closure_env,
-                                      state.literal_use_env))) {
+            if (!literal_matches(&state, state.input,
+                                 (int64_t)instr->operand)) {
                 if (!backtrack(&state))
                     failed = true;
             }

@@ -604,6 +604,12 @@ static inline unsigned make_syntax_transformer_with_default_ellipsis(
     int64_t ellipsis_id = 0; // 0 means no ellipsis (disabled/shadowed)
     unsigned literals = 0;
     unsigned rules = 0;
+    if (macros_freezing_core_keywords) {
+        gc_protect(&closure_env);
+        transformer_form = macros_freeze_core_keywords(
+            transformer_form, closure_env, default_ellipsis_id);
+        gc_unprotect(1);
+    }
     syntax_rules_parts(transformer_form, default_ellipsis_id, &ellipsis_id,
                        &literals, &rules);
 

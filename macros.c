@@ -130,38 +130,9 @@ unsigned expand_form(unsigned expr, unsigned syn_env, unsigned *bindings_out);
 static unsigned expand_form_list(unsigned list, unsigned syn_env,
                                 unsigned *bindings_out);
 
-static unsigned expand_form_vector(unsigned vec, unsigned syn_env,
-                                  unsigned *bindings_out)
-{
-    unsigned len = vector_len(vec);
-    if (!len)
-        return vec;
-
-    GC_GUARD;
-    gc_protect(&vec);
-    gc_protect(&syn_env);
-
-    // Build the result up front so expanded elements live in a GC-scanned
-    // container while later elements are still being expanded.
-    unsigned new_vec = make_vector(len, 0);
-    if (new_vec == TOK_ERROR)
-        return TOK_ERROR;
-    gc_protect(&new_vec);
-
-    bool changed = false;
-    for (unsigned i = 0; i < len; i++) {
-        unsigned expanded = expand_form(vector_data_ptr(vec)[i], syn_env,
-                                        bindings_out);
-        if (expanded == TOK_ERROR)
-            return TOK_ERROR;
-        if (expanded != vector_data_ptr(vec)[i])
-            changed = true;
-        vector_set_elem(new_vec, i, expanded);
-    }
-
-    return changed ? new_vec : vec;
-}
-
+// Expand each element of list. The result shares list itself until an
+// element changes - most forms in an expanded body are applications that
+// expansion leaves alone - and from there on is a copy.
 static unsigned expand_form_list(unsigned list, unsigned syn_env,
                                 unsigned *bindings_out)
 {
@@ -178,6 +149,7 @@ static unsigned expand_form_list(unsigned list, unsigned syn_env,
     unsigned out_tail = 0;
     gc_protect(&out);
     gc_protect(&out_tail);
+    bool changed = false;
 
     unsigned it = list;
     gc_protect(&it);
@@ -185,13 +157,35 @@ static unsigned expand_form_list(unsigned list, unsigned syn_env,
         unsigned expanded = expand_form(car(it), syn_env, bindings_out);
         if (expanded == TOK_ERROR)
             return TOK_ERROR;
-        list_append(&out, &out_tail, expanded);
+        // Compared with the element as it is now: a collection during the
+        // expansion moves the original, and can hand its old index on.
+        if (!changed && expanded != car(it)) {
+            changed = true;
+            unsigned p = list;
+            gc_protect(&expanded);
+            gc_protect(&p);
+            for (; p != it; p = cdr(p))
+                list_append(&out, &out_tail, car(p));
+            gc_unprotect(2);
+        }
+        if (changed)
+            list_append(&out, &out_tail, expanded);
         it = cdr(it);
     }
 
     unsigned tail = expand_form(it, syn_env, bindings_out);
     if (tail == TOK_ERROR)
         return TOK_ERROR;
+    if (!changed) {
+        if (tail == it)
+            return list;
+        unsigned p = list;
+        gc_protect(&tail);
+        gc_protect(&p);
+        for (; p != it; p = cdr(p))
+            list_append(&out, &out_tail, car(p));
+        gc_unprotect(2);
+    }
     if (!out)
         return tail;
 
@@ -201,12 +195,33 @@ static unsigned expand_form_list(unsigned list, unsigned syn_env,
     return out;
 }
 
+// The environment the procedure being expanded closes over: real frames,
+// unlike the placeholder frames expansion layers over it. Set by expand_body
+// (rooted there) for as long as it runs.
+static unsigned expansion_real_env = 0;
+static bool expansion_real_env_set = false;
+
+unsigned expand_body(unsigned body, unsigned syn_env, unsigned real_env,
+                     unsigned *bindings_out)
+{
+    unsigned saved_env = expansion_real_env;
+    bool saved_set = expansion_real_env_set;
+    GC_GUARD;
+    gc_protect(&saved_env);
+    gc_protect(&expansion_real_env);
+    expansion_real_env = real_env;
+    expansion_real_env_set = true;
+    unsigned result = expand_form_list(body, syn_env, bindings_out);
+    expansion_real_env = saved_env;
+    expansion_real_env_set = saved_set;
+    return result;
+}
+
 static unsigned expand_let_syntax(unsigned form, unsigned syn_env,
                                  unsigned *bindings_out)
 {
-    const char *syn_arity =
-        (CELL_ID(car(form)) == ctx.kw_let_syntax) ? "let-syntax" :
-                                                   "letrec-syntax";
+    bool is_let_syntax = IS_KEYWORD(car(form), ctx.kw_let_syntax);
+    const char *syn_arity = is_let_syntax ? "let-syntax" : "letrec-syntax";
     GC_GUARD;
     gc_protect(&form);
     gc_protect(&syn_env);
@@ -244,9 +259,7 @@ static unsigned expand_let_syntax(unsigned form, unsigned syn_env,
     unsigned expanded_env = extend_env_empty(syn_env);
     gc_protect(&expanded_env);
     int64_t ellipsis_id =
-        syntax_default_ellipsis_id((CELL_ID(car(form)) == ctx.kw_let_syntax)
-                                       ? syn_env
-                                       : expanded_env);
+        syntax_default_ellipsis_id(is_let_syntax ? syn_env : expanded_env);
 
     unsigned b = bindings;
     gc_protect(&b);
@@ -265,9 +278,7 @@ static unsigned expand_let_syntax(unsigned form, unsigned syn_env,
             return TOK_ERROR;
 
         unsigned p = make_syntax_transformer(
-            transformer_form,
-            (CELL_ID(keyword) == ctx.kw_let_syntax) ? syn_env :
-                                                      expanded_env);
+            transformer_form, is_let_syntax ? syn_env : expanded_env);
         if (p == TOK_ERROR)
             return TOK_ERROR;
         gc_protect(&p);
@@ -415,22 +426,43 @@ static bool atom_cell_listed(unsigned atom, unsigned atoms)
 // a define target that is one of them - a name the use supplied - is
 // defined as written. A target the macros introduced is renamed by the real
 // expansion (hygienize_define), so binding it here left a #f placeholder
-// that hid the outer variable of the same name.
+// that hid the outer variable of the same name. template_env: the
+// environment of the transformer that made body (with user_atoms); a head
+// the transformer introduced means what it means there, so a template's
+// define is still a definition where the use site rebinds define - the real
+// expansion renames it to define's core alias.
 static int bind_internal_definitions_at(unsigned env, unsigned body,
                                         unsigned *frame, unsigned expansions,
                                         unsigned user_atoms,
+                                        unsigned template_env,
                                         bool *saw_define_syntax)
 {
     GC_GUARD;
     gc_protect(&env);
     gc_protect(&body);
     gc_protect(&user_atoms);
+    gc_protect(&template_env);
     for (; IS_PAIR(body); body = cdr(body)) {
         unsigned form = car(body);
         if (!IS_PAIR(form) || !IS_ATOM(car(form)))
             return 0;
-        int64_t kw = CELL_ID(car(form));
-        unsigned head_binding = lookup_silent(kw, env);
+        int64_t head_id = CELL_ID(car(form));
+        int64_t kw = kw_canon(head_id);
+        unsigned head_env = user_atoms && !atom_cell_listed(car(form),
+                                                            user_atoms)
+                                ? template_env
+                                : env;
+        // No lookup for a core alias - and none needed for one that is not
+        // a definition form - which is what most bodies of an expanded
+        // procedure start with.
+        unsigned head_binding = TOK_ERROR;
+        if (core_alias_unbound_fast(head_id)) {
+            if (kw != ctx.kw_begin && kw != ctx.kw_define &&
+                kw != ctx.kw_define_syntax)
+                return 0;
+        } else {
+            head_binding = lookup_silent(head_id, head_env);
+        }
         if (head_binding != TOK_ERROR && IS_SYNTAX(head_binding)) {
             // A macro use may expand into definitions - define-values,
             // define-record-type, a user macro around define - and those
@@ -459,7 +491,8 @@ static int bind_internal_definitions_at(unsigned env, unsigned body,
             unsigned as_body = alloc_cons(expanded, 0);
             gc_protect(&as_body);
             int status = bind_internal_definitions_at(
-                env, as_body, frame, expansions + 1, atoms, saw_define_syntax);
+                env, as_body, frame, expansions + 1, atoms,
+                cdr(head_binding), saw_define_syntax);
             gc_unprotect(3);
             if (status != 1)
                 return status;
@@ -467,7 +500,7 @@ static int bind_internal_definitions_at(unsigned env, unsigned body,
         }
         if (kw == ctx.kw_begin && head_binding == TOK_ERROR) {
             int status = bind_internal_definitions_at(
-                env, cdr(form), frame, expansions, user_atoms,
+                env, cdr(form), frame, expansions, user_atoms, template_env,
                 saw_define_syntax);
             if (status != 1)
                 return status;
@@ -505,7 +538,7 @@ static int bind_internal_definitions(unsigned env, unsigned body,
                                      unsigned *frame)
 {
     bool saw_define_syntax = false;
-    return bind_internal_definitions_at(env, body, frame, 0, 0,
+    return bind_internal_definitions_at(env, body, frame, 0, 0, 0,
                                         &saw_define_syntax);
 }
 
@@ -522,148 +555,505 @@ unsigned extend_env_with_internal_defines(unsigned env, unsigned body)
     return frame ? frame : env;
 }
 
-static unsigned expand_form_inner(unsigned expr, unsigned syn_env,
-                                  unsigned *bindings_out)
+// The head a core form gets in expanded code: its core alias, so that a
+// procedure keeps its if, say, after the name is redefined at top level -
+// display is a stdlib closure, and an error reported through it while if
+// was a variable used to loop forever - and the evaluator dispatches without
+// looking the keyword up. The head stays as written when the alias itself is
+// bound here (see core_alias_bound).
+static unsigned core_head_atom(unsigned head, unsigned alias, unsigned syn_env)
 {
-    if (!expr || !IS_CELL(expr))
+    if (core_alias_bound &&
+        lookup_silent(CELL_ID(alias), syn_env) != TOK_ERROR)
+        return head;
+    return alias;
+}
+
+// expr with its head replaced by form's core alias.
+static unsigned with_core_head(unsigned expr, int form, unsigned syn_env)
+{
+    unsigned head = core_head_atom(car(expr), core_alias_cell(form), syn_env);
+    if (head == car(expr))
         return expr;
+    return alloc_cons(head, cdr(expr));
+}
 
-    if (IS_VECTOR(expr))
-        return expand_form_vector(expr, syn_env, bindings_out);
-
-    if (!IS_PAIR(expr))
+// (head . operands) with every operand expanded and the head made the core
+// alias of form.
+static unsigned expand_core_operands(unsigned expr, int form, unsigned syn_env,
+                                     unsigned *bindings_out)
+{
+    GC_GUARD;
+    gc_protect(&expr);
+    gc_protect(&syn_env);
+    unsigned operands = expand_form_list(cdr(expr), syn_env, bindings_out);
+    if (operands == TOK_ERROR)
+        return TOK_ERROR;
+    gc_protect(&operands);
+    unsigned head = with_core_head(expr, form, syn_env);
+    if (head == expr && operands == cdr(expr))
         return expr;
+    return alloc_cons(car(head), operands);
+}
 
-    unsigned head = car(expr);
-    if (IS_ATOM(head)) {
-        int64_t kw = CELL_ID(head);
-        if (kw != ctx.kw_quote && kw != ctx.kw_quasiquote &&
-            kw != ctx.kw_cond_expand) {
-            unsigned binding = lookup_silent(kw, syn_env);
-            if (binding != TOK_ERROR && IS_SYNTAX(binding)) {
-                GC_GUARD;
-                gc_protect(&expr);
-                gc_protect(&syn_env);
-                unsigned produced_bindings = 0;
-                gc_protect(&produced_bindings);
-                unsigned expanded =
-                    apply_syntax(binding, expr, syn_env, &produced_bindings);
-                if (expanded == TOK_ERROR)
-                    return TOK_ERROR;
+// A <body> in env: its leading definitions bound first, as the evaluator
+// binds them before running it.
+static unsigned expand_body_in(unsigned body, unsigned env,
+                               unsigned *bindings_out)
+{
+    GC_GUARD;
+    gc_protect(&body);
+    unsigned body_env = extend_env_with_internal_defines(env, body);
+    if (body_env == TOK_ERROR)
+        return TOK_ERROR;
+    gc_protect(&body_env);
+    return expand_form_list(body, body_env, bindings_out);
+}
 
-                if (bindings_out && produced_bindings)
-                    append_bindings_chain(bindings_out, produced_bindings);
+// ((var init) ...) as the core let forms accept it; anything else is left
+// unexpanded for the evaluator to report.
+static bool let_bindings_well_formed(unsigned bindings)
+{
+    unsigned n = 0;
+    for (unsigned b = bindings; b; b = cdr(b)) {
+        if (!IS_PAIR(b) || ++n > 100000)
+            return false;
+        unsigned binding = car(b);
+        if (!IS_PAIR(binding) || !identifier_valid(car(binding)) ||
+            !IS_PAIR(cdr(binding)) || cddr(binding))
+            return false;
+    }
+    return true;
+}
 
-                return expand_form(expanded, syn_env, bindings_out);
-            }
-        }
+// The core let, let* and letrec (the evaluator's own; the stdlib's let and
+// let* are macros): the inits and the body expanded in the scopes the
+// evaluator will give them, so that a binder named like a keyword shadows it
+// - (letrec ((when 1)) when) - and is never itself mistaken for a form.
+static unsigned expand_core_let(unsigned expr, int form, unsigned syn_env,
+                                unsigned *bindings_out)
+{
+    GC_GUARD;
+    gc_protect(&expr);
+    gc_protect(&syn_env);
+    unsigned name = 0;
+    unsigned bindings = IS_PAIR(cdr(expr)) ? cadr(expr) : 0;
+    unsigned body = IS_PAIR(cdr(expr)) ? cddr(expr) : 0;
+    if (form == CF_LET && IS_PAIR(cdr(expr)) && IS_ATOM(cadr(expr)) &&
+        cadr(expr)) {
+        name = cadr(expr); // named let
+        bindings = IS_PAIR(cddr(expr)) ? caddr(expr) : 0;
+        body = IS_PAIR(cddr(expr)) ? cdddr(expr) : 0;
+    }
+    gc_protect(&name);
+    gc_protect(&bindings);
+    gc_protect(&body);
+    if (!IS_PAIR(cdr(expr)) || (name && !IS_PAIR(cddr(expr))) || !body ||
+        !proper_list_silent(body) || !let_bindings_well_formed(bindings))
+        return with_core_head(expr, form, syn_env);
 
-        if (kw == ctx.kw_quote || kw == ctx.kw_quasiquote ||
-            kw == ctx.kw_cond_expand)
-            return expr;
+    unsigned b = bindings;
+    gc_protect(&b);
+    unsigned all_env = syn_env; // every binder in scope (not for let*)
+    gc_protect(&all_env);
+    if (form != CF_LETSTAR) {
+        unsigned names = 0;
+        gc_protect(&names);
+        for (b = bindings; b; b = cdr(b))
+            names = alloc_cons(car(car(b)), names);
+        all_env = extend_env_with_binder_names(syn_env, names);
+        if (all_env == TOK_ERROR)
+            return TOK_ERROR;
+        gc_unprotect(1);
+    }
 
-        if (kw == ctx.kw_define_syntax) {
-            GC_GUARD;
-            gc_protect(&expr);
-            gc_protect(&syn_env);
-            if (!syntax_arity_checked(expr, 2, 2, "define-syntax"))
+    // Inits: let's and a named let's in the enclosing scope, letrec's in the
+    // new one, let*'s each in the scope of the binders before it.
+    unsigned init_env = form == CF_LETREC ? all_env : syn_env;
+    gc_protect(&init_env);
+    unsigned new_bindings = 0, nb_tail = 0;
+    gc_protect(&new_bindings);
+    gc_protect(&nb_tail);
+    for (b = bindings; b; b = cdr(b)) {
+        unsigned init = expand_form(cadr(car(b)), init_env, bindings_out);
+        if (init == TOK_ERROR)
+            return TOK_ERROR;
+        gc_protect(&init);
+        unsigned init_tail = alloc_cons(init, 0);
+        gc_protect(&init_tail);
+        unsigned binding = alloc_cons(car(car(b)), init_tail);
+        gc_protect(&binding);
+        list_append(&new_bindings, &nb_tail, binding);
+        gc_unprotect(3);
+        if (form == CF_LETSTAR) {
+            unsigned one = alloc_cons(car(car(b)), 0);
+            gc_protect(&one);
+            init_env = extend_env_with_binder_names(init_env, one);
+            gc_unprotect(1);
+            if (init_env == TOK_ERROR)
                 return TOK_ERROR;
-
-            unsigned name = cadr(expr);
-            unsigned transformer_form = caddr(expr);
-            gc_protect(&name);
-            gc_protect(&transformer_form);
-            if (!identifier_valid(name)) {
-                show_error("define-syntax: expected name");
-                return TOK_ERROR;
-            }
-            if (!syntax_rules_valid(transformer_form,
-                                   syntax_default_ellipsis_id(syn_env),
-                                   "define-syntax")) {
-                return TOK_ERROR;
-            }
-
-            unsigned p =
-                make_syntax_transformer(transformer_form, syn_env);
-            if (p == TOK_ERROR)
-                return TOK_ERROR;
-            gc_protect(&p);
-            if (defvar(name, p, syn_env) == TOK_ERROR)
-                return TOK_ERROR;
-
-            return expr;
-        }
-
-        if (kw == ctx.kw_let_syntax || kw == ctx.kw_letrec_syntax)
-            return expand_let_syntax(expr, syn_env, bindings_out);
-
-        // Lambda bodies expand at their own creation (handle_lambda), so
-        // the walker must not descend here: expanding them now would fire
-        // syntax errors - and bake hygiene decisions - in the enclosing
-        // scope instead of the lambda's own.
-        if (kw == ctx.kw_lambda)
-            return expr;
-
-        // (define (name . formals) body ...) is a lambda in disguise, so its
-        // body must expand in the scope its closure will have: walking it
-        // as a plain list treated (define (inner when) (when 1 2)) as calls
-        // in the enclosing scope, where when is still the macro. Expand it
-        // here, once, against the frames build_lambda_closure would add -
-        // leaving it for handle_define instead re-expanded the body, minting
-        // fresh gensyms, every time the enclosing procedure ran. For
-        // (define name expr) only expr is an expression.
-        if (kw == ctx.kw_define && lookup_silent(kw, syn_env) == TOK_ERROR &&
-            IS_PAIR(cdr(expr))) {
-            if (IS_PAIR(cadr(expr))) {
-                GC_GUARD;
-                gc_protect(&expr); // lambda_params_valid may allocate
-                if (!IS_ATOM(car(cadr(expr))) || !cddr(expr) ||
-                    !proper_list_silent(cddr(expr)) ||
-                    !lambda_params_valid(cdr(cadr(expr))))
-                    return expr; // handle_define reports what is wrong
-                unsigned binder_env =
-                    extend_env_with_binder_names(syn_env, cdr(cadr(expr)));
-                if (binder_env == TOK_ERROR)
-                    return TOK_ERROR;
-                gc_protect(&binder_env);
-                unsigned body_env =
-                    extend_env_with_internal_defines(binder_env, cddr(expr));
-                if (body_env == TOK_ERROR)
-                    return TOK_ERROR;
-                gc_protect(&body_env);
-                unsigned new_body =
-                    expand_form(cddr(expr), body_env, bindings_out);
-                if (new_body == TOK_ERROR)
-                    return TOK_ERROR;
-                if (new_body == cddr(expr))
-                    return expr;
-                gc_protect(&new_body);
-                unsigned target_tail = alloc_cons(cadr(expr), new_body);
-                gc_protect(&target_tail);
-                return alloc_cons(car(expr), target_tail);
-            }
-            if (!IS_ATOM(cadr(expr)))
-                return expr;
-            if (!IS_PAIR(cddr(expr)) || cdr(cddr(expr)))
-                return expr; // malformed; handle_define reports it
-            GC_GUARD;
-            gc_protect(&expr);
-            unsigned value = expand_form(car(cddr(expr)), syn_env,
-                                         bindings_out);
-            if (value == TOK_ERROR)
-                return TOK_ERROR;
-            if (value == car(cddr(expr)))
-                return expr;
-            gc_protect(&value);
-            unsigned value_tail = alloc_cons(value, 0);
-            gc_protect(&value_tail);
-            unsigned target_tail = alloc_cons(cadr(expr), value_tail);
-            gc_protect(&target_tail);
-            return alloc_cons(car(expr), target_tail);
         }
     }
 
-    return expand_form_list(expr, syn_env, bindings_out);
+    unsigned body_env = form == CF_LETSTAR ? init_env : all_env;
+    if (name) {
+        unsigned one = alloc_cons(name, 0);
+        gc_protect(&one);
+        body_env = extend_env_with_binder_names(body_env, one);
+        gc_unprotect(1);
+        if (body_env == TOK_ERROR)
+            return TOK_ERROR;
+    }
+    unsigned new_body = expand_body_in(body, body_env, bindings_out);
+    if (new_body == TOK_ERROR)
+        return TOK_ERROR;
+    gc_protect(&new_body);
+
+    unsigned rest = alloc_cons(new_bindings, new_body);
+    gc_protect(&rest);
+    if (name)
+        rest = alloc_cons(name, rest);
+    return alloc_cons(core_alias_cell(form), rest);
+}
+
+// While true, the walk only names core forms by alias and leaves macro uses
+// as written (see expand_procedure).
+static bool core_heads_only = false;
+
+// True if every alias in bindings stands for a binding the code will reach
+// at run time - one visible from the procedure's own closure environment, or
+// a value. An alias of a placeholder (a local of the code being expanded,
+// renamed past a use that shadows it) would install the placeholder itself.
+// Allocates nothing.
+static bool aliases_reach_real_bindings(unsigned bindings)
+{
+    for (unsigned b = bindings; IS_PAIR(b); b = cdr(b)) {
+        unsigned target = IS_PAIR(car(b)) ? cdr(car(b)) : 0;
+        if (!IS_BINDING_REF(target))
+            continue;
+        unsigned var = cdr(target);
+        if (!IS_ATOM(var) ||
+            env_find_binding_cell(CELL_ID(var), expansion_real_env) !=
+                CELL_CAR(target))
+            return false;
+    }
+    return true;
+}
+
+// The body of a procedure inside the code being expanded - a lambda's, or
+// that of (define (name . formals) ...). Expanded now, against frames naming
+// its formals, it need not be expanded again: *expanded is set and the
+// caller marks the lambda (CELL_EXPANDED_LAMBDA), which handle_lambda then
+// takes as it is. So a procedure made over and over does not redo the work
+// or mint its gensyms each time, and keeps what its macros meant when it was
+// written: the code in a stdlib procedure's named let survives a later
+// top-level (define if ...). Where that cannot be done - the expansion
+// fails, or needs an alias of a placeholder - only the body's core keywords
+// are named by alias, and the rest is left for when the lambda is made, in
+// its real scope, which also reports the failure.
+static unsigned expand_procedure(unsigned params, unsigned body,
+                                 unsigned syn_env, unsigned *bindings_out,
+                                 bool *expanded)
+{
+    GC_GUARD;
+    gc_protect(&params);
+    gc_protect(&body);
+    gc_protect(&syn_env);
+    *expanded = false;
+    unsigned binder_env = extend_env_with_binder_names(syn_env, params);
+    if (binder_env == TOK_ERROR)
+        return TOK_ERROR;
+    gc_protect(&binder_env);
+    bool saved_suppress = ctx.suppress_error_output;
+    if (!core_heads_only && expansion_real_env_set) {
+        unsigned local = 0;
+        gc_protect(&local);
+        ctx.suppress_error_output = true;
+        unsigned full = expand_body_in(body, binder_env, &local);
+        ctx.suppress_error_output = saved_suppress;
+        if (full != TOK_ERROR && aliases_reach_real_bindings(local)) {
+            if (bindings_out && local)
+                append_bindings_chain(bindings_out, local);
+            *expanded = true;
+            return full;
+        }
+    }
+    bool saved_heads_only = core_heads_only;
+    core_heads_only = true;
+    ctx.suppress_error_output = true;
+    unsigned walked = expand_body_in(body, binder_env, bindings_out);
+    core_heads_only = saved_heads_only;
+    ctx.suppress_error_output = saved_suppress;
+    return walked == TOK_ERROR ? body : walked;
+}
+
+// The head marking a lambda as expanded, or 0 if that alias is bound here
+// (see core_head_atom): the lambda is then expanded again when it is made,
+// which is harmless.
+static unsigned expanded_lambda_head(unsigned syn_env)
+{
+    return core_head_atom(0, CELL_EXPANDED_LAMBDA, syn_env);
+}
+
+static unsigned expand_lambda(unsigned expr, unsigned syn_env,
+                              unsigned *bindings_out)
+{
+    if (car(expr) == CELL_EXPANDED_LAMBDA)
+        return expr;
+    GC_GUARD;
+    gc_protect(&expr);
+    gc_protect(&syn_env);
+    if (!IS_PAIR(cdr(expr)) || !IS_PAIR(cddr(expr)) ||
+        !proper_list_silent(cddr(expr)) || !lambda_params_valid(cadr(expr)))
+        return with_core_head(expr, CF_LAMBDA, syn_env); // reported later
+    bool expanded = false;
+    unsigned body = expand_procedure(cadr(expr), cddr(expr), syn_env,
+                                     bindings_out, &expanded);
+    if (body == TOK_ERROR)
+        return TOK_ERROR;
+    gc_protect(&body);
+    unsigned head = expanded ? expanded_lambda_head(syn_env) : 0;
+    if (!head)
+        head = core_head_atom(car(expr), core_alias_cell(CF_LAMBDA), syn_env);
+    if (head == car(expr) && body == cddr(expr))
+        return expr;
+    gc_protect(&head);
+    unsigned rest = alloc_cons(cadr(expr), body);
+    gc_protect(&rest);
+    return alloc_cons(head, rest);
+}
+
+// cond: each clause's test and expressions expanded, an else or => that is
+// the keyword here made its core alias.
+static unsigned expand_core_cond(unsigned expr, unsigned syn_env,
+                                 unsigned *bindings_out)
+{
+    GC_GUARD;
+    gc_protect(&expr);
+    gc_protect(&syn_env);
+    if (!proper_list_silent(cdr(expr)))
+        return with_core_head(expr, CF_COND, syn_env);
+    unsigned out = 0, tail = 0;
+    gc_protect(&out);
+    gc_protect(&tail);
+    unsigned c = cdr(expr);
+    gc_protect(&c);
+    for (; c; c = cdr(c)) {
+        unsigned clause = car(c);
+        if (!IS_PAIR(clause) || !proper_list_silent(clause)) {
+            list_append(&out, &tail, clause);
+            continue;
+        }
+        unsigned test = car(clause);
+        if (IS_KEYWORD(test, ctx.kw_else) &&
+            env_find_binding_cell(CELL_ID(test), syn_env) == 0) {
+            if (!core_alias_bound)
+                test = core_alias_cell(CF_ELSE);
+        } else {
+            test = expand_form(test, syn_env, bindings_out);
+        }
+        if (test == TOK_ERROR)
+            return TOK_ERROR;
+        gc_protect(&test);
+        unsigned exprs = cdr(car(c));
+        unsigned arrow = 0;
+        gc_protect(&arrow);
+        if (IS_PAIR(exprs) && IS_KEYWORD(car(exprs), ctx.kw_arrow) &&
+            env_find_binding_cell(CELL_ID(car(exprs)), syn_env) == 0) {
+            arrow = core_alias_bound ? car(exprs) : core_alias_cell(CF_ARROW);
+            exprs = cdr(exprs);
+        }
+        exprs = expand_form_list(exprs, syn_env, bindings_out);
+        if (exprs == TOK_ERROR)
+            return TOK_ERROR;
+        gc_protect(&exprs);
+        if (arrow)
+            exprs = alloc_cons(arrow, exprs);
+        unsigned new_clause = alloc_cons(test, exprs);
+        gc_unprotect(3);
+        list_append(&out, &tail, new_clause);
+    }
+    return alloc_cons(core_alias_cell(CF_COND), out);
+}
+
+static unsigned expand_form_inner(unsigned expr, unsigned syn_env,
+                                  unsigned *bindings_out)
+{
+    // A vector is self-evaluating data, never code: expanding one turned
+    // #((when 1 2)) into #((if 1 (begin 2))).
+    if (!expr || !IS_PAIR(expr))
+        return expr;
+
+    unsigned head = car(expr);
+    if (!IS_ATOM(head))
+        return expand_form_list(expr, syn_env, bindings_out);
+
+    int64_t head_id = CELL_ID(head);
+    unsigned binding = core_alias_unbound_fast(head_id)
+                           ? TOK_ERROR
+                           : lookup_silent(head_id, syn_env);
+    if (binding != TOK_ERROR) {
+        if (IS_SYNTAX(binding) && core_heads_only)
+            return expr;
+        if (IS_SYNTAX(binding)) {
+            GC_GUARD;
+            gc_protect(&expr);
+            gc_protect(&syn_env);
+            unsigned produced_bindings = 0;
+            gc_protect(&produced_bindings);
+            unsigned expanded =
+                apply_syntax(binding, expr, syn_env, &produced_bindings);
+            if (expanded == TOK_ERROR)
+                return TOK_ERROR;
+
+            if (bindings_out && produced_bindings)
+                append_bindings_chain(bindings_out, produced_bindings);
+
+            return expand_form(expanded, syn_env, bindings_out);
+        }
+        // A define-macro use gets its operands as written.
+        if (IS_MACRO(binding))
+            return expr;
+        return expand_form_list(expr, syn_env, bindings_out);
+    }
+
+    int form = atom_core_form(head_id);
+    switch (form) {
+    case CF_QUOTE:
+        if (IS_PAIR(cdr(expr)) && !cddr(expr)) {
+            GC_GUARD;
+            gc_protect(&expr);
+            gc_protect(&syn_env);
+            unsigned datum = macros_strip_core_aliases(cadr(expr));
+            if (datum != cadr(expr)) {
+                gc_protect(&datum);
+                unsigned datum_tail = alloc_cons(datum, 0);
+                gc_protect(&datum_tail);
+                expr = alloc_cons(car(expr), datum_tail);
+            }
+            return with_core_head(expr, form, syn_env);
+        }
+        return with_core_head(expr, form, syn_env);
+    case CF_QUASIQUOTE:
+    case CF_COND_EXPAND:
+    case CF_DEFINE_MACRO:
+        return with_core_head(expr, form, syn_env);
+
+    case CF_LAMBDA:
+        return expand_lambda(expr, syn_env, bindings_out);
+
+    case CF_IF:
+    case CF_BEGIN:
+    case CF_SET:
+    case CF_AND:
+    case CF_OR:
+        return expand_core_operands(expr, form, syn_env, bindings_out);
+
+    case CF_LET:
+    case CF_LETSTAR:
+    case CF_LETREC:
+        return expand_core_let(expr, form, syn_env, bindings_out);
+
+    case CF_COND:
+        return expand_core_cond(expr, syn_env, bindings_out);
+
+    case CF_LET_SYNTAX:
+    case CF_LETREC_SYNTAX: {
+        GC_GUARD;
+        gc_protect(&syn_env);
+        expr = with_core_head(expr, form, syn_env);
+        return expand_let_syntax(expr, syn_env, bindings_out);
+    }
+
+    case CF_DEFINE_SYNTAX: {
+        GC_GUARD;
+        gc_protect(&expr);
+        gc_protect(&syn_env);
+        if (!syntax_arity_checked(expr, 2, 2, "define-syntax"))
+            return TOK_ERROR;
+
+        unsigned name = cadr(expr);
+        unsigned transformer_form = caddr(expr);
+        gc_protect(&name);
+        gc_protect(&transformer_form);
+        if (!identifier_valid(name)) {
+            show_error("define-syntax: expected name");
+            return TOK_ERROR;
+        }
+        if (!syntax_rules_valid(transformer_form,
+                               syntax_default_ellipsis_id(syn_env),
+                               "define-syntax")) {
+            return TOK_ERROR;
+        }
+
+        unsigned p = make_syntax_transformer(transformer_form, syn_env);
+        if (p == TOK_ERROR)
+            return TOK_ERROR;
+        gc_protect(&p);
+        if (defvar(name, p, syn_env) == TOK_ERROR)
+            return TOK_ERROR;
+
+        return with_core_head(expr, form, syn_env);
+    }
+
+    case CF_DEFINE: {
+        // (define (name . formals) body ...) is a lambda in disguise, so its
+        // body must expand in the scope its closure will have: walking it
+        // as a plain list treated (define (inner when) (when 1 2)) as calls
+        // in the enclosing scope, where when is still the macro. It is
+        // expanded like a lambda's (expand_procedure); once that is done it
+        // becomes (define name <expanded lambda>), so that handle_define does
+        // not expand it again - minting fresh gensyms - every time the
+        // enclosing procedure runs. For (define name expr) only expr is an
+        // expression.
+        GC_GUARD;
+        gc_protect(&expr); // lambda_params_valid may allocate
+        gc_protect(&syn_env);
+        if (!IS_PAIR(cdr(expr)))
+            return with_core_head(expr, form, syn_env);
+        unsigned target = cadr(expr);
+        unsigned rest = 0;
+        gc_protect(&target);
+        gc_protect(&rest);
+        if (IS_PAIR(target)) {
+            if (!IS_ATOM(car(target)) || !cddr(expr) ||
+                !proper_list_silent(cddr(expr)) ||
+                !lambda_params_valid(cdr(target)))
+                return with_core_head(expr, form, syn_env); // reported later
+            bool expanded = false;
+            rest = expand_procedure(cdr(target), cddr(expr), syn_env,
+                                    bindings_out, &expanded);
+            unsigned lambda_head =
+                expanded ? expanded_lambda_head(syn_env) : 0;
+            if (rest != TOK_ERROR && lambda_head) {
+                unsigned lambda_rest = alloc_cons(cdr(target), rest);
+                gc_protect(&lambda_rest);
+                unsigned lambda_form = alloc_cons(lambda_head, lambda_rest);
+                gc_protect(&lambda_form);
+                rest = alloc_cons(lambda_form, 0);
+                target = car(target);
+            }
+        } else {
+            if (!IS_ATOM(target) || !IS_PAIR(cddr(expr)) || cdr(cddr(expr)))
+                return with_core_head(expr, form, syn_env); // malformed
+            rest = expand_form_list(cddr(expr), syn_env, bindings_out);
+        }
+        if (rest == TOK_ERROR)
+            return TOK_ERROR;
+        unsigned head_form = with_core_head(expr, form, syn_env);
+        if (head_form == expr && rest == cddr(expr))
+            return expr;
+        gc_protect(&head_form);
+        unsigned target_tail = alloc_cons(target, rest);
+        gc_protect(&target_tail);
+        return alloc_cons(car(head_form), target_tail);
+    }
+
+    default:
+        // Not a form: an application of an unbound name, or a stray
+        // auxiliary keyword (else, unquote) the evaluator will report.
+        return expand_form_list(expr, syn_env, bindings_out);
+    }
 }
 
 // What a (##protected## . x) wrapper - one or more deep - holds, or 0 if
@@ -958,7 +1348,7 @@ static unsigned unwrap_protected(unsigned expr, bool preserve_identifiers)
         // Nested transformers still need identifier protection for hygiene.
         // Compound substitutions, however, must regain their original shape
         // before the nested patterns/templates are processed.
-        if (IS_ATOM(head) && CELL_ID(head) == ctx.kw_syntax_rules)
+        if (IS_KEYWORD(head, ctx.kw_syntax_rules))
             return unwrap_syntax_rules_form(expr);
         // Walk the spine iteratively, recursing only into the cars. Recursing
         // on the cdr as well cost one C frame per list element, so a macro
@@ -986,7 +1376,8 @@ static unsigned unwrap_protected(unsigned expr, bool preserve_identifiers)
             if (!spine_end && IS_ATOM(car(cursor))) {
                 int64_t id = CELL_ID(car(cursor));
                 spine_end = id == ctx.kw_protected ||
-                            (id == ctx.kw_syntax_rules && cursor != expr);
+                            (kw_canon(id) == ctx.kw_syntax_rules &&
+                             cursor != expr);
             }
             if (spine_end) {
                 tail = unwrap_protected(cursor, preserve_identifiers);
@@ -1113,27 +1504,24 @@ static bool is_pattern_var(int64_t sym_id, unsigned bindings)
 }
 
 // Check if an identifier is a special form keyword
+// (or its core alias)
 bool is_special_form(int64_t id)
 {
-    return id == ctx.kw_lambda || id == ctx.kw_if || id == ctx.kw_define ||
-           id == ctx.kw_set || id == ctx.kw_quote || id == ctx.kw_begin ||
-           id == ctx.kw_cond || id == ctx.kw_cond_expand ||
-           id == ctx.kw_and || id == ctx.kw_or ||
-           id == ctx.kw_let_syntax || id == ctx.kw_letrec_syntax ||
-           id == ctx.kw_define_syntax || id == ctx.kw_syntax_rules ||
-           id == ctx.kw_quasiquote || id == ctx.kw_unquote ||
-           id == ctx.kw_unquote_splicing || id == ctx.kw_else ||
-           id == ctx.kw_ellipsis || id == ctx.kw_underscore ||
-           id == ctx.kw_let || id == ctx.kw_letstar || id == ctx.kw_letrec;
+    int form = atom_core_form(id);
+    if (form != CF_NONE)
+        return form != CF_DEFINE_MACRO && form != CF_ARROW;
+    return id == ctx.kw_ellipsis || id == ctx.kw_underscore;
 }
 
 // The identifier a hygiene alias gensym stands for, indexed by the gensym's
 // atom id; 0 for anything else. Only consulted to recognise a form whose head
-// was renamed to a definition alias (see template_case_form).
+// was renamed to a definition alias (see template_case_form), and, for an
+// alias flagged ALIAS_OF_SYNTAX, a renamed binding form (template_keyword).
 static int64_t *alias_origins = NULL;
 static size_t alias_origins_len = 0;
+#define ALIAS_OF_SYNTAX ((int64_t)1 << 62) // atom ids are far below this
 
-void macros_note_alias(int64_t alias_id, int64_t origin_id)
+void macros_note_alias(int64_t alias_id, int64_t origin_id, bool syntax)
 {
     if (alias_id <= 0 || origin_id <= 0)
         return;
@@ -1149,7 +1537,7 @@ void macros_note_alias(int64_t alias_id, int64_t origin_id)
         alias_origins = grown;
         alias_origins_len = new_len;
     }
-    alias_origins[alias_id] = origin_id;
+    alias_origins[alias_id] = origin_id | (syntax ? ALIAS_OF_SYNTAX : 0);
 }
 
 static int64_t identifier_origin(int64_t id)
@@ -1157,8 +1545,21 @@ static int64_t identifier_origin(int64_t id)
     for (int hops = 0; hops < 64 && id > 0 && (size_t)id < alias_origins_len &&
                        alias_origins[id];
          hops++)
-        id = alias_origins[id];
+        id = alias_origins[id] & ~ALIAS_OF_SYNTAX;
     return id;
+}
+
+// The keyword a template walker should take a form head for: a core alias
+// is its core keyword, and an alias standing for a syntax binding (the
+// stdlib's let, renamed past a use site that rebinds let) is the name it
+// renames. Anything else is itself. Allocates nothing.
+static int64_t template_keyword(int64_t id)
+{
+    for (int hops = 0; hops < 64 && id > 0 && (size_t)id < alias_origins_len &&
+                       (alias_origins[id] & ALIAS_OF_SYNTAX);
+         hops++)
+        id = alias_origins[id] & ~ALIAS_OF_SYNTAX;
+    return kw_canon(id);
 }
 
 int64_t macros_toplevel_defines_marker_id(void)
@@ -1214,6 +1615,11 @@ bool macros_same_binding(int64_t id, unsigned env_a, unsigned env_b)
     return hygiene_binding_cell(id, env_a) == hygiene_binding_cell(id, env_b);
 }
 
+bool macros_binding_is_core(int64_t id, unsigned env)
+{
+    return hygiene_binding_cell(id, env) == 0;
+}
+
 bool template_case_form(unsigned tmpl)
 {
     static int case_id = -1;
@@ -1225,9 +1631,11 @@ bool template_case_form(unsigned tmpl)
 }
 
 // Rebuild (case key clause ...) with walk applied to the key and to each
-// clause's expressions, never to a clause's datum list (or else). The
-// datums are quoted by case itself: renaming one changed what it matches -
-// (case v ((+) ...)) stopped matching + once + was a definition alias.
+// clause's expressions, never to a clause's datum list. The datums are
+// quoted by case itself: renaming one changed what it matches - (case v ((+)
+// ...)) stopped matching + once + was a definition alias. A clause headed by
+// an identifier - else - is walked like the expressions: an else the use
+// site rebinds has to become else's core alias to stay the keyword.
 typedef unsigned (*case_walker)(unsigned form, void *arg);
 
 static unsigned map_case_form(unsigned tmpl, case_walker walk, void *arg)
@@ -1253,12 +1661,16 @@ static unsigned map_case_form(unsigned tmpl, case_walker walk, void *arg)
             list_append(&out, &tail, clause);
             continue;
         }
-        unsigned body = walk(cdr(clause), arg);
+        unsigned clause_head = car(clause);
+        if (IS_ATOM(clause_head))
+            clause_head = walk(clause_head, arg); // atoms: no allocation
+        gc_protect(&clause_head);
+        unsigned body = walk(cdr(car(c)), arg);
         if (body == TOK_ERROR)
             return TOK_ERROR;
         gc_protect(&body);
-        unsigned new_clause = alloc_cons(car(car(c)), body);
-        gc_unprotect(1);
+        unsigned new_clause = alloc_cons(clause_head, body);
+        gc_unprotect(2);
         list_append(&out, &tail, new_clause);
     }
     return out;
@@ -1279,16 +1691,14 @@ static bool keyword_bound_at_definition(int64_t sym_id, unsigned closure_env)
 
 static bool set_form_like(unsigned expr)
 {
-    return IS_PAIR(expr) && IS_ATOM(car(expr)) &&
-           CELL_ID(car(expr)) == ctx.kw_set && IS_PAIR(cdr(expr)) &&
-           IS_PAIR(cddr(expr)) && !cdddr(expr);
+    return IS_PAIR(expr) && IS_KEYWORD(car(expr), ctx.kw_set) &&
+           IS_PAIR(cdr(expr)) && IS_PAIR(cddr(expr)) && !cdddr(expr);
 }
 
 static bool define_form_like(unsigned expr)
 {
-    return IS_PAIR(expr) && IS_ATOM(car(expr)) &&
-           CELL_ID(car(expr)) == ctx.kw_define && IS_PAIR(cdr(expr)) &&
-           IS_PAIR(cddr(expr));
+    return IS_PAIR(expr) && IS_KEYWORD(car(expr), ctx.kw_define) &&
+           IS_PAIR(cdr(expr)) && IS_PAIR(cddr(expr));
 }
 
 // Collect free identifiers from a template
@@ -1552,7 +1962,16 @@ static unsigned collect_free_ids(unsigned tmpl, unsigned bindings,
         unsigned head = car(tmpl);
         // Skip protected wrappers and syntax-rules (they'll be processed later)
         if (IS_ATOM(head)) {
+            // The structural cases below also collect the keyword heading
+            // the form: where the use site rebinds it, apply_syntax renames
+            // it (to its core alias when it is core here) so the form stays
+            // the one written - (let ((quote list)) (m)) must not turn the
+            // template's 'x into (list x).
             int64_t head_id = CELL_ID(head);
+            int64_t head_kw = kw_canon(head_id);
+            bool structural = !binding_shadows_special(head_id, bindings) &&
+                              !keyword_bound_at_definition(head_id,
+                                                           closure_env);
             if (head_id == ctx.kw_protected) {
                 // In a nested macro's template, an identifier the outer
                 // macro substituted is still wrapped. It came from the outer
@@ -1568,26 +1987,30 @@ static unsigned collect_free_ids(unsigned tmpl, unsigned bindings,
                     return alloc_cons(payload, collected);
                 return collected;
             }
-            if (syntax_rules_form_like(tmpl) &&
-                !binding_shadows_special(head_id, bindings) &&
-                !keyword_bound_at_definition(head_id, closure_env))
+            bool structural_form =
+                structural &&
+                (syntax_rules_form_like(tmpl) || head_kw == ctx.kw_quote ||
+                 (head_kw == ctx.kw_quasiquote && IS_PAIR(cdr(tmpl))) ||
+                 head_kw == ctx.kw_lambda || head_kw == ctx.kw_let ||
+                 head_kw == ctx.kw_letstar || head_kw == ctx.kw_letrec ||
+                 (head_kw == ctx.kw_set && set_form_like(tmpl)) ||
+                 (head_kw == ctx.kw_define && define_form_like(tmpl)));
+            if (structural_form)
+                collected = collect_free_ids(head, bindings, collected,
+                                             ellipsis_id, closure_env);
+            if (syntax_rules_form_like(tmpl) && structural)
                 return collected;
             // For quote, skip the quoted data
-            if (head_id == ctx.kw_quote &&
-                !binding_shadows_special(head_id, bindings) &&
-                !keyword_bound_at_definition(head_id, closure_env)) {
+            if (head_kw == ctx.kw_quote && structural) {
                 return collected;
             }
-            if (head_id == ctx.kw_quasiquote && IS_PAIR(cdr(tmpl)) &&
-                !binding_shadows_special(head_id, bindings) &&
-                !keyword_bound_at_definition(head_id, closure_env)) {
+            if (head_kw == ctx.kw_quasiquote && IS_PAIR(cdr(tmpl)) &&
+                structural) {
                 return collect_free_ids_quasiquote(
                     cadr(tmpl), bindings, collected, ellipsis_id, 1,
                     closure_env);
             }
-            if (head_id == ctx.kw_lambda &&
-                !binding_shadows_special(head_id, bindings) &&
-                !keyword_bound_at_definition(head_id, closure_env)) {
+            if (head_kw == ctx.kw_lambda && structural) {
                 if (!IS_PAIR(cdr(tmpl)) || !IS_PAIR(cddr(tmpl)))
                     return collected;
                 unsigned body_bindings =
@@ -1596,24 +2019,21 @@ static unsigned collect_free_ids(unsigned tmpl, unsigned bindings,
                 return collect_free_ids(cddr(tmpl), body_bindings, collected,
                                         ellipsis_id, closure_env);
             }
-            if ((head_id == ctx.kw_let || head_id == ctx.kw_letstar ||
-                 head_id == ctx.kw_letrec) &&
-                !binding_shadows_special(head_id, bindings) &&
-                !keyword_bound_at_definition(head_id, closure_env)) {
+            if ((head_kw == ctx.kw_let || head_kw == ctx.kw_letstar ||
+                 head_kw == ctx.kw_letrec) &&
+                structural) {
                 if (!IS_PAIR(cdr(tmpl)) || !IS_PAIR(cddr(tmpl)))
                     return collected;
-                if (head_id == ctx.kw_let && IS_ATOM(cadr(tmpl))) {
+                if (head_kw == ctx.kw_let && IS_ATOM(cadr(tmpl))) {
                     return collect_free_ids_named_let(
                         tmpl, bindings, collected, ellipsis_id, closure_env);
                 }
                 return collect_free_ids_let(
                     tmpl, bindings, collected, ellipsis_id,
-                    head_id == ctx.kw_letstar, head_id == ctx.kw_letrec,
+                    head_kw == ctx.kw_letstar, head_kw == ctx.kw_letrec,
                     closure_env);
             }
-            if (head_id == ctx.kw_set && set_form_like(tmpl) &&
-                !binding_shadows_special(head_id, bindings) &&
-                !keyword_bound_at_definition(head_id, closure_env)) {
+            if (head_kw == ctx.kw_set && set_form_like(tmpl) && structural) {
                 collected = collect_free_ids(cadr(tmpl), bindings, collected,
                                              ellipsis_id, closure_env);
                 gc_protect(&collected);
@@ -1626,9 +2046,8 @@ static unsigned collect_free_ids(unsigned tmpl, unsigned bindings,
             }
             // For define, collect the target too. An introduced define target
             // must be renamed with introduced references to preserve hygiene.
-            if (head_id == ctx.kw_define && define_form_like(tmpl) &&
-                !binding_shadows_special(head_id, bindings) &&
-                !keyword_bound_at_definition(head_id, closure_env)) {
+            if (head_kw == ctx.kw_define && define_form_like(tmpl) &&
+                structural) {
                 unsigned target = cadr(tmpl);
                 if (IS_ATOM(target)) {
                     collected = collect_free_ids(target, bindings, collected,
@@ -1644,7 +2063,8 @@ static unsigned collect_free_ids(unsigned tmpl, unsigned bindings,
             }
         }
         if (template_case_form(tmpl)) {
-            // Skip the clauses' datum lists; see map_case_form.
+            // Skip the clauses' datum lists; see map_case_form. A clause
+            // headed by an identifier - else - is collected like any other.
             collected = collect_free_ids(car(tmpl), bindings, collected,
                                          ellipsis_id, closure_env);
             collected = collect_free_ids(cadr(tmpl), bindings, collected,
@@ -1652,10 +2072,15 @@ static unsigned collect_free_ids(unsigned tmpl, unsigned bindings,
             unsigned c = cddr(tmpl);
             gc_protect(&c);
             for (; c; c = cdr(c)) {
-                if (IS_PAIR(car(c)))
-                    collected = collect_free_ids(cdr(car(c)), bindings,
+                if (!IS_PAIR(car(c)))
+                    continue;
+                if (IS_ATOM(car(car(c))))
+                    collected = collect_free_ids(car(car(c)), bindings,
                                                  collected, ellipsis_id,
                                                  closure_env);
+                collected = collect_free_ids(cdr(car(c)), bindings,
+                                             collected, ellipsis_id,
+                                             closure_env);
             }
             return collected;
         }
@@ -1938,8 +2363,17 @@ static unsigned rename_free_ids_inner(unsigned tmpl, unsigned rename_map,
         // Skip protected wrappers and syntax-rules
         if (IS_ATOM(head)) {
             int64_t head_id = CELL_ID(head);
+            int64_t head_kw = kw_canon(head_id);
+            // A head renamed to its core alias still heads the core form,
+            // rebuilt with the alias; one renamed to a definition alias
+            // names whatever that binding is, so the form is a plain list.
+            unsigned new_head = rename_free_ids_inner(head, rename_map, false,
+                                                      false);
+            gc_protect(&new_head);
             bool head_is_definition_alias =
-                id_in_rename_map(head_id, rename_map);
+                new_head != car(tmpl) &&
+                !atom_is_core_alias(CELL_ID(new_head));
+            bool head_renamed = new_head != car(tmpl);
             if (head_id == ctx.kw_protected) {
                 // A wrapped identifier collected by collect_free_ids: rename
                 // it inside its wrapper, so hygienize still leaves it alone.
@@ -1953,13 +2387,12 @@ static unsigned rename_free_ids_inner(unsigned tmpl, unsigned rename_map,
                 gc_protect(&renamed);
                 return alloc_cons(car(tmpl), renamed);
             }
-            if (syntax_rules_form_like(tmpl) && !head_is_definition_alias)
-                return tmpl;
-            if (head_id == ctx.kw_quote && !quote_shadowed &&
-                !head_is_definition_alias) {
-                return tmpl;
+            if ((syntax_rules_form_like(tmpl) && !head_is_definition_alias) ||
+                (head_kw == ctx.kw_quote && !quote_shadowed &&
+                 !head_is_definition_alias)) {
+                return head_renamed ? alloc_cons(new_head, cdr(tmpl)) : tmpl;
             }
-            if (head_id == ctx.kw_lambda && !head_is_definition_alias &&
+            if (head_kw == ctx.kw_lambda && !head_is_definition_alias &&
                 IS_PAIR(cdr(tmpl)) && IS_PAIR(cddr(tmpl))) {
                 bool body_quote_shadowed =
                     quote_shadowed ||
@@ -1976,20 +2409,22 @@ static unsigned rename_free_ids_inner(unsigned tmpl, unsigned rename_map,
                 if (new_body == TOK_ERROR)
                     return TOK_ERROR;
                 gc_protect(&new_body);
-                if (new_body == cddr(tmpl))
+                if (new_body == cddr(tmpl) && !head_renamed)
                     return tmpl;
                 unsigned result_tail = alloc_cons(cadr(tmpl), new_body);
                 gc_protect(&result_tail);
-                return alloc_cons(head, result_tail);
+                return alloc_cons(new_head, result_tail);
             }
-            if ((head_id == ctx.kw_let || head_id == ctx.kw_letstar ||
-                 head_id == ctx.kw_letrec) &&
+            if ((head_kw == ctx.kw_let || head_kw == ctx.kw_letstar ||
+                 head_kw == ctx.kw_letrec) &&
                 !head_is_definition_alias &&
                 IS_PAIR(cdr(tmpl)) && IS_PAIR(cddr(tmpl)) &&
-                !(head_id == ctx.kw_let && IS_ATOM(cadr(tmpl))) &&
+                !(head_kw == ctx.kw_let && IS_ATOM(cadr(tmpl))) &&
                 proper_list_silent(cadr(tmpl))) {
                 unsigned binding_list = cadr(tmpl);
                 unsigned body = cddr(tmpl);
+                gc_protect(&binding_list);
+                gc_protect(&body);
                 unsigned new_bindings = rename_free_ids_inner(
                     binding_list, rename_map, quote_shadowed,
                     quasiquote_shadowed);
@@ -2012,13 +2447,14 @@ static unsigned rename_free_ids_inner(unsigned tmpl, unsigned rename_map,
                 if (new_body == TOK_ERROR)
                     return TOK_ERROR;
                 gc_protect(&new_body);
-                if (new_bindings == binding_list && new_body == body)
+                if (new_bindings == binding_list && new_body == body &&
+                    !head_renamed)
                     return tmpl;
                 unsigned result_tail = alloc_cons(new_bindings, new_body);
                 gc_protect(&result_tail);
-                return alloc_cons(head, result_tail);
+                return alloc_cons(new_head, result_tail);
             }
-            if (head_id == ctx.kw_quasiquote && IS_PAIR(cdr(tmpl)) &&
+            if (head_kw == ctx.kw_quasiquote && IS_PAIR(cdr(tmpl)) &&
                 !quasiquote_shadowed && !head_is_definition_alias) {
                 unsigned new_body =
                     rename_free_ids_quasiquote(cadr(tmpl), rename_map, 1);
@@ -2027,12 +2463,13 @@ static unsigned rename_free_ids_inner(unsigned tmpl, unsigned rename_map,
                 gc_protect(&new_body);
                 unsigned result_tail = alloc_cons(new_body, cddr(tmpl));
                 gc_protect(&result_tail);
-                return alloc_cons(head, result_tail);
+                return alloc_cons(new_head, result_tail);
             }
-            if (head_id == ctx.kw_set && set_form_like(tmpl) &&
+            if (head_kw == ctx.kw_set && set_form_like(tmpl) &&
                 !head_is_definition_alias) {
                 unsigned var = cadr(tmpl);
                 unsigned expr = cddr(tmpl);
+                gc_protect(&expr);
                 unsigned new_var =
                     rename_free_ids_inner(var, rename_map, quote_shadowed,
                                           quasiquote_shadowed);
@@ -2050,37 +2487,40 @@ static unsigned rename_free_ids_inner(unsigned tmpl, unsigned rename_map,
                     gc_protect(&expr_tail);
                     unsigned var_tail = alloc_cons(new_var, expr_tail);
                     gc_protect(&var_tail);
-                    return alloc_cons(head, var_tail);
+                    return alloc_cons(new_head, var_tail);
                 }
                 return tmpl;
             }
             // For define, rename the target too. The later hygienize pass
             // decides whether this is an introduced binding or a pattern
             // variable binding.
-            if (head_id == ctx.kw_define && define_form_like(tmpl) &&
+            if (head_kw == ctx.kw_define && define_form_like(tmpl) &&
                 !head_is_definition_alias) {
                 unsigned var = cadr(tmpl);
-                unsigned expr = cddr(tmpl);
                 unsigned new_var =
                     rename_free_ids_inner(var, rename_map, quote_shadowed,
                                           quasiquote_shadowed);
                 if (new_var == TOK_ERROR)
                     return TOK_ERROR;
                 gc_protect(&new_var);
-                if (expr && IS_PAIR(expr)) {
+                // Every form after the target: a procedure definition's
+                // body can have several (only the first used to be kept).
+                unsigned new_exprs = 0, exprs_tail = 0;
+                gc_protect(&new_exprs);
+                gc_protect(&exprs_tail);
+                unsigned e = cddr(tmpl);
+                gc_protect(&e);
+                for (; IS_PAIR(e); e = cdr(e)) {
                     unsigned new_expr = rename_free_ids_inner(
-                        car(expr), rename_map, quote_shadowed,
+                        car(e), rename_map, quote_shadowed,
                         quasiquote_shadowed);
                     if (new_expr == TOK_ERROR)
                         return TOK_ERROR;
-                    gc_protect(&new_expr);
-                    unsigned expr_tail = alloc_cons(new_expr, 0);
-                    gc_protect(&expr_tail);
-                    unsigned var_tail = alloc_cons(new_var, expr_tail);
-                    gc_protect(&var_tail);
-                    return alloc_cons(head, var_tail);
+                    list_append(&new_exprs, &exprs_tail, new_expr);
                 }
-                return tmpl;
+                unsigned var_tail = alloc_cons(new_var, new_exprs);
+                gc_protect(&var_tail);
+                return alloc_cons(new_head, var_tail);
             }
         }
         if (template_case_form(tmpl)) {
@@ -2373,14 +2813,17 @@ static unsigned rename_in_template(unsigned tmpl, int64_t old_id,
         // as part of an introduced binding's lexical scope.
         unsigned head = car(tmpl);
         if (IS_ATOM(head)) {
+            // A core alias head is its core form even when old_id is the
+            // keyword's own name.
             int64_t head_id = CELL_ID(head);
+            int64_t head_kw = kw_canon(head_id);
             if (head_id == ctx.kw_protected ||
-                (head_id == ctx.kw_quote && head_id != old_id)) {
+                (head_kw == ctx.kw_quote && head_id != old_id)) {
                 return tmpl;
             }
             if (syntax_rules_form_like(tmpl))
                 return rename_in_syntax_rules(tmpl, old_id, new_sym);
-            if (head_id == ctx.kw_quasiquote && head_id != old_id &&
+            if (head_kw == ctx.kw_quasiquote && head_id != old_id &&
                 IS_PAIR(cdr(tmpl))) {
                 unsigned new_body =
                     rename_in_quasiquote(cadr(tmpl), old_id, new_sym, 1);
@@ -2433,8 +2876,9 @@ static unsigned rename_in_template(unsigned tmpl, int64_t old_id,
             }
             if (IS_ATOM(car(next))) {
                 int64_t next_id = CELL_ID(car(next));
-                if (next_id == ctx.kw_protected || next_id == ctx.kw_quote ||
-                    next_id == ctx.kw_quasiquote ||
+                int64_t next_kw = kw_canon(next_id);
+                if (next_id == ctx.kw_protected || next_kw == ctx.kw_quote ||
+                    next_kw == ctx.kw_quasiquote ||
                     syntax_rules_form_like(next)) {
                     unsigned new_tail =
                         rename_in_template(next, old_id, new_sym);
@@ -2461,8 +2905,7 @@ static unsigned rename_in_template(unsigned tmpl, int64_t old_id,
 static unsigned rename_in_syntax_rules(unsigned tmpl, int64_t old_id,
                                        unsigned new_sym)
 {
-    if (!IS_PAIR(tmpl) || !IS_ATOM(car(tmpl)) ||
-        CELL_ID(car(tmpl)) != ctx.kw_syntax_rules)
+    if (!IS_PAIR(tmpl) || !IS_KEYWORD(car(tmpl), ctx.kw_syntax_rules))
         return tmpl;
 
     unsigned rest = cdr(tmpl);
@@ -3166,8 +3609,8 @@ static unsigned hygienize_lambda(unsigned tmpl, unsigned bindings)
 
 static unsigned define_target_name(unsigned expr)
 {
-    if (!IS_PAIR(expr) || !IS_ATOM(car(expr)) ||
-        CELL_ID(car(expr)) != ctx.kw_define || !IS_PAIR(cdr(expr)))
+    if (!IS_PAIR(expr) || !IS_KEYWORD(car(expr), ctx.kw_define) ||
+        !IS_PAIR(cdr(expr)))
         return 0;
 
     unsigned target = cadr(expr);
@@ -3379,9 +3822,10 @@ static unsigned hygienize_template(unsigned tmpl, unsigned bindings)
             return tmpl; // Return protected wrapper unchanged
         }
 
-        // Check for binding forms
+        // Check for binding forms, whose head the free-identifier rename
+        // may have replaced by a core alias or a syntax alias.
         if (IS_ATOM(head)) {
-            int64_t head_id = CELL_ID(head);
+            int64_t head_id = template_keyword(CELL_ID(head));
 
             // let, let*, letrec
             if (head_id == ctx.kw_let || head_id == ctx.kw_letstar) {
@@ -4105,8 +4549,25 @@ unsigned apply_syntax(unsigned transformer, unsigned input, unsigned use_env,
                             hygiene_binding_cell(free_id, use_env);
                 }
 
+                int core = closure_val == TOK_ERROR &&
+                                   !atom_is_core_alias(free_id)
+                               ? atom_core_form(free_id)
+                               : CF_NONE;
                 if (same_binding_at_use_site) {
                     // No rename needed - fall through to the next free id.
+                } else if (core != CF_NONE) {
+                    // A core keyword where the macro was defined, rebound
+                    // where it is used: the template means the core form, so
+                    // it gets the keyword's core alias - a permanent atom
+                    // that needs no binding and mints no gensym, so a macro
+                    // expanded in a loop costs no atom-table slots.
+                    if (bound_for_hygiene(free_id, use_env)) {
+                        unsigned entry =
+                            alloc_cons(free_atom, core_alias_cell(core));
+                        gc_protect(&entry);
+                        rename_map = alloc_cons(entry, rename_map);
+                        gc_unprotect(1);
+                    }
                 } else if (closure_val != TOK_ERROR &&
                            !generated_gensym_atom(free_atom)) {
                     // Found in closure env - create gensym and record the
@@ -4116,7 +4577,8 @@ unsigned apply_syntax(unsigned transformer, unsigned input, unsigned use_env,
                     unsigned gensym = do_gensym();
                     gc_protect(&gensym);
                     gc_protect(&closure_val);
-                    macros_note_alias(CELL_ID(gensym), free_id);
+                    macros_note_alias(CELL_ID(gensym), free_id,
+                                      IS_SYNTAX(closure_val));
 
                     unsigned target_val_cell =
                         env_find_binding_cell(free_id, closure_env);
@@ -4216,4 +4678,264 @@ void apply_syntax_bindings(unsigned env, unsigned bindings)
         }
         gc_unprotect(2);
     }
+}
+
+// ============================================================================
+// Definition-time core keywords for the standard library's macros
+// ============================================================================
+
+bool macros_freezing_core_keywords = false;
+
+// id is a core keyword (by name) that is core - unbound - in env.
+static bool core_keyword_free_in(unsigned atom, unsigned env)
+{
+    return IS_ATOM(atom) && atom_core_form(CELL_ID(atom)) != CF_NONE &&
+           !atom_is_core_alias(CELL_ID(atom)) &&
+           lookup_silent(CELL_ID(atom), env) == TOK_ERROR;
+}
+
+// tmpl with each atom whose id is a key of map ((atom . alias) ...) replaced,
+// through pairs and vectors - for patterns, where every atom is structure.
+static unsigned freeze_pattern_atoms(unsigned pat, unsigned map)
+{
+    if (IS_ATOM(pat)) {
+        for (unsigned m = map; m; m = cdr(m))
+            if (CELL_ID(car(car(m))) == CELL_ID(pat))
+                return cdr(car(m));
+        return pat;
+    }
+    GC_GUARD;
+    gc_protect(&pat);
+    gc_protect(&map);
+    if (IS_PAIR(pat)) {
+        unsigned a = freeze_pattern_atoms(car(pat), map);
+        gc_protect(&a);
+        unsigned d = freeze_pattern_atoms(cdr(pat), map);
+        if (a == car(pat) && d == cdr(pat))
+            return pat;
+        gc_protect(&d);
+        return alloc_cons(a, d);
+    }
+    if (IS_VECTOR(pat)) {
+        unsigned as_list = vector_to_list_copy(pat);
+        if (as_list == TOK_ERROR)
+            return TOK_ERROR;
+        gc_protect(&as_list);
+        unsigned frozen = freeze_pattern_atoms(as_list, map);
+        if (frozen == as_list)
+            return pat;
+        gc_protect(&frozen);
+        return list_to_vector_copy(frozen);
+    }
+    return pat;
+}
+
+// The pattern variables of a rule's pattern (its keyword position skipped),
+// as the ((var . #f) ...) alist collect_free_ids reads them from.
+static unsigned pattern_var_alist(unsigned pattern, unsigned literals,
+                                  int64_t ellipsis_id, unsigned alist)
+{
+    GC_GUARD;
+    gc_protect(&pattern);
+    gc_protect(&literals);
+    gc_protect(&alist);
+    if (IS_ATOM(pattern)) {
+        if (!syntax_pattern_atom_is_variable(pattern, literals, ellipsis_id))
+            return alist;
+        unsigned entry = alloc_cons(pattern, ctx.atom_false);
+        gc_protect(&entry);
+        return alloc_cons(entry, alist);
+    }
+    if (IS_PAIR(pattern)) {
+        alist = pattern_var_alist(car(pattern), literals, ellipsis_id, alist);
+        return pattern_var_alist(cdr(pattern), literals, ellipsis_id, alist);
+    }
+    if (IS_VECTOR(pattern)) {
+        unsigned as_list = vector_to_list_copy(pattern);
+        if (as_list == TOK_ERROR)
+            return alist;
+        gc_protect(&as_list);
+        return pattern_var_alist(as_list, literals, ellipsis_id, alist);
+    }
+    return alist;
+}
+
+// A syntax-rules form being defined while the standard library loads, with
+// the core keywords it uses - in templates and as literals - replaced by
+// their core aliases wherever they are core at the definition. The user's
+// top-level definitions share the stdlib's frame, so without this a later
+// (define if ...) there reached into every stdlib macro expanded afterwards:
+// (when #t 7) called the new if. MIT's system macros live in a frame user
+// code cannot touch and keep their keywords; a user macro defined before
+// such a define does see it, in both systems.
+unsigned macros_freeze_core_keywords(unsigned transformer_form,
+                                     unsigned closure_env,
+                                     int64_t default_ellipsis_id)
+{
+    GC_GUARD;
+    gc_protect(&transformer_form);
+    gc_protect(&closure_env);
+    int64_t ellipsis_id = 0;
+    unsigned literals = 0, rules = 0;
+    syntax_rules_parts(transformer_form, default_ellipsis_id, &ellipsis_id,
+                       &literals, &rules);
+    gc_protect(&literals);
+    gc_protect(&rules);
+
+    // Literals: else in (syntax-rules (else) ...) becomes else's alias, in
+    // the literal list and in every pattern alike; it still matches a plain
+    // else that is core where the macro is used (see literal_matches).
+    unsigned literal_map = 0;
+    gc_protect(&literal_map);
+    unsigned new_literals = 0, lit_tail = 0;
+    gc_protect(&new_literals);
+    gc_protect(&lit_tail);
+    unsigned l = literals;
+    gc_protect(&l);
+    for (; IS_PAIR(l); l = cdr(l)) {
+        unsigned lit = car(l);
+        if (core_keyword_free_in(lit, closure_env)) {
+            unsigned alias = core_alias_cell(atom_core_form(CELL_ID(lit)));
+            unsigned entry = alloc_cons(car(l), alias);
+            gc_protect(&entry);
+            literal_map = alloc_cons(entry, literal_map);
+            gc_unprotect(1);
+            lit = alias;
+        } else {
+            lit = car(l);
+        }
+        list_append(&new_literals, &lit_tail, lit);
+    }
+
+    unsigned new_rules = 0, rule_tail = 0;
+    gc_protect(&new_rules);
+    gc_protect(&rule_tail);
+    unsigned r = rules;
+    gc_protect(&r);
+    for (; IS_PAIR(r); r = cdr(r)) {
+        unsigned pattern = car(car(r));
+        unsigned tmpl = cadr(car(r));
+        gc_protect(&pattern);
+        gc_protect(&tmpl);
+        unsigned vars =
+            pattern_var_alist(IS_PAIR(pattern) ? cdr(pattern) : 0, literals,
+                              ellipsis_id, 0);
+        gc_protect(&vars);
+        unsigned free_ids =
+            collect_free_ids(tmpl, vars, 0, ellipsis_id, closure_env);
+        gc_protect(&free_ids);
+        unsigned map = 0;
+        gc_protect(&map);
+        unsigned f = free_ids;
+        gc_protect(&f);
+        for (; f; f = cdr(f)) {
+            if (!core_keyword_free_in(car(f), closure_env))
+                continue;
+            unsigned alias = core_alias_cell(atom_core_form(CELL_ID(car(f))));
+            unsigned entry = alloc_cons(car(f), alias);
+            gc_protect(&entry);
+            map = alloc_cons(entry, map);
+            gc_unprotect(1);
+        }
+        if (map)
+            tmpl = rename_free_ids(tmpl, map);
+        if (literal_map)
+            pattern = freeze_pattern_atoms(pattern, literal_map);
+        if (tmpl == TOK_ERROR || pattern == TOK_ERROR)
+            return transformer_form;
+        unsigned tmpl_tail = alloc_cons(tmpl, cddr(car(r)));
+        gc_protect(&tmpl_tail);
+        unsigned rule = alloc_cons(pattern, tmpl_tail);
+        list_append(&new_rules, &rule_tail, rule);
+        gc_unprotect(7);
+    }
+
+    // (syntax-rules [ellipsis] literals rule ...)
+    unsigned tail = alloc_cons(new_literals, new_rules);
+    gc_protect(&tail);
+    if (IS_ATOM(cadr(transformer_form)))
+        tail = alloc_cons(cadr(transformer_form), tail);
+    return alloc_cons(car(transformer_form), tail);
+}
+
+// ============================================================================
+// Core aliases in quoted data
+// ============================================================================
+
+#define CORE_ALIAS_SCAN_LIMIT 4096
+
+// 1 if datum holds a core alias, 0 if not, -1 if it is too large (or
+// circular) to tell within *budget nodes. Allocates nothing.
+static int datum_core_alias_scan(unsigned datum, unsigned *budget)
+{
+    int found = 0;
+    for (;;) {
+        if (*budget == 0)
+            return -1;
+        (*budget)--;
+        if (IS_ATOM(datum))
+            return found | atom_is_core_alias(CELL_ID(datum));
+        if (IS_VECTOR(datum)) {
+            unsigned len = vector_len(datum);
+            for (unsigned i = 0; i < len; i++) {
+                int r = datum_core_alias_scan(vector_data_ptr(datum)[i],
+                                              budget);
+                if (r < 0)
+                    return -1;
+                found |= r;
+            }
+            return found;
+        }
+        if (!IS_PAIR(datum))
+            return found;
+        int r = datum_core_alias_scan(car(datum), budget);
+        if (r < 0)
+            return -1;
+        found |= r;
+        datum = cdr(datum);
+    }
+}
+
+static unsigned datum_without_core_aliases(unsigned datum)
+{
+    if (IS_ATOM(datum)) {
+        if (!atom_is_core_alias(CELL_ID(datum)))
+            return datum;
+        int64_t id = kw_canon(CELL_ID(datum));
+        unsigned plain = alloc();
+        CELL_TYPE(plain) = BT_ATOM;
+        CELL_ID(plain) = id;
+        return plain;
+    }
+    GC_GUARD;
+    gc_protect(&datum);
+    if (IS_PAIR(datum)) {
+        unsigned a = datum_without_core_aliases(car(datum));
+        gc_protect(&a);
+        unsigned d = datum_without_core_aliases(cdr(datum));
+        if (a == car(datum) && d == cdr(datum))
+            return datum;
+        gc_protect(&d);
+        return alloc_cons(a, d);
+    }
+    if (IS_VECTOR(datum)) {
+        unsigned as_list = vector_to_list_copy(datum);
+        if (as_list == TOK_ERROR)
+            return datum;
+        gc_protect(&as_list);
+        unsigned stripped = datum_without_core_aliases(as_list);
+        if (stripped == as_list)
+            return datum;
+        gc_protect(&stripped);
+        return list_to_vector_copy(stripped);
+    }
+    return datum;
+}
+
+unsigned macros_strip_core_aliases(unsigned datum)
+{
+    unsigned budget = CORE_ALIAS_SCAN_LIMIT;
+    if (datum_core_alias_scan(datum, &budget) != 1)
+        return datum;
+    return datum_without_core_aliases(datum);
 }

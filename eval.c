@@ -100,7 +100,7 @@ static bool qq_syntax_valid(unsigned x, unsigned env, int depth,
 
     unsigned head = car(x);
     if (IS_KEYWORD(head, ctx.kw_unquote) &&
-        !is_keyword_shadowed(ctx.kw_unquote, env)) {
+        !is_keyword_shadowed(CELL_ID(head), env)) {
         if (!syntax_arity_checked(x, 1, 1, "unquote"))
             return false;
         if (depth == 1)
@@ -109,7 +109,7 @@ static bool qq_syntax_valid(unsigned x, unsigned env, int depth,
                                structural_depth + 1);
     }
     if (IS_KEYWORD(head, ctx.kw_unquote_splicing) &&
-        !is_keyword_shadowed(ctx.kw_unquote_splicing, env)) {
+        !is_keyword_shadowed(CELL_ID(head), env)) {
         if (!syntax_arity_checked(x, 1, 1, "unquote-splicing"))
             return false;
         if (depth == 1)
@@ -118,7 +118,7 @@ static bool qq_syntax_valid(unsigned x, unsigned env, int depth,
                                structural_depth + 1);
     }
     if (IS_KEYWORD(head, ctx.kw_quasiquote) &&
-        !is_keyword_shadowed(ctx.kw_quasiquote, env)) {
+        !is_keyword_shadowed(CELL_ID(head), env)) {
         return syntax_arity_checked(x, 1, 1, "quasiquote") &&
                qq_syntax_valid(cadr(x), env, depth + 1,
                                structural_depth + 1);
@@ -175,7 +175,7 @@ static unsigned qq_expand_depth(unsigned x, unsigned env, int depth)
 
     // Check for (unquote expr) - only if unquote is not shadowed
     if (IS_KEYWORD(head, ctx.kw_unquote) &&
-        !is_keyword_shadowed(ctx.kw_unquote, env)) {
+        !is_keyword_shadowed(CELL_ID(head), env)) {
         if (depth == 1) {
             // Evaluate the unquote
             return eval_cps(cadr(x), env);
@@ -194,7 +194,7 @@ static unsigned qq_expand_depth(unsigned x, unsigned env, int depth)
 
     // Check for (unquote-splicing expr) - only if not shadowed
     if (IS_KEYWORD(head, ctx.kw_unquote_splicing) &&
-        !is_keyword_shadowed(ctx.kw_unquote_splicing, env)) {
+        !is_keyword_shadowed(CELL_ID(head), env)) {
         if (depth == 1) {
             show_error("unquote-splicing not inside list");
             return TOK_ERROR;
@@ -213,7 +213,7 @@ static unsigned qq_expand_depth(unsigned x, unsigned env, int depth)
 
     // Check for nested (quasiquote expr) - only if not shadowed
     if (IS_KEYWORD(head, ctx.kw_quasiquote) &&
-        !is_keyword_shadowed(ctx.kw_quasiquote, env)) {
+        !is_keyword_shadowed(CELL_ID(head), env)) {
         unsigned inner = qq_expand_depth(cadr(x), env, depth + 1);
         if (inner == TOK_ERROR)
             return TOK_ERROR;
@@ -239,7 +239,7 @@ static unsigned qq_expand_depth(unsigned x, unsigned env, int depth)
 
         // Check if element is (unquote-splicing expr) - only if not shadowed
         if (IS_PAIR(elem) && IS_KEYWORD(car(elem), ctx.kw_unquote_splicing) &&
-            !is_keyword_shadowed(ctx.kw_unquote_splicing, env)) {
+            !is_keyword_shadowed(CELL_ID(car(elem)), env)) {
             if (depth == 1) {
                 // Evaluate and splice
                 unsigned spliced = eval_cps(cadr(elem), env);
@@ -353,11 +353,11 @@ static bool qq_spine_tail_unquote(unsigned l, unsigned env)
 {
     unsigned h = car(l);
     return (IS_KEYWORD(h, ctx.kw_unquote) &&
-            !is_keyword_shadowed(ctx.kw_unquote, env)) ||
+            !is_keyword_shadowed(CELL_ID(h), env)) ||
            (IS_KEYWORD(h, ctx.kw_unquote_splicing) &&
-            !is_keyword_shadowed(ctx.kw_unquote_splicing, env)) ||
+            !is_keyword_shadowed(CELL_ID(h), env)) ||
            (IS_KEYWORD(h, ctx.kw_quasiquote) &&
-            !is_keyword_shadowed(ctx.kw_quasiquote, env));
+            !is_keyword_shadowed(CELL_ID(h), env));
 }
 
 static unsigned qq_transform(unsigned x, unsigned env, int depth)
@@ -372,7 +372,7 @@ static unsigned qq_transform(unsigned x, unsigned env, int depth)
             unsigned elem = vector_data_ptr(x)[i];
             if (IS_PAIR(elem) &&
                 IS_KEYWORD(car(elem), ctx.kw_unquote_splicing) &&
-                !is_keyword_shadowed(ctx.kw_unquote_splicing, env))
+                !is_keyword_shadowed(CELL_ID(car(elem)), env))
                 has_splice = true;
         }
         if (has_splice) {
@@ -419,7 +419,7 @@ static unsigned qq_transform(unsigned x, unsigned env, int depth)
     gc_protect(&head);
 
     if (IS_KEYWORD(head, ctx.kw_unquote) &&
-        !is_keyword_shadowed(ctx.kw_unquote, env)) {
+        !is_keyword_shadowed(CELL_ID(head), env)) {
         if (depth == 1)
             return cadr(x);
         unsigned inner = qq_transform(cadr(x), env, depth - 1);
@@ -428,7 +428,7 @@ static unsigned qq_transform(unsigned x, unsigned env, int depth)
         return qq_keyword_pair_expr(head, inner);
     }
     if (IS_KEYWORD(head, ctx.kw_unquote_splicing) &&
-        !is_keyword_shadowed(ctx.kw_unquote_splicing, env)) {
+        !is_keyword_shadowed(CELL_ID(head), env)) {
         if (depth == 1) {
             show_error("unquote-splicing not inside list");
             return TOK_ERROR;
@@ -439,7 +439,7 @@ static unsigned qq_transform(unsigned x, unsigned env, int depth)
         return qq_keyword_pair_expr(head, inner);
     }
     if (IS_KEYWORD(head, ctx.kw_quasiquote) &&
-        !is_keyword_shadowed(ctx.kw_quasiquote, env)) {
+        !is_keyword_shadowed(CELL_ID(head), env)) {
         unsigned inner = qq_transform(cadr(x), env, depth + 1);
         if (inner == TOK_ERROR)
             return TOK_ERROR;
@@ -479,7 +479,7 @@ static unsigned qq_transform(unsigned x, unsigned env, int depth)
         gc_protect(&elem);
         if (depth == 1 && IS_PAIR(elem) &&
             IS_KEYWORD(car(elem), ctx.kw_unquote_splicing) &&
-            !is_keyword_shadowed(ctx.kw_unquote_splicing, env)) {
+            !is_keyword_shadowed(CELL_ID(car(elem)), env)) {
             // ,@e: splice - append validates e is a proper list
             result = qq_call2(PAPPEND, cadr(elem), result);
         } else {

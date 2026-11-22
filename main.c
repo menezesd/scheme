@@ -355,8 +355,12 @@ int main(int argc, char **argv)
     // raised during loading is dispatched the same way as one raised later.
     ctx.global_environment = env;
 
-    // Load standard library
-    if (!load_stdlib(&env))
+    // Load standard library. Its macros keep the core keywords they were
+    // written with (see macros_freeze_core_keywords).
+    macros_freezing_core_keywords = true;
+    bool stdlib_loaded = load_stdlib(&env);
+    macros_freezing_core_keywords = false;
+    if (!stdlib_loaded)
         return 1;
 
     // Keep a pristine standard-library environment as the source for

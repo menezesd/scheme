@@ -4658,18 +4658,23 @@ TEST(eval_macro_expansion_rejects_recursive_expansion)
                "  (loop))",
                env) == TOK_ERROR);
 
+    // The template's 'macro-quote is closed in the let-syntax's outer
+    // scope, where quote is core: it quotes rather than re-entering the
+    // macro the body binds quote to (MIT agrees).
     ASSERT(eval_string(
-               "(let-syntax "
-               "    ((quote (syntax-rules () "
-               "              ((quote x) 'macro-quote)))) "
-               "  (quote a))",
-               env) == TOK_ERROR);
+               "(eq? (let-syntax "
+               "         ((quote (syntax-rules () "
+               "                   ((quote x) 'macro-quote)))) "
+               "       (quote a)) "
+               "     'macro-quote)",
+               env) == ctx.atom_true);
     ASSERT(compiled_eval_string(
-               "(let-syntax "
-               "    ((quote (syntax-rules () "
-               "              ((quote x) 'macro-quote)))) "
-               "  (quote a))",
-               env) == TOK_ERROR);
+               "(eq? (let-syntax "
+               "         ((quote (syntax-rules () "
+               "                   ((quote x) 'macro-quote)))) "
+               "       (quote a)) "
+               "     'macro-quote)",
+               env) == ctx.atom_true);
     PASS();
 }
 
@@ -7973,6 +7978,131 @@ TEST(eval_shadowed_keyword_head_is_applied)
 }
 
 // ============================================================================
+// Core aliases
+// ============================================================================
+
+// Replace, in place, every atom spelled %ck-<keyword> by that keyword's core
+// alias, to write the forms a macro expansion produces for a template
+// keyword the use site rebinds. Allocates nothing.
+static void substitute_core_aliases(unsigned expr)
+{
+    for (; IS_PAIR(expr); expr = cdr(expr)) {
+        unsigned item = car(expr);
+        if (!IS_ATOM(item)) {
+            substitute_core_aliases(item);
+            continue;
+        }
+        const char *name = ctx.atom_table[CELL_ID(item)];
+        if (name && strncmp(name, "%ck-", 4) == 0) {
+            int form = atom_core_form(intern(name + 4));
+            if (form != CF_NONE)
+                cell_set_car(expr, core_alias_cell(form));
+        }
+    }
+}
+
+static unsigned core_alias_eval(const char *src, unsigned env, bool compiled)
+{
+    GC_GUARD;
+    gc_protect(&env);
+    unsigned expr = read_expr_from_string(src);
+    if (expr == TOK_ERROR)
+        return TOK_ERROR;
+    gc_protect(&expr);
+    substitute_core_aliases(expr);
+    if (!compiled)
+        return eval_obj(expr, env);
+    code_object *code = compile_toplevel(expr, env);
+    vm_state vm;
+    vm_init(&vm);
+    unsigned result = vm_run(&vm, code, env);
+    vm_free(&vm);
+    gc_sweep_code_objects();
+    return result;
+}
+
+// A core alias heads its core form however its name is bound: dispatch, the
+// body-definition scans, cond's auxiliary keywords and - in the VM - the
+// analysis deciding whether a closure captures a variable kept in a stack
+// slot all read it as the keyword.
+static void check_core_alias_forms(bool compiled)
+{
+    unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
+    ASSERT(is_int(
+        core_alias_eval("((lambda (if) (%ck-if #t 1 2)) list)", env, compiled),
+        1));
+    ASSERT(is_int(
+        core_alias_eval("((lambda (x) ((%ck-lambda () x))) 5)", env, compiled),
+        5));
+    ASSERT(is_int(core_alias_eval("((lambda (lambda x) (let ((f (%ck-lambda "
+                                       "() x))) (set! x 6) (f))) 0 5)",
+                                       env, compiled),
+                       6));
+    ASSERT(is_bool(
+        core_alias_eval("(equal? ((lambda (when) (%ck-quote (when 1 2))) 0) "
+                        "        '(when 1 2))",
+                        env, compiled),
+        1));
+    ASSERT(is_int(
+        core_alias_eval("((lambda () (%ck-define x 9) x))", env, compiled), 9));
+    ASSERT(is_int(core_alias_eval("((lambda (define) (%ck-begin "
+                                       "(%ck-define y 4)) y) list)",
+                                       env, compiled),
+                       4));
+    ASSERT(is_int(
+        core_alias_eval("((lambda (else) (cond (#f 1) (%ck-else 2))) #f)", env,
+                        compiled),
+        2));
+    ASSERT(is_int(core_alias_eval("((lambda (=> else) (cond (5 %ck-=> "
+                                       "(%ck-lambda (v) (+ v 1))) (%ck-else "
+                                       "0))) 1 2)",
+                                       env, compiled),
+                       6));
+    PASS();
+}
+
+TEST(eval_core_alias_forms)
+{
+    check_core_alias_forms(false);
+}
+
+TEST(compiled_core_alias_forms)
+{
+    check_core_alias_forms(true);
+}
+
+// A top-level define of a keyword binds a variable, which code written
+// afterwards sees; a procedure written before keeps the core form (MIT
+// agrees). The interpreter's procedures name their core forms by alias.
+static void check_toplevel_keyword_redefinition(bool compiled)
+{
+    unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
+    unsigned (*run)(const char *, unsigned) =
+        compiled ? compiled_eval_string : eval_string;
+    ASSERT(run("(define (g x) (if x 1 2))", env) != TOK_ERROR);
+    ASSERT(run("(define (h x) ((lambda () (if x 1 2))))", env) != TOK_ERROR);
+    ASSERT(run("(define if list)", env) != TOK_ERROR);
+    ASSERT(is_int(run("(g #t)", env), 1));
+    ASSERT(is_int(run("(h #f)", env), 2));
+    ASSERT(is_bool(run("(equal? (if 1 2 3) (list 1 2 3))", env), 1));
+    PASS();
+}
+
+TEST(eval_toplevel_keyword_redefinition)
+{
+    check_toplevel_keyword_redefinition(false);
+}
+
+TEST(compiled_toplevel_keyword_redefinition)
+{
+    check_toplevel_keyword_redefinition(true);
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -8294,6 +8424,10 @@ int main(void)
     RUN_TEST(compiled_macro_hygiene_respects_shadowed_quote_in_templates);
     RUN_TEST(eval_macro_hygiene_preserves_definition_site_keyword_bindings);
     RUN_TEST(compiled_macro_hygiene_preserves_definition_site_keyword_bindings);
+    RUN_TEST(eval_core_alias_forms);
+    RUN_TEST(compiled_core_alias_forms);
+    RUN_TEST(eval_toplevel_keyword_redefinition);
+    RUN_TEST(compiled_toplevel_keyword_redefinition);
     RUN_TEST(eval_syntax_rules_unwraps_pattern_vars_in_quoted_templates);
     RUN_TEST(compiled_syntax_rules_unwraps_pattern_vars_in_quoted_templates);
     RUN_TEST(eval_macro_hygiene_preserves_quasiquote_data);

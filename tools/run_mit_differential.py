@@ -66,6 +66,24 @@ PROBES = [
     # User identifiers resembling implementation names still obey hygiene.
     "(let-syntax ((m (syntax-rules () ((m) |##gensym##999999|)))) (let ((|##gensym##999999| 7)) (m)))",
     "(let ((|##gensym##999998| 42)) (let-syntax ((m (syntax-rules () ((m) |##gensym##999998|)))) (let ((|##gensym##999998| 7)) (m))))",
+    # A template's core keywords keep their meaning where the use site
+    # rebinds them (they become core aliases).
+    "(let-syntax ((m (syntax-rules () ((_ a b) (let ((t a)) (if t t b)))))) (let ((if list)) (m #f 3)))",
+    "(let-syntax ((m (syntax-rules () ((_ a b) (let ((t a)) (if t t b)))))) (let ((let 0) (if list) (t 5)) (m #f t)))",
+    "(let-syntax ((m (syntax-rules () ((_ a b) (begin a b))))) (let ((begin list)) (m 1 2)))",
+    "(let-syntax ((m (syntax-rules () ((_ v) (cond (#f 1) (else v)))))) (let ((else #f)) (m 5)))",
+    "(let-syntax ((m (syntax-rules () ((_) (quote (when 1 2)))))) (let ((quote list)) (m)))",
+    "(let-syntax ((m (syntax-rules () ((_ v) ((lambda (y) y) v))))) (let ((lambda list)) (m 7)))",
+    "(let-syntax ((m (syntax-rules () ((_ a) (lambda () a))))) ((lambda (x y) (let ((lambda list)) (list ((m x)) ((m y))))) 5 6))",
+    "(let-syntax ((m (syntax-rules () ((_ a b) (let ((tmp a)) (set! a b) (set! b tmp)))))) (let ((set! list) (let 0) (p 1) (q 2)) (m p q) (list p q)))",
+    "(let-syntax ((m (syntax-rules () ((_ n v) (define n v))))) (let ((define list)) (m x 9) x))",
+    "(let-syntax ((m (syntax-rules () ((_ n) (letrec ((f (lambda (k) (if (= k 0) n (f (- k 1)))))) (f 3)))))) (let ((letrec list) (lambda list)) (m 8)))",
+    "(let-syntax ((m (syntax-rules () ((_ x) (case x ((1) 'one) (else 0)))))) (let ((else #f)) (m 5)))",
+    "(let-syntax ((m (syntax-rules () ((_ x) (cond ((assv x '((1 . one))) => cdr) (else 'none)))))) (let ((else #f) (=> #f)) (m 1)))",
+    "(let-syntax ((m (syntax-rules () ((_ a b) (let ((t a)) (if t t b)))))) (let-syntax ((if (syntax-rules () ((_ a b c) 'macro-if)))) (m #f 3)))",
+    "(let ((if list) (begin list) (letrec list) (lambda list)) (list (when #t 5) (do ((i 0 (+ i 1))) ((= i 3) i)) ((case-lambda ((a) a) ((a b) (+ a b))) 1 2)))",
+    "(eval '(let ((else #f)) (case 1 (else 0))) (interaction-environment))",
+    "(let-syntax ((quote (syntax-rules () ((quote x) 'macro-quote)))) (quote a))",
     # --- numeric tower ---
     "(+ 1 2)",
     "(exact->inexact 1/3)",
@@ -446,6 +464,36 @@ def build_source(probes):
     return PRELUDE + body
 
 
+# Whole programs, for what a probe cannot do in its shared top level: each
+# runs on its own, printing one line per %emit, in all three systems. A core
+# keyword redefined at top level reaches code written afterwards, and a user
+# macro defined before (it shares the frame), but not procedures written
+# before nor the standard library's macros.
+PROGRAMS = [
+    """(define (g x) (if x 1 2))
+(define-syntax m (syntax-rules () ((_ x) (if x 1 2))))
+(define if list)
+(%emit (lambda () (g #t)))
+(%emit (lambda () (m #t)))
+(%emit (lambda () (if 1 2 3)))
+(%emit (lambda () (when #t 7)))
+(%emit (lambda () (map (lambda (x) (* x x)) '(1 2 3))))
+(%emit (lambda () (call-with-output-string (lambda (p) (display 42 p)))))
+""",
+    """(define (if a b c) (list a b c))
+(%emit (lambda () (if 1 2 3)))
+(%emit (lambda () (map (lambda (x) (+ x 1)) '(1 2 3))))
+(%emit (lambda () (assq 'b '((a 1) (b 2)))))
+(%emit (lambda () (call-with-output-string (lambda (p) (write 'ok p)))))
+""",
+    """(define if 5)
+(%emit (lambda () (if #t 1 2)))
+(%emit (lambda () (call-with-output-string (lambda (p) (write 'still-printing p)))))
+(%emit (lambda () (unless #f 'unless-works)))
+""",
+]
+
+
 def run_scheme(argv_for, source, timeout=600):
     handle, path = tempfile.mkstemp(suffix=".scm")
     try:
@@ -520,6 +568,22 @@ def main():
         elif not equivalent(vm, ref):
             failures.append((probe, "vesper and MIT disagree", vm, cps, ref))
 
+    for program in PROGRAMS:
+        outputs = {}
+        for name, argv_for in engines:
+            try:
+                # A program that loops forever is the failure this catches.
+                outputs[name] = run_scheme(argv_for, PRELUDE + program,
+                                           timeout=60)
+            except (OSError, RuntimeError) as error:
+                outputs[name] = f"<{error}>"
+        vm, cps, ref = (normalize(outputs[n]) for n in ("vm", "cps", "mit"))
+        label = program.strip().replace("\n", " ")
+        if not equivalent(vm, cps):
+            failures.append((label, "VM and CPS interpreter disagree", vm, cps, ref))
+        elif not equivalent(vm, ref):
+            failures.append((label, "vesper and MIT disagree", vm, cps, ref))
+
     for probe, why, vm, cps, ref in failures:
         print("FAIL: %s" % probe)
         print("      %s" % why)
@@ -531,8 +595,8 @@ def main():
     for probe in unused:
         print("FAIL: expected deviation is not a probe: %s" % probe)
 
-    print("%d probes, %d failures (%d expected deviations skipped)"
-          % (len(PROBES), len(failures) + len(unused), deviations))
+    print("%d probes, %d programs, %d failures (%d expected deviations skipped)"
+          % (len(PROBES), len(PROGRAMS), len(failures) + len(unused), deviations))
     return 1 if failures or unused else 0
 
 

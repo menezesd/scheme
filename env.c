@@ -586,6 +586,7 @@ unsigned defvar(unsigned var, unsigned aval, unsigned env)
 
     // Invalidate lookup cache - new binding may shadow outer variables
     bump_acyclic_epoch();
+    note_binder(var);
 
     int64_t vid = CELL_ID(var);
     unsigned vals = cdr(frame);
@@ -816,6 +817,7 @@ unsigned bind_params(unsigned params, unsigned args)
         }
         var = car(params);
         val = car(args);
+        note_binder(var);
 
         vc = alloc_cons(var, 0);
         ac = alloc_cons(val, 0);
@@ -836,6 +838,7 @@ unsigned bind_params(unsigned params, unsigned args)
 
     // Handle rest parameter (dotted notation)
     if (IS_ATOM(params)) {
+        note_binder(params);
         vc = alloc_cons(params, 0);
         ac = alloc_cons(args, 0);
 

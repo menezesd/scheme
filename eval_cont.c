@@ -135,7 +135,7 @@ void handle_cont_cond_test(unsigned val, unsigned data, unsigned env,
             // No consequent: return test value
             tramp_apply(val, next);
         } else if (IS_KEYWORD(car(conseq), ctx.kw_arrow) &&
-                   env_find_binding_cell(ctx.kw_arrow, env) == 0) {
+                   env_find_binding_cell(CELL_ID(car(conseq)), env) == 0) {
             // (test => receiver) syntax - evaluate receiver, then call with val
             // Only if => is not lexically bound (R5RS hygiene)
             GC_GUARD;
@@ -166,7 +166,7 @@ void handle_cont_cond_test(unsigned val, unsigned data, unsigned env,
             unsigned clause = car(rest);
             unsigned test = car(clause);
             if (IS_KEYWORD(test, ctx.kw_else) &&
-                env_find_binding_cell(ctx.kw_else, env) == 0) {
+                env_find_binding_cell(CELL_ID(test), env) == 0) {
                 unsigned conseq2 = cdr(clause);
                 if (!conseq2) {
                     tramp_apply(ctx.atom_true, next);

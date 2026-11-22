@@ -103,6 +103,14 @@ static bool builtin_keyword_unbound(int64_t kw, unsigned env)
     return lookup_silent(kw, env) == TOK_ERROR;
 }
 
+// True if expr is a kw form: its head spells kw, or is kw's core alias, and
+// that identifier has no binding in env that would shadow the core form.
+static bool form_is_core(unsigned expr, int64_t kw, unsigned env)
+{
+    return IS_PAIR(expr) && IS_KEYWORD(car(expr), kw) &&
+           builtin_keyword_unbound(CELL_ID(car(expr)), env);
+}
+
 // True if target_cell is reachable through the persistent top-level global
 // environment (the outermost frame of cctx->env). Only bindings satisfying
 // this are safe to embed as a compile-time cell reference (OP_DEFINE_ALIAS_REF):
@@ -241,7 +249,7 @@ static bool body_defines_internally(unsigned body, unsigned env)
         if (is_internal_define(expr, env))
             return true;
         if (IS_PAIR(expr) && IS_KEYWORD(car(expr), ctx.kw_begin) &&
-            !is_keyword_shadowed(ctx.kw_begin, env)) {
+            !is_keyword_shadowed(CELL_ID(car(expr)), env)) {
             if (body_defines_internally(cdr(expr), env))
                 return true;
         }
@@ -269,17 +277,24 @@ static bool captured_by_inner_lambda(unsigned expr, int64_t var_id, unsigned env
             continue;
         }
 
-        int64_t kw = CELL_ID(car(expr));
-        if (kw == ctx.kw_quote && builtin_keyword_unbound(ctx.kw_quote, env))
+        // Heads are compared as keywords with core aliases read as the
+        // keyword they stand for, but looked up as written: a core alias is
+        // the core form even where its name is rebound. Missing one here
+        // would leave a captured variable in a stack slot.
+        int64_t head_id = CELL_ID(car(expr));
+        int64_t kw = kw_canon(head_id);
+        unsigned binding = lookup_silent(head_id, env);
+        bool unbound = binding == TOK_ERROR;
+        if (kw == ctx.kw_quote && unbound)
             return false;
         // A nested lambda captures this variable if its body refers to the
         // outer binding. Check the full lambda form so shadowing parameters
         // are handled by contains_reference.
-        if (kw == ctx.kw_lambda && builtin_keyword_unbound(ctx.kw_lambda, env))
+        if (kw == ctx.kw_lambda && unbound)
             return contains_reference(expr, var_id);
         // (define (name . formals) body ...) builds a closure without a
         // literal lambda; treat it as (lambda formals body ...).
-        if (kw == ctx.kw_define && builtin_keyword_unbound(ctx.kw_define, env) &&
+        if (kw == ctx.kw_define && unbound &&
             IS_PAIR(cdr(expr)) && IS_PAIR(cadr(expr))) {
             for (unsigned p = cdr(cadr(expr)); p; p = IS_PAIR(p) ? cdr(p) : 0) {
                 if (IS_ATOM(p))
@@ -294,7 +309,7 @@ static bool captured_by_inner_lambda(unsigned expr, int64_t var_id, unsigned env
         }
         // A named let built in (when let is not a macro) compiles its body
         // as a closure, so any reference in the form counts.
-        if (kw == ctx.kw_let && builtin_keyword_unbound(ctx.kw_let, env) &&
+        if (kw == ctx.kw_let && unbound &&
             IS_PAIR(cdr(expr)) && IS_ATOM(cadr(expr)) && cadr(expr))
             return contains_reference(expr, var_id);
         // let/let*/letrec binding initializers may create closures over this
@@ -303,11 +318,10 @@ static bool captured_by_inner_lambda(unsigned expr, int64_t var_id, unsigned env
         // above.
         if ((kw == ctx.kw_let || kw == ctx.kw_letstar ||
              kw == ctx.kw_letrec) &&
-            builtin_keyword_unbound(kw, env)) {
+            unbound) {
             expr = cdr(expr);
             continue;
         }
-        unsigned binding = lookup_silent(kw, env);
         if (binding != TOK_ERROR && IS_SYNTAX(binding))
             return contains_reference(expr, var_id);
         if (captured_by_inner_lambda(car(expr), var_id, env))
@@ -329,7 +343,7 @@ static bool contains_reference(unsigned expr, int64_t var_id)
             return false;
 
         // Check lambda - don't descend if var_id is shadowed by a parameter
-        if (IS_ATOM(car(expr)) && CELL_ID(car(expr)) == ctx.kw_lambda) {
+        if (IS_KEYWORD(car(expr), ctx.kw_lambda)) {
             unsigned params = cadr(expr);
             // Check if var_id is in params
             if (IS_ATOM(params) && CELL_ID(params) == var_id)
@@ -2041,7 +2055,7 @@ static bool collect_syntax_free_vars(compile_ctx *cctx, unsigned rules,
                          gensym_counter++);
                 unsigned gensym_atom = make_uninterned_symbol(name);
                 gc_protect(&gensym_atom);
-                macros_note_alias(CELL_ID(gensym_atom), var_id);
+                macros_note_alias(CELL_ID(gensym_atom), var_id, false);
                 unsigned entry = alloc_cons(var_atom, gensym_atom);
                 gc_protect(&entry);
                 rename_map = alloc_cons(entry, rename_map);
@@ -2065,7 +2079,8 @@ static bool collect_syntax_free_vars(compile_ctx *cctx, unsigned rules,
                 unsigned gensym_atom = make_uninterned_symbol(name);
                 gc_protect(&gensym_atom);
                 gc_protect(&val);
-                macros_note_alias(CELL_ID(gensym_atom), var_id);
+                macros_note_alias(CELL_ID(gensym_atom), var_id,
+                                  IS_SYNTAX(val));
 
                 unsigned entry = alloc_cons(var_atom, gensym_atom);
                 gc_protect(&entry);
@@ -2313,8 +2328,11 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
 
         // Check for special forms
         if (IS_ATOM(head)) {
-            int64_t kw = CELL_ID(head);
-            unsigned special_binding = lookup_silent(kw, cctx->env);
+            // Dispatch on the keyword, a core alias read as the one it
+            // stands for, but look up the head as written: the alias is the
+            // core form wherever its name has been rebound.
+            int64_t kw = kw_canon(CELL_ID(head));
+            unsigned special_binding = lookup_silent(CELL_ID(head), cctx->env);
             compile_result macro_result;
             if (special_binding != TOK_ERROR &&
                 compile_macro_binding(special_binding, expr, cctx,
@@ -2324,8 +2342,10 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
             if (special_binding == TOK_ERROR && kw == ctx.kw_quote) {
                 if (!syntax_arity_checked(expr, 1, 1, "quote"))
                     return emit_syntax_error(cctx, "quote: invalid syntax");
-                unsigned val = cadr(expr);
+                unsigned val = macros_strip_core_aliases(cadr(expr));
+                gc_protect(&val);
                 emit2(cctx, OP_CONST, code_add_const(cctx->code, val));
+                gc_unprotect(1);
                 return const_result(val);
             }
             if (special_binding == TOK_ERROR && kw == ctx.kw_if)
@@ -2552,7 +2572,8 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
                                 gc_protect(&gensym_atom);
                                 gc_protect(&val);
                                 // So a renamed case is still seen as case
-                                macros_note_alias(CELL_ID(gensym_atom), var_id);
+                                macros_note_alias(CELL_ID(gensym_atom), var_id,
+                                                  IS_SYNTAX(val));
 
                                 // Add to rename map: (var_atom . gensym_atom)
                                 unsigned entry = alloc_cons(var_atom, gensym_atom);
@@ -3015,8 +3036,8 @@ static bool trmc_capture_free(unsigned expr, compile_ctx *cctx, int depth)
     if (!IS_ATOM(head))
         return false;
 
-    int64_t kw = CELL_ID(head);
-    unsigned binding = lookup_silent(kw, cctx->env);
+    int64_t kw = kw_canon(CELL_ID(head));
+    unsigned binding = lookup_silent(CELL_ID(head), cctx->env);
 
     if (binding == TOK_ERROR) {
         // Unbound: a special form, but only while unshadowed - the same
@@ -3033,7 +3054,7 @@ static bool trmc_capture_free(unsigned expr, compile_ctx *cctx, int depth)
     }
 
     if (!IS_BUILTIN(binding) || !trmc_safe_primitive(CELL_ID(binding)) ||
-        !env_binding_is_immutable(kw, cctx->env))
+        !env_binding_is_immutable(CELL_ID(head), cctx->env))
         return false;
     for (unsigned a = cdr(expr); IS_PAIR(a); a = cdr(a))
         if (!trmc_capture_free(car(a), cctx, depth + 1))
@@ -3151,8 +3172,8 @@ static bool trmc_scan_tail(unsigned expr, compile_ctx *cctx,
     }
 
     if (IS_PAIR(expr) && IS_ATOM(car(expr))) {
-        int64_t kw = CELL_ID(car(expr));
-        if (lookup_silent(kw, cctx->env) == TOK_ERROR) {
+        int64_t kw = kw_canon(CELL_ID(car(expr)));
+        if (lookup_silent(CELL_ID(car(expr)), cctx->env) == TOK_ERROR) {
             if (kw == ctx.kw_if) {
                 unsigned rest = cdr(expr);
                 unsigned len = list_length(rest);
@@ -3189,13 +3210,14 @@ static bool trmc_scan_tail(unsigned expr, compile_ctx *cctx,
                     unsigned conseq = cdr(clause);
                     bool is_else =
                         IS_KEYWORD(test, ctx.kw_else) &&
-                        env_find_binding_cell(ctx.kw_else, cctx->env) == 0;
+                        env_find_binding_cell(CELL_ID(test), cctx->env) == 0;
                     if (!is_else && !trmc_capture_free(test, cctx, 0))
                         st->capture_free = false;
                     if (!IS_PAIR(conseq))
                         continue; // (test): the test value is the result
                     if (IS_KEYWORD(car(conseq), ctx.kw_arrow) &&
-                        env_find_binding_cell(ctx.kw_arrow, cctx->env) == 0) {
+                        env_find_binding_cell(CELL_ID(car(conseq)),
+                                              cctx->env) == 0) {
                         // (test => receiver) applies the receiver, and a call
                         // can capture whatever the receiver expression is.
                         st->capture_free = false;
@@ -3267,9 +3289,7 @@ static bool trmc_scan_tail(unsigned expr, compile_ctx *cctx,
     // Same caveat as a let besides: the scan reads the body without these
     // bindings in scope, so it cannot tell that one shadows a name it
     // resolved to a primitive. HOLE is given up; FOLD is unaffected.
-    if (IS_PAIR(expr) && IS_PAIR(car(expr)) && IS_ATOM(car(car(expr))) &&
-        CELL_ID(car(car(expr))) == ctx.kw_lambda &&
-        builtin_keyword_unbound(ctx.kw_lambda, cctx->env)) {
+    if (IS_PAIR(expr) && form_is_core(car(expr), ctx.kw_lambda, cctx->env)) {
         unsigned fn = car(expr);
         unsigned params = IS_PAIR(cdr(fn)) ? cadr(fn) : 0;
         unsigned fn_body = IS_PAIR(cdr(fn)) ? cddr(fn) : 0;
@@ -3671,10 +3691,7 @@ static unsigned is_internal_define(unsigned expr, unsigned env)
 {
     if (!IS_PAIR(expr))
         return 0;
-    unsigned kw = car(expr);
-    if (!IS_KEYWORD(kw, ctx.kw_define))
-        return 0;
-    if (lookup_silent(ctx.kw_define, env) != TOK_ERROR)
+    if (!form_is_core(expr, ctx.kw_define, env))
         return 0;
     if (!IS_PAIR(cdr(expr)))
         return 0;
@@ -3714,7 +3731,7 @@ static bool collect_internal_defines(unsigned body, unsigned env,
 
         // A begin can contain more begins, all in the same definition scope.
         if (IS_PAIR(expr) && IS_KEYWORD(car(expr), ctx.kw_begin) &&
-            !is_keyword_shadowed(ctx.kw_begin, env)) {
+            !is_keyword_shadowed(CELL_ID(car(expr)), env)) {
             if (collect_internal_defines(cdr(expr), env, names)) {
                 body = cdr(body);
                 gc_unprotect(1);
@@ -3727,7 +3744,7 @@ static bool collect_internal_defines(unsigned body, unsigned env,
         // the compile-time frame, so a macro defined first resolved their
         // names past the body - to a global, or to nothing at all.
         if (IS_PAIR(expr) && IS_KEYWORD(car(expr), ctx.kw_define_syntax) &&
-            !is_keyword_shadowed(ctx.kw_define_syntax, env)) {
+            !is_keyword_shadowed(CELL_ID(car(expr)), env)) {
             body = cdr(body);
             gc_unprotect(1);
             continue;
@@ -3785,16 +3802,15 @@ static unsigned extend_compile_env_with_names(unsigned env, unsigned names)
 // pending_defines_marker_id).
 static bool body_has_define_syntax(unsigned exprs, unsigned env)
 {
-    if (is_keyword_shadowed(ctx.kw_define_syntax, env))
-        return false;
     for (unsigned e = exprs; IS_PAIR(e); e = cdr(e)) {
         unsigned form = car(e);
         if (!IS_PAIR(form))
             continue;
-        if (IS_KEYWORD(car(form), ctx.kw_define_syntax))
+        if (IS_KEYWORD(car(form), ctx.kw_define_syntax) &&
+            !is_keyword_shadowed(CELL_ID(car(form)), env))
             return true;
         if (IS_KEYWORD(car(form), ctx.kw_begin) &&
-            !is_keyword_shadowed(ctx.kw_begin, env) &&
+            !is_keyword_shadowed(CELL_ID(car(form)), env) &&
             proper_list_silent(cdr(form)) &&
             body_has_define_syntax(cdr(form), env))
             return true;
@@ -3817,7 +3833,7 @@ static void emit_pending_define_aliases(compile_ctx *cctx, unsigned pending,
     if (name && IS_ATOM(name))
         defined = alloc_cons(name, 0);
     else if (IS_PAIR(expr) && IS_KEYWORD(car(expr), ctx.kw_begin) &&
-             !is_keyword_shadowed(ctx.kw_begin, cctx->env))
+             !is_keyword_shadowed(CELL_ID(car(expr)), cctx->env))
         defined = scan_internal_defines(cdr(expr), cctx->env);
     if (!defined)
         return;
@@ -3882,9 +3898,12 @@ static compile_result compile_begin(unsigned exprs, compile_ctx *cctx)
         // unbound gensym, and a literal defined after its macro failed to
         // match. See macros_toplevel_defines_marker_id.
         if (!cctx->parent && cctx->env_depth == 0) {
+            // The id first: making it the first time allocates, which
+            // would collect the marker cell from under us.
+            int64_t marker_id = macros_toplevel_defines_marker_id();
             unsigned marker = alloc();
             CELL_TYPE(marker) = BT_ATOM;
-            CELL_ID(marker) = macros_toplevel_defines_marker_id();
+            CELL_ID(marker) = marker_id;
             defvar(marker, ctx.atom_true, cctx->env);
         }
     }
@@ -3911,9 +3930,10 @@ static compile_result compile_begin(unsigned exprs, compile_ctx *cctx)
         gc_protect(&owner);
         unsigned binding = alloc_cons(owner, pending);
         gc_protect(&binding);
+        int64_t marker_id = pending_defines_marker_id(); // may allocate
         unsigned marker = alloc();
         CELL_TYPE(marker) = BT_ATOM;
-        CELL_ID(marker) = pending_defines_marker_id();
+        CELL_ID(marker) = marker_id;
         defvar(marker, binding, cctx->env);
         gc_unprotect(2);
     }
@@ -4136,9 +4156,7 @@ static compile_result compile_let(unsigned expr, compile_ctx *cctx)
         unsigned val_expr = cadr(binding);
 
         // Check if value is a lambda expression
-        if (IS_PAIR(val_expr) && IS_ATOM(car(val_expr)) &&
-            CELL_ID(car(val_expr)) == ctx.kw_lambda &&
-            builtin_keyword_unbound(ctx.kw_lambda, cctx->env)) {
+        if (form_is_core(val_expr, ctx.kw_lambda, cctx->env)) {
             // Only inline if the lambda doesn't reference the bound variable
             // (self-referential lambdas need letrec semantics to work)
             unsigned lambda_body = cddr(val_expr);
@@ -4273,9 +4291,8 @@ static compile_result compile_letrec(unsigned expr, compile_ctx *cctx)
     if (binding_count == 1) {
         unsigned binding = car(car(bindings));
         unsigned val_expr = cadr(car(bindings));
-        if (IS_ATOM(binding) && IS_PAIR(val_expr) && IS_ATOM(car(val_expr)) &&
-            CELL_ID(car(val_expr)) == ctx.kw_lambda &&
-            builtin_keyword_unbound(ctx.kw_lambda, cctx->env) &&
+        if (IS_ATOM(binding) &&
+            form_is_core(val_expr, ctx.kw_lambda, cctx->env) &&
             IS_PAIR(cdr(val_expr))) {
             unsigned lparams = cadr(val_expr);
             unsigned lbody = cddr(val_expr);
@@ -4554,8 +4571,9 @@ static compile_result compile_cond_expand(unsigned expr, compile_ctx *cctx)
         unsigned body = cdr(clause);
         if (!list_length_checked(body, NULL, "cond-expand"))
             return emit_syntax_error(cctx, "cond-expand: invalid syntax");
-        bool is_else = IS_KEYWORD(requirement, ctx.kw_else) &&
-                       env_find_binding_cell(ctx.kw_else, cctx->env) == 0;
+        bool is_else =
+            IS_KEYWORD(requirement, ctx.kw_else) &&
+            env_find_binding_cell(CELL_ID(requirement), cctx->env) == 0;
         if (is_else || cond_expand_requirement_satisfied(requirement))
             return compile_begin(body, cctx);
     }
@@ -4607,7 +4625,7 @@ static compile_result compile_cond(unsigned expr, compile_ctx *cctx)
 
         // Check for else clause
         if (IS_KEYWORD(test, ctx.kw_else) &&
-            env_find_binding_cell(ctx.kw_else, cctx->env) == 0) {
+            env_find_binding_cell(CELL_ID(test), cctx->env) == 0) {
             cctx->tail_position = tail;
             if (conseq) {
                 compile_begin(conseq, cctx);
@@ -4633,8 +4651,9 @@ static compile_result compile_cond(unsigned expr, compile_ctx *cctx)
             }
 
             cctx->tail_position = tail;
-            bool is_arrow = conseq && IS_KEYWORD(car(conseq), ctx.kw_arrow) &&
-                            env_find_binding_cell(ctx.kw_arrow, cctx->env) == 0;
+            bool is_arrow =
+                conseq && IS_KEYWORD(car(conseq), ctx.kw_arrow) &&
+                env_find_binding_cell(CELL_ID(car(conseq)), cctx->env) == 0;
             if (is_arrow) {
                 emit2(cctx, OP_CONST,
                       code_add_const(cctx->code, test_result.value));
@@ -4660,7 +4679,8 @@ static compile_result compile_cond(unsigned expr, compile_ctx *cctx)
 
         // Check if we need the test value (=> syntax or no consequent)
         bool is_arrow = conseq && IS_KEYWORD(car(conseq), ctx.kw_arrow) &&
-                        env_find_binding_cell(ctx.kw_arrow, cctx->env) == 0;
+                        env_find_binding_cell(CELL_ID(car(conseq)),
+                                              cctx->env) == 0;
         bool need_test_value = is_arrow || !conseq;
 
         if (need_test_value) {
@@ -5126,9 +5146,7 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
     // Lambda Inlining: ((lambda (params) body) args) -> inline as let
     // ========================================================================
     // This avoids closure allocation and function call overhead
-    if (IS_PAIR(fn_expr) && IS_ATOM(car(fn_expr)) &&
-        CELL_ID(car(fn_expr)) == ctx.kw_lambda &&
-        builtin_keyword_unbound(ctx.kw_lambda, cctx->env)) {
+    if (form_is_core(fn_expr, ctx.kw_lambda, cctx->env)) {
 
         if (!syntax_arity_checked(fn_expr, 2, UINT_MAX, "lambda"))
             return emit_syntax_error(cctx, "lambda: invalid syntax");
@@ -5323,10 +5341,8 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
                         unsigned var = car(p);
                         unsigned val_expr = car(a);
                         // Check if arg is a lambda that doesn't self-reference
-                        if (IS_PAIR(val_expr) && IS_ATOM(car(val_expr)) &&
-                            CELL_ID(car(val_expr)) == ctx.kw_lambda &&
-                            builtin_keyword_unbound(ctx.kw_lambda,
-                                                    cctx->env)) {
+                        if (form_is_core(val_expr, ctx.kw_lambda,
+                                         cctx->env)) {
                             unsigned arg_body = cddr(val_expr);
                             if (!contains_reference(arg_body, CELL_ID(var)))
                                 register_known_lambda(cctx, var, val_expr);
@@ -5409,11 +5425,11 @@ static bool qq_compile_spine_tail_unquote(unsigned l, compile_ctx *cctx)
 {
     unsigned h = car(l);
     return (IS_KEYWORD(h, ctx.kw_unquote) &&
-            !is_keyword_shadowed(ctx.kw_unquote, cctx->env)) ||
+            !is_keyword_shadowed(CELL_ID(h), cctx->env)) ||
            (IS_KEYWORD(h, ctx.kw_unquote_splicing) &&
-            !is_keyword_shadowed(ctx.kw_unquote_splicing, cctx->env)) ||
+            !is_keyword_shadowed(CELL_ID(h), cctx->env)) ||
            (IS_KEYWORD(h, ctx.kw_quasiquote) &&
-            !is_keyword_shadowed(ctx.kw_quasiquote, cctx->env));
+            !is_keyword_shadowed(CELL_ID(h), cctx->env));
 }
 
 // Check if quasiquote contains unquote or unquote-splicing
@@ -5435,23 +5451,23 @@ static bool qq_has_unquote(unsigned x, compile_ctx *cctx, int depth)
 
     // Found unquote at depth 1
     if (IS_KEYWORD(head, ctx.kw_unquote) &&
-        !is_keyword_shadowed(ctx.kw_unquote, cctx->env) && depth == 1)
+        !is_keyword_shadowed(CELL_ID(head), cctx->env) && depth == 1)
         return true;
     if (IS_KEYWORD(head, ctx.kw_unquote_splicing) &&
-        !is_keyword_shadowed(ctx.kw_unquote_splicing, cctx->env) &&
+        !is_keyword_shadowed(CELL_ID(head), cctx->env) &&
         depth == 1)
         return true;
 
     // Nested quasiquote increases depth
     if (IS_KEYWORD(head, ctx.kw_quasiquote) &&
-        !is_keyword_shadowed(ctx.kw_quasiquote, cctx->env))
+        !is_keyword_shadowed(CELL_ID(head), cctx->env))
         return qq_has_unquote(cadr(x), cctx, depth + 1);
 
     // Unquote decreases depth
     if ((IS_KEYWORD(head, ctx.kw_unquote) &&
-         !is_keyword_shadowed(ctx.kw_unquote, cctx->env)) ||
+         !is_keyword_shadowed(CELL_ID(head), cctx->env)) ||
         (IS_KEYWORD(head, ctx.kw_unquote_splicing) &&
-         !is_keyword_shadowed(ctx.kw_unquote_splicing, cctx->env)))
+         !is_keyword_shadowed(CELL_ID(head), cctx->env)))
         return qq_has_unquote(cadr(x), cctx, depth - 1);
 
     // Check all elements of list
@@ -5490,7 +5506,7 @@ static bool qq_syntax_valid(unsigned x, compile_ctx *cctx, int depth,
 
     unsigned head = car(x);
     if (IS_KEYWORD(head, ctx.kw_unquote) &&
-        !is_keyword_shadowed(ctx.kw_unquote, cctx->env)) {
+        !is_keyword_shadowed(CELL_ID(head), cctx->env)) {
         if (!syntax_arity_checked(x, 1, 1, "unquote"))
             return false;
         if (depth == 1)
@@ -5499,7 +5515,7 @@ static bool qq_syntax_valid(unsigned x, compile_ctx *cctx, int depth,
                                structural_depth + 1);
     }
     if (IS_KEYWORD(head, ctx.kw_unquote_splicing) &&
-        !is_keyword_shadowed(ctx.kw_unquote_splicing, cctx->env)) {
+        !is_keyword_shadowed(CELL_ID(head), cctx->env)) {
         if (!syntax_arity_checked(x, 1, 1, "unquote-splicing"))
             return false;
         if (depth == 1)
@@ -5508,7 +5524,7 @@ static bool qq_syntax_valid(unsigned x, compile_ctx *cctx, int depth,
                                structural_depth + 1);
     }
     if (IS_KEYWORD(head, ctx.kw_quasiquote) &&
-        !is_keyword_shadowed(ctx.kw_quasiquote, cctx->env)) {
+        !is_keyword_shadowed(CELL_ID(head), cctx->env)) {
         return syntax_arity_checked(x, 1, 1, "quasiquote") &&
                qq_syntax_valid(cadr(x), cctx, depth + 1,
                                structural_depth + 1);
@@ -5553,7 +5569,7 @@ static void compile_qq_rec(unsigned x, compile_ctx *cctx, int depth)
             unsigned elem = vector_data_ptr(x)[i];
             if (IS_PAIR(elem) &&
                 IS_KEYWORD(car(elem), ctx.kw_unquote_splicing) &&
-                !is_keyword_shadowed(ctx.kw_unquote_splicing, cctx->env))
+                !is_keyword_shadowed(CELL_ID(car(elem)), cctx->env))
                 has_splice = true;
         }
         if (has_splice) {
@@ -5583,13 +5599,13 @@ static void compile_qq_rec(unsigned x, compile_ctx *cctx, int depth)
 
     // (unquote expr) at depth 1: compile the expression
     if (IS_KEYWORD(head, ctx.kw_unquote) &&
-        !is_keyword_shadowed(ctx.kw_unquote, cctx->env) && depth == 1) {
+        !is_keyword_shadowed(CELL_ID(head), cctx->env) && depth == 1) {
         compile_expr_internal(cadr(x), cctx);
         return;
     }
 
     if (IS_KEYWORD(head, ctx.kw_unquote_splicing) &&
-        !is_keyword_shadowed(ctx.kw_unquote_splicing, cctx->env) &&
+        !is_keyword_shadowed(CELL_ID(head), cctx->env) &&
         depth == 1) {
         compile_qq_error(cctx, "unquote-splicing not inside list");
         return;
@@ -5597,7 +5613,7 @@ static void compile_qq_rec(unsigned x, compile_ctx *cctx, int depth)
 
     // (unquote expr) at depth > 1: decrement depth and wrap result
     if (IS_KEYWORD(head, ctx.kw_unquote) &&
-        !is_keyword_shadowed(ctx.kw_unquote, cctx->env) && depth > 1) {
+        !is_keyword_shadowed(CELL_ID(head), cctx->env) && depth > 1) {
         compile_qq_rec(cadr(x), cctx, depth - 1);
         emit2(cctx, OP_CONST, code_add_const(cctx->code, ctx.atom_unquote));
         emit(cctx, OP_SWAP);
@@ -5608,7 +5624,7 @@ static void compile_qq_rec(unsigned x, compile_ctx *cctx, int depth)
 
     // (unquote-splicing expr) at depth > 1: decrement depth and wrap result
     if (IS_KEYWORD(head, ctx.kw_unquote_splicing) &&
-        !is_keyword_shadowed(ctx.kw_unquote_splicing, cctx->env) &&
+        !is_keyword_shadowed(CELL_ID(head), cctx->env) &&
         depth > 1) {
         compile_qq_rec(cadr(x), cctx, depth - 1);
         emit2(cctx, OP_CONST,
@@ -5621,7 +5637,7 @@ static void compile_qq_rec(unsigned x, compile_ctx *cctx, int depth)
 
     // Nested quasiquote: keep structure but recurse with depth+1
     if (IS_KEYWORD(head, ctx.kw_quasiquote) &&
-        !is_keyword_shadowed(ctx.kw_quasiquote, cctx->env)) {
+        !is_keyword_shadowed(CELL_ID(head), cctx->env)) {
         compile_qq_rec(cadr(x), cctx, depth + 1);
         emit2(cctx, OP_CONST, code_add_const(cctx->code, ctx.atom_quasiquote));
         emit(cctx, OP_SWAP);
@@ -5638,7 +5654,7 @@ static void compile_qq_rec(unsigned x, compile_ctx *cctx, int depth)
             break; // (... . ,tail): rest of spine is a tail form
         unsigned elem = car(l);
         if (IS_PAIR(elem) && IS_KEYWORD(car(elem), ctx.kw_unquote_splicing) &&
-            !is_keyword_shadowed(ctx.kw_unquote_splicing, cctx->env) &&
+            !is_keyword_shadowed(CELL_ID(car(elem)), cctx->env) &&
             depth == 1) {
             has_splice = true;
             break;
@@ -5664,7 +5680,7 @@ static void compile_qq_rec(unsigned x, compile_ctx *cctx, int depth)
             unsigned elem = car(cursor);
             if (IS_PAIR(elem) &&
                 IS_KEYWORD(car(elem), ctx.kw_unquote_splicing) &&
-                !is_keyword_shadowed(ctx.kw_unquote_splicing, cctx->env) &&
+                !is_keyword_shadowed(CELL_ID(car(elem)), cctx->env) &&
                 depth == 1) {
                 // ,@expr: compile expr and append
                 compile_expr_internal(cadr(elem), cctx);

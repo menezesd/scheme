@@ -31,7 +31,7 @@ UBSAN_OBJS = $(SRCS:.c=.ubsan.o)
 UBSAN_CFLAGS = $(DEBUG_CFLAGS) -fsanitize=undefined
 UBSAN_LDFLAGS = $(LDFLAGS) -fsanitize=undefined
 
-.PHONY: all clean distclean debug sanitize ubsan test test-interpreter test-c test-prop test-r5rs test-stress test-sanitize test-ubsan test-repl-exit test-diff test-gcstress test-all unicode-tables
+.PHONY: all clean distclean debug sanitize ubsan test test-interpreter test-c test-prop test-r5rs test-stress test-sanitize test-ubsan test-repl-exit test-diff test-gcstress test-atom-growth test-all unicode-tables
 
 all: $(TARGET)
 
@@ -283,9 +283,22 @@ test-gcstress: $(TARGET)
 		done; \
 	done
 
+# A million macro expansions under keyword shadowing in each engine: none may
+# mint a symbol, since the atom table is fixed-size and panics when full.
+test-atom-growth: $(TARGET)
+	@for mode in "" "--interpreter"; do \
+		printf "atom growth %-14s " "$${mode:-vm}"; \
+		if ./$(TARGET) $$mode atom_growth_tests.scm 2>&1 | \
+		   grep -q "^atom growth: all passed"; then \
+			echo "ok"; \
+		else \
+			echo "FAILED"; exit 1; \
+		fi; \
+	done
+
 # Run all tests, including the UBSan-only smoke path that works on macOS
 # systems where ASan can hang before main.
-test-all: test test-interpreter test-c test-prop test-r5rs test-stress test-ubsan test-repl-exit test-diff test-gcstress
+test-all: test test-interpreter test-c test-prop test-r5rs test-stress test-ubsan test-repl-exit test-diff test-gcstress test-atom-growth
 
 clean:
 	rm -f $(OBJS) $(DEBUG_OBJS) $(SAN_OBJS) $(UBSAN_OBJS) $(TARGET) \

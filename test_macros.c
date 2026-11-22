@@ -413,6 +413,78 @@ TEST(internal_define_body_expands_once)
     PASS();
 }
 
+extern unsigned gensym_counter;
+
+TEST(apply_syntax_renames_rebound_keyword_to_core_alias)
+{
+    // (m a b) => (if a a b), defined where if is core. Used where if is a
+    // variable, the template's if becomes if's core alias: no gensym, and no
+    // binding for the use site to install. Used where if is core too, it is
+    // left alone.
+    unsigned def_env = default_environment();
+    GC_GUARD;
+    gc_protect(&def_env);
+    unsigned tform =
+        read_from_string("(syntax-rules () ((_ a b) (if a a b)))");
+    gc_protect(&tform);
+    unsigned transformer = make_syntax_transformer(tform, def_env);
+    gc_protect(&transformer);
+    unsigned input = read_from_string("(m #f 3)");
+    gc_protect(&input);
+
+    unsigned use_env = extend_env_empty(def_env);
+    gc_protect(&use_env);
+    defvar(atom("if"), store(0), use_env);
+    unsigned before = gensym_counter;
+    unsigned bindings = store(7); // must be overwritten
+    gc_protect(&bindings);
+    unsigned result = apply_syntax(transformer, input, use_env, &bindings);
+    ASSERT(result != TOK_ERROR && IS_PAIR(result));
+    ASSERT_EQ(car(result), core_alias_cell(CF_IF));
+    ASSERT_EQ(bindings, 0);
+    ASSERT_EQ(gensym_counter, before);
+
+    result = apply_syntax(transformer, input, def_env, &bindings);
+    ASSERT(result != TOK_ERROR && IS_PAIR(result));
+    ASSERT(IS_ATOM(car(result)) && CELL_ID(car(result)) == ctx.kw_if);
+    ASSERT_EQ(bindings, 0);
+    PASS();
+}
+
+TEST(freeze_core_keywords_in_stdlib_transformers)
+{
+    // While the stdlib loads, a transformer's core keywords become their
+    // core aliases: in the template, and as literals (in the literal list
+    // and the patterns alike), which still match a plain else.
+    unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
+    unsigned tform = read_from_string(
+        "(syntax-rules (else) ((_ else x) (if x 'yes 'no)) ((_ y) y))");
+    gc_protect(&tform);
+    macros_freezing_core_keywords = true;
+    unsigned transformer = make_syntax_transformer(tform, env);
+    macros_freezing_core_keywords = false;
+    gc_protect(&transformer);
+    unsigned literals = car(cdr(car(transformer)));
+    ASSERT(IS_PAIR(literals) && car(literals) == core_alias_cell(CF_ELSE));
+
+    unsigned input = read_from_string("(m else #t)");
+    gc_protect(&input);
+    unsigned result = apply_syntax(transformer, input, env, 0);
+    ASSERT(result != TOK_ERROR && IS_PAIR(result));
+    ASSERT_EQ(car(result), core_alias_cell(CF_IF));
+
+    // A frozen template keeps its if even where if is now a variable.
+    unsigned use_env = extend_env_empty(env);
+    gc_protect(&use_env);
+    defvar(atom("if"), store(0), use_env);
+    result = apply_syntax(transformer, input, use_env, 0);
+    ASSERT(result != TOK_ERROR && IS_PAIR(result));
+    ASSERT_EQ(car(result), core_alias_cell(CF_IF));
+    PASS();
+}
+
 int main(void)
 {
     // Initialize interpreter infrastructure
@@ -458,6 +530,8 @@ int main(void)
     RUN_TEST(apply_syntax_rejects_malformed_rules);
     RUN_TEST(apply_syntax_rejects_unregistered_compiled_pattern);
     RUN_TEST(internal_define_body_expands_once);
+    RUN_TEST(apply_syntax_renames_rebound_keyword_to_core_alias);
+    RUN_TEST(freeze_core_keywords_in_stdlib_transformers);
 
     TEST_SUMMARY("macros");
 }

@@ -2373,6 +2373,129 @@ b")
                 (eval '(guard (e (#t (error-object-message e))) (car 5))
                       (interaction-environment))))))
 
+;; A template's core keywords mean the core forms even where the use site
+;; rebinds those names: such a keyword is renamed to its core alias, which
+;; is never bound (it used to become an unbound gensym, or stay the plain
+;; name and be captured). Expected values are MIT's.
+(define-syntax regress-ck-or
+  (syntax-rules () ((_ a b) (let ((t a)) (if t t b)))))
+(define-syntax regress-ck-let
+  (syntax-rules () ((_ v e) (let ((x v)) (+ x e)))))
+(define-syntax regress-ck-begin (syntax-rules () ((_ a b) (begin a b))))
+(define-syntax regress-ck-cond
+  (syntax-rules () ((_ v) (cond (#f 1) (else v)))))
+(define-syntax regress-ck-quote (syntax-rules () ((_) 'x)))
+(define-syntax regress-ck-quote-form
+  (syntax-rules () ((_) (quote (when 1 2)))))
+(define-syntax regress-ck-lambda
+  (syntax-rules () ((_ v) ((lambda (y) y) v))))
+(define-syntax regress-ck-set
+  (syntax-rules () ((_ v e) (begin (set! v e) v))))
+(define-syntax regress-ck-swap!
+  (syntax-rules () ((_ a b) (let ((tmp a)) (set! a b) (set! b tmp)))))
+(define-syntax regress-ck-define (syntax-rules () ((_ n v) (define n v))))
+(define-syntax regress-ck-letrec
+  (syntax-rules ()
+    ((_ n) (letrec ((f (lambda (k) (if (= k 0) n (f (- k 1)))))) (f 3)))))
+(define-syntax regress-ck-case
+  (syntax-rules () ((_ x) (case x ((1) 'one) (else 0)))))
+(define-syntax regress-ck-arrow
+  (syntax-rules ()
+    ((_ x) (cond ((assv x '((1 . one))) => cdr) (else 'none)))))
+(test "template if with if rebound" 3
+    (guard (e (#t 'error)) (let ((if list)) (regress-ck-or #f 3))))
+(test "template let with let rebound" 4
+    (guard (e (#t 'error)) (let ((let 0)) (regress-ck-let 1 3))))
+(test "template begin with begin rebound" 2
+    (guard (e (#t 'error)) (let ((begin list)) (regress-ck-begin 1 2))))
+(test "template else with else rebound" 5
+    (guard (e (#t 'error)) (let ((else #f)) (regress-ck-cond 5))))
+(test "template quote with quote rebound" 'x
+    (guard (e (#t 'error)) (let ((quote list)) (regress-ck-quote))))
+(test "quoted template data is not expanded" '(when 1 2)
+    (guard (e (#t 'error)) (let ((quote list)) (regress-ck-quote-form))))
+(define-syntax regress-ck-quote-it (syntax-rules () ((_ x) 'x)))
+(define-syntax regress-ck-quoted-keywords
+  (syntax-rules () ((_) (regress-ck-quote-it (if else)))))
+(test "a renamed keyword quoted by another macro is the plain symbol" #t
+    (guard (e (#t 'error))
+      (let ((if list) (else 1))
+        (equal? (regress-ck-quoted-keywords) '(if else)))))
+(test "template lambda with lambda rebound" 7
+    (guard (e (#t 'error)) (let ((lambda list)) (regress-ck-lambda 7))))
+(test "template set! with set! rebound" 9
+    (guard (e (#t 'error)) (let ((set! list) (z 1)) (regress-ck-set z 9))))
+(test "template let and set! with both rebound" '(2 1)
+    (guard (e (#t 'error))
+      (let ((set! list) (let 0) (p 1) (q 2)) (regress-ck-swap! p q) (list p q))))
+(test "template define with define rebound" 9
+    (guard (e (#t 'error))
+      (let ((define list)) (regress-ck-define regress-ck-x 9) regress-ck-x)))
+(test "template letrec and lambda with both rebound" 8
+    (guard (e (#t 'error))
+      (let ((letrec list) (lambda list)) (regress-ck-letrec 8))))
+(test "template binder stays hygienic with let and if rebound" 5
+    (guard (e (#t 'error))
+      (let ((let 0) (if list) (t 5)) (regress-ck-or #f t))))
+(test "template case else with else rebound" 0
+    (guard (e (#t 'error)) (let ((else #f)) (regress-ck-case 5))))
+(test "template => and else with both rebound" 'one
+    (guard (e (#t 'error)) (let ((else #f) (=> #f)) (regress-ck-arrow 1))))
+(test "if rebound to a macro at the use site" 3
+    (guard (e (#t 'error))
+      (let-syntax ((if (syntax-rules () ((_ a b c) 'macro-if))))
+        (regress-ck-or #f 3))))
+(test "a user's else that is bound is still not case's else" 'error
+    (guard (e (#t 'error)) (eval '(let ((else #f)) (case 1 (else 0)))
+                                 (interaction-environment))))
+
+;; The VM keeps a variable in a stack slot unless an inner closure captures
+;; it; a closure introduced as a core alias still counts.
+(define-syntax regress-ck-thunk (syntax-rules () ((_ a) (lambda () a))))
+(define (regress-ck-thunks x y)
+  (let ((lambda list)) (list ((regress-ck-thunk x)) ((regress-ck-thunk y)))))
+(test "closure made by a template lambda with lambda rebound" '(5 6)
+    (guard (e (#t 'error)) (regress-ck-thunks 5 6)))
+
+;; The standard library's macros under the same shadowing.
+(define regress-ck-param (make-parameter 1))
+(test "stdlib macros with their keywords rebound"
+    '(5 3 b (caught oops) 3 2)
+    (guard (e (#t 'error))
+      (let ((if list) (begin list) (letrec list) (lambda list) (let 0)
+            (memv list))
+        (list (when #t 5)
+              (do ((i 0 (+ i 1))) ((= i 3) i))
+              (case 2 ((1) 'a) ((2) 'b) (else 'c))
+              (guard (e (#t (list 'caught e))) (raise 'oops))
+              ((case-lambda ((a) a) ((a b) (+ a b))) 1 2)
+              (parameterize ((regress-ck-param 2)) (regress-ck-param))))))
+
+;; Renaming to a core alias mints nothing: an inner lambda's body is
+;; expanded each time it is made in the interpreter, so a gensym per
+;; expansion would grow the fixed-size atom table without bound.
+(define (regress-ck-gensym-counter)
+  (let ((s (symbol->string (gensym))))
+    (string->number (substring s 1 (string-length s)))))
+(define-syntax regress-ck-when
+  (syntax-rules () ((_ c e) (if c (begin e) #f))))
+(define (regress-ck-shadowed n)
+  (let ((if list) (begin list))
+    ((lambda () (regress-ck-when #t n)))))
+(test "keyword renames mint no symbols" '(1000 #t)
+    (let ((before (regress-ck-gensym-counter)))
+      (let loop ((i 0) (sum 0))
+        (if (= i 1000)
+            (list sum (<= (- (regress-ck-gensym-counter) before 1) 2))
+            (loop (+ i 1) (+ sum (regress-ck-shadowed 1)))))))
+
+;; Code walkers that stop at quoted data and vector literals.
+(test "vector literal in a body is data" '(#((when 1 2)) #(if))
+    (guard (e (#t 'error))
+      ((lambda () (list '#((when 1 2)) #(if))))))
+(test "letrec binder named like a macro" 1
+    (guard (e (#t 'error)) ((lambda () (letrec ((when 1)) when)))))
+
 ;;; ============================================================================
 ;;; Summary
 ;;; ============================================================================

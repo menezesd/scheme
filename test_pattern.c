@@ -703,6 +703,61 @@ TEST(execute_literal_matches_by_binding)
     PASS();
 }
 
+TEST(execute_literal_matches_core_alias)
+{
+    // A core alias of else is else's core form wherever it appears: it
+    // matches the literal else when else is core (unbound) where the macro
+    // was defined, whatever the use site binds else to. A plain else bound
+    // at the use site still does not match.
+    unsigned else_atom = atom("else");
+    unsigned x = atom("x");
+    gc_protect(&else_atom);
+    gc_protect(&x);
+    unsigned pat = list2(else_atom, x);
+    gc_protect(&pat);
+    unsigned literals = alloc_cons(else_atom, 0);
+    gc_protect(&literals);
+    compiled_pattern *cpat = compile_pattern(pat, literals, ctx.kw_ellipsis);
+    unsigned alias_input = list2(core_alias_cell(CF_ELSE), store(1));
+    gc_protect(&alias_input);
+    unsigned plain_input = list2(atom("else"), store(1));
+    gc_protect(&plain_input);
+
+    unsigned use_env = extend_env_empty(0);
+    gc_protect(&use_env);
+    defvar(atom("else"), store(5), use_env);
+    ASSERT(execute_pattern_in_envs(cpat, alias_input, 0, use_env) !=
+           TOK_ERROR);
+    ASSERT(execute_pattern_in_envs(cpat, plain_input, 0, use_env) ==
+           TOK_ERROR);
+
+    // Once else is bound where the macro was defined, the literal is that
+    // binding, which the core alias is not.
+    unsigned def_env = extend_env_empty(0);
+    gc_protect(&def_env);
+    defvar(atom("else"), store(6), def_env);
+    ASSERT(execute_pattern_in_envs(cpat, alias_input, def_env, use_env) ==
+           TOK_ERROR);
+
+    // The other way round, as in the stdlib's frozen literals (see
+    // macros_freeze_core_keywords): a literal that is else's core alias
+    // matches a plain else that is core at the use site, and only then.
+    unsigned alias_literals = alloc_cons(core_alias_cell(CF_ELSE), 0);
+    gc_protect(&alias_literals);
+    unsigned alias_pat = list2(core_alias_cell(CF_ELSE), x);
+    gc_protect(&alias_pat);
+    compiled_pattern *alias_cpat =
+        compile_pattern(alias_pat, alias_literals, ctx.kw_ellipsis);
+    ASSERT(execute_pattern_in_envs(alias_cpat, plain_input, 0, 0) !=
+           TOK_ERROR);
+    ASSERT(execute_pattern_in_envs(alias_cpat, alias_input, 0, use_env) !=
+           TOK_ERROR);
+    ASSERT(execute_pattern_in_envs(alias_cpat, plain_input, 0, use_env) ==
+           TOK_ERROR);
+    gc_unprotect(10);
+    PASS();
+}
+
 // ============================================================================
 // Main
 // ============================================================================
@@ -741,6 +796,7 @@ int main(void)
     RUN_TEST(execute_ellipsis_with_tail_binding);
     RUN_TEST(execute_ellipsis_dotted_tail_takes_only_final_cdr);
     RUN_TEST(execute_literal_matches_by_binding);
+    RUN_TEST(execute_literal_matches_core_alias);
 
     // Vector tests
     printf("\nVector:\n");

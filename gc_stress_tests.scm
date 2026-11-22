@@ -404,6 +404,29 @@
          (gc-flip)
          (list (force p) (char-in-set? #\b set) (char-in-set? #\z set))))
 
+;; Template keywords the use site rebinds become core aliases, through the
+;; renamer, the matcher (case's else) and the interpreter's expansion of
+;; procedure bodies; each of those allocates while holding forms.
+(define-syntax gc-ck-or (syntax-rules () ((_ a b) (let ((t a)) (if t t b)))))
+(define-syntax gc-ck-case (syntax-rules () ((_ x) (case x ((1) 'one) (else 0)))))
+(define-syntax gc-ck-define (syntax-rules () ((_ n v) (define n v))))
+(define (gc-ck-procedure n)
+  (let ((if list) (let 0) (else #f) (define list))
+    (gc-ck-define m (gc-ck-or #f n))
+    (list m (gc-ck-case n)
+          ((lambda (k) (cond ((assv k '((1 . one))) => cdr) (#t 'none))) n)
+          (letrec ((loop (lambda (i acc) (cond ((= i 0) acc) (#t (loop (- i 1) (+ acc 1)))))))
+            (loop 3 0)))))
+(check "core aliases under keyword shadowing" '((5 0 none 3) (1 one one 3))
+       (list (gc-ck-procedure 5) (gc-ck-procedure 1)))
+;; The stdlib's macros had their keywords replaced by core aliases as it
+;; loaded (macros_freeze_core_keywords); a template walk that lost a cell
+;; there breaks every later use.
+(check "stdlib do, case and when after loading" '(3 b 7)
+       (list (do ((i 0 (+ i 1))) ((= i 3) i))
+             (case 2 ((1) 'a) ((2) 'b) (else 'c))
+             (when #t 7)))
+
 ;; (command-line) is the script's own view of its invocation - its name and
 ;; arguments - without vesper's options. make test-gcstress runs this file as
 ;; `vesper [--interpreter] gc_stress_tests.scm`.

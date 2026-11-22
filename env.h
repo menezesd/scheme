@@ -17,6 +17,8 @@ static inline unsigned make_frame(unsigned vars, unsigned vals)
 // Extend environment with a new frame
 static inline unsigned extend_env(unsigned vars, unsigned vals, unsigned env)
 {
+    for (unsigned v = vars; IS_PAIR(v); v = cdr(v))
+        note_binder(car(v));
     gc_protect(&vars);
     gc_protect(&vals);
     gc_protect(&env);

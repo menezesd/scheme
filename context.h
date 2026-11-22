@@ -352,6 +352,60 @@ int intern(const char *s);
 unsigned make_uninterned_symbol(const char *name);
 bool atom_is_uninterned(unsigned atom);
 
+// Core keywords (enum core_form). atom_core_forms, indexed by atom id, holds
+// the form a core keyword's interned name stands for, or the form flagged
+// with CORE_ALIAS_FLAG for its core alias; 0 for every other atom.
+#define CORE_ALIAS_FLAG 0x80
+extern uint8_t *atom_core_forms;
+extern int64_t core_form_keywords[CF_COUNT];
+// Set once any core alias is bound - by a template that hands one to a
+// binding form it does not know (a do, a user macro). Until then a core
+// alias can be dispatched on without looking it up.
+extern bool core_alias_bound;
+
+static inline unsigned atom_core_entry(int64_t id)
+{
+    return (uint64_t)id < ctx.atom_table_cap ? atom_core_forms[id] : 0;
+}
+
+static inline int atom_core_form(int64_t id)
+{
+    return (int)(atom_core_entry(id) & ~CORE_ALIAS_FLAG);
+}
+
+static inline bool atom_is_core_alias(int64_t id)
+{
+    return (atom_core_entry(id) & CORE_ALIAS_FLAG) != 0;
+}
+
+// The interned keyword a core alias stands for; any other id unchanged.
+static inline int64_t kw_canon(int64_t id)
+{
+    unsigned entry = atom_core_entry(id);
+    return (entry & CORE_ALIAS_FLAG)
+               ? core_form_keywords[entry & ~CORE_ALIAS_FLAG]
+               : id;
+}
+
+static inline unsigned core_alias_cell(int form)
+{
+    return CELL_CORE_ALIAS_BASE + (unsigned)form;
+}
+
+// For every frame builder: record that a core alias became a binder.
+static inline void note_binder(unsigned var)
+{
+    if (IS_ATOM(var) && atom_is_core_alias(CELL_ID(var)))
+        core_alias_bound = true;
+}
+
+// A core alias heading a form, for a dispatcher: true when it can be taken as
+// its core form without an environment lookup.
+static inline bool core_alias_unbound_fast(int64_t id)
+{
+    return !core_alias_bound && atom_is_core_alias(id);
+}
+
 // Convert string to atom or number
 unsigned atom_from_string(const char *s);
 

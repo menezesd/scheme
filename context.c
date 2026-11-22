@@ -65,6 +65,11 @@ lisp_context ctx = {.hptr = HEAP_RESERVED,
 tramp_state tramp;
 unsigned gensym_counter = 0;
 
+// See enum core_form and context.h.
+uint8_t *atom_core_forms = NULL; // Allocated in init_heap
+int64_t core_form_keywords[CF_COUNT];
+bool core_alias_bound = false;
+
 // Registries below track live heap-allocated external objects (vectors,
 // bignums, ports, ...) so a raw pointer stashed in a cell can be validated
 // before use (defends against use-after-free / corrupted cells). They are
@@ -533,7 +538,8 @@ void init_heap(void)
     }
     memset(ctx.atom_table, 0, table_size);
     ctx.atom_uninterned = calloc(ctx.atom_table_cap, sizeof(bool));
-    if (!ctx.atom_uninterned) {
+    atom_core_forms = calloc(ctx.atom_table_cap, sizeof(uint8_t));
+    if (!ctx.atom_uninterned || !atom_core_forms) {
         fprintf(stderr, "Fatal: failed to allocate atom metadata\n");
         exit(EXIT_FAILURE);
     }
@@ -1965,9 +1971,11 @@ unsigned make_uninterned_symbol(const char *name)
 
 bool atom_is_uninterned(unsigned atom)
 {
-    // The booleans occupy private slots but are not generated symbols.
+    // The booleans and the core aliases occupy private slots but are not
+    // generated symbols.
     return atom_is_valid(atom) && CELL_ID(atom) != CELL_ID(CELL_ATOM_TRUE) &&
            CELL_ID(atom) != CELL_ID(CELL_ATOM_FALSE) &&
+           !atom_is_core_alias(CELL_ID(atom)) &&
            ctx.atom_uninterned[CELL_ID(atom)];
 }
 
@@ -2345,8 +2353,7 @@ bool is_eof_object(unsigned expr)
 
 bool syntax_rules_form_like(unsigned expr)
 {
-    return IS_PAIR(expr) && IS_ATOM(car(expr)) &&
-           CELL_ID(car(expr)) == ctx.kw_syntax_rules &&
+    return IS_PAIR(expr) && IS_KEYWORD(car(expr), ctx.kw_syntax_rules) &&
            IS_PAIR(cdr(expr)) && IS_PAIR(cddr(expr));
 }
 
@@ -2542,11 +2549,19 @@ bool cond_clauses_valid(unsigned clauses, const char *name, unsigned env)
         }
         unsigned test = car(clause);
         unsigned conseq = cdr(clause);
-        if (else_unbound && IS_KEYWORD(test, ctx.kw_else) && cdr(c)) {
+        // A core alias of else or => is looked up as itself (see IS_KEYWORD).
+        if (IS_KEYWORD(test, ctx.kw_else) &&
+            (CELL_ID(test) == ctx.kw_else
+                 ? else_unbound
+                 : env_find_binding_cell(CELL_ID(test), env) == 0) &&
+            cdr(c)) {
             show_error("%s: else clause must be last", name);
             return false;
         }
-        if (arrow_unbound && conseq && IS_KEYWORD(car(conseq), ctx.kw_arrow) &&
+        if (conseq && IS_KEYWORD(car(conseq), ctx.kw_arrow) &&
+            (CELL_ID(car(conseq)) == ctx.kw_arrow
+                 ? arrow_unbound
+                 : env_find_binding_cell(CELL_ID(car(conseq)), env) == 0) &&
             len != 3) {
             show_error("%s: invalid => clause", name);
             return false;
@@ -3495,6 +3510,51 @@ static void init_boolean_atom(unsigned cell_id, const char *name)
     CELL_ID(cell_id) = atom_slot(name, true);
 }
 
+// Record each core keyword in atom_core_forms and give it its core alias: a
+// permanent atom in reserved space (so it needs no GC root) whose private slot
+// prints as the keyword, like the booleans' (see enum core_form).
+static void init_core_forms(void)
+{
+    static const char *const names[CF_COUNT] = {
+        [CF_QUOTE] = "quote",
+        [CF_QUASIQUOTE] = "quasiquote",
+        [CF_UNQUOTE] = "unquote",
+        [CF_UNQUOTE_SPLICING] = "unquote-splicing",
+        [CF_LAMBDA] = "lambda",
+        [CF_IF] = "if",
+        [CF_DEFINE] = "define",
+        [CF_SET] = "set!",
+        [CF_BEGIN] = "begin",
+        [CF_LET] = "let",
+        [CF_LETSTAR] = "let*",
+        [CF_LETREC] = "letrec",
+        [CF_COND] = "cond",
+        [CF_AND] = "and",
+        [CF_OR] = "or",
+        [CF_COND_EXPAND] = "cond-expand",
+        [CF_DEFINE_SYNTAX] = "define-syntax",
+        [CF_LET_SYNTAX] = "let-syntax",
+        [CF_LETREC_SYNTAX] = "letrec-syntax",
+        [CF_SYNTAX_RULES] = "syntax-rules",
+        [CF_DEFINE_MACRO] = "define-macro",
+        [CF_ELSE] = "else",
+        [CF_ARROW] = "=>",
+    };
+    for (int form = CF_NONE + 1; form < CF_COUNT; form++) {
+        int64_t id = intern(names[form]);
+        core_form_keywords[form] = id;
+        atom_core_forms[id] = (uint8_t)form;
+        unsigned alias = core_alias_cell(form);
+        CELL_TYPE(alias) = BT_ATOM;
+        CELL_ID(alias) = atom_slot(names[form], true);
+        atom_core_forms[CELL_ID(alias)] = (uint8_t)(form | CORE_ALIAS_FLAG);
+    }
+    CELL_TYPE(CELL_EXPANDED_LAMBDA) = BT_ATOM;
+    CELL_ID(CELL_EXPANDED_LAMBDA) = atom_slot(names[CF_LAMBDA], true);
+    atom_core_forms[CELL_ID(CELL_EXPANDED_LAMBDA)] =
+        (uint8_t)(CF_LAMBDA | CORE_ALIAS_FLAG);
+}
+
 void init_keywords(void)
 {
     // Initialize current ports
@@ -3564,4 +3624,6 @@ void init_keywords(void)
     ctx.kw_letrec_syntax = intern("letrec-syntax");
     // This marker is private syntax metadata, never a user-spellable symbol.
     ctx.kw_protected = atom_slot("##protected##", true);
+
+    init_core_forms();
 }
