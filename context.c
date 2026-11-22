@@ -620,6 +620,10 @@ static unsigned gc_stress_countdown = 0;
 static unsigned gc_stress_major_interval = 0;
 static unsigned gc_stress_major_countdown = 0;
 
+// VESPER_GC_VERIFY=1 checks the external payload lists against a walk of the
+// heap at every collection (see "External payload tracking").
+static bool gc_verify_external = false;
+
 #ifdef VESPER_GC_TRAP_FREE_CELLS
 void gc_report_free_cell_access(unsigned id, const char *accessor)
 {
@@ -648,6 +652,7 @@ void init_gc_stress(void)
     gc_stress_countdown = gc_stress_interval;
     gc_stress_major_interval = read_stress_interval("VESPER_GC_STRESS_MAJOR");
     gc_stress_major_countdown = gc_stress_major_interval;
+    gc_verify_external = read_stress_interval("VESPER_GC_VERIFY") != 0;
 }
 
 // Only stress once there is an allocation root to collect from. Startup interns
@@ -686,70 +691,41 @@ static inline bool gc_stress_major_due(void)
     return true;
 }
 
-// Shadow stack for GC roots - protects local C variables during allocation
-// When GC runs, these are collected and updated in place
-// Now dynamically expandable
-static unsigned **shadow_stack = NULL;
-static int shadow_stack_size = 0;
-static int shadow_stack_top = 0;
+// Shadow stack for GC roots - protects local C variables during allocation.
+// When GC runs, these are collected and updated in place. The push and pop
+// paths are inline in context.h; it starts empty (size 0), so the first
+// gc_protect allocates it here.
+unsigned **gc_shadow_stack = NULL;
+int gc_shadow_stack_size = 0;
+int gc_shadow_stack_top = 0;
 
-static void init_shadow_stack(void)
+void gc_shadow_stack_grow(void)
 {
-    if (!shadow_stack) {
-        shadow_stack_size = 4096;
-        shadow_stack =
-            checked_malloc_array((unsigned)shadow_stack_size, sizeof(unsigned *));
-        if (!shadow_stack) {
-            lisp_panic("failed to allocate shadow stack");
-        }
+    if (gc_shadow_stack_top < gc_shadow_stack_size)
+        return;
+    if (gc_shadow_stack_size > INT_MAX / 2 ||
+        (size_t)gc_shadow_stack_size * 2 > SIZE_MAX / sizeof(unsigned *)) {
+        lisp_panic("shadow stack too large");
     }
-}
-
-void gc_protect(unsigned *ptr)
-{
-    LISP_ASSERT_MSG(ptr != NULL, "gc_protect: null pointer");
-    init_shadow_stack();
-    if (shadow_stack_top >= shadow_stack_size) {
-        // Expand the shadow stack
-        if (shadow_stack_size > INT_MAX / 2 ||
-            (size_t)shadow_stack_size * 2 > SIZE_MAX / sizeof(unsigned *)) {
-            lisp_panic("shadow stack too large");
-        }
-        int new_size = shadow_stack_size * 2;
-        unsigned **new_stack = checked_realloc_array(
-            shadow_stack, (unsigned)new_size, sizeof(unsigned *));
-        if (!new_stack) {
-            lisp_panic("failed to expand shadow stack");
-        }
-        shadow_stack = new_stack;
-        shadow_stack_size = new_size;
+    int new_size = gc_shadow_stack_size ? gc_shadow_stack_size * 2 : 4096;
+    unsigned **new_stack = checked_realloc_array(
+        gc_shadow_stack, (unsigned)new_size, sizeof(unsigned *));
+    if (!new_stack) {
+        lisp_panic(gc_shadow_stack ? "failed to expand shadow stack"
+                                   : "failed to allocate shadow stack");
     }
-    LISP_ASSERT_FMT(shadow_stack_top >= 0 && shadow_stack_top < shadow_stack_size,
-                    "gc_protect: invalid shadow_stack_top=%d (size=%d)",
-                    shadow_stack_top, shadow_stack_size);
-    shadow_stack[shadow_stack_top++] = ptr;
+    gc_shadow_stack = new_stack;
+    gc_shadow_stack_size = new_size;
 }
 
-void gc_unprotect(int count)
+void gc_shadow_stack_underflow(void)
 {
-    LISP_ASSERT_FMT(count >= 0, "gc_unprotect: negative count %d", count);
-    LISP_ASSERT_FMT(count <= shadow_stack_top,
-                    "gc_unprotect: count %d > stack_top %d",
-                    count, shadow_stack_top);
-    shadow_stack_top -= count;
-    if (shadow_stack_top < 0) {
-        lisp_panic("shadow stack underflow");
-    }
+    lisp_panic("shadow stack underflow");
 }
 
-int gc_mark(void)
+void gc_shadow_stack_bad_mark(void)
 {
-    return shadow_stack_top;
-}
-
-int get_shadow_stack_top(void)
-{
-    return shadow_stack_top;
+    lisp_panic("invalid gc_release mark");
 }
 
 // After a lisp_panic longjmp the C frames that registered shadow-stack
@@ -759,7 +735,7 @@ int get_shadow_stack_top(void)
 // inside a collection exits instead, so the collector state is already idle.)
 void gc_recover_after_panic(void)
 {
-    shadow_stack_top = 0;
+    gc_shadow_stack_top = 0;
     in_gc_mode = false;
     collection_in_progress = false;
     alloc_gc_root = NULL;
@@ -768,14 +744,6 @@ void gc_recover_after_panic(void)
     tramp.expr = tramp.env = tramp.cont = tramp.value = 0;
     vm_reset_after_panic();
     pattern_reset_after_panic();
-}
-
-void gc_release(int mark)
-{
-    if (mark < 0 || mark > shadow_stack_top) {
-        lisp_panic("invalid gc_release mark");
-    }
-    shadow_stack_top = mark;
 }
 
 void trigger_gc(void)
@@ -870,13 +838,31 @@ unsigned alloc(void)
     LISP_ASSERT_FMT(cell >= ctx.nursery_start && cell < nursery_end,
                     "alloc (nursery): cell %u outside nursery [%u, %u)",
                     cell, ctx.nursery_start, nursery_end);
+    // The collectors no longer reset every reclaimed cell, so a reused cell
+    // still holds whatever was there before. Clear the type, so a cell the
+    // caller has not typed yet reads as free, as it did when the sweep reset
+    // the whole nursery.
+    CELL_TYPE(cell) = BT_FREE;
     return cell;
 }
 
 unsigned alloc_cons(unsigned car_val, unsigned cdr_val)
 {
-    GC_PROTECT_GUARD2(&car_val, &cdr_val);
-    unsigned p = alloc();
+    unsigned p;
+    // The common case takes the next nursery cell and cannot collect, so it
+    // needs no roots: no collection in progress, no stress schedule, room
+    // left. Anything else goes through alloc() with the operands rooted.
+    unsigned nursery_end =
+        (ctx.mmin < SEMISPACE_SIZE) ? SEMISPACE_SIZE : 2 * SEMISPACE_SIZE;
+    if (__builtin_expect(!in_gc_mode && !gc_stress_interval &&
+                             !gc_stress_major_interval &&
+                             ctx.nursery_ptr < nursery_end,
+                         1)) {
+        p = ctx.nursery_ptr++;
+    } else {
+        GC_PROTECT_GUARD2(&car_val, &cdr_val);
+        p = alloc();
+    }
     CELL_TYPE(p) = BT_CONS;
     CELL_CAR(p) = car_val;
     CELL_CDR(p) = cdr_val;
@@ -915,6 +901,7 @@ unsigned store_bignum(bignum *bn)
     CELL_TYPE(p) = BT_BIGNUM;
     CELL_PTR(p) = bn;
     bignum_register(bn);
+    gc_note_external(p);
     return p;
 }
 
@@ -973,8 +960,33 @@ bool hash_table_data_well_formed(const hash_table_data *ht)
            ht->size <= ht->capacity;
 }
 
+// The types whose cells own a malloc'd payload, which free_external_cell_data
+// releases. Keep the two in step.
+static inline bool cell_type_owns_external(int t)
+{
+    switch (t) {
+    case BT_BIGNUM:
+    case BT_HASHTABLE:
+    case BT_VECTOR:
+    case BT_RECORD:
+    case BT_RECORD_TYPE:
+    case BT_STRING:
+    case BT_BYTEVEC:
+    case BT_STRINPORT:
+    case BT_STROUTPORT:
+    case BT_INPORT:
+    case BT_OUTPORT:
+    case BT_VMCONT:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static void free_external_cell_data(unsigned x)
 {
+    if (!cell_type_owns_external(CELL_TYPE(x)))
+        return;
     if (CELL_TYPE(x) == BT_BIGNUM) {
         free_bignum_cell(x);
     } else if (CELL_TYPE(x) == BT_HASHTABLE) {
@@ -1061,6 +1073,221 @@ static void free_external_cell_data(unsigned x)
         }
         CELL_PTR(x) = NULL;
     }
+}
+
+// ============================================================================
+// External payload tracking
+// ============================================================================
+//
+// A copying collector never visits dead cells, yet a dead cell of an owning
+// type must have its payload freed. The sweep used to find them by walking
+// every cell of the reclaimed space: the whole nursery at each minor
+// collection, and the whole 16M-cell semispace at each major one, which took
+// ~40ms even with next to nothing live - and the REPL runs a major collection
+// after every top-level form. Instead two lists record which cells own a
+// payload:
+//
+//   young_external  every cell given an owning type since the last
+//                   collection (gc_note_external); nursery cells, except for
+//                   the rare old cell that takes over a payload
+//   old_external    old-generation cells of an owning type
+//
+// A collection walks only the entries in the space it reclaims. An entry whose
+// cell was copied (BT_BROKENHEART) is replaced by the copy, a dead one has its
+// payload freed, and either way the reclaimed cell is made BT_FREE, which
+// turns any duplicate entry into a no-op. An entry whose cell no longer has
+// an owning type (a reader placeholder took over its payload) just drops out.
+//
+// The lists are complete only if every cell is noted when it gets an owning
+// type. If one cannot grow, external_tracking_lost makes the collectors fall
+// back to sweeping every cell, as they used to, and the next major collection
+// rebuilds the old list from the copied heap. VESPER_GC_VERIFY=1 checks the
+// lists against a full walk at every collection.
+
+typedef struct {
+    unsigned *cells;
+    unsigned len;
+    unsigned cap;
+} cell_list;
+
+static cell_list young_external;
+static cell_list old_external;
+static cell_list spare_external; // reused as the next old_external
+static bool external_tracking_lost = false;
+
+static bool cell_list_push(cell_list *list, unsigned cell)
+{
+    if (list->len == list->cap) {
+        if (list->cap > UINT_MAX / 2)
+            return false;
+        unsigned new_cap = list->cap ? list->cap * 2 : 1024;
+        unsigned *cells =
+            checked_realloc_array(list->cells, new_cap, sizeof(unsigned));
+        if (!cells)
+            return false;
+        list->cells = cells;
+        list->cap = new_cap;
+    }
+    list->cells[list->len++] = cell;
+    return true;
+}
+
+void gc_note_external(unsigned cell)
+{
+    if (!cell_list_push(&young_external, cell))
+        external_tracking_lost = true;
+}
+
+static void track_old_external(cell_list *list, unsigned cell)
+{
+    if (!cell_list_push(list, cell))
+        external_tracking_lost = true;
+}
+
+void gc_set_verify_external(bool enabled)
+{
+    gc_verify_external = enabled;
+}
+
+void gc_lose_external_tracking(void)
+{
+    external_tracking_lost = true;
+}
+
+unsigned gc_tracked_external_count(bool young)
+{
+    return young ? young_external.len : old_external.len;
+}
+
+// Settle one entry for a collection reclaiming [from_start, from_end): a
+// copied cell's copy goes on `keep`, a dead cell's payload is freed. Entries
+// outside the reclaimed space that still own a payload are kept as they are.
+static void settle_external_entry(unsigned cell, unsigned from_start,
+                                  unsigned from_end, cell_list *keep)
+{
+    if (cell < from_start || cell >= from_end) {
+        if (cell >= HEAP_RESERVED && cell < 2 * SEMISPACE_SIZE &&
+            cell_type_owns_external(CELL_TYPE(cell)))
+            track_old_external(keep, cell);
+        return;
+    }
+    int type = CELL_TYPE(cell);
+    if (type == BT_BROKENHEART) {
+        unsigned copy = CELL_CAR(cell);
+        if (cell_type_owns_external(CELL_TYPE(copy)))
+            track_old_external(keep, copy);
+        CELL_TYPE(cell) = BT_FREE;
+    } else if (cell_type_owns_external(type)) {
+        free_external_cell_data(cell);
+        CELL_TYPE(cell) = BT_FREE;
+    }
+}
+
+// The fallback when the lists are incomplete: every cell of the range.
+static void sweep_external_full(unsigned start, unsigned end)
+{
+    for (unsigned i = start; i < end; i++) {
+        free_external_cell_data(i);
+        CELL_TYPE(i) = BT_FREE;
+    }
+}
+
+// The collector leaves dead cells' types alone, but a build that traps on
+// reclaimed cells needs every one of them marked.
+static void mark_reclaimed_cells_free(unsigned start, unsigned end)
+{
+#ifdef VESPER_GC_TRAP_FREE_CELLS
+    for (unsigned i = start; i < end; i++)
+        CELL_TYPE(i) = BT_FREE;
+#else
+    (void)start;
+    (void)end;
+#endif
+}
+
+// VESPER_GC_VERIFY: before a collection's sweep, check that every cell in
+// [start, end) that owns a payload, or was copied to a cell that does, is on
+// one of the lists. A miss is a constructor that forgot gc_note_external, and
+// would leak the payload, so stop right there.
+static void verify_external_tracked(unsigned start, unsigned end,
+                                    const char *collection)
+{
+    if (end <= start)
+        return;
+    unsigned span = end - start;
+    unsigned char *listed = calloc(((size_t)span + 7) / 8, 1);
+    if (!listed) {
+        fprintf(stderr, "GC VERIFY: out of memory\n");
+        abort();
+    }
+    const cell_list *lists[] = {&young_external, &old_external};
+    for (size_t l = 0; l < 2; l++)
+        for (unsigned i = 0; i < lists[l]->len; i++) {
+            unsigned cell = lists[l]->cells[i];
+            if (cell >= start && cell < end)
+                listed[(cell - start) / 8] |=
+                    (unsigned char)(1u << ((cell - start) % 8));
+        }
+    for (unsigned cell = start; cell < end; cell++) {
+        int type = CELL_TYPE(cell);
+        if (type == BT_BROKENHEART)
+            type = CELL_TYPE(CELL_CAR(cell));
+        if (!cell_type_owns_external(type))
+            continue;
+        if (!(listed[(cell - start) / 8] & (1u << ((cell - start) % 8)))) {
+            fprintf(stderr,
+                    "GC VERIFY: %s collection: cell %u of type %d owns a "
+                    "payload but was never passed to gc_note_external\n",
+                    collection, cell, type);
+            abort();
+        }
+    }
+    free(listed);
+}
+
+// Minor collection: the nursery [start, end) is reclaimed. Promoted copies
+// join the old list, and so does any old cell noted since the last
+// collection.
+static void sweep_nursery_external(unsigned start, unsigned end)
+{
+    if (external_tracking_lost) {
+        // The next major collection rebuilds the old list; all that is
+        // needed here is to free the nursery's dead payloads.
+        sweep_external_full(start, end);
+    } else {
+        for (unsigned i = 0; i < young_external.len; i++)
+            settle_external_entry(young_external.cells[i], start, end,
+                                  &old_external);
+        mark_reclaimed_cells_free(start, end);
+    }
+    young_external.len = 0;
+}
+
+// Major collection: the whole other semispace [start, end) is reclaimed and
+// the live heap is now [to_start, to_end).
+static void sweep_semispace_external(unsigned start, unsigned end,
+                                     unsigned to_start, unsigned to_end)
+{
+    spare_external.len = 0;
+    if (external_tracking_lost) {
+        sweep_external_full(start, end);
+        external_tracking_lost = false;
+        for (unsigned cell = to_start; cell < to_end; cell++)
+            if (cell_type_owns_external(CELL_TYPE(cell)))
+                track_old_external(&spare_external, cell);
+    } else {
+        for (unsigned i = 0; i < old_external.len; i++)
+            settle_external_entry(old_external.cells[i], start, end,
+                                  &spare_external);
+        for (unsigned i = 0; i < young_external.len; i++)
+            settle_external_entry(young_external.cells[i], start, end,
+                                  &spare_external);
+        mark_reclaimed_cells_free(start, end);
+    }
+    young_external.len = 0;
+    cell_list next = spare_external;
+    spare_external = old_external;
+    old_external = next;
 }
 
 static void collect_vm_continuation_roots(vm_continuation *cont,
@@ -1609,6 +1836,7 @@ unsigned make_vector(unsigned len, unsigned fill)
     unsigned p = alloc();
     CELL_TYPE(p) = BT_VECTOR;
     CELL_PTR(p) = vd;
+    gc_note_external(p);
     for (unsigned i = 0; i < len; i++) {
         vd->data[i] = fill;
     }
@@ -1642,6 +1870,7 @@ static unsigned make_vector_like(enum lisp_type type, unsigned len,
     unsigned p = alloc();
     CELL_TYPE(p) = type;
     CELL_PTR(p) = vd;
+    gc_note_external(p);
     for (unsigned i = 0; i < len; i++)
         vd->data[i] = ctx.atom_false;
     return p;
@@ -3170,6 +3399,12 @@ unsigned gc(unsigned root)
     unsigned *saved_gc_root = alloc_gc_root;
     alloc_gc_root = NULL;
 
+    // The parts of the space being reclaimed that hold allocated cells, for
+    // VESPER_GC_VERIFY.
+    unsigned from_old_start = ctx.mmin, from_old_end = ctx.hptr;
+    unsigned from_nursery_start = ctx.nursery_start;
+    unsigned from_nursery_end = ctx.nursery_ptr;
+
     // Switch to new semispace
     ctx.hptr = ctx.nmin;
     unsigned scan = ctx.hptr;
@@ -3208,9 +3443,9 @@ unsigned gc(unsigned root)
 
     // Collect shadow stack entries - these are pointers to local C variables
     // that hold cell IDs. After GC, we update them to point to new locations.
-    for (int i = 0; i < shadow_stack_top; i++) {
-        if (shadow_stack[i] && *shadow_stack[i] >= HEAP_RESERVED) {
-            *shadow_stack[i] = collect(*shadow_stack[i]);
+    for (int i = 0; i < gc_shadow_stack_top; i++) {
+        if (gc_shadow_stack[i] && *gc_shadow_stack[i] >= HEAP_RESERVED) {
+            *gc_shadow_stack[i] = collect(*gc_shadow_stack[i]);
         }
     }
     gc_update_active_pattern_state();
@@ -3249,14 +3484,17 @@ unsigned gc(unsigned root)
     //   - We only free data from cells that still have their original type
     //   - All pointer types (bignums, strings, vectors, string ports) share
     //     their heap data with the new cell, so only unreachable data is freed
-    // Note: old_end covers the ENTIRE old semispace including its nursery
+    // Only the cells on the external lists are visited (see "External payload
+    // tracking"); old_end covers the ENTIRE old semispace including its
+    // nursery.
     unsigned old_start = ctx.nmin;
     unsigned old_end =
         (ctx.nmin < SEMISPACE_SIZE) ? SEMISPACE_SIZE : 2 * SEMISPACE_SIZE;
-    for (unsigned i = old_start; i < old_end; i++) {
-        free_external_cell_data(i);
-        CELL_TYPE(i) = BT_FREE;
+    if (gc_verify_external && !external_tracking_lost) {
+        verify_external_tracked(from_old_start, from_old_end, "major");
+        verify_external_tracked(from_nursery_start, from_nursery_end, "major");
     }
+    sweep_semispace_external(old_start, old_end, ctx.mmin, ctx.hptr);
 
     // Reset nursery to end of new active semispace
     if (ctx.mmin < SEMISPACE_SIZE) {
@@ -3405,9 +3643,9 @@ unsigned minor_gc(unsigned root)
     reader_update_datum_labels(collect_to_old);
 
     // Collect shadow stack entries
-    for (int i = 0; i < shadow_stack_top; i++) {
-        if (shadow_stack[i]) {
-            *shadow_stack[i] = collect_to_old(*shadow_stack[i]);
+    for (int i = 0; i < gc_shadow_stack_top; i++) {
+        if (gc_shadow_stack[i]) {
+            *gc_shadow_stack[i] = collect_to_old(*gc_shadow_stack[i]);
         }
     }
     minor_gc_update_active_pattern_state();
@@ -3452,19 +3690,13 @@ unsigned minor_gc(unsigned root)
         gc_scan_cell(scan++, collect_to_old);
 
     // Free external data for unreachable nursery cells. Promoted cells were
-    // rewritten as BT_BROKENHEART, so they are skipped here.
-    //
-    // Only the cells allocated this cycle need visiting: everything from
-    // nursery_ptr up to the nursery end is still BT_FREE from the previous
-    // reset and holds no external data. When the nursery is full (the normal
-    // trigger) the two bounds coincide, so this changes nothing there - but a
-    // collection forced early, by gc-flip or VESPER_GC_STRESS, used to scan
-    // all 256K cells to reclaim a few hundred. Under stress in the CPS
-    // interpreter that scan was ~80% of the process's time.
-    for (unsigned i = ctx.nursery_start; i < ctx.nursery_ptr; i++) {
-        free_external_cell_data(i);
-        CELL_TYPE(i) = BT_FREE;
-    }
+    // rewritten as BT_BROKENHEART, so their payloads go with the copies.
+    // Only the cells on the young external list are visited (see "External
+    // payload tracking"), not the whole nursery: that walk was ~5% of the
+    // run time of allocation-heavy loops.
+    if (gc_verify_external && !external_tracking_lost)
+        verify_external_tracked(ctx.nursery_start, ctx.nursery_ptr, "minor");
+    sweep_nursery_external(ctx.nursery_start, ctx.nursery_ptr);
 
     // Reset nursery - all survivors are now in old gen
     ctx.nursery_ptr = ctx.nursery_start;

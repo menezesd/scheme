@@ -486,9 +486,6 @@ void peephole_optimize(code_object *code)
         // Fuse: NUMEQ, JUMPIFNOT target -> NUMEQ_JUMPIFNOT target
         // Handled in CSE pass (not peephole) since it changes instruction sizes
 
-        // Pattern: CAR, CDR can be fused (if we add CADR) - already have
-        // OP_CADR Pattern: CDR, CDR can be fused (if we add CDDR) - already
-        // have OP_CDDR
 
         // Pattern: PAIRP, NOT -> use directly in conditional
         if (op == OP_PAIRP && i + 1 < len && c[i + 1] == OP_NOT &&
@@ -512,45 +509,11 @@ void peephole_optimize(code_object *code)
             continue;
         }
 
-        // Only two-instruction cxr fusions exist. The compiler never emits a
-        // composite accessor itself and a fused instruction is not examined
-        // again, so patterns starting from CDDR/CADR (or three-op chains,
-        // shadowed by the pairs below) could never fire.
-        // Pattern: CDR, CDR -> CDDR (if not jump target)
-        if (op == OP_CDR && i + 1 < len && c[i + 1] == OP_CDR &&
-            !is_jump_target[i + 1]) {
-            c[i] = OP_CDDR;
-            remove[i + 1] = true;
-            i += 1;
-            continue;
-        }
-
-        // Pattern: CDR, CAR -> CADR (access second element)
-        if (op == OP_CDR && i + 1 < len && c[i + 1] == OP_CAR &&
-            !is_jump_target[i + 1]) {
-            c[i] = OP_CADR;
-            remove[i + 1] = true;
-            i += 1;
-            continue;
-        }
-
-        // Pattern: CAR, CDR -> CDAR (cdr of car) (if not jump target)
-        if (op == OP_CAR && i + 1 < len && c[i + 1] == OP_CDR &&
-            !is_jump_target[i + 1]) {
-            c[i] = OP_CDAR;
-            remove[i + 1] = true;
-            i += 1;
-            continue;
-        }
-
-        // Pattern: CAR, CAR -> CAAR (car of car)
-        if (op == OP_CAR && i + 1 < len && c[i + 1] == OP_CAR &&
-            !is_jump_target[i + 1]) {
-            c[i] = OP_CAAR;
-            remove[i + 1] = true;
-            i += 1;
-            continue;
-        }
+        // CAR/CDR pairs are deliberately not fused into CAAR/CADR/CDAR/CDDR.
+        // The compiler emits those for caar/cadr/cdar/cddr themselves, and
+        // they report failures under that name, where (car (cdr x)) must
+        // report car or cdr - whichever step failed - as the interpreter
+        // does.
 
         // NOTE: CONST x, CONST x -> CONST x, DUP is handled in cse_pass()
         // which properly rebuilds the code array to handle size changes.

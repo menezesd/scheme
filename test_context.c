@@ -18,7 +18,9 @@
 #include <stdint.h>
 #include <limits.h>
 #include <stdlib.h>
+#include <signal.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 static unsigned test_gc_collector_from;
@@ -3254,6 +3256,7 @@ TEST(gc_closes_unreachable_file_port)
     CELL_TYPE(port) = BT_INPORT;
     CELL_PTR(port) = file_port_new(f, false, true, true);
     ASSERT(CELL_PTR(port) != NULL);
+    gc_note_external(port);
 
     gc(0);
 
@@ -3272,6 +3275,7 @@ TEST(gc_forgets_unreachable_file_port_reader_state)
     CELL_TYPE(port) = BT_INPORT;
     CELL_PTR(port) = file_port_new(f, false, true, true);
     ASSERT(CELL_PTR(port) != NULL);
+    gc_note_external(port);
 
     unsigned value = read_obj_port(f);
     ASSERT(value != TOK_ERROR);
@@ -3294,6 +3298,7 @@ TEST(gc_preserves_current_file_port_until_replaced)
     CELL_TYPE(port) = BT_INPORT;
     CELL_PTR(port) = file_port_new(f, false, true, true);
     ASSERT(CELL_PTR(port) != NULL);
+    gc_note_external(port);
     ctx.current_input = f;
     ctx.current_input_cell = port;
 
@@ -4253,6 +4258,292 @@ TEST(peephole_optimize_prim_tail_flag_survives)
 // Main
 // ============================================================================
 
+// ----------------------------------------------------------------------------
+// External payload tracking (context.c): the collectors free dead cells'
+// payloads from the young/old external lists instead of walking every cell.
+// ----------------------------------------------------------------------------
+
+// Collect twice so that no cell left over by an earlier test is in a range
+// the verifier walks: the second collection copies only what is live.
+static void settle_heap_for_external_tests(void)
+{
+    gc(0);
+    gc(0);
+}
+
+static unsigned test_vector(unsigned len)
+{
+    return make_vector(len, ctx.atom_false);
+}
+
+TEST(external_payload_freed_when_nursery_cell_dies_in_minor_gc)
+{
+    settle_heap_for_external_tests();
+    gc_set_verify_external(true);
+    unsigned vec = test_vector(3);
+    vector_data *payload = GET_VECTOR_PTR(vec);
+    unsigned str = make_string_copy("dies young");
+    char *text = GET_STRING_PTR(str);
+    ASSERT(is_in_nursery(vec) && is_in_nursery(str));
+    ASSERT(gc_tracked_external_count(true) >= 2);
+    minor_gc(0);
+    gc_set_verify_external(false);
+    ASSERT(!vector_is_registered(payload));
+    ASSERT(!string_is_registered(text));
+    ASSERT_EQ(gc_tracked_external_count(true), 0);
+    PASS();
+}
+
+TEST(external_payload_follows_promotion_and_dies_in_major_gc)
+{
+    settle_heap_for_external_tests();
+    unsigned old_before = gc_tracked_external_count(false);
+    gc_set_verify_external(true);
+    GC_GUARD;
+    unsigned vec = test_vector(4);
+    gc_protect(&vec);
+    vector_data *payload = GET_VECTOR_PTR(vec);
+    unsigned big = store_bignum(bn_from_string("123456789012345678901234567890",
+                                               10));
+    gc_protect(&big);
+    bignum *digits = (bignum *)CELL_PTR(big);
+    ASSERT(is_in_nursery(vec) && is_in_nursery(big));
+
+    minor_gc(0);
+    ASSERT(is_in_old_gen(vec) && is_in_old_gen(big));
+    ASSERT(GET_VECTOR_PTR(vec) == payload);
+    ASSERT(vector_is_registered(payload));
+    ASSERT(bignum_is_registered(digits));
+    ASSERT_EQ(gc_tracked_external_count(true), 0);
+    ASSERT(gc_tracked_external_count(false) >= old_before + 2);
+
+    // Still reachable: a major collection keeps both and their payloads.
+    gc(0);
+    ASSERT(GET_VECTOR_PTR(vec) == payload);
+    ASSERT(vector_is_registered(payload));
+    ASSERT(bignum_is_registered(digits));
+    ASSERT(gc_tracked_external_count(false) >= old_before + 2);
+
+    // Unreachable: the next major collection frees them.
+    vec = 0;
+    big = 0;
+    gc(0);
+    gc_set_verify_external(false);
+    ASSERT(!vector_is_registered(payload));
+    ASSERT(!bignum_is_registered(digits));
+    ASSERT_EQ(gc_tracked_external_count(false), old_before);
+    PASS();
+}
+
+TEST(external_payload_of_nursery_cell_freed_by_major_gc)
+{
+    settle_heap_for_external_tests();
+    gc_set_verify_external(true);
+    unsigned str = make_string_copy("never promoted");
+    char *text = GET_STRING_PTR(str);
+    GC_GUARD;
+    unsigned kept = make_string_copy("kept");
+    gc_protect(&kept);
+    char *kept_text = GET_STRING_PTR(kept);
+    gc(0);
+    gc_set_verify_external(false);
+    ASSERT(!string_is_registered(text));
+    ASSERT(string_is_registered(kept_text));
+    ASSERT(GET_STRING_PTR(kept) == kept_text);
+    ASSERT_EQ(gc_tracked_external_count(true), 0);
+    PASS();
+}
+
+// Noting a cell twice, or noting one that owns nothing, must not free a
+// payload twice or keep anything alive.
+TEST(external_duplicate_and_non_owning_notes_are_harmless)
+{
+    settle_heap_for_external_tests();
+    unsigned old_before = gc_tracked_external_count(false);
+    GC_GUARD;
+    unsigned vec = test_vector(2);
+    gc_protect(&vec);
+    vector_data *payload = GET_VECTOR_PTR(vec);
+    gc_note_external(vec);
+    unsigned pair = alloc_cons(ctx.atom_true, ctx.atom_false);
+    gc_protect(&pair);
+    gc_note_external(pair);
+    unsigned dead = make_string_copy("noted twice");
+    char *dead_text = GET_STRING_PTR(dead);
+    gc_note_external(dead);
+
+    minor_gc(0);
+    ASSERT(vector_is_registered(payload));
+    ASSERT(!string_is_registered(dead_text));
+    ASSERT(IS_PAIR(pair) && car(pair) == ctx.atom_true);
+    gc(0);
+    ASSERT(vector_is_registered(payload));
+    // The major collection settled the duplicate entry into one.
+    ASSERT_EQ(gc_tracked_external_count(false), old_before + 1);
+    vec = 0;
+    gc(0);
+    ASSERT(!vector_is_registered(payload));
+    ASSERT_EQ(gc_tracked_external_count(false), old_before);
+    PASS();
+}
+
+// An old cell that takes over a payload (as a reader placeholder does) is
+// noted while old; the minor collection moves it to the old list.
+TEST(external_payload_taken_over_by_old_cell_is_tracked)
+{
+    settle_heap_for_external_tests();
+    gc_set_verify_external(true);
+    GC_GUARD;
+    unsigned holder = alloc_cons(0, 0);
+    gc_protect(&holder);
+    minor_gc(0);
+    ASSERT(is_in_old_gen(holder));
+
+    char *text = checked_string_copy("adopted");
+    ASSERT(text != NULL);
+    CELL_TYPE(holder) = BT_STRING;
+    CELL_PTR(holder) = text;
+    string_register(text);
+    gc_note_external(holder);
+    minor_gc(0);
+    ASSERT(string_is_registered(text));
+    gc(0);
+    ASSERT(string_is_registered(text));
+    ASSERT(GET_STRING_PTR(holder) == text);
+    holder = 0;
+    gc(0);
+    gc_set_verify_external(false);
+    ASSERT(!string_is_registered(text));
+    PASS();
+}
+
+// Reused nursery cells come back from alloc() typed BT_FREE even though the
+// collector no longer resets them.
+TEST(alloc_returns_cells_typed_free)
+{
+    GC_GUARD;
+    unsigned keep = alloc_cons(ctx.atom_true, 0);
+    gc_protect(&keep);
+    for (int i = 0; i < 16; i++)
+        (void)alloc_cons(ctx.atom_true, 0);
+    minor_gc(0);
+    for (int i = 0; i < 64; i++) {
+        unsigned cell = alloc();
+        ASSERT(is_in_nursery(cell));
+        ASSERT_EQ(CELL_TYPE(cell), BT_FREE);
+        CELL_TYPE(cell) = BT_CONS;
+        CELL_CAR(cell) = 0;
+        CELL_CDR(cell) = 0;
+    }
+    PASS();
+}
+
+// With the lists marked incomplete the collectors sweep every cell, and the
+// next major collection rebuilds the old list from the copied heap.
+TEST(external_tracking_falls_back_to_full_sweep)
+{
+    settle_heap_for_external_tests();
+    unsigned old_before = gc_tracked_external_count(false);
+    GC_GUARD;
+    unsigned vec = test_vector(5);
+    gc_protect(&vec);
+    vector_data *payload = GET_VECTOR_PTR(vec);
+    unsigned dead = make_string_copy("swept the old way");
+    char *dead_text = GET_STRING_PTR(dead);
+    gc_lose_external_tracking();
+    minor_gc(0);
+    ASSERT(!string_is_registered(dead_text));
+    ASSERT(vector_is_registered(payload));
+    gc(0);
+    ASSERT(vector_is_registered(payload));
+    ASSERT_EQ(gc_tracked_external_count(false), old_before + 1);
+    // Tracking is complete again: verification passes and the vector is
+    // freed from the rebuilt list once it dies.
+    gc_set_verify_external(true);
+    unsigned young = make_string_copy("tracked again");
+    char *young_text = GET_STRING_PTR(young);
+    vec = 0;
+    gc(0);
+    gc_set_verify_external(false);
+    ASSERT(!vector_is_registered(payload));
+    ASSERT(!string_is_registered(young_text));
+    ASSERT_EQ(gc_tracked_external_count(false), old_before);
+    PASS();
+}
+
+// VESPER_GC_VERIFY stops at a cell that owns a payload but was never noted.
+// It aborts, so check it in a child process.
+TEST(external_verification_catches_unnoted_cell)
+{
+    fflush(stdout);
+    pid_t pid = fork();
+    ASSERT(pid >= 0);
+    if (pid == 0) {
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0)
+            dup2(devnull, STDERR_FILENO);
+        settle_heap_for_external_tests();
+        gc_set_verify_external(true);
+        char *text = checked_string_copy("untracked");
+        unsigned cell = alloc();
+        CELL_TYPE(cell) = BT_STRING;
+        CELL_PTR(cell) = text;
+        string_register(text);
+        minor_gc(0);
+        _exit(0);
+    }
+    int status = 0;
+    ASSERT(waitpid(pid, &status, 0) == pid);
+    ASSERT(WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
+    PASS();
+}
+
+// Many objects of every owning type, some kept and some dropped, through
+// minor and major collections with verification on.
+TEST(external_tracking_survives_mixed_workload)
+{
+    settle_heap_for_external_tests();
+    gc_set_verify_external(true);
+    GC_GUARD;
+    unsigned keep = 0;
+    gc_protect(&keep);
+    for (int round = 0; round < 200; round++) {
+        unsigned obj;
+        switch (round % 5) {
+        case 0:
+            obj = test_vector((unsigned)(round % 7));
+            break;
+        case 1:
+            obj = make_string_copy("workload");
+            break;
+        case 2:
+            obj = store_bignum(bn_from_string("99999999999999999999999", 10));
+            break;
+        case 3: {
+            unsigned args[1] = {store(round % 4)};
+            obj = apply_primitive_argv(PMAKEBYTEVEC, 1, args);
+            break;
+        }
+        default:
+            obj = apply_primitive_argv(PMAKEEQUALHASHTABLE, 0, NULL);
+            break;
+        }
+        ASSERT(obj != TOK_ERROR);
+        if (round % 3 == 0)
+            keep = alloc_cons(obj, keep);
+        if (round % 17 == 0)
+            minor_gc(0);
+        if (round % 61 == 0)
+            gc(0);
+    }
+    gc(0);
+    ASSERT_EQ(list_length(keep), 67);
+    keep = 0;
+    gc(0);
+    gc_set_verify_external(false);
+    PASS();
+}
+
 int main(void)
 {
     // Initialize interpreter infrastructure
@@ -4439,6 +4730,15 @@ int main(void)
     RUN_TEST(gc_closes_unreachable_file_port);
     RUN_TEST(gc_forgets_unreachable_file_port_reader_state);
     RUN_TEST(gc_preserves_current_file_port_until_replaced);
+    RUN_TEST(external_payload_freed_when_nursery_cell_dies_in_minor_gc);
+    RUN_TEST(external_payload_follows_promotion_and_dies_in_major_gc);
+    RUN_TEST(external_payload_of_nursery_cell_freed_by_major_gc);
+    RUN_TEST(external_duplicate_and_non_owning_notes_are_harmless);
+    RUN_TEST(external_payload_taken_over_by_old_cell_is_tracked);
+    RUN_TEST(alloc_returns_cells_typed_free);
+    RUN_TEST(external_tracking_falls_back_to_full_sweep);
+    RUN_TEST(external_verification_catches_unnoted_cell);
+    RUN_TEST(external_tracking_survives_mixed_workload);
 
     // Environment
     RUN_TEST(empty_environment_test);

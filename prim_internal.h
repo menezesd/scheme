@@ -29,6 +29,54 @@ static inline unsigned scheme_bool(bool value)
     return value ? ctx.atom_true : ctx.atom_false;
 }
 
+// eq?: identity, except that the types whose cells are compared by value
+// (numbers, characters, symbols, procedures) match on type and payload, since
+// equal values of those types need not share a cell.
+static inline bool values_eq(unsigned a, unsigned b)
+{
+    if (a == b)
+        return true;
+    if (IS_FIXNUM(a))
+        return IS_NUM(b) && CELL_ID(b) == (int64_t)FIXNUM_VALUE(a);
+    if (IS_FIXNUM(b))
+        return IS_NUM(a) && CELL_ID(a) == (int64_t)FIXNUM_VALUE(b);
+    if (!IS_CELL(a) || !IS_CELL(b) || CELL_TYPE(a) != CELL_TYPE(b))
+        return false;
+    switch (CELL_TYPE(a)) {
+    case BT_NUM:
+    case BT_FUNCTION:
+    case BT_BUILTIN:
+    case BT_ATOM:
+    case BT_CHAR:
+        return CELL_ID(a) == CELL_ID(b);
+    default:
+        return false;
+    }
+}
+
+// True when values_eq(x, y) can hold for some y != x, so a search for x has
+// to compare payloads rather than cell indices.
+static inline bool eq_compares_payload(unsigned x)
+{
+    if (IS_FIXNUM(x))
+        return true;
+    if (!IS_CELL(x))
+        return false;
+    switch (CELL_TYPE(x)) {
+    case BT_NUM:
+    case BT_FUNCTION:
+    case BT_BUILTIN:
+    case BT_ATOM:
+    case BT_CHAR:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// eqv? extends eq? by comparing numbers of the same type by value (R7RS 6.1)
+bool values_eqv(unsigned a, unsigned b);
+
 // ============================================================================
 // Numeric Tower Classification
 // ============================================================================
@@ -593,6 +641,7 @@ static inline unsigned make_pointer_cell(enum lisp_type type, void *ptr)
     unsigned cell = alloc();
     CELL_TYPE(cell) = type;
     CELL_PTR(cell) = ptr;
+    gc_note_external(cell);
     return cell;
 }
 
@@ -1307,6 +1356,7 @@ static inline unsigned make_string_owned(char *s)
     CELL_TYPE(p) = BT_STRING;
     CELL_PTR(p) = s;
     string_register(s);
+    gc_note_external(p);
     return p;
 }
 
@@ -1352,6 +1402,12 @@ unsigned string_compare(unsigned argc, unsigned *argv, cmp_op op,
 // List operations (prim_list.c)
 unsigned prim_append(unsigned argc, unsigned *argv);
 unsigned prim_reverse(unsigned argc, unsigned *argv);
+// PCAAR..PCDDDDR
+unsigned prim_cxr(unsigned prim_id, unsigned argc, unsigned *argv);
+// PMEMQ, PMEMV, PMEMBER, PASSQ, PASSV, PASSOC
+unsigned prim_member_search(unsigned prim_id, unsigned argc, unsigned *argv);
+unsigned prim_list_tail(unsigned argc, unsigned *argv);
+unsigned prim_list_ref(unsigned argc, unsigned *argv);
 
 // String operations (prim_string.c)
 unsigned prim_string_append(unsigned argc, unsigned *argv);

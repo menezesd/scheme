@@ -1183,42 +1183,12 @@
     ((do-step var step) step)))
 
 ;;; ============================================================================
-;;; List accessors (compositions of car/cdr)
-;;; ============================================================================
-
-(define (caar x) (car (car x)))
-(define (cadr x) (car (cdr x)))
-(define (cdar x) (cdr (car x)))
-(define (cddr x) (cdr (cdr x)))
-
-(define (caaar x) (car (car (car x))))
-(define (caadr x) (car (car (cdr x))))
-(define (cadar x) (car (cdr (car x))))
-(define (caddr x) (car (cdr (cdr x))))
-(define (cdaar x) (cdr (car (car x))))
-(define (cdadr x) (cdr (car (cdr x))))
-(define (cddar x) (cdr (cdr (car x))))
-(define (cdddr x) (cdr (cdr (cdr x))))
-
-(define (caaaar x) (car (car (car (car x)))))
-(define (caaadr x) (car (car (car (cdr x)))))
-(define (caadar x) (car (car (cdr (car x)))))
-(define (caaddr x) (car (car (cdr (cdr x)))))
-(define (cadaar x) (car (cdr (car (car x)))))
-(define (cadadr x) (car (cdr (car (cdr x)))))
-(define (caddar x) (car (cdr (cdr (car x)))))
-(define (cadddr x) (car (cdr (cdr (cdr x)))))
-(define (cdaaar x) (cdr (car (car (car x)))))
-(define (cdaadr x) (cdr (car (car (cdr x)))))
-(define (cdadar x) (cdr (car (cdr (car x)))))
-(define (cdaddr x) (cdr (car (cdr (cdr x)))))
-(define (cddaar x) (cdr (cdr (car (car x)))))
-(define (cddadr x) (cdr (cdr (car (cdr x)))))
-(define (cdddar x) (cdr (cdr (cdr (car x)))))
-(define (cddddr x) (cdr (cdr (cdr (cdr x)))))
-
-;;; ============================================================================
 ;;; List utilities
+;;;
+;;; The car/cdr compositions (caar ... cddddr), memq, memv, assq, assv,
+;;; list-tail and list-ref are C primitives (prim_list.c), as are the equal?
+;;; searches %member and %assoc that member and assoc below use when no
+;;; comparison procedure is given.
 ;;; ============================================================================
 
 (define (%require-proper-list who lst)
@@ -1256,48 +1226,19 @@
                  (error (string-append who ": circular list"))
                  (loop slow2 fast2)))))))
 
-(define (list-ref lst k)
-  (%require-nonnegative-integer "list-ref" k)
-  (let loop ((lst lst) (k k))
-    (cond ((not (pair? lst)) (error "list-ref: index out of bounds"))
-          ((= k 0) (car lst))
-          (else (loop (cdr lst) (- k 1))))))
-
-(define (list-tail lst k)
-  (%require-nonnegative-integer "list-tail" k)
-  (let loop ((lst lst) (k k))
-    (cond ((= k 0) lst)
-          ((not (pair? lst)) (error "list-tail: index out of bounds"))
-          (else (loop (cdr lst) (- k 1))))))
-
-; Membership functions
-(define (memq obj lst)
-  (let loop ((lst lst))
-    (cond ((null? lst) #f)
-          ((not (pair? lst)) (error "memq: improper list"))
-          ((eq? obj (car lst)) lst)
-          (else (loop (cdr lst))))))
-
-(define (memv obj lst)
-  (let loop ((lst lst))
-    (cond ((null? lst) #f)
-          ((not (pair? lst)) (error "memv: improper list"))
-          ((eqv? obj (car lst)) lst)
-          (else (loop (cdr lst))))))
-
+; member and assoc with a comparison procedure. Without one they are the C
+; equal? searches, which also reject circular lists instead of looping.
 (define (member obj lst . maybe-compare)
-  (if (> (length maybe-compare) 1)
-      (error "member: too many arguments"))
-  (if (null? lst)
-      #f
-      (let ((compare (%require-procedure
-                      "member"
-                      (if (null? maybe-compare) equal? (car maybe-compare)))))
-        (let loop ((lst lst))
-          (cond ((null? lst) #f)
-                ((not (pair? lst)) (error "member: improper list"))
-                ((compare obj (car lst)) lst)
-                (else (loop (cdr lst))))))))
+  (cond ((null? maybe-compare) (%member obj lst))
+        ((pair? (cdr maybe-compare)) (error "member: too many arguments"))
+        ((null? lst) #f)
+        (else
+         (let ((compare (%require-procedure "member" (car maybe-compare))))
+           (let loop ((lst lst))
+             (cond ((null? lst) #f)
+                   ((not (pair? lst)) (error "member: improper list"))
+                   ((compare obj (car lst)) lst)
+                   (else (loop (cdr lst)))))))))
 
 (define (member-procedure predicate)
   (lambda (obj lst)
@@ -1315,35 +1256,18 @@
              (and (pair? (car alist))
                   (loop (cdr alist)))))))
 
-(define (assq obj alist)
-  (let loop ((alist alist))
-    (cond ((null? alist) #f)
-          ((not (pair? alist)) (error "assq: improper association list"))
-          ((eq? obj (caar alist)) (car alist))
-          (else (loop (cdr alist))))))
-
-(define (assv obj alist)
-  (let loop ((alist alist))
-    (cond ((null? alist) #f)
-          ((not (pair? alist)) (error "assv: improper association list"))
-          ((eqv? obj (caar alist)) (car alist))
-          (else (loop (cdr alist))))))
-
 (define (assoc obj alist . maybe-compare)
-  (if (> (length maybe-compare) 1)
-      (error "assoc: too many arguments"))
-  (if (null? alist)
-      #f
-      (begin
-        (let ((compare (%require-procedure
-                        "assoc"
-                        (if (null? maybe-compare) equal? (car maybe-compare)))))
-          (let loop ((alist alist))
-            (cond ((null? alist) #f)
-                  ((not (pair? alist))
-                   (error "assoc: improper association list"))
-                  ((compare obj (caar alist)) (car alist))
-                  (else (loop (cdr alist)))))))))
+  (cond ((null? maybe-compare) (%assoc obj alist))
+        ((pair? (cdr maybe-compare)) (error "assoc: too many arguments"))
+        ((null? alist) #f)
+        (else
+         (let ((compare (%require-procedure "assoc" (car maybe-compare))))
+           (let loop ((alist alist))
+             (cond ((null? alist) #f)
+                   ((not (and (pair? alist) (pair? (car alist))))
+                    (error "assoc: improper association list"))
+                   ((compare obj (caar alist)) (car alist))
+                   (else (loop (cdr alist)))))))))
 
 ;;; ============================================================================
 ;;; Numeric predicates
@@ -1946,19 +1870,9 @@
         ((pair? lst) #f)
         (else (error "null-list?: not a proper list"))))
 
-; proper-list? - true if x is a proper list (finite, nil-terminated)
-; Uses tortoise-and-hare algorithm for cycle detection
-(define (proper-list? x)
-  (let loop ((fast x) (slow x) (first? #t))
-    (cond ((null? fast) #t)
-          ((not (pair? fast)) #f)
-          ((null? (cdr fast)) #t)
-          ((not (pair? (cdr fast))) #f)
-          ((and (not first?) (eq? fast slow)) #f)  ; cycle detected
-          (else (loop (cddr fast) (cdr slow) #f)))))
-
-; list? - alias for proper-list?
-(define list? proper-list?)
+; proper-list? - true if x is a proper list (finite, nil-terminated). The C
+; list? primitive, which detects cycles without allocating.
+(define proper-list? list?)
 
 ; dotted-list? - true if x is a finite, non-nil-terminated list
 (define (dotted-list? x)
@@ -2024,11 +1938,12 @@
 ;;; Additional SRFI-1 Selectors
 ;;; ============================================================================
 
-; first through tenth - positional accessors
-(define (first x) (car x))
-(define (second x) (cadr x))
-(define (third x) (caddr x))
-(define (fourth x) (cadddr x))
+; first through tenth - positional accessors. The first four are the
+; primitives themselves, so calls to them compile to the same inline accessors.
+(define first car)
+(define second cadr)
+(define third caddr)
+(define fourth cadddr)
 (define (fifth x) (car (cddddr x)))
 (define (sixth x) (cadr (cddddr x)))
 (define (seventh x) (caddr (cddddr x)))
@@ -2060,7 +1975,7 @@
      ((not (pair? (cdr fast))) (finite-count object))
      (else
       (let ((slow2 (cdr slow))
-            (fast2 (cdr (cdr fast))))
+            (fast2 (cddr fast)))
         (if (eq? slow2 fast2)
             (let find-entry ((a object) (b slow2) (prefix 0))
               (if (eq? a b)
@@ -3321,9 +3236,6 @@
                        less?
                        (lambda (a b) (less? (key a) (key b))))))
       (let sort-list ((xs lst))
-        ; (cdr (cdr fast)) rather than cddr: cddr is a Scheme-level define,
-        ; not a C primitive, so it costs a full non-inlinable call on every
-        ; step of this split.
         (let split ((slow xs) (fast xs) (front '()))
           (if (or (null? fast) (null? (cdr fast)))
               (let ((left (reverse front))
@@ -3333,7 +3245,7 @@
                       (else (%merge-nocheck compare
                                             (sort-list left)
                                             (sort-list right)))))
-              (split (cdr slow) (cdr (cdr fast))
+              (split (cdr slow) (cddr fast)
                      (cons (car slow) front))))))))
 
 (define (stable-sort sequence less? . maybe-key)
@@ -3654,7 +3566,7 @@
                     (loop (cdr xs) out)
                     (add (cdr rs)
                          (%char-set-range-insert
-                          out (car (car rs)) (cdr (car rs))))))))
+                          out (caar rs) (cdar rs)))))))
         (if (or (symbol? (car xs))
                 (and (char-set? (car xs))
                      (eq? (%char-set-kind (car xs)) 'predicate)))

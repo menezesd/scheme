@@ -121,16 +121,60 @@ static inline unsigned cadddr(unsigned id)
 // Memory Allocation
 // ============================================================================
 
-// Allocate a new cell
+// Allocate a new cell. A nursery cell comes back typed BT_FREE; the caller
+// sets its type and contents (and calls gc_note_external for a payload).
 unsigned alloc(void);
 
 // Allocate a cons cell with given car and cdr
 unsigned alloc_cons(unsigned car_val, unsigned cdr_val);
 
-// Forward declarations for GC protection (defined below)
-void gc_protect(unsigned *ptr);
-void gc_unprotect(int count);
-int get_shadow_stack_top(void);
+// Shadow stack of GC roots: addresses of C variables holding cell indices,
+// which every collection updates in place. gc_protect pushes one, and
+// gc_unprotect/gc_release pop back down. They run on nearly every allocation
+// path, so they are inline; only growing the stack is out of line. Use them
+// through the functions below, never directly.
+extern unsigned **gc_shadow_stack;
+extern int gc_shadow_stack_top;
+extern int gc_shadow_stack_size;
+void gc_shadow_stack_grow(void);
+void gc_shadow_stack_underflow(void) __attribute__((noreturn));
+void gc_shadow_stack_bad_mark(void) __attribute__((noreturn));
+
+static inline void gc_protect(unsigned *ptr)
+{
+    LISP_ASSERT_MSG(ptr != NULL, "gc_protect: null pointer");
+    if (__builtin_expect(gc_shadow_stack_top >= gc_shadow_stack_size, 0))
+        gc_shadow_stack_grow();
+    gc_shadow_stack[gc_shadow_stack_top++] = ptr;
+}
+
+static inline void gc_unprotect(int count)
+{
+    LISP_ASSERT_FMT(count >= 0, "gc_unprotect: negative count %d", count);
+    int top = gc_shadow_stack_top - count;
+    if (__builtin_expect(top < 0, 0))
+        gc_shadow_stack_underflow();
+    gc_shadow_stack_top = top;
+}
+
+// gc_mark() returns the current stack position and gc_release() restores it,
+// which avoids counting protects by hand (see GC_GUARD below).
+static inline int gc_mark(void)
+{
+    return gc_shadow_stack_top;
+}
+
+static inline void gc_release(int mark)
+{
+    if (__builtin_expect(mark < 0 || mark > gc_shadow_stack_top, 0))
+        gc_shadow_stack_bad_mark();
+    gc_shadow_stack_top = mark;
+}
+
+static inline int get_shadow_stack_top(void)
+{
+    return gc_shadow_stack_top;
+}
 
 // Reset GC roots, collector mode and the active-VM chain after recovering from
 // lisp_panic. Empties the shadow stack and clears the allocation root; the
@@ -564,6 +608,26 @@ void init_gc_stress(void);
 // Trigger GC using the registered alloc root (for escape commands)
 void trigger_gc(void);
 
+// Record that cell now owns a malloc'd payload: a bignum, string, vector,
+// record, record type, bytevector, hash table, port or VM continuation (the
+// types free_external_cell_data frees). Call it once the cell's type and
+// payload are set, from every constructor of those types and wherever a cell
+// takes over a payload. The collectors free dead cells' payloads from these
+// records instead of visiting every dead cell, so a cell never noted leaks its
+// payload; VESPER_GC_VERIFY=1 catches one at the next collection.
+void gc_note_external(unsigned cell);
+
+// VESPER_GC_VERIFY at run time, for tests.
+void gc_set_verify_external(bool enabled);
+
+// Behave as if a list had failed to grow: the collectors sweep every cell
+// until a major collection rebuilds the lists. For tests.
+void gc_lose_external_tracking(void);
+
+// Entries on the young list (cells noted since the last collection) or the
+// old list (old-generation cells owning a payload), for tests.
+unsigned gc_tracked_external_count(bool young);
+
 // Write barrier: call when setting car/cdr/vector element of an old-gen cell
 // to a nursery value. This adds the cell to the remembered set.
 void write_barrier(unsigned target, unsigned value);
@@ -605,13 +669,7 @@ static inline bool is_in_old_gen(unsigned x)
 // Shadow stack for protecting local C variables during nested allocations.
 // Use gc_protect before a sequence of allocations that depend on local vars,
 // then gc_unprotect when done. This ensures GC updates the variables in place.
-// (gc_protect and gc_unprotect declared above for inline functions)
-
-// Alternative: mark/release for safer scope-based protection.
-// gc_mark() returns current stack position, gc_release() restores it.
-// This avoids manual counting errors.
-int gc_mark(void);
-void gc_release(int mark);
+// (gc_protect, gc_unprotect, gc_mark and gc_release are defined above.)
 
 // Helper macro for scope-based GC protection:
 //   GC_PROTECTED { gc_protect(&a); gc_protect(&b); ... allocations ... }

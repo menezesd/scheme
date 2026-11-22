@@ -62,6 +62,13 @@ promotion, or the card-table scan for old-to-young pointers.
 `make test-gcstress` runs a small workload at several intervals in both
 engines, and is part of `make test-all`.
 
+The collectors free the malloc'd payloads of dead strings, vectors, bignums,
+ports and the like from lists of the cells that own one, rather than by
+visiting every dead cell, so each constructor of such a cell must call
+`gc_note_external`. `VESPER_GC_VERIFY=1` checks those lists against a walk of
+the heap at every collection and aborts on a cell that was never noted; it
+combines with the stress settings above.
+
 Building with `-DVESPER_GC_TRAP_FREE_CELLS` additionally aborts the moment a
 reclaimed cell is dereferenced, which points at the stale read rather than the
 corruption it causes later. It is compile-time because `car`/`cdr` are the

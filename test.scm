@@ -4404,6 +4404,187 @@
 (test "closures over rest-parameter frames" '((1 2) (3) (1 2))
       (let ((a (ic-rest 1 2)) (b (ic-rest 3)))
         (list (a) (b) (a))))
+;;; ============================================================================
+;;; car/cdr compositions, memq/memv/member, assq/assv/assoc, list-tail and
+;;; list-ref as C primitives
+;;; ============================================================================
+
+(section "List primitives (cxr, member, assoc, list-tail, list-ref)")
+
+(define (cxr-test-message thunk)
+  (guard (e (#t (if (error-object? e) (error-object-message e) e)))
+    (thunk)))
+
+;; A full binary tree four levels deep whose leaves name their own path.
+(define cxr-test-tree
+  (let build ((depth 0) (path '()))
+    (if (= depth 4)
+        (reverse path)
+        (cons (build (+ depth 1) (cons 'a path))
+              (build (+ depth 1) (cons 'd path))))))
+(test "two-level cxr"
+      (list (car (car cxr-test-tree)) (car (cdr cxr-test-tree))
+            (cdr (car cxr-test-tree)) (cdr (cdr cxr-test-tree)))
+      (list (caar cxr-test-tree) (cadr cxr-test-tree)
+            (cdar cxr-test-tree) (cddr cxr-test-tree)))
+(test "three-level cxr"
+      (list (car (car (car cxr-test-tree))) (car (car (cdr cxr-test-tree)))
+            (car (cdr (car cxr-test-tree))) (car (cdr (cdr cxr-test-tree)))
+            (cdr (car (car cxr-test-tree))) (cdr (car (cdr cxr-test-tree)))
+            (cdr (cdr (car cxr-test-tree))) (cdr (cdr (cdr cxr-test-tree))))
+      (list (caaar cxr-test-tree) (caadr cxr-test-tree)
+            (cadar cxr-test-tree) (caddr cxr-test-tree)
+            (cdaar cxr-test-tree) (cdadr cxr-test-tree)
+            (cddar cxr-test-tree) (cdddr cxr-test-tree)))
+(test "four-level cxr name their own path"
+      '((a a a a) (d a a a) (a d a a) (d d a a) (a a d a) (d a d a)
+        (a d d a) (d d d a) (a a a d) (d a a d) (a d a d) (d d a d)
+        (a a d d) (d a d d) (a d d d) (d d d d))
+      (map (lambda (f) (f cxr-test-tree))
+           (list caaaar caaadr caadar caaddr cadaar cadadr caddar cadddr
+                 cdaaar cdaadr cdadar cdaddr cddaar cddadr cdddar cddddr)))
+(test "cxr through apply and map" '(2 (3) 3)
+      (list (apply cadr '((1 2))) (car (map cddr '((1 2 3)))) (caddr '(1 2 3))))
+(test "cxr errors name the procedure"
+      '("cadr: not a pair" "cadr: not a pair" "caar: not a pair"
+        "cdar: not a pair" "cddr: not a pair" "caddr: not a pair"
+        "cdddr: not a pair" "cadddr: not a pair" "cddddr: not a pair"
+        "cadr: not a pair")
+      (map cxr-test-message
+           (list (lambda () (cadr 5)) (lambda () (cadr '(1)))
+                 (lambda () (caar '(1))) (lambda () (cdar '()))
+                 (lambda () (cddr '(1 . 2))) (lambda () (caddr '(1 2)))
+                 (lambda () (cdddr '(1 2))) (lambda () (cadddr '(1 2 3)))
+                 (lambda () (cddddr '(1 2 3))) (lambda () (apply cadr '((1)))))))
+(test "nested car/cdr report the step that failed" '("car: not a pair" "cdr: not a pair")
+      (list (cxr-test-message (lambda () (car (cdr '(1)))))
+            (cxr-test-message (lambda () (car (cdr 5))))))
+(test "cxr arity is checked" '(error error)
+      (list (guard (e (#t 'error)) (cadr))
+            (guard (e (#t 'error)) (apply caddr '((1 2 3) (4))))))
+(test "cxr in a standard-library environment" '(2 "cadr: not a pair" "car: not a pair" 3)
+      (list (eval '(cadr '(1 2)) (environment '(scheme base)))
+            (cxr-test-message
+             (lambda () (eval '(cadr '(1)) (environment '(scheme base)))))
+            (cxr-test-message
+             (lambda () (eval '(car (cdr '(1))) (environment '(scheme base)))))
+            (eval '(caddr '(1 2 3)) (environment '(scheme base) '(scheme cxr)))))
+
+(test "memq/memv/member find the tail"
+      '((c d) (1.5 2) ((1) 3) ("b") #f (#\b) (100000000000000000000 x))
+      (list (memq 'c '(a b c d)) (memv 1.5 (list 1 1.5 2))
+            (member (list 1) (list 2 (list 1) 3)) (member "b" (list "a" "b"))
+            (memq 'z '(a b)) (memv #\b '(#\a #\b))
+            (memv (expt 10 20) (list 1 (expt 10 20) 'x))))
+(test "memq compares numbers and characters like eq?"
+      '(#t #t #f)
+      (list (pair? (memq 1000 (list 999 1000))) (pair? (memq #\x (list #\x)))
+            (pair? (memq (list 1) (list (list 1))))))
+(test "memv and member compare inexact numbers by value"
+      '((2.5) (2.5) #f)
+      (list (memv 2.5 (list 1 2.5)) (member 2.5 (list 1 2.5)) (memv 2 (list 2.0))))
+(test "assq/assv/assoc find the entry"
+      '((b 2) (2 . b) ("b" . 2) (#\y . 2) #f (1/2 . half) ((1 2) . list))
+      (list (assq 'b '((a 1) (b 2))) (assv 2 '((1 . a) (2 . b)))
+            (assoc "b" (list (cons "a" 1) (cons "b" 2)))
+            (assv #\y '((#\x . 1) (#\y . 2))) (assq 'z '((a . 1)))
+            (assv 1/2 (list (cons 1/3 'third) (cons 1/2 'half)))
+            (assoc (list 1 2) (list (cons (list 1) 'one) (cons (list 1 2) 'list)))))
+(test "member and assoc with a comparison procedure"
+      '((2 3) (2 . b) #f (3) #f)
+      (list (member 2.0 '(1 2 3) =) (assoc 2.0 '((1 . a) (2 . b)) =)
+            (member 1 '() 5) (member 2 '(1 2 3) <) (assoc 1 '() 'not-a-procedure)))
+(test "searches on the empty list" '(#f #f #f #f #f #f)
+      (list (memq 'a '()) (memv 1 '()) (member 1 '())
+            (assq 'a '()) (assv 1 '()) (assoc 1 '())))
+(test "search errors"
+      '("memq: improper list" "memv: improper list" "member: improper list"
+        "assq: improper association list" "assv: improper association list"
+        "assoc: improper association list" "assq: improper association list"
+        "assoc: improper association list" "member: improper list"
+        "member: expected procedure" "member: too many arguments"
+        "assoc: improper association list")
+      (map cxr-test-message
+           (list (lambda () (memq 'x '(a . b))) (lambda () (memv 1 5))
+                 (lambda () (member 1 '(2 . 3))) (lambda () (assq 1 5))
+                 (lambda () (assv 1 '((2 . 3) . 4)))
+                 (lambda () (assoc 1 '((2 . 3) . 4)))
+                 (lambda () (assq 1 '((2 . 3) 5)))
+                 (lambda () (assoc 1 '((2 . 3) 5) =))
+                 (lambda () (member 1 '(2 . 3) =))
+                 (lambda () (member 1 '(1) 5))
+                 (lambda () (member 1 '(1) = =))
+                 (lambda () (assoc 1 '(5))))))
+(test "a match ahead of the bad tail is still found" '((1 . 2) (a . b))
+      (list (memv 1 '(1 . 2)) (assq 'a '((a . b) . junk))))
+(test "searches find a key in a circular list" '(b b (c . 3) c)
+      (list (car (memq 'b (circular-list 'a 'b)))
+            (car (member 'b (circular-list 'a 'b)))
+            (assq 'c (circular-list '(a . 1) '(b . 2) '(c . 3)))
+            (car (memv 'c (append '(x y) (circular-list 'a 'b 'c))))))
+(test "searches reject a circular list without the key"
+      '("memq: circular list" "memv: circular list" "member: circular list"
+        "assq: circular list" "assv: circular list" "assoc: circular list"
+        "memq: circular list")
+      (map cxr-test-message
+           (list (lambda () (memq 'z (circular-list 'a 'b)))
+                 (lambda () (memv 9 (circular-list 1)))
+                 (lambda () (member "z" (circular-list "a" "b" "c")))
+                 (lambda () (assq 'z (circular-list '(a . 1))))
+                 (lambda () (assv 9 (circular-list '(1 . 1) '(2 . 2))))
+                 (lambda () (assoc "z" (circular-list (cons "a" 1))))
+                 (lambda () (memq 'z (append (iota 1000) (circular-list 'a)))))))
+(test "case still dispatches through memv" '(two other two)
+      (map (lambda (x) (case x ((1) 'one) ((2 3.5) 'two) (else 'other)))
+           (list 2 'q 3.5)))
+
+(test "list-tail and list-ref" '((3 4) 3 () (1 2 . 3) 3 b c)
+      (list (list-tail '(1 2 3 4) 2) (list-ref '(1 2 3 4) 2)
+            (list-tail '(1 2) 2) (list-tail '(1 2 . 3) 0) (list-tail '(1 2 . 3) 2)
+            (list-ref (circular-list 'a 'b 'c) 100)
+            (list-ref (circular-list 'a 'b 'c) (+ (expt 10 30) 1))))
+(test "list-tail and list-ref errors"
+      '("list-tail: index out of bounds" "list-ref: index out of bounds"
+        "list-ref: index out of bounds" "list-tail: expected nonnegative integer"
+        "list-ref: expected nonnegative integer" "list-ref: expected nonnegative integer"
+        "list-tail: index out of bounds" "list-ref: expected nonnegative integer")
+      (map cxr-test-message
+           (list (lambda () (list-tail '(1 2) 3)) (lambda () (list-ref '(1 2) 2))
+                 (lambda () (list-ref '(1 2 . 3) 2)) (lambda () (list-tail '(1) -1))
+                 (lambda () (list-ref '(1) 1.0)) (lambda () (list-ref '(1) 'x))
+                 (lambda () (list-tail '(1 2) (expt 10 30)))
+                 (lambda () (list-ref '(1) (- (expt 10 30)))))))
+(test "list-set! still goes through list-tail" '(1 x 3)
+      (let ((l (list 1 2 3))) (list-set! l 1 'x) l))
+
+;; Redefining a primitive: code compiled before and after the definition, and
+;; procedures passed around, all see the new binding; restoring the builtin
+;; restores the fast path.
+(define (cxr-redef-before x) (list (cadr x) (caddr x)))
+(define (search-redef-before x l) (list (memq x l) (assq x l) (member x l)))
+(define cxr-saved (list cadr caddr memq assq member))
+(define (cadr x) 'user-cadr)
+(define (caddr x) 'user-caddr)
+(define (memq x l) 'user-memq)
+(define (assq x l) 'user-assq)
+(define (member x l . rest) 'user-member)
+(define (cxr-redef-after x) (list (cadr x) (caddr x)))
+(test "user redefinition of cxr and searches"
+      '((user-cadr user-caddr) (user-cadr user-caddr)
+        (user-memq user-assq user-member) (user-cadr))
+      (list (cxr-redef-before '(1 2 3)) (cxr-redef-after '(1 2 3))
+            (search-redef-before 'a '((a . 1))) (map cadr '((1 2)))))
+(set! cadr (list-ref cxr-saved 0))
+(set! caddr (list-ref cxr-saved 1))
+(set! memq (list-ref cxr-saved 2))
+(set! assq (list-ref cxr-saved 3))
+(set! member (list-ref cxr-saved 4))
+(test "restored primitives" '((2 3) (2 3) (#f (a . 1) #f))
+      (list (cxr-redef-before '(1 2 3)) (cxr-redef-after '(1 2 3))
+            (search-redef-before 'a '((a . 1)))))
+(test "local bindings shadow the primitives" '(1 (1 2) mine)
+      (let ((cadr car) (memq list) (assv (lambda (k l) 'mine)))
+        (list (cadr '(1 2)) (memq 1 2) (assv 1 '((1 . 1))))))
 
 ;;; ============================================================================
 ;;; Summary

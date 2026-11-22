@@ -155,6 +155,7 @@ static unsigned make_bytevector_owned(bytevec_data *bv)
     unsigned cell = alloc();
     CELL_TYPE(cell) = BT_BYTEVEC;
     CELL_PTR(cell) = bv;
+    gc_note_external(cell);
     return cell;
 }
 
@@ -315,22 +316,6 @@ static char *string_buffer_new(uint64_t len, const char *name,
     if (!s)
         show_error("%s: out of memory", name);
     return s;
-}
-
-static unsigned list_cell_at(unsigned lst, int64_t idx, const char *name)
-{
-    for (int64_t i = 0; i < idx; i++) {
-        if (!IS_PAIR(lst)) {
-            show_error("%s: index out of bounds", name);
-            return TOK_ERROR;
-        }
-        lst = cdr(lst);
-    }
-    if (!IS_PAIR(lst)) {
-        show_error("%s: index out of bounds", name);
-        return TOK_ERROR;
-    }
-    return lst;
 }
 
 static bool char_list_length(unsigned lst, unsigned *len_out,
@@ -717,61 +702,39 @@ static unsigned length_value(unsigned value, const char *name)
 
 static unsigned eq_value(unsigned arg1, unsigned arg2)
 {
-    if (arg1 == arg2)
-        return ctx.atom_true;
-    if (IS_FIXNUM(arg1)) {
-        return scheme_bool(IS_NUM(arg2) &&
-                           CELL_ID(arg2) ==
-                               (int64_t)FIXNUM_VALUE(arg1));
-    }
-    if (IS_FIXNUM(arg2)) {
-        return scheme_bool(IS_NUM(arg1) &&
-                           CELL_ID(arg1) ==
-                               (int64_t)FIXNUM_VALUE(arg2));
-    }
-    if (!IS_CELL(arg1) || !IS_CELL(arg2))
-        return ctx.atom_false;
-    if (CELL_TYPE(arg1) != CELL_TYPE(arg2))
-        return ctx.atom_false;
-    switch (CELL_TYPE(arg1)) {
-    case BT_NUM:
-    case BT_FUNCTION:
-    case BT_BUILTIN:
-    case BT_ATOM:
-    case BT_CHAR:
-        return scheme_bool(CELL_ID(arg1) == CELL_ID(arg2));
-    default:
-        return scheme_bool(arg1 == arg2);
-    }
+    return scheme_bool(values_eq(arg1, arg2));
 }
 
-// eqv? extends eq? by comparing numbers of the same type by value (R7RS 6.1)
-static unsigned eqv_value(unsigned arg1, unsigned arg2)
+bool values_eqv(unsigned arg1, unsigned arg2)
 {
-    if (eq_value(arg1, arg2) == ctx.atom_true)
-        return ctx.atom_true;
+    if (values_eq(arg1, arg2))
+        return true;
     if (!IS_CELL(arg1) || !IS_CELL(arg2))
-        return ctx.atom_false;
+        return false;
     if (CELL_TYPE(arg1) != CELL_TYPE(arg2))
-        return ctx.atom_false;
+        return false;
     switch (CELL_TYPE(arg1)) {
     case BT_BIGNUM: {
         bignum *a = get_bignum(arg1);
         bignum *b = get_bignum(arg2);
-        return scheme_bool(a && b && bn_cmp(a, b) == 0);
+        return a && b && bn_cmp(a, b) == 0;
     }
     case BT_INEXACT:
         // Bit equality: distinguishes 0.0 from -0.0, treats nan as eqv to
         // itself
-        return scheme_bool(CELL_ID(arg1) == CELL_ID(arg2));
+        return CELL_ID(arg1) == CELL_ID(arg2);
     case BT_RATIONAL:
     case BT_COMPLEX:
-        return scheme_bool(
-            eqv_value(CELL_CAR(arg1), CELL_CAR(arg2)) == ctx.atom_true &&
-            eqv_value(CELL_CDR(arg1), CELL_CDR(arg2)) == ctx.atom_true);
+        return values_eqv(CELL_CAR(arg1), CELL_CAR(arg2)) &&
+               values_eqv(CELL_CDR(arg1), CELL_CDR(arg2));
     default:
-        return ctx.atom_false;
+        return false;
     }
+}
+
+static unsigned eqv_value(unsigned arg1, unsigned arg2)
+{
+    return scheme_bool(values_eqv(arg1, arg2));
 }
 
 static unsigned pair_car(unsigned pair, const char *name)
@@ -1568,7 +1531,20 @@ static unsigned apply_list_primitive(unsigned prim_id, unsigned argc,
     case PLASTPAIR:
         REQUIRE_ARGC(argc, 1, 1, "last-pair");
         return last_pair(argv[0], "last-pair");
+    case PLISTTAIL:
+        return prim_list_tail(argc, argv);
+    case PLISTREF:
+        return prim_list_ref(argc, argv);
+    case PMEMQ:
+    case PMEMV:
+    case PMEMBER:
+    case PASSQ:
+    case PASSV:
+    case PASSOC:
+        return prim_member_search(prim_id, argc, argv);
     default:
+        if (prim_id >= PCAAR && prim_id <= PCDDDDR)
+            return prim_cxr(prim_id, argc, argv);
         show_error("list primitive: unsupported id %u", prim_id);
         return TOK_ERROR;
     }
@@ -1716,18 +1692,6 @@ static unsigned current_jiffy_value(void)
         return TOK_ERROR;
     }
     return store((int64_t)ts.tv_sec * JIFFIES_PER_SECOND + ts.tv_nsec);
-}
-
-static unsigned list_ref_value(unsigned lst, unsigned index_arg,
-                               const char *name)
-{
-    int64_t idx;
-    if (!expect_nonneg_int64(index_arg, &idx, name))
-        return TOK_ERROR;
-    unsigned cell = list_cell_at(lst, idx, name);
-    if (cell == TOK_ERROR)
-        return TOK_ERROR;
-    return car(cell);
 }
 
 static void prepend_stat_entry(unsigned *result, const char *key_name,
@@ -2846,9 +2810,6 @@ static unsigned apply_misc_primitive(unsigned prim_id, unsigned argc,
     case PWRITETOSTRING:
         REQUIRE_ARGC(argc, 1, 1, "write-to-string");
         return write_to_string_value(argv[0], "write-to-string");
-    case PLISTREF:
-        REQUIRE_ARGC(argc, 2, 2, "list-ref");
-        return list_ref_value(argv[0], argv[1], "list-ref");
     case POPENBINARYINPUT:
         REQUIRE_ARGC(argc, 1, 1, "open-binary-input-file");
         return open_binary_input_file(argv[0], "open-binary-input-file");
@@ -3039,6 +3000,46 @@ unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
     if (argc > 0 && !argv) {
         show_error("primitive: null argv");
         return TOK_ERROR;
+    }
+
+    // Accessors, searches, comparisons and type predicates never allocate a
+    // cell, so nothing can collect under them and their arguments need no
+    // roots.
+    switch (prim_id) {
+    case PCAR:
+    case PCDR:
+    case PSETCAR:
+    case PSETCDR:
+    case PLASTPAIR:
+    case PLISTREF:
+        return apply_list_primitive(prim_id, argc, argv);
+    case PNOT:
+    case PEQ:
+    case PEQV:
+    case PEQUALP:
+        return apply_logic_primitive(prim_id, argc, argv);
+    case PSYMP:
+    case PNUMP:
+    case PINTEGERP:
+    case PREALP:
+    case PEXACTP:
+    case PINEXACTP:
+    case PCOMPLEXP:
+    case PRATIONALP:
+    case PPROCP:
+    case PCONSP:
+    case PNULLP:
+    case PSTRINGP:
+    case PCHARP:
+    case PVECTORP:
+    case PBOOLP:
+    case PLISTP:
+        return apply_type_predicate(prim_id, argc, argv);
+    default:
+        // c[ad]{2,4}r, memq ... assoc, list-tail
+        if (prim_id >= PCAAR && prim_id <= PLISTTAIL)
+            return apply_list_primitive(prim_id, argc, argv);
+        break;
     }
 
     GC_GUARD;
@@ -3283,7 +3284,6 @@ unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
     case PVALUES:
     case PCOMMANDLINE:
     case PWRITETOSTRING:
-    case PLISTREF:
     case POPENBINARYINPUT:
     case PREADBYTEVEC:
     case PFILEEXISTS:

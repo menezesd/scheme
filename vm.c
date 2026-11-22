@@ -1060,6 +1060,7 @@ static unsigned capture_continuation(vm_state *vm)
     CELL_TYPE(cell) = BT_VMCONT;
     CELL_PTR(cell) = cont;
     vm_continuation_register(cont);
+    gc_note_external(cell);
 
     return cell;
 }
@@ -3168,7 +3169,7 @@ static unsigned vm_dispatch(vm_state *vm)
             unsigned pair = vm_pop(vm);
             VM_CHECK_PAIR(vm, pair, "cadr: not a pair");
             unsigned inner = cdr(pair);
-            VM_CHECK_PAIR(vm, inner, "cadr: cdr not a pair");
+            VM_CHECK_PAIR(vm, inner, "cadr: not a pair");
             vm_push(vm, car(inner));
             break;
         }
@@ -3177,7 +3178,7 @@ static unsigned vm_dispatch(vm_state *vm)
             unsigned pair = vm_pop(vm);
             VM_CHECK_PAIR(vm, pair, "cddr: not a pair");
             unsigned inner = cdr(pair);
-            VM_CHECK_PAIR(vm, inner, "cddr: cdr not a pair");
+            VM_CHECK_PAIR(vm, inner, "cddr: not a pair");
             vm_push(vm, cdr(inner));
             break;
         }
@@ -3286,7 +3287,7 @@ static unsigned vm_dispatch(vm_state *vm)
             unsigned pair = vm_pop(vm);
             VM_CHECK_PAIR(vm, pair, "caar: not a pair");
             unsigned inner = car(pair);
-            VM_CHECK_PAIR(vm, inner, "caar: car not a pair");
+            VM_CHECK_PAIR(vm, inner, "caar: not a pair");
             vm_push(vm, car(inner));
             break;
         }
@@ -3295,7 +3296,7 @@ static unsigned vm_dispatch(vm_state *vm)
             unsigned pair = vm_pop(vm);
             VM_CHECK_PAIR(vm, pair, "cdar: not a pair");
             unsigned inner = car(pair);
-            VM_CHECK_PAIR(vm, inner, "cdar: car not a pair");
+            VM_CHECK_PAIR(vm, inner, "cdar: not a pair");
             vm_push(vm, cdr(inner));
             break;
         }

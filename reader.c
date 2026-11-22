@@ -415,6 +415,9 @@ static void resolve_datum_label_placeholder(unsigned placeholder,
     }
 
     CELL_ID(placeholder) = CELL_ID(datum);
+    // The placeholder takes over any payload (datum is freed below). Noting
+    // a cell whose type owns none is harmless: the collector drops it.
+    gc_note_external(placeholder);
 
     if (type == BT_VECTOR) {
         unsigned len = vector_len(placeholder);
@@ -1557,6 +1560,7 @@ static unsigned read_string_literal(void)
     CELL_PTR(x) = s;
     string_register(s);
     string_mark_immutable(s);
+    gc_note_external(x);
     return x;
 }
 
@@ -1802,6 +1806,7 @@ static unsigned read_bytevector_literal(void)
     unsigned cell = alloc();
     CELL_TYPE(cell) = BT_BYTEVEC;
     CELL_PTR(cell) = bv;
+    gc_note_external(cell);
     return cell;
 }
 

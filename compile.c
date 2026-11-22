@@ -4866,6 +4866,12 @@ static void emit_primitive_operation(compile_ctx *cctx, int64_t prim, unsigned a
         switch (prim) {
         case PCAR: emit(cctx, OP_CAR); return;
         case PCDR: emit(cctx, OP_CDR); return;
+        // The deeper compositions go through OP_PRIM: a chain of CAR/CDR
+        // would report a failure under car or cdr instead of their own name.
+        case PCAAR: emit(cctx, OP_CAAR); return;
+        case PCADR: emit(cctx, OP_CADR); return;
+        case PCDAR: emit(cctx, OP_CDAR); return;
+        case PCDDR: emit(cctx, OP_CDDR); return;
         case PNULLP: emit(cctx, OP_NULLP); return;
         case PCONSP: emit(cctx, OP_PAIRP); return;
         case PNOT: emit(cctx, OP_NOT); return;

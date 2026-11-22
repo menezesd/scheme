@@ -169,6 +169,7 @@ unsigned prim_string_slice(unsigned argc, unsigned *argv)
     gc_unprotect(1);
     CELL_TYPE(result) = BT_STRING;
     CELL_PTR(result) = view;
+    gc_note_external(result);
     return result;
 }
 

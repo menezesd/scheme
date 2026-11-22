@@ -767,6 +767,48 @@ enum primitive_id {
     PRECORDREF,
     PRECORDSET,
     PREGISTERBUILTINRECORDTYPE,
+    // c[ad]{2,4}r compositions (prim_list.c). Keep each level contiguous and
+    // in this order: the offset from the level's first entry spells the
+    // accessor path in binary, a = 0 and d = 1, most significant letter first
+    // (see cxr_apply).
+    PCAAR,
+    PCADR,
+    PCDAR,
+    PCDDR,
+    PCAAAR,
+    PCAADR,
+    PCADAR,
+    PCADDR,
+    PCDAAR,
+    PCDADR,
+    PCDDAR,
+    PCDDDR,
+    PCAAAAR,
+    PCAAADR,
+    PCAADAR,
+    PCAADDR,
+    PCADAAR,
+    PCADADR,
+    PCADDAR,
+    PCADDDR,
+    PCDAAAR,
+    PCDAADR,
+    PCDADAR,
+    PCDADDR,
+    PCDDAAR,
+    PCDDADR,
+    PCDDDAR,
+    PCDDDDR,
+    // Membership, association and list indexing (prim_list.c). member and
+    // assoc are the equal? versions; the stdlib procedures of those names
+    // call them when no comparison procedure is given.
+    PMEMQ,
+    PMEMV,
+    PMEMBER,
+    PASSQ,
+    PASSV,
+    PASSOC,
+    PLISTTAIL,
     PRIM_COUNT // Total number of primitives
 };
 
