@@ -793,6 +793,14 @@ static inline int32_t FIXNUM_VALUE(unsigned v)
 #define IS_EXACT_INT(c)                                                        \
     (IS_FIXNUM(c) ||                                                           \
      (IS_CELL(c) && (CELL_TYPE(c) == BT_NUM || CELL_TYPE(c) == BT_BIGNUM)))
+// True if c is the exact integer v. Bignums are normalized, so a value that
+// fits a small integer is never a bignum.
+static inline bool exact_integer_equals(unsigned c, int64_t v)
+{
+    if (IS_FIXNUM(c))
+        return FIXNUM_VALUE(c) == v;
+    return IS_CELL(c) && CELL_TYPE(c) == BT_NUM && CELL_ID(c) == v;
+}
 #define IS_STRING(c) (IS_CELL(c) && CELL_TYPE(c) == BT_STRING)
 #define IS_CHAR(c) (IS_CELL(c) && CELL_TYPE(c) == BT_CHAR)
 #define IS_VECTOR(c) (IS_CELL(c) && CELL_TYPE(c) == BT_VECTOR)

@@ -430,6 +430,10 @@ extern uint64_t string_buffer_epoch;
 void string_register(char *string);
 void string_unregister(char *string);
 bool string_is_registered(const char *string);
+// Per-buffer cache slot used by utf8.c to remember a string's character count
+// and whether it is all ASCII. NULL unless string is the start of a
+// registered string buffer. Zero means nothing is cached yet.
+unsigned *string_buffer_info_slot(const char *string);
 void string_view_register(string_view_data *view);
 void string_view_unregister(string_view_data *view);
 bool string_view_is_registered(const string_view_data *view);

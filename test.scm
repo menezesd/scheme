@@ -928,9 +928,9 @@
 (test "call-with-input-string" #\a
       (call-with-input-string "abc" (lambda (p) (read-char p))))
 (test "with-output-to-string" "test"
-      (with-output-to-string (display "test")))
+      (with-output-to-string (lambda () (display "test"))))
 (test "with-input-from-string" #\a
-      (with-input-from-string "abc" (read-char)))
+      (with-input-from-string "abc" read-char))
 (test "with-output-to-string restores on continuation escape" "after"
       (let ((old (current-output-port))
             (p (open-output-string))
@@ -939,7 +939,7 @@
         (call/cc
           (lambda (k)
             (set! escape k)
-            (with-output-to-string (escape #t))))
+            (with-output-to-string (lambda () (escape #t)))))
         (display "after")
         (set-current-output-port! old)
         (get-output-string p)))
@@ -953,7 +953,7 @@
                  (call/cc
                    (lambda (k)
                      (set! escape k)
-                     (with-input-from-string "abc" (escape #t))))
+                     (with-input-from-string "abc" (lambda () (escape #t)))))
                  (read-char))))
           (set-current-input-port! old)
           result)))
@@ -3548,8 +3548,9 @@
             (entries 0))
         (set-current-output-port! a)
         (with-output-to-string
-          (call-with-current-continuation (lambda (c) (set! k c)))
-          (set! entries (+ entries 1)))
+          (lambda ()
+            (call-with-current-continuation (lambda (c) (set! k c)))
+            (set! entries (+ entries 1))))
         (if (= entries 1)
             (begin
               (set-current-output-port! b)
@@ -3760,6 +3761,50 @@
       (eval '(case 1 ((1) 'a) (else 'b)) (null-environment 5)))
 (test "null-environment has no procedures" 'unbound
       (guard (e (#t 'unbound)) (eval '(car '(1)) (null-environment 5))))
+;; string-length/string-ref cache each buffer's character count (and an
+;; all-ASCII flag) and the last non-ASCII index lookup. Mutation installs a
+;; new buffer, so the cache must never show stale contents.
+(test "string-ref and string-length follow mutation" '(4 #\a 4 #\x3BB #\a #\a error 4 #\b)
+      (let ((s (make-string 4 #\a)))
+        (let* ((a (string-length s)) (b (string-ref s 3)))
+          (string-set! s 1 (integer->char #x3BB))
+          (let* ((c (string-length s)) (d (string-ref s 1)) (e (string-ref s 2))
+                 (f (string-ref s 3))
+                 (g (guard (x (#t 'error)) (string-ref s 4))))
+            (string-set! s 1 #\b)
+            (list a b c d e f g (string-length s) (string-ref s 1))))))
+(test "non-ASCII string-ref in any order" '(#\c #\x3BB #\x1F600 #\a #\b #\c 5)
+      (let ((u (string #\x3BB #\a #\x1F600 #\b #\c)))
+        (list (string-ref u 4) (string-ref u 0) (string-ref u 2) (string-ref u 1)
+              (string-ref u 3) (string-ref u 4) (string-length u))))
+(test "substring of a mutated string keeps its own contents" '("world" 5 #\w #\x3A9)
+      (let* ((p (string-copy "hello world")) (v (substring p 6 11)))
+        (string-set! p 6 (integer->char #x3A9))
+        (list v (string-length v) (string-ref v 0) (string-ref p 6))))
+(test "scanning a long string with string-ref is linear" 19400000
+      (let* ((s (make-string 200000 #\a)) (n (string-length s)))
+        (let loop ((i 0) (acc 0))
+          (if (= i n) acc (loop (+ i 1) (+ acc (char->integer (string-ref s i))))))))
+(test "scanning a long non-ASCII string with string-ref is linear" 95500000
+      (let* ((s (make-string 100000 (integer->char #x3BB))) (n (string-length s)))
+        (let loop ((i 0) (acc 0))
+          (if (= i n) acc (loop (+ i 1) (+ acc (char->integer (string-ref s i))))))))
+(test "with-output-to-string is a procedure taking a thunk" '(#t "hi1")
+      (list (procedure? with-output-to-string)
+            (with-output-to-string (lambda () (display "hi") (write 1)))))
+(test "with-input-from-string calls a thunk and returns its value" '(42 (#\a #\b))
+      (list (with-input-from-string "42 43" read)
+            (with-input-from-string "ab" (lambda () (let ((x (read-char))) (list x (read-char)))))))
+(test "with-output-to-string works through map" '("1" "2")
+      (map with-output-to-string (list (lambda () (display 1)) (lambda () (display 2)))))
+(test "complex numbers print like MIT Scheme" '("+i" "-i" "+2i" "1-i" "+1/2i" "3-2i" "1.5+1.0i")
+      (map number->string
+           (list (make-rectangular 0 1) (make-rectangular 0 -1) (sqrt -4)
+                 (make-rectangular 1 -1) (make-rectangular 0 1/2)
+                 (make-rectangular 3 -2) (make-rectangular 1.5 1.))))
+(test "write of a pure imaginary matches number->string" "(+i -2i)"
+      (call-with-output-string
+        (lambda (p) (write (list (make-rectangular 0 1) (make-rectangular 0 -2)) p))))
 (test "quasiquote transforms a vector in a dotted tail" '((a . #(5)) (a . #(1 5 5)))
       (let ((y 5)) (list `(a . #(,y)) `(a . #(1 ,@(list y y))))))
 

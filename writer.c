@@ -841,7 +841,12 @@ static void write_obj_fp_inner(unsigned s, bool with_quotes, FILE *fp)
             fprintf(fp, "[invalid-number]");
             break;
         }
-        write_obj_fp(CELL_CAR(s), with_quotes, fp);
+        // Like MIT Scheme, omit an exact zero real part and write an exact
+        // unit imaginary part as a bare sign: +i, -2i, 3-i. Both forms read
+        // back as the same number.
+        unsigned real = CELL_CAR(s);
+        if (!exact_integer_equals(real, 0))
+            write_obj_fp(real, with_quotes, fp);
         unsigned imag = CELL_CDR(s);
         bool needs_plus;
         if (IS_INEXACT(imag)) {
@@ -856,7 +861,10 @@ static void write_obj_fp_inner(unsigned s, bool with_quotes, FILE *fp)
         }
         if (needs_plus)
             fprintf(fp, "+");
-        write_obj_fp(imag, with_quotes, fp);
+        if (exact_integer_equals(imag, -1))
+            fprintf(fp, "-");
+        else if (!exact_integer_equals(imag, 1))
+            write_obj_fp(imag, with_quotes, fp);
         fprintf(fp, "i");
         break;
     }

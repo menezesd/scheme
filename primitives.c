@@ -861,9 +861,14 @@ static unsigned string_ref_value(unsigned str, unsigned index,
     if (!utf8_byte_offset_for_index(s, (size_t)idx, false, &byte_offset,
                                     name))
         return TOK_ERROR;
+    // One character is at most four bytes; bounding the decode there keeps
+    // string-ref from measuring the whole string with strlen.
     size_t decode_offset = byte_offset;
+    size_t limit = byte_offset;
+    while (limit < byte_offset + 4 && s[limit])
+        limit++;
     int code;
-    if (!utf8_decode_next(s, strlen(s), &decode_offset, &code, name))
+    if (!utf8_decode_next(s, limit, &decode_offset, &code, name))
         return TOK_ERROR;
     return make_char(code);
 }
@@ -1402,8 +1407,16 @@ static unsigned number_to_string_value(unsigned num, int radix,
         if (imag == TOK_ERROR)
             return TOK_ERROR;
         gc_protect(&imag);
-        const char *real_text = GET_STRING_PTR(real);
+        // Match the writer (and MIT Scheme): omit an exact zero real part
+        // and write an exact unit imaginary part as a bare sign.
+        const char *real_text = exact_integer_equals(CELL_CAR(num), 0)
+                                    ? ""
+                                    : GET_STRING_PTR(real);
         const char *imag_text = GET_STRING_PTR(imag);
+        if (exact_integer_equals(CELL_CDR(num), 1))
+            imag_text = "+";
+        else if (exact_integer_equals(CELL_CDR(num), -1))
+            imag_text = "-";
         size_t real_len = strlen(real_text), imag_len = strlen(imag_text);
         bool needs_plus = *imag_text != '+' && *imag_text != '-';
         size_t suffix_len = needs_plus ? 3 : 2; // optional '+', 'i', and NUL

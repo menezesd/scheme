@@ -339,6 +339,16 @@ bool string_is_registered(const char *string)
     return ptr_registry_contains(&string_registry, string);
 }
 
+unsigned *string_buffer_info_slot(const char *string)
+{
+    // The registry node's len field is otherwise unused for strings. A node
+    // lives exactly as long as its buffer is registered, and strings are
+    // never modified in place, so whatever is cached there stays valid.
+    ptr_registry_node *node =
+        (ptr_registry_node *)ptr_registry_find(&string_registry, string);
+    return node ? &node->len : NULL;
+}
+
 void string_view_register(string_view_data *view)
 {
     if (!view)

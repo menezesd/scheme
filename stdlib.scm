@@ -1601,7 +1601,9 @@
   (let ((port (open-input-string str)))
     (proc port)))
 
-(define (%with-output-to-string thunk)
+; Call thunk with output captured to a string and return the string
+; (MIT Scheme, Chez, Guile, Chicken, Racket all take a thunk).
+(define (with-output-to-string thunk)
   (let ((port (open-output-string))
         (old-port #f))
     (dynamic-wind
@@ -1612,7 +1614,8 @@
       (lambda () (set-current-output-port! old-port)))
     (get-output-string port)))
 
-(define (%with-input-from-string str thunk)
+; Call thunk with input coming from a string
+(define (with-input-from-string str thunk)
   (let ((port (open-input-string str))
         (old-port #f))
     (dynamic-wind
@@ -1622,17 +1625,6 @@
       thunk
       (lambda () (set-current-input-port! old-port)))))
 
-; Execute thunk with output captured to a string
-(define-syntax with-output-to-string
-  (syntax-rules ()
-    ((with-output-to-string body ...)
-     (%with-output-to-string (lambda () body ...)))))
-
-; Execute thunk with input coming from a string
-(define-syntax with-input-from-string
-  (syntax-rules ()
-    ((with-input-from-string str body ...)
-     (%with-input-from-string str (lambda () body ...)))))
 
 ;;; ============================================================================
 ;;; List Processing Utilities (SRFI-1 style)
