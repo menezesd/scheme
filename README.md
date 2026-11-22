@@ -1,19 +1,22 @@
 # Vesper
 
 A compact R5RS-inspired Scheme interpreter written in C, featuring a bytecode
-compiler, semispace garbage collector, hygienic macros, and full numeric tower.
+compiler, generational copying garbage collector, hygienic macros, and full
+numeric tower. Where the standards leave room, behavior follows MIT/GNU Scheme,
+which `make test-diff` checks it against.
 
 ## Features
 
 - **Bytecode Compiler**: Compiles to bytecode for a stack-based VM with peephole optimization
-- **Garbage Collection**: Generational collector with semispace nursery (Cheney's algorithm)
+- **Garbage Collection**: Generational copying collector: a nursery promoted into Cheney semispaces
 - **Tail Call Optimization**: Proper tail calls in both interpreter and VM
 - **R5RS Compliance**: Passes standard compliance tests including tricky edge cases
 - **Numeric Tower**: Integers, bignums, rationals, floats, and complex numbers
 - **Hygienic Macros**: Full `syntax-rules` with referential transparency
 - **First-Class Continuations**: Full `call/cc` with multi-shot continuation support
-- **SRFI Support**: SRFI-1 (lists), SRFI-9 (records), SRFI-26 (cut/cute)
-- **Ports**: File I/O and string ports with standard Scheme port operations
+- **SRFI Support**: SRFI-1 (lists), SRFI-2 (`and-let*`), SRFI-8 (`receive`),
+  SRFI-9 (records), SRFI-26 (cut/cute), SRFI-27 (random bits), SRFI-28 (`format`)
+- **Ports**: File I/O, string ports, and bytevector ports with standard Scheme port operations
 - **Unicode Strings**: UTF-8 strings with table-driven normalization, case folding,
   and character predicates from Unicode 15.1
 
@@ -24,14 +27,20 @@ make          # Build the interpreter
 make debug    # Build with debug symbols
 make sanitize # Build with AddressSanitizer/UBSan
 make ubsan    # Build with UBSan only
-make test     # Run Scheme test suite
-make test-interpreter # Run Scheme test suite with CPS interpreter
-make test-c   # Run C unit tests
+make test     # Run the Scheme test suite (test.scm) on the bytecode VM
+make test-interpreter # Run the same suite on the CPS interpreter
+make test-c   # Run the C unit tests
+make test-prop # Run the property tests (property_tests.scm)
+make test-r5rs # Run the R5RS conformance tests in both engines
+make test-stress # Run the stress tests (stress_tests.scm)
+make test-repl-exit # Check REPL exit codes and input handling in both engines
+make test-gcstress # Run a workload under forced collections in both engines
+make test-diff # Compare semantic probes, in both engines, against MIT Scheme (skipped without mit-scheme)
 make test-sanitize # Run bounded AddressSanitizer/UBSan smoke tests
 make test-ubsan # Run bounded UBSan-only smoke tests
-make test-all # Run all tests
-make test-diff # Compare semantic probes, in both engines, against MIT Scheme (requires mit-scheme)
+make test-all # Run every test target above except test-sanitize
 make clean    # Remove build artifacts
+make unicode-tables # Download the Unicode 15.1 data files and regenerate the tables
 ```
 
 ### Debugging aids
@@ -76,13 +85,19 @@ behavior checks on those systems.
 ```bash
 ./vesper
 ]=> (+ 1 2 3)
+
 ;Value: 6
 ]=> (define (factorial n)
       (if (= n 0) 1 (* n (factorial (- n 1)))))
+
 ;Value: factorial
 ]=> (factorial 50)
+
 ;Value: 30414093201713378043612608166064768844377641568960512000000000000
 ```
+
+With input piped rather than typed, the exit status is 1 if any top-level form
+signalled an error, as when running a script.
 
 ### Running Scripts
 
@@ -129,10 +144,10 @@ delay     define-syntax        syntax-rules
 
 ; Floating point (inexact)
 (sqrt 2)          ; => 1.4142135623730951
-(sin 3.14159)     ; => 2.65358979335e-06
+(sin 3.14159)     ; => 2.65358979335273e-06
 
 ; Complex numbers
-(sqrt -1)         ; => 0+1i
+(sqrt -1)         ; => +i
 (+ 1+2i 3+4i)     ; => 4+6i
 ```
 
@@ -294,28 +309,40 @@ counter     ; => 1 (evaluated once at definition)
 | File | Description |
 |------|-------------|
 | `main.c` | Entry point, REPL, file loading |
-| `compile.c/h` | Bytecode compiler with constant folding |
+| `compile.c`, `compile_internal.h` | Bytecode compiler with constant folding |
+| `optimize.c` | Peephole optimizer and bytecode disassembler |
+| `code_object.c` | Code objects and their garbage collection |
 | `vm.c` | Stack-based virtual machine |
 | `bytecode.h` | Opcode definitions and VM structures |
 | `types.h` | Core type definitions, cell structure |
 | `context.c/h` | Memory management, GC, cell allocation |
 | `reader.c/h` | S-expression parser, tokenizer |
 | `writer.c/h` | S-expression printer with cycle detection |
-| `eval.c/h` | CPS interpreter (fallback mode) |
+| `eval.c/h`, `eval_forms.c`, `eval_cont.c` | CPS interpreter (`--interpreter`) |
 | `env.c/h` | Environment frames, variable binding |
-| `primitives.c/h` | Built-in procedures (~150 primitives) |
-| `macros.c/h` | Hygienic macro expander |
+| `primitives.c/h`, `prim_*.c` | Built-in procedures (over 250 primitives) |
+| `primitive_table.c/h` | Names the primitives are bound to |
+| `macros.c/h`, `compiled_pattern.c/h` | Hygienic macro expander, compiled `syntax-rules` patterns |
+| `utf8.c/h` | UTF-8 decoding, encoding and string indexing |
 | `bignum.c/h` | Arbitrary precision integer arithmetic |
-| `stdlib.scm` | Standard library (Scheme code) |
+| `feature_table.c/h` | `cond-expand` / `(features)` identifiers |
+| `stdlib.scm` | Standard library (Scheme code), embedded via the generated `stdlib_data.h` |
+| `unicode_*.h` | Unicode tables and test fixtures generated by `tools/gen_unicode_*.py` |
+| `tools/` | MIT differential runner, sanitizer smoke tests, Unicode table generators |
 
 ### Memory Model
 
-The interpreter uses a generational garbage collector:
+The interpreter uses a generational copying garbage collector:
 
-- **Nursery**: Semispace copying collector (Cheney's algorithm)
-- **Old Generation**: Mark-and-sweep for long-lived objects
-- **Cells**: 12-byte tagged unions containing type, car/cdr or numeric value
-- **Reserved Space**: Cells 0-271 (nil, booleans, atoms, integer cache 0-255)
+- **Nursery**: New cells are allocated in a 256K-cell nursery; a minor collection
+  copies its survivors into the old generation, with a card table recording
+  old-to-young pointers
+- **Old Generation**: Two semispaces, collected by Cheney copying on a major
+  collection
+- **Cells**: 12-byte packed structs: a type tag plus a car/cdr pair, a 64-bit
+  value, or a pointer to external data (strings, vectors, bignums, ports)
+- **Reserved Space**: Cells 0-272 (reader tokens, nil, booleans, permanent atoms,
+  the integer cache 0-255, the end-of-file object)
 
 ### Bytecode VM
 
@@ -330,13 +357,18 @@ The default execution mode compiles Scheme to bytecode:
 
 Key optimizations:
 - Peephole optimization (fused compare-and-jump, etc.)
-- Specialized opcodes for common operations (car, cdr, +, -, etc.)
+- Specialized opcodes for common operations (car, cdr, +, -, etc.), guarded
+  so that redefining the primitive's name still takes effect
 - Constant folding for pure operations
-- Tail call optimization via dedicated TAILCALL opcode
+- Inline caches for variable lookup, and side indexes for large frames
+- Parameters kept on the VM stack when no closure can capture them
+- Fixnum arithmetic and comparisons quickened in place on first use
+- Tail call optimization via dedicated TAILCALL opcode, and loops for
+  recursion in tail position modulo `cons`/`append`
 
 ### Type System
 
-Cell types are tagged with a 4-bit enum:
+Each cell carries an `enum lisp_type` tag (`types.h`). The main ones:
 
 | Type | Description |
 |------|-------------|
@@ -347,15 +379,21 @@ Cell types are tagged with a 4-bit enum:
 | `BT_INEXACT` | IEEE 754 double |
 | `BT_COMPLEX` | Complex number (real/imag) |
 | `BT_CHAR` | Unicode character |
-| `BT_STRING` | Mutable string |
+| `BT_STRING` | String (UTF-8) |
 | `BT_CONS` | Pair (car/cdr) |
-| `BT_FUNCTION` | Lambda closure |
-| `BT_PRIMOP` | Built-in procedure |
 | `BT_VECTOR` | Fixed-size array |
+| `BT_BYTEVEC` | Bytevector |
+| `BT_HASHTABLE` | Hash table |
+| `BT_INPORT`, `BT_OUTPORT`, `BT_STRINPORT`, `BT_STROUTPORT` | Ports |
+| `BT_FUNCTION` | Interpreter closure |
+| `BT_BUILTIN` | Built-in procedure |
 | `BT_SYNTAX` | syntax-rules transformer |
-| `BT_CONT` | First-class continuation |
-| `BT_CLOSURE` | VM closure (bytecode) |
+| `BT_CONT` | Interpreter continuation |
+| `BT_VMCLOSURE` | VM closure: a `BT_CLOSURE` code cell and an environment |
 | `BT_VMCONT` | VM continuation |
+
+Inside the VM, integers that fit in 31 bits travel as tagged immediates
+(fixnums) rather than cells, and are boxed when they leave it.
 
 ## Testing
 
@@ -366,7 +404,10 @@ make test
 ```
 
 Runs `test.scm` which exercises all language features including arithmetic,
-list operations, macros, continuations, and the standard library.
+list operations, macros, continuations, and the standard library;
+`make test-interpreter` runs it on the CPS interpreter. `r5rs_tests.scm`,
+`property_tests.scm`, `stress_tests.scm` and `gc_stress_tests.scm` have
+targets of their own (see Building), and `make test-all` runs them all.
 
 ### C Unit Tests
 
@@ -374,20 +415,25 @@ list operations, macros, continuations, and the standard library.
 make test-c
 ```
 
-Runs four test suites:
+Runs eight test suites:
 - `test_bignum` - Arbitrary precision arithmetic
-- `test_reader` - S-expression parsing
-- `test_context` - Memory management and GC
-- `test_macros` - Pattern matching and expansion
+- `test_reader` - S-expression parsing and printing
+- `test_context` - Memory management, GC, environments and VM edge cases
+- `test_macros` - Macro expansion
+- `test_eval` - Both evaluators, the compiler and the VM
+- `test_pattern` - Compiled `syntax-rules` patterns
+- `test_unicode_norm` - Normalization against Unicode's NormalizationTest.txt
+- `test_unicode_case` - Case mapping and character properties
 
 ## Configuration
 
 Key constants in `types.h`:
 
 ```c
-#define SEMISPACE_SIZE (1 << 24)  // 16M cells per semispace
-#define HEAP_RESERVED 272         // Reserved cells (atoms + integer cache)
-#define INITIAL_STRING_CAP 32     // Initial string buffer size
+#define SEMISPACE_SIZE (16384 * 1024) // 16M cells per semispace
+#define NURSERY_SIZE (256 * 1024)     // Cells in the nursery
+#define HEAP_RESERVED 273             // Reserved cells (0-272)
+#define INITIAL_STRING_CAP 32         // Initial string buffer size
 ```
 
 ## License

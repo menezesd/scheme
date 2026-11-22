@@ -72,7 +72,6 @@ enum opcode {
     // Special operations
     OP_PUSHCONT, // Capture continuation: push reified continuation
     OP_CALLCC,   // call/cc: CALLCC -> pop proc, call with captured continuation
-    OP_APPLY,    // apply primitive: APPLY -> pop proc, pop args-list, apply
 
     // Environment
     OP_PUSHENV, // Push new empty frame onto environment
@@ -143,8 +142,6 @@ enum opcode {
     // Additional list accessors
     OP_CAAR,  // Inline caar: pop pair, push caar
     OP_CDAR,  // Inline cdar: pop pair, push cdar
-    OP_CADDR, // Inline caddr: pop pair, push caddr
-    OP_CDDDR, // Inline cdddr: pop pair, push cdddr
 
     // Type predicates
     OP_SYMBOLP,  // Symbol predicate: pop val, push (symbol? val)
@@ -174,6 +171,8 @@ enum opcode {
     // Numeric operations
     OP_NEG,     // Unary negation: pop n, push (- n)
     OP_ABS,     // Absolute value: pop n, push (abs n)
+    // Never emitted (the stdlib defines these as procedures); kept for
+    // hand-built bytecode, which gets what those definitions compute.
     OP_POSITIVE, // Positive check: pop n, push (positive? n)
     OP_NEGATIVE, // Negative check: pop n, push (negative? n)
     OP_EVEN,    // Even check: pop n, push (even? n)

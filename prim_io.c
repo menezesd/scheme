@@ -32,23 +32,6 @@
 #include <poll.h>
 #include <sys/stat.h>
 
-static bool count_utf8_chars_in_bytes(const char *data, size_t len,
-                                      size_t *count, const char **error_msg)
-{
-    size_t offset = 0;
-    *count = 0;
-    while (offset < len) {
-        size_t consumed = 0;
-        uint32_t codepoint;
-        if (!scheme_utf8_decode_next(data + offset, len - offset, &consumed,
-                                     &codepoint, error_msg) || consumed == 0)
-            return false;
-        offset += consumed;
-        (*count)++;
-    }
-    return true;
-}
-
 // Writers used by the output primitives. Each reports its own failure (for
 // example data nested too deeply) and returns false, so the primitive can
 // raise instead of silently producing partial output.
@@ -149,6 +132,21 @@ static bool encode_char_utf8(int c, char encoded[4], size_t *encoded_len,
     return true;
 }
 
+// Append LEN bytes (no NUL among them) to a string output port.
+static bool string_port_append(string_port *sport, const char *data,
+                               size_t len, const char *name)
+{
+    if (len > SIZE_MAX - sport->len - 1 ||
+        !strport_ensure_capacity(sport, sport->len + len + 1)) {
+        show_error("%s: string port write failed", name);
+        return false;
+    }
+    memcpy(sport->data + sport->len, data, len);
+    sport->len += len;
+    sport->data[sport->len] = '\0';
+    return true;
+}
+
 static bool write_char_to_string_port(string_port *sport, int c,
                                       const char *name)
 {
@@ -160,15 +158,7 @@ static bool write_char_to_string_port(string_port *sport, int c,
     size_t encoded_len;
     if (!encode_char_utf8(c, encoded, &encoded_len, name))
         return false;
-    if (encoded_len > SIZE_MAX - sport->len - 1 ||
-        !strport_ensure_capacity(sport, sport->len + encoded_len + 1)) {
-        show_error("%s: string port write failed", name);
-        return false;
-    }
-    memcpy(sport->data + sport->len, encoded, encoded_len);
-    sport->len += encoded_len;
-    sport->data[sport->len] = '\0';
-    return true;
+    return string_port_append(sport, encoded, encoded_len, name);
 }
 
 static bool write_char_to_file_port(FILE *fport, int c, const char *name)
@@ -215,6 +205,45 @@ static bool file_has_buffered_input(FILE *fp)
 #endif
 }
 
+// char-ready? and u8-ready? for a file port: #t when a read would not block -
+// pushed-back or buffered input, end of file or an error (the read returns
+// at once), or a descriptor poll() reports readable - #f when it would, and
+// TOK_ERROR (reported under NAME) when the port is unusable.
+static unsigned file_input_ready(FILE *fport, const char *name)
+{
+    if (reader_port_pending_bytes(fport) > 0 || feof(fport) || ferror(fport) ||
+        file_has_buffered_input(fport))
+        return ctx.atom_true;
+    int fd = fileno(fport);
+    if (fd < 0)
+        return ctx.atom_true; // Not a real file descriptor, assume ready
+
+    struct pollfd pfd = {.fd = fd, .events = POLLIN, .revents = 0};
+    int ret = poll(&pfd, 1, 0); // Non-blocking check
+    if (ret < 0) {
+        if (errno == EINTR)
+            return ctx.atom_false;
+        show_error("%s: poll failed", name);
+        return TOK_ERROR;
+    }
+    // POLLERR also means the operation will not block.  Some Unix special
+    // files, notably /dev/null on macOS, report EOF this way. Let the read
+    // operation surface a real I/O error; only POLLNVAL means that the
+    // descriptor itself is invalid - and poll(2) reports even that for some
+    // valid special files on macOS (including /dev/null), so confirm the
+    // descriptor before treating it as an actual invalid-port error.
+    if (pfd.revents & POLLNVAL) {
+        struct stat st;
+        if (fstat(fd, &st) != 0) {
+            show_error("%s: port error", name);
+            return TOK_ERROR;
+        }
+        return ctx.atom_true;
+    }
+    return scheme_bool(ret > 0 &&
+                       (pfd.revents & (POLLIN | POLLHUP | POLLERR)));
+}
+
 static int extract_optional_port(unsigned argc, unsigned *argv,
                                  unsigned argc_with_port, port_dir dir,
                                  FILE **fport, string_port **sport,
@@ -235,6 +264,13 @@ static unsigned write_object_with_optional_port(unsigned argc, unsigned *argv,
                                       &sport, name);
     if (ptype == -1)
         return TOK_ERROR;
+    if (ptype == 1 && writer == display_checked && IS_STRING(arg)) {
+        // Nothing to format: skip the memory stream.
+        char *s = require_string_ptr(arg, name);
+        if (!s || !string_port_append(sport, s, strlen(s), name))
+            return TOK_ERROR;
+        return arg;
+    }
     if (ptype == 1)
         return write_arg_to_string_port(arg, sport, name, writer);
     if (!write_arg_to_file_port(arg, fport, name, writer))
@@ -253,19 +289,6 @@ static bool reject_reader_token(unsigned result, const char *name)
     if (result == TOK_ERROR)
         note_error_kind("read");
     return true;
-}
-
-static size_t utf8_char_byte_len(unsigned char first)
-{
-    if (first < 0x80)
-        return 1;
-    if (first >= 0xC2 && first <= 0xDF)
-        return 2;
-    if (first >= 0xE0 && first <= 0xEF)
-        return 3;
-    if (first >= 0xF0 && first <= 0xF4)
-        return 4;
-    return 0;
 }
 
 /* Returns 1 for a character, 0 for EOF, and -1 for an invalid sequence. */
@@ -291,7 +314,7 @@ static int read_or_peek_utf8_char(FILE *fport, string_port *sport, int ptype,
     if (c == EOF)
         return 0;
     bytes[0] = (char)c;
-    *byte_len = utf8_char_byte_len((unsigned char)c);
+    *byte_len = scheme_utf8_sequence_length((unsigned char)c);
     if (*byte_len == 0) {
         *error_msg = "invalid UTF-8 leading byte";
         *byte_len = 1;
@@ -528,18 +551,9 @@ static unsigned write_string_value(unsigned argc, unsigned *argv,
     if (ptype == 0 && !require_textual_file_port(fport, name))
         return TOK_ERROR;
     if (ptype == 1) {
-        size_t slice_len = end_byte - start_byte;
-        char *slice = checked_string_copy_len(str + start_byte, slice_len);
-        if (!slice) {
-            show_error("%s: out of memory", name);
+        if (!string_port_append(sport, str + start_byte, end_byte - start_byte,
+                                name))
             return TOK_ERROR;
-        }
-        bool ok = strport_puts(sport, slice);
-        free(slice);
-        if (!ok) {
-            show_error("%s: string port write failed", name);
-            return TOK_ERROR;
-        }
     } else {
         size_t slice_len = end_byte - start_byte;
         if ((slice_len > 0 &&
@@ -635,9 +649,9 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
             if (sport->source_string != ctx.atom_false) {
                 size_t consumed_chars = 0;
                 const char *utf8_error = NULL;
-                if (!count_utf8_chars_in_bytes(
-                        sport->data + source_start_pos, advanced,
-                        &consumed_chars, &utf8_error)) {
+                if (!scheme_utf8_count_range(sport->data + source_start_pos,
+                                             advanced, &consumed_chars, NULL,
+                                             &utf8_error)) {
                     close_reader_stream(mem);
                     show_error("read: invalid UTF-8 sequence");
                     return TOK_ERROR;
@@ -676,11 +690,11 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         if (ptype == -1)
             return TOK_ERROR;
         if (ptype == 0) {
-            unsigned ready = apply_io_primitive(PCHARREADY, argc, argv);
-            if (ready == TOK_ERROR)
+            if (!require_textual_file_port(fport, "read-char-no-hang"))
                 return TOK_ERROR;
-            if (ready == ctx.atom_false)
-                return ctx.atom_false;
+            unsigned ready = file_input_ready(fport, "read-char-no-hang");
+            if (ready != ctx.atom_true)
+                return ready; // #f, or TOK_ERROR
         }
         return read_or_peek_char(fport, sport, ptype, false,
                                  "read-char-no-hang");
@@ -799,47 +813,7 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
             // String port: never blocks (a char or the eof object is ready)
             return ctx.atom_true;
         }
-        if (reader_port_pending_bytes(fport) > 0)
-            return ctx.atom_true;
-        // At end of file read-char returns the eof object without blocking,
-        // so R7RS requires char-ready? to return #t
-        if (feof(fport) || ferror(fport))
-            return ctx.atom_true;
-        if (file_has_buffered_input(fport))
-            return ctx.atom_true;
-
-        // File port: use poll() to check if data is available
-        int fd = fileno(fport);
-        if (fd < 0) {
-            // Not a real file descriptor, assume ready
-            return ctx.atom_true;
-        }
-
-        struct pollfd pfd = {.fd = fd, .events = POLLIN, .revents = 0};
-        int ret = poll(&pfd, 1, 0); // Non-blocking check
-        if (ret < 0) {
-            if (errno == EINTR)
-                return ctx.atom_false;
-            show_error("char-ready?: poll failed");
-            return TOK_ERROR;
-        }
-        // POLLERR also means the operation will not block.  Some Unix
-        // special files, notably /dev/null on macOS, report EOF this way.
-        // Let the read operation surface a real I/O error; only POLLNVAL
-        // means that the descriptor itself is invalid.
-        if (pfd.revents & POLLNVAL) {
-            // poll(2) reports POLLNVAL for some valid special files on
-            // macOS (including /dev/null).  Confirm the descriptor before
-            // treating it as an actual invalid-port error.
-            struct stat st;
-            if (fstat(fd, &st) != 0) {
-                show_error("char-ready?: port error");
-                return TOK_ERROR;
-            }
-            return ctx.atom_true;
-        }
-        return scheme_bool(ret > 0 &&
-                           (pfd.revents & (POLLIN | POLLHUP | POLLERR)));
+        return file_input_ready(fport, "char-ready?");
     }
     case PU8READY: {
         REQUIRE_ARGC(argc, 0, 1, "u8-ready?");
@@ -850,33 +824,7 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         if (ptype == -1) return TOK_ERROR;
         if (ptype == 1)
             return ctx.atom_true; // Never blocks: a byte or eof is ready
-        if (reader_port_pending_bytes(fport) > 0)
-            return ctx.atom_true;
-        if (feof(fport) || ferror(fport))
-            return ctx.atom_true;
-        if (file_has_buffered_input(fport))
-            return ctx.atom_true;
-        int fd = fileno(fport);
-        if (fd < 0)
-            return ctx.atom_true;
-        struct pollfd pfd = {.fd = fd, .events = POLLIN, .revents = 0};
-        int ret = poll(&pfd, 1, 0);
-        if (ret < 0) {
-            if (errno == EINTR)
-                return ctx.atom_false;
-            show_error("u8-ready?: poll failed");
-            return TOK_ERROR;
-        }
-        if (pfd.revents & POLLNVAL) {
-            struct stat st;
-            if (fstat(fd, &st) != 0) {
-                show_error("u8-ready?: port error");
-                return TOK_ERROR;
-            }
-            return ctx.atom_true;
-        }
-        return scheme_bool(ret > 0 &&
-                           (pfd.revents & (POLLIN | POLLHUP | POLLERR)));
+        return file_input_ready(fport, "u8-ready?");
     }
     case PPEEKU8: {
         REQUIRE_ARGC(argc, 0, 1, "peek-u8");
@@ -953,10 +901,9 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         if (ptype == 1 && sport->source_string != ctx.atom_false) {
             size_t consumed_chars = 0;
             const char *utf8_error = NULL;
-            if (!count_utf8_chars_in_bytes(
-                    sport->data + source_start_pos,
-                    sport->pos - source_start_pos, &consumed_chars,
-                    &utf8_error)) {
+            if (!scheme_utf8_count_range(sport->data + source_start_pos,
+                                         sport->pos - source_start_pos,
+                                         &consumed_chars, NULL, &utf8_error)) {
                 free(buf);
                 show_error("read-line: %s",
                            utf8_error ? utf8_error : "invalid UTF-8 sequence");

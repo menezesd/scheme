@@ -28,6 +28,7 @@
 #include "bignum.h"
 #include "context.h"
 #include "prim_internal.h"
+#include "utf8.h"
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
@@ -45,6 +46,11 @@ static const char *reader_filename = "<stdin>";
 static bool reader_fold_case = true;
 
 #define READER_PUSHBACK_CAP 16
+// Characters read, most recent last, for reader_ungetc to push back. Only the
+// last READER_PUSHBACK_CAP can ever be pushed back, but the buffer holds
+// twice that so it is shifted down once per READER_PUSHBACK_CAP characters
+// instead of on every one.
+#define READER_HISTORY_CAP (2 * READER_PUSHBACK_CAP)
 #define READER_MAX_OBJECT_DEPTH 1024
 
 typedef struct {
@@ -55,7 +61,7 @@ typedef struct {
 
 static reader_char_state reader_pushback[READER_PUSHBACK_CAP];
 static int reader_pushback_len = 0;
-static reader_char_state reader_history[READER_PUSHBACK_CAP];
+static reader_char_state reader_history[READER_HISTORY_CAP];
 static int reader_history_len = 0;
 
 // Per-port reader state. Peeked characters are physically consumed from the
@@ -67,7 +73,7 @@ typedef struct port_reader_state {
     int line, col;
     reader_char_state pushback[READER_PUSHBACK_CAP];
     int pushback_len;
-    reader_char_state history[READER_PUSHBACK_CAP];
+    reader_char_state history[READER_HISTORY_CAP];
     int history_len;
     bool fold_case;
     struct port_reader_state *next;
@@ -108,26 +114,31 @@ static port_reader_state *port_state_get(FILE *port)
     return ps;
 }
 
+static void record_history(reader_char_state *history, int *len,
+                           reader_char_state state)
+{
+    if (*len == READER_HISTORY_CAP) {
+        memmove(history, history + READER_HISTORY_CAP - READER_PUSHBACK_CAP,
+                READER_PUSHBACK_CAP * sizeof(history[0]));
+        *len = READER_PUSHBACK_CAP;
+    }
+    history[(*len)++] = state;
+}
+
 static void reader_record_history(reader_char_state state)
 {
-    if (reader_history_len == READER_PUSHBACK_CAP) {
-        memmove(reader_history, reader_history + 1,
-                (READER_PUSHBACK_CAP - 1) * sizeof(reader_history[0]));
-        reader_history_len--;
-    }
-    reader_history[reader_history_len++] = state;
+    record_history(reader_history, &reader_history_len, state);
 }
 
 static void port_state_record_history(port_reader_state *ps,
                                       reader_char_state state)
 {
-    if (ps->history_len == READER_PUSHBACK_CAP) {
-        memmove(ps->history, ps->history + 1,
-                (READER_PUSHBACK_CAP - 1) * sizeof(ps->history[0]));
-        ps->history_len--;
-    }
-    ps->history[ps->history_len++] = state;
+    record_history(ps->history, &ps->history_len, state);
 }
+
+// Copy the first LEN entries of a pushback or history buffer.
+#define COPY_CHAR_STATES(dst, src, len)                                        \
+    memcpy((dst), (src), (size_t)(len) * sizeof((dst)[0]))
 
 static void advance_position_for_char(int c, int *line, int *col)
 {
@@ -547,27 +558,19 @@ static bool valid_string_scalar(int64_t code)
     return code > 0 && is_valid_unicode_scalar(code);
 }
 
+// Append CODE's UTF-8 encoding, rejecting (and reporting) anything a string
+// cannot hold.
 static bool sb_append_utf8(string_buffer *sb, int64_t code)
 {
-    if (!valid_string_scalar(code)) {
+    char bytes[4];
+    size_t len;
+    if (!valid_string_scalar(code) ||
+        !scheme_utf8_encode_scalar((uint32_t)code, bytes, &len)) {
         show_error("invalid string character scalar value");
         return false;
     }
-    if (code <= 0x7F) {
-        sb_append(sb, (int)code);
-    } else if (code <= 0x7FF) {
-        sb_append(sb, 0xC0 | (int)(code >> 6));
-        sb_append(sb, 0x80 | (int)(code & 0x3F));
-    } else if (code <= 0xFFFF) {
-        sb_append(sb, 0xE0 | (int)(code >> 12));
-        sb_append(sb, 0x80 | (int)((code >> 6) & 0x3F));
-        sb_append(sb, 0x80 | (int)(code & 0x3F));
-    } else {
-        sb_append(sb, 0xF0 | (int)(code >> 18));
-        sb_append(sb, 0x80 | (int)((code >> 12) & 0x3F));
-        sb_append(sb, 0x80 | (int)((code >> 6) & 0x3F));
-        sb_append(sb, 0x80 | (int)(code & 0x3F));
-    }
+    for (size_t i = 0; i < len; i++)
+        sb_append(sb, (unsigned char)bytes[i]);
     return true;
 }
 
@@ -593,23 +596,13 @@ static bool read_hex_scalar_value(const char *digits, int64_t *out,
 static bool read_utf8_tail_bytes(int first, int64_t *codepoint,
                                  const char *name)
 {
-    int needed;
-    int value;
-    if (first >= 0xC2 && first <= 0xDF) {
-        needed = 1;
-        value = first & 0x1F;
-    } else if (first >= 0xE0 && first <= 0xEF) {
-        needed = 2;
-        value = first & 0x0F;
-    } else if (first >= 0xF0 && first <= 0xF4) {
-        needed = 3;
-        value = first & 0x07;
-    } else {
+    char bytes[4] = {(char)first};
+    size_t needed = scheme_utf8_sequence_length((unsigned char)first);
+    if (needed < 2) {
         show_error("%s: invalid UTF-8 leading byte", name);
         return false;
     }
-
-    for (int i = 0; i < needed; i++) {
+    for (size_t i = 1; i < needed; i++) {
         int b = reader_getchar();
         if ((b & 0xC0) != 0x80) {
             if (b != EOF)
@@ -617,73 +610,31 @@ static bool read_utf8_tail_bytes(int first, int64_t *codepoint,
             show_error("%s: invalid UTF-8 continuation byte", name);
             return false;
         }
-        value = (value << 6) | (b & 0x3F);
+        bytes[i] = (char)b;
     }
-
-    if ((needed == 2 && value < 0x800) ||
-        (needed == 3 && value < 0x10000) ||
-        !is_valid_unicode_scalar(value)) {
-        show_error("%s: invalid UTF-8 sequence", name);
+    // Lead and continuation bytes are checked; this rejects overlong forms,
+    // surrogates and values past U+10FFFF.
+    size_t offset = 0;
+    uint32_t value;
+    const char *error_msg = NULL;
+    if (!scheme_utf8_decode_next(bytes, needed, &offset, &value, &error_msg)) {
+        show_error("%s: %s", name, error_msg);
         return false;
     }
     *codepoint = value;
     return true;
 }
 
-static bool validate_utf8_string(const char *s)
+static bool sb_valid_utf8(const string_buffer *sb)
 {
-    const unsigned char *p = (const unsigned char *)s;
-    while (*p) {
-        unsigned char first = *p++;
-        if (first < 0x80)
-            continue;
-        int needed;
-        int value;
-        if (first >= 0xC2 && first <= 0xDF) {
-            needed = 1;
-            value = first & 0x1F;
-        } else if (first >= 0xE0 && first <= 0xEF) {
-            needed = 2;
-            value = first & 0x0F;
-        } else if (first >= 0xF0 && first <= 0xF4) {
-            needed = 3;
-            value = first & 0x07;
-        } else {
-            return false;
-        }
-        for (int i = 0; i < needed; i++) {
-            if ((p[i] & 0xC0) != 0x80)
-                return false;
-            value = (value << 6) | (p[i] & 0x3F);
-        }
-        if ((needed == 2 && value < 0x800) ||
-            (needed == 3 && value < 0x10000) ||
-            !valid_string_scalar(value))
-            return false;
-        p += needed;
-    }
-    return true;
+    const char *error_msg = NULL;
+    return scheme_utf8_count_range(sb->data, sb->len, NULL, NULL, &error_msg);
 }
 
-static void sb_append_utf8_scalar(string_buffer *sb, uint32_t code)
-{
-    if (code < 0x80) {
-        sb_append(sb, (int)code);
-    } else if (code < 0x800) {
-        sb_append(sb, 0xC0 | (int)(code >> 6));
-        sb_append(sb, 0x80 | (int)(code & 0x3F));
-    } else if (code < 0x10000) {
-        sb_append(sb, 0xE0 | (int)(code >> 12));
-        sb_append(sb, 0x80 | (int)((code >> 6) & 0x3F));
-        sb_append(sb, 0x80 | (int)(code & 0x3F));
-    } else {
-        sb_append(sb, 0xF0 | (int)(code >> 18));
-        sb_append(sb, 0x80 | (int)((code >> 12) & 0x3F));
-        sb_append(sb, 0x80 | (int)((code >> 6) & 0x3F));
-        sb_append(sb, 0x80 | (int)(code & 0x3F));
-    }
-}
-
+// Append token character C, reading the rest of the UTF-8 sequence it
+// starts, case-folded unless #!no-fold-case is in effect. An ill-formed
+// sequence goes in as raw bytes, which sb_valid_utf8 then rejects for the
+// whole token.
 static void sb_append_token_char(string_buffer *sb, int c)
 {
     if (c < 0x80) {
@@ -693,49 +644,25 @@ static void sb_append_token_char(string_buffer *sb, int c)
         return;
     }
 
-    unsigned char first = (unsigned char)c;
-    size_t needed;
-    uint32_t code;
-    if (first >= 0xC2 && first <= 0xDF) {
-        needed = 2;
-        code = first & 0x1F;
-    } else if (first >= 0xE0 && first <= 0xEF) {
-        needed = 3;
-        code = first & 0x0F;
-    } else if (first >= 0xF0 && first <= 0xF4) {
-        needed = 4;
-        code = first & 0x07;
-    } else {
-        sb_append(sb, c);
-        return;
-    }
-
-    unsigned char bytes[4] = {first, 0, 0, 0};
-    for (size_t i = 1; i < needed; i++) {
+    char bytes[4] = {(char)c};
+    size_t needed = scheme_utf8_sequence_length((unsigned char)c);
+    size_t have = 1;
+    while (have < needed) {
         int next = reader_getchar();
-        if (next == EOF) {
-            sb_append(sb, c);
-            return;
-        }
-        bytes[i] = (unsigned char)next;
-        if ((bytes[i] & 0xC0) != 0x80) {
-            for (size_t j = 0; j <= i; j++)
-                sb_append(sb, bytes[j]);
-            return;
-        }
-        code = (code << 6) | (uint32_t)(bytes[i] & 0x3F);
+        if (next == EOF)
+            break;
+        bytes[have++] = (char)next;
+        if ((next & 0xC0) != 0x80)
+            break;
     }
-
-    if ((needed == 3 && code < 0x800) ||
-        (needed == 4 && code < 0x10000) || !valid_string_scalar(code)) {
-        for (size_t i = 0; i < needed; i++)
-            sb_append(sb, bytes[i]);
-        return;
-    }
-
-    if (!reader_fold_case) {
-        for (size_t i = 0; i < needed; i++)
-            sb_append(sb, bytes[i]);
+    size_t offset = 0;
+    uint32_t code;
+    const char *error_msg = NULL;
+    if (needed == 0 || !reader_fold_case ||
+        !scheme_utf8_decode_next(bytes, have, &offset, &code, &error_msg) ||
+        offset != have) {
+        for (size_t i = 0; i < have; i++)
+            sb_append(sb, (unsigned char)bytes[i]);
         return;
     }
 
@@ -743,9 +670,9 @@ static void sb_append_token_char(string_buffer *sb, int c)
     size_t length;
     if (unicode_full_foldcase(code, &mapping, &length)) {
         for (size_t i = 0; i < length; i++)
-            sb_append_utf8_scalar(sb, mapping[i]);
+            sb_append_utf8(sb, mapping[i]);
     } else {
-        sb_append_utf8_scalar(sb, unicode_simple_foldcase(code));
+        sb_append_utf8(sb, unicode_simple_foldcase(code));
     }
 }
 
@@ -1550,12 +1477,6 @@ static unsigned read_string_literal(void)
                         sb_free(&sb);
                         return TOK_ERROR;
                     }
-                    if (!valid_string_scalar(scalar)) {
-                        show_error("invalid string character scalar value");
-                        sb_free(&hex);
-                        sb_free(&sb);
-                        return TOK_ERROR;
-                    }
                     if (!sb_append_utf8(&sb, scalar)) {
                         sb_free(&hex);
                         sb_free(&sb);
@@ -1624,7 +1545,7 @@ static unsigned read_string_literal(void)
         sb_append(&sb, c);
     }
 
-    if (!validate_utf8_string(sb.data)) {
+    if (!sb_valid_utf8(&sb)) {
         show_error("string literal contains invalid UTF-8");
         sb_free(&sb);
         return TOK_ERROR;
@@ -1748,7 +1669,7 @@ static unsigned read_escaped_identifier(void)
         sb_append(&sb, c);
     }
 
-    if (!validate_utf8_string(sb.data)) {
+    if (!sb_valid_utf8(&sb)) {
         show_error("escaped identifier contains invalid UTF-8");
         sb_free(&sb);
         return TOK_ERROR;
@@ -1814,7 +1735,7 @@ static unsigned read_number_or_symbol_token(int c)
         sb_append_token_char(&sb, c);
     }
     reader_ungetc(c);
-    if (!validate_utf8_string(sb.data)) {
+    if (!sb_valid_utf8(&sb)) {
         show_error("symbol contains invalid UTF-8");
         sb_free(&sb);
         return TOK_ERROR;
@@ -1833,6 +1754,55 @@ static unsigned read_number_or_symbol_token(int c)
     }
     sb_free(&sb);
     return res;
+}
+
+// After "#u": read the rest of a #u8(...) literal. The bytes are read as an
+// ordinary list, then copied into the bytevector.
+static unsigned read_bytevector_literal(void)
+{
+    int c = reader_getchar();
+    if (c != '8')
+        return unknown_dispatch_syntax("#u", c);
+    c = reader_getchar();
+    reader_ungetc(c);
+    if (c != '(')
+        return unknown_dispatch_syntax("#u8", c);
+    // Nothing below allocates a cell before the result, so the list needs
+    // no rooting.
+    unsigned list = read_obj();
+    if (list == TOK_ERROR)
+        return TOK_ERROR;
+    unsigned count = 0;
+    for (unsigned p = list; p; p = cdr(p)) {
+        uint8_t byte;
+        if (!IS_PAIR(p)) {
+            show_error("bytevector literal: improper list");
+            return TOK_ERROR;
+        }
+        if (!read_byte_value(car(p), &byte)) {
+            show_error("bytevector literal: byte out of range");
+            return TOK_ERROR;
+        }
+        count++;
+    }
+    if (count > 1024 * 1024) {
+        show_error("bytevector literal too large");
+        return TOK_ERROR;
+    }
+    bytevec_data *bv = checked_malloc_flex(sizeof(bytevec_data), count, 1);
+    if (!bv) {
+        show_error("bytevector literal: out of memory");
+        return TOK_ERROR;
+    }
+    bv->len = count;
+    unsigned i = 0;
+    for (unsigned p = list; p; p = cdr(p))
+        (void)read_byte_value(car(p), &bv->data[i++]); // checked above
+    bytevec_register(bv);
+    unsigned cell = alloc();
+    CELL_TYPE(cell) = BT_BYTEVEC;
+    CELL_PTR(cell) = bv;
+    return cell;
 }
 
 unsigned read_token(void)
@@ -1919,74 +1889,7 @@ unsigned read_token(void)
                        c == 'e' || c == 'E' || c == 'i' || c == 'I') {
                 return read_prefixed_number(c);
             } else if (c == 'u') {
-                // Bytevector literal: #u8(...)
-                c = reader_getchar();
-                if (c == EOF) {
-                    show_error("unexpected end of file after #u");
-                    return TOK_ERROR;
-                }
-                if (c == '8') {
-                    c = reader_getchar();
-                    if (c == EOF) {
-                        show_error("unexpected end of file after #u8");
-                        return TOK_ERROR;
-                    }
-                    if (c == '(') {
-                        // Read bytes by reading a list then converting
-                        reader_ungetc(c); // put back '('
-                        unsigned list = read_obj(); // read (b1 b2 ...)
-                        if (list == TOK_ERROR)
-                            return TOK_ERROR;
-                        if (list == TOK_EOF) {
-                            show_error("unexpected end of file in bytevector literal");
-                            return TOK_ERROR;
-                        }
-                        unsigned count = 0;
-                        for (unsigned p = list; p; p = cdr(p)) {
-                            if (!IS_PAIR(p)) {
-                                show_error("bytevector literal: improper list");
-                                return TOK_ERROR;
-                            }
-                            unsigned byte = car(p);
-                            uint8_t byte_value;
-                            if (!read_byte_value(byte, &byte_value)) {
-                                show_error("bytevector literal: byte out of range");
-                                return TOK_ERROR;
-                            }
-                            count++;
-                        }
-                        if (count > 1024 * 1024) {
-                            show_error("bytevector literal too large");
-                            return TOK_ERROR;
-                        }
-                        bytevec_data *bv =
-                            checked_malloc_flex(sizeof(bytevec_data), count, 1);
-                        if (!bv) {
-                            show_error("bytevector literal: out of memory");
-                            return TOK_ERROR;
-                        }
-                        bv->len = count;
-                        bytevec_register(bv);
-                        unsigned i = 0;
-                        for (unsigned p = list; p && IS_PAIR(p); p = cdr(p)) {
-                            uint8_t byte_value;
-                            if (!read_byte_value(car(p), &byte_value)) {
-                                bytevec_unregister(bv);
-                                free(bv);
-                                show_error("bytevector literal: byte out of range");
-                                return TOK_ERROR;
-                            }
-                            bv->data[i++] = byte_value;
-                        }
-                        unsigned cell = alloc();
-                        CELL_TYPE(cell) = BT_BYTEVEC;
-                        CELL_PTR(cell) = bv;
-                        return cell;
-                    }
-                    reader_ungetc(c);
-                    return unknown_dispatch_syntax("#u8", c);
-                }
-                return unknown_dispatch_syntax("#u", c);
+                return read_bytevector_literal();
             } else if (isdigit(c)) {
                 // Datum label: #n= or #n#
                 int label = c - '0';
@@ -2258,8 +2161,9 @@ void reader_recover_after_panic(void)
             ps->pos = ftell(reader_port);
             ps->line = reader_line;
             ps->col = reader_col;
-            memcpy(ps->pushback, reader_pushback, sizeof(ps->pushback));
-            memcpy(ps->history, reader_history, sizeof(ps->history));
+            COPY_CHAR_STATES(ps->pushback, reader_pushback,
+                             reader_pushback_len);
+            COPY_CHAR_STATES(ps->history, reader_history, reader_history_len);
             ps->pushback_len = reader_pushback_len;
             ps->history_len = reader_history_len;
             ps->fold_case = reader_fold_case;
@@ -2280,12 +2184,12 @@ static unsigned read_obj_from_port(FILE *port, bool keep_position,
     int old_line = reader_line;
     int old_col = reader_col;
     reader_char_state old_pushback[READER_PUSHBACK_CAP];
-    reader_char_state old_history[READER_PUSHBACK_CAP];
+    reader_char_state old_history[READER_HISTORY_CAP];
     int old_pushback_len = reader_pushback_len;
     int old_history_len = reader_history_len;
     bool old_fold_case = reader_fold_case;
-    memcpy(old_pushback, reader_pushback, sizeof(old_pushback));
-    memcpy(old_history, reader_history, sizeof(old_history));
+    COPY_CHAR_STATES(old_pushback, reader_pushback, old_pushback_len);
+    COPY_CHAR_STATES(old_history, reader_history, old_history_len);
 
     reader_port = port;
     port_reader_state *ps = port_state_get(port);
@@ -2296,8 +2200,8 @@ static unsigned read_obj_from_port(FILE *port, bool keep_position,
         port_state_reset(ps);
     reader_line = ps->line;
     reader_col = ps->col;
-    memcpy(reader_pushback, ps->pushback, sizeof(reader_pushback));
-    memcpy(reader_history, ps->history, sizeof(reader_history));
+    COPY_CHAR_STATES(reader_pushback, ps->pushback, ps->pushback_len);
+    COPY_CHAR_STATES(reader_history, ps->history, ps->history_len);
     reader_pushback_len = ps->pushback_len;
     reader_history_len = ps->history_len;
     reader_fold_case = no_fold_case ? !*no_fold_case : ps->fold_case;
@@ -2310,8 +2214,8 @@ static unsigned read_obj_from_port(FILE *port, bool keep_position,
     ps->pos = ftell(port);
     ps->line = reader_line;
     ps->col = reader_col;
-    memcpy(ps->pushback, reader_pushback, sizeof(ps->pushback));
-    memcpy(ps->history, reader_history, sizeof(ps->history));
+    COPY_CHAR_STATES(ps->pushback, reader_pushback, reader_pushback_len);
+    COPY_CHAR_STATES(ps->history, reader_history, reader_history_len);
     ps->pushback_len = reader_pushback_len;
     ps->history_len = reader_history_len;
     ps->fold_case = reader_fold_case;
@@ -2322,8 +2226,8 @@ static unsigned read_obj_from_port(FILE *port, bool keep_position,
     reader_line = keep_position ? ps->line : old_line;
     reader_col = keep_position ? ps->col : old_col;
     reader_fold_case = old_fold_case;
-    memcpy(reader_pushback, old_pushback, sizeof(reader_pushback));
-    memcpy(reader_history, old_history, sizeof(reader_history));
+    COPY_CHAR_STATES(reader_pushback, old_pushback, old_pushback_len);
+    COPY_CHAR_STATES(reader_history, old_history, old_history_len);
     reader_pushback_len = old_pushback_len;
     reader_history_len = old_history_len;
     return result;

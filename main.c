@@ -24,9 +24,6 @@ static const char *stdlib_path = NULL;
 // File Loading Utilities
 // ============================================================================
 
-// Track evaluation depth to only sweep code objects at top level
-static int eval_depth = 0;
-
 // Restore the baseline exception and dynamic-wind state of the interaction
 // environment after a top-level form ended abnormally.
 static void reset_toplevel_dynamic_state(unsigned env)
@@ -37,7 +34,10 @@ static void reset_toplevel_dynamic_state(unsigned env)
     setvar(intern("*wind-stack*"), 0, env);
 }
 
-// Evaluate expression (interpreter or bytecode depending on mode)
+// Evaluate a top-level form (interpreter or bytecode depending on mode).
+// Never re-entered: eval and load run inside the engine that calls them, so
+// every call here is between top-level forms, where sweeping unreachable code
+// objects and resetting the dynamic state after an error are both safe.
 static unsigned eval_expr(unsigned expr, unsigned env)
 {
     // Both parameters are by-value copies, so a caller's gc_protect (or the
@@ -57,35 +57,23 @@ static unsigned eval_expr(unsigned expr, unsigned env)
         }
         vm_state vm;
         vm_init(&vm);
-        eval_depth++;
         result = vm_run(&vm, code, env);
-        eval_depth--;
         vm_free(&vm);
-        // Only sweep unreachable code objects at top level
-        // (nested eval via callback must not sweep parent's code)
-        if (eval_depth == 0) {
-            gc_sweep_code_objects();
-            gc_sweep_patterns();
-        }
+        gc_sweep_code_objects();
+        gc_sweep_patterns();
     } else {
-        eval_depth++;
         result = eval_obj(expr, env);
-        eval_depth--;
     }
     // Error boundary: a non-local exit that escaped every Scheme handler
     // (e.g. the OP_ERROR_RETURN marker terminal) may have torn exception
     // state - a stale with-exception-handler wrapper left as the current
-    // handler, leftover *wind-stack* frames. Restore the baseline at the
-    // top level so the next REPL expression starts clean; nested eval
-    // (load/eval callbacks) must not reset while an outer guard could
-    // still catch the error.
-    if (result == TOK_ERROR && eval_depth == 0)
+    // handler, leftover *wind-stack* frames. Restore the baseline so the next
+    // REPL expression starts clean.
+    if (result == TOK_ERROR)
         reset_toplevel_dynamic_state(env);
     return result;
 }
 
-// Load and evaluate expressions from a port
-// Returns true on success, false on error
 // Check if expression is a define-syntax form
 static bool is_define_syntax(unsigned expr)
 {
@@ -139,6 +127,8 @@ static bool eval_pending_batch(unsigned *batch, unsigned *batch_tail,
     return true;
 }
 
+// Load and evaluate expressions from a port
+// Returns true on success, false on error
 static bool load_from_port(FILE *f, unsigned *env, bool warn_on_error,
                            const char *filename)
 {
@@ -191,20 +181,17 @@ static bool load_from_port(FILE *f, unsigned *env, bool warn_on_error,
             }
             // Evaluate define-syntax immediately
             unsigned result = eval_expr(expr, *env);
-            gc_unprotect(1); // expr - per-iteration cleanup
             if (result == TOK_ERROR) {
+                gc_unprotect(1);
                 restore_reader_context(old_filename);
                 if (warn_on_error)
                     fprintf(stderr, "Warning: error during load\n");
                 return false;
             }
         } else {
-            gc_unprotect(1); // expr - will be re-protected by list_append
-            // Add to batch
-            gc_protect(&expr);
             list_append(&batch, &batch_tail, expr);
-            gc_unprotect(1); // expr - per-iteration cleanup
         }
+        gc_unprotect(1); // expr - per-iteration cleanup
 
         *env = maybe_gc(*env, 75);
     }
@@ -341,26 +328,25 @@ int main(int argc, char **argv)
     // bootstrap bindings part of the public primitive set.
     GC_GUARD;
     gc_protect(&env);
-    unsigned assigned_name = atom_from_string("%unicode-assigned?");
-    gc_protect(&assigned_name);
-    unsigned assigned_prim = mk_primop(PUNICODEASSIGNED);
-    gc_protect(&assigned_prim);
-    defvar(assigned_name, assigned_prim, env);
-    unsigned combining_name = atom_from_string("%char-combining?");
-    gc_protect(&combining_name);
-    unsigned combining_prim = mk_primop(PCHARCOMBINING);
-    gc_protect(&combining_prim);
-    defvar(combining_name, combining_prim, env);
-    unsigned punctuation_name = atom_from_string("%unicode-punctuation?");
-    gc_protect(&punctuation_name);
-    unsigned punctuation_prim = mk_primop(PUNICODEPUNCTUATION);
-    gc_protect(&punctuation_prim);
-    defvar(punctuation_name, punctuation_prim, env);
-    unsigned symbol_name = atom_from_string("%unicode-symbol?");
-    gc_protect(&symbol_name);
-    unsigned symbol_prim = mk_primop(PUNICODESYMBOL);
-    gc_protect(&symbol_prim);
-    defvar(symbol_name, symbol_prim, env);
+    static const struct {
+        const char *name;
+        int prim;
+    } bootstrap_primitives[] = {
+        {"%unicode-assigned?", PUNICODEASSIGNED},
+        {"%char-combining?", PCHARCOMBINING},
+        {"%unicode-punctuation?", PUNICODEPUNCTUATION},
+        {"%unicode-symbol?", PUNICODESYMBOL},
+    };
+    for (size_t i = 0;
+         i < sizeof(bootstrap_primitives) / sizeof(bootstrap_primitives[0]);
+         i++) {
+        unsigned name = atom_from_string(bootstrap_primitives[i].name);
+        gc_protect(&name);
+        unsigned prim = mk_primop(bootstrap_primitives[i].prim);
+        gc_protect(&prim);
+        defvar(name, prim, env);
+        gc_unprotect(2);
+    }
 
     // Set up automatic GC during allocation
     set_alloc_gc_root(&env);
@@ -441,11 +427,8 @@ int main(int argc, char **argv)
         set_alloc_gc_root(&env);
         reader_recover_after_panic();
         macros_reset_expansion_depth();
-        // The abandoned form never got back to eval_expr to decrement this;
-        // left raised, code objects would never be swept again.
-        eval_depth = 0;
-        // Nor did its dynamic-wind and parameterize frames run their after
-        // thunks, so put the console ports back.
+        // The abandoned form's dynamic-wind and parameterize frames never ran
+        // their after thunks, so put the console ports back.
         ctx.current_input = stdin;
         ctx.current_output = stdout;
         ctx.current_error = stderr;

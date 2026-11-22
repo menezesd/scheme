@@ -16,11 +16,6 @@ static void free_string_append_lengths(size_t *lengths, size_t *stack_lengths)
         free(lengths);
 }
 
-static bool utf8_decode_next_codepoint_string(const char *s, size_t byte_len,
-                                              size_t *offset,
-                                              uint32_t *codepoint,
-                                              const char *name);
-
 unsigned prim_string_append(unsigned argc, unsigned *argv)
 {
     // First pass: validate and compute total length, cache individual lengths
@@ -83,70 +78,56 @@ static bool utf8_decode_next_codepoint_string(const char *s, size_t byte_len,
     return true;
 }
 
-static bool utf8_count_chars_string(const char *s, size_t *chars,
-                                    const char *name)
+// The [start, end) character range of (NAME string [start [end]]) as a fresh
+// byte copy, with *start_out and *end_out set to the character indices.
+static char *string_range_copy(unsigned argc, unsigned *argv, const char *name,
+                               size_t *start_out, size_t *end_out)
 {
-    const char *error_msg = NULL;
-    if (scheme_utf8_count_chars(s, chars, &error_msg))
-        return true;
-    show_error("%s: %s", name, error_msg);
-    return false;
-}
-
-static bool utf8_byte_offset_for_index_string(const char *s,
-                                              size_t char_index,
-                                              size_t *byte_offset,
-                                              const char *name)
-{
-    const char *error_msg = NULL;
-    if (!scheme_utf8_byte_offset_for_index(s, char_index, true,
-                                           byte_offset, &error_msg)) {
-        show_error("%s: %s", name, error_msg);
-        return false;
+    char *s = require_string_ptr(argv[0], name);
+    if (!s)
+        return NULL;
+    size_t char_len;
+    const char *utf8_error = NULL;
+    if (!scheme_utf8_count_chars(s, &char_len, &utf8_error)) {
+        show_error("%s: %s", name, utf8_error);
+        return NULL;
     }
-    return true;
+    int64_t start = 0;
+    int64_t end = (int64_t)char_len;
+    if (argc > 1 && !expect_nonneg_int64(argv[1], &start, name))
+        return NULL;
+    if (argc > 2 && !expect_nonneg_int64(argv[2], &end, name))
+        return NULL;
+    if (end < start || end > (int64_t)char_len) {
+        show_error("%s: invalid indices", name);
+        return NULL;
+    }
+    size_t start_byte;
+    size_t end_byte;
+    if (!scheme_utf8_byte_offset_for_index(s, (size_t)start, true, &start_byte,
+                                           &utf8_error) ||
+        !scheme_utf8_byte_offset_for_index(s, (size_t)end, true, &end_byte,
+                                           &utf8_error)) {
+        show_error("%s: %s", name, utf8_error);
+        return NULL;
+    }
+    char *copy = checked_string_copy_len(s + start_byte, end_byte - start_byte);
+    if (!copy) {
+        show_error("%s: out of memory", name);
+        return NULL;
+    }
+    *start_out = (size_t)start;
+    *end_out = (size_t)end;
+    return copy;
 }
 
 unsigned prim_substring(unsigned argc, unsigned *argv)
 {
     REQUIRE_ARGC(argc, 1, 3, "substring");
-    char *s = require_string_ptr(argv[0], "substring");
-    if (!s)
+    size_t start, end;
+    char *result = string_range_copy(argc, argv, "substring", &start, &end);
+    if (!result)
         return TOK_ERROR;
-    size_t char_len;
-    if (!utf8_count_chars_string(s, &char_len, "substring"))
-        return TOK_ERROR;
-    int64_t start;
-    if (argc > 1) {
-        if (!expect_nonneg_int64(argv[1], &start, "substring"))
-            return TOK_ERROR;
-    } else {
-        start = 0;
-    }
-    int64_t end;
-    if (argc == 3) {
-        if (!expect_nonneg_int64(argv[2], &end, "substring"))
-            return TOK_ERROR;
-    } else {
-        end = (int64_t)char_len;
-    }
-    if (start < 0 || end < start || end > (int64_t)char_len) {
-        show_error("substring: invalid indices");
-        return TOK_ERROR;
-    }
-    size_t start_byte;
-    size_t end_byte;
-    if (!utf8_byte_offset_for_index_string(s, (size_t)start, &start_byte,
-                                           "substring") ||
-        !utf8_byte_offset_for_index_string(s, (size_t)end, &end_byte,
-                                           "substring"))
-        return TOK_ERROR;
-    size_t result_len = end_byte - start_byte;
-    char *result = checked_string_copy_len(s + start_byte, result_len);
-    if (!result) {
-        show_error("substring: out of memory");
-        return TOK_ERROR;
-    }
     return make_string_immutable_owned(result);
 }
 
@@ -154,35 +135,10 @@ unsigned prim_string_slice(unsigned argc, unsigned *argv)
 {
     GC_GUARD;
     REQUIRE_ARGC(argc, 1, 3, "string-slice");
-    char *s = require_string_ptr(argv[0], "string-slice");
-    if (!s)
+    size_t start, end;
+    char *copy = string_range_copy(argc, argv, "string-slice", &start, &end);
+    if (!copy)
         return TOK_ERROR;
-    size_t char_len;
-    if (!utf8_count_chars_string(s, &char_len, "string-slice"))
-        return TOK_ERROR;
-    int64_t start = 0;
-    int64_t end = (int64_t)char_len;
-    if (argc > 1 && !expect_nonneg_int64(argv[1], &start, "string-slice"))
-        return TOK_ERROR;
-    if (argc > 2 && !expect_nonneg_int64(argv[2], &end, "string-slice"))
-        return TOK_ERROR;
-    if (start < 0 || end < start || end > (int64_t)char_len) {
-        show_error("string-slice: invalid indices");
-        return TOK_ERROR;
-    }
-    size_t start_byte = 0;
-    size_t end_byte = 0;
-    if (!utf8_byte_offset_for_index_string(s, (size_t)start, &start_byte,
-                                           "string-slice") ||
-        !utf8_byte_offset_for_index_string(s, (size_t)end, &end_byte,
-                                           "string-slice"))
-        return TOK_ERROR;
-    char *copy = checked_string_copy_len(s + start_byte,
-                                         end_byte - start_byte);
-    if (!copy) {
-        show_error("string-slice: out of memory");
-        return TOK_ERROR;
-    }
     string_view_data *view = checked_malloc_size(sizeof(*view));
     if (!view) {
         free(copy);
@@ -191,8 +147,8 @@ unsigned prim_string_slice(unsigned argc, unsigned *argv)
     }
     view->data = copy;
     view->parent = argv[0];
-    view->start = (size_t)start;
-    view->end = (size_t)end;
+    view->start = start;
+    view->end = end;
     view->immutable = string_cell_is_immutable(argv[0]);
     // Keep ranges relative to the original string. Retaining each
     // intermediate slice creates chains that eventually exceed the view
@@ -269,20 +225,6 @@ static bool cp_buffer_append(codepoint_buffer *buf, uint32_t codepoint)
     if (!cp_buffer_reserve(buf, buf->length + 1))
         return false;
     buf->data[buf->length++] = codepoint;
-    return true;
-}
-
-static bool utf8_encode_codepoint_string(uint32_t codepoint,
-                                         codepoint_buffer *bytes)
-{
-    char encoded[4];
-    size_t encoded_len;
-    if (!scheme_utf8_encode_scalar(codepoint, encoded, &encoded_len))
-        return false;
-    for (size_t i = 0; i < encoded_len; i++) {
-        if (!cp_buffer_append(bytes, (uint8_t)encoded[i]))
-            return false;
-    }
     return true;
 }
 
@@ -452,31 +394,29 @@ static void compose_codepoints(codepoint_buffer *buf)
 static unsigned make_string_from_codepoints(const codepoint_buffer *codepoints,
                                             const char *name)
 {
-    codepoint_buffer bytes;
-    cp_buffer_init(&bytes);
+    // No overflow: the buffer already holds four bytes per code point.
+    size_t total = 1;
+    char encoded[4];
+    size_t encoded_len;
     for (size_t i = 0; i < codepoints->length; i++) {
-        if (!utf8_encode_codepoint_string(codepoints->data[i], &bytes)) {
-            cp_buffer_free(&bytes);
+        if (!scheme_utf8_encode_scalar(codepoints->data[i], encoded,
+                                       &encoded_len)) {
             show_error("%s: invalid Unicode scalar value", name);
             return TOK_ERROR;
         }
+        total += encoded_len;
     }
-    if (!cp_buffer_append(&bytes, 0)) {
-        cp_buffer_free(&bytes);
-        show_error("%s: out of memory", name);
-        return TOK_ERROR;
-    }
-
-    char *result = checked_malloc_size(bytes.length);
+    char *result = checked_malloc_size(total);
     if (!result) {
-        cp_buffer_free(&bytes);
         show_error("%s: out of memory", name);
         return TOK_ERROR;
     }
-    for (size_t i = 0; i < bytes.length; i++)
-        result[i] = (char)bytes.data[i];
-
-    cp_buffer_free(&bytes);
+    char *out = result;
+    for (size_t i = 0; i < codepoints->length; i++) {
+        scheme_utf8_encode_scalar(codepoints->data[i], out, &encoded_len);
+        out += encoded_len;
+    }
+    *out = '\0';
     return make_string_immutable_owned(result);
 }
 

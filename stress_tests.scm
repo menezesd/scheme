@@ -575,6 +575,60 @@
                 (if (= (vector-length v) 0) k (depth (vector-ref v 0) (+ k 1))))))))
 
 ;; ============================================================================
+;; String and File Port Paths
+;; ============================================================================
+
+(section "String and File Port Paths")
+
+(define (error-message thunk)
+  (call-with-current-continuation
+    (lambda (k)
+      (with-exception-handler
+        (lambda (e) (k (if (error-object? e) (error-object-message e) e)))
+        thunk))))
+
+;; display appends a string to a string port directly; everything else is
+;; rendered first.
+(test "display and write into a string port" "h\xe9;llo|x|sym|1.5|\"q\""
+      (call-with-output-string
+        (lambda (p)
+          (display "h\xe9;llo" p) (display "|" p) (display #\x p)
+          (display "|" p) (display 'sym p) (display "|" p) (display 1.5 p)
+          (display "|" p) (write "q" p))))
+(test "write-string slices into a string port" "llo\xe9;"
+      (call-with-output-string
+        (lambda (p) (write-string "hello" p 2) (write-string "\xe9;x" p 0 1))))
+(test "string port output grows" 100000
+      (string-length
+        (call-with-output-string
+          (lambda (p)
+            (do ((i 0 (+ i 1))) ((= i 10000)) (display "0123456789" p))))))
+(test "read-char-no-hang reports errors under its own name"
+      "read-char-no-hang: not a textual port"
+      (let* ((b (open-binary-input-file "stress_tests.scm"))
+             (m (error-message (lambda () (read-char-no-hang b)))))
+        (close-port b)
+        m))
+;; The bytecode VM's inline list operations and apply report errors in the
+;; same words as the primitives the interpreter calls.
+(test "length of a non-list" "length: improper list"
+      (error-message (lambda () (length 7))))
+(test "append onto an improper list" "append: improper list"
+      (error-message (lambda () (append '(1 . 2) '(3)))))
+(test "reverse of a circular list" "reverse: circular list"
+      (error-message
+        (lambda () (let ((c (list 1 2))) (set-cdr! (cdr c) c) (reverse c)))))
+(test "apply with an improper argument list" "apply: improper list"
+      (error-message (lambda () (apply + 1 '(2 . 3)))))
+(test "file ports are ready without blocking" '(#t #t #\;)
+      (let* ((f (open-input-file "stress_tests.scm"))
+             (b (open-binary-input-file "stress_tests.scm"))
+             (r (list (char-ready? f) (u8-ready? b) (read-char-no-hang f))))
+        (close-port f)
+        (close-port b)
+        r))
+
+;; ============================================================================
 ;; Summary
 ;; ============================================================================
 

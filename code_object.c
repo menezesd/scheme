@@ -144,7 +144,6 @@ static void code_set_remove(const code_object *code)
     }
 }
 
-// Register a code object with the GC registry
 // Registrations since the last sweep, how many objects survived it, and the
 // full-collection count it ran at. gc_sweep_code_objects_if_due uses them to
 // rate-limit sweeps from inside a run.
@@ -152,6 +151,7 @@ static size_t code_objects_since_sweep;
 static size_t code_objects_live_after_sweep;
 static unsigned major_collections_at_last_sweep;
 
+// Register a code object with the GC registry
 void code_register(code_object *code)
 {
     if (!code || code_object_is_registered(code))
@@ -471,6 +471,17 @@ static void mark_vm_continuation_code(vm_continuation *cont)
     }
 }
 
+// Mark the code of every closure and VM continuation in cells [start, end).
+static void mark_code_in_cells(unsigned start, unsigned end)
+{
+    for (unsigned i = start; i < end; i++) {
+        if (CELL_TYPE(i) == BT_CLOSURE)
+            mark_registered_code_object((code_object *)CELL_PTR(i));
+        else if (is_vm_continuation_object(i))
+            mark_vm_continuation_code((vm_continuation *)CELL_PTR(i));
+    }
+}
+
 // Code reachable from a running VM: its current code object and the code
 // every saved frame returns into. Neither needs a closure on the heap: a
 // top-level form or an eval'd expression is executed without one.
@@ -502,27 +513,11 @@ void gc_sweep_code_objects(void)
     }
     mark_active_vm_code();
 
-    // Walk the heap and mark code objects referenced by closures
-    // Scan old generation: [mmin, hptr)
-    for (unsigned i = ctx.mmin; i < ctx.hptr; i++) {
-        if (CELL_TYPE(i) == BT_CLOSURE) {
-            code_object *code = (code_object *)CELL_PTR(i);
-            mark_registered_code_object(code);
-        } else if (is_vm_continuation_object(i)) {
-            mark_vm_continuation_code((vm_continuation *)CELL_PTR(i));
-        }
-    }
-    // Scan nursery if generational GC is enabled: [nursery_start, nursery_ptr)
-    if (ctx.card_table) {
-        for (unsigned i = ctx.nursery_start; i < ctx.nursery_ptr; i++) {
-            if (CELL_TYPE(i) == BT_CLOSURE) {
-                code_object *code = (code_object *)CELL_PTR(i);
-                mark_registered_code_object(code);
-            } else if (is_vm_continuation_object(i)) {
-                mark_vm_continuation_code((vm_continuation *)CELL_PTR(i));
-            }
-        }
-    }
+    // Walk the heap: the old generation, then the nursery if generational
+    // GC is enabled.
+    mark_code_in_cells(ctx.mmin, ctx.hptr);
+    if (ctx.card_table)
+        mark_code_in_cells(ctx.nursery_start, ctx.nursery_ptr);
 
     // Sweep: remove unreachable code objects from registry
     size_t live = 0;

@@ -920,6 +920,69 @@ TEST(read_bytevector_rejects_incomplete_prefix)
     PASS();
 }
 
+TEST(read_bytevector_literal_shapes)
+{
+    unsigned x = read_from_string("#u8()");
+    ASSERT(CELL_TYPE(x) == BT_BYTEVEC);
+    ASSERT_EQ(((bytevec_data *)CELL_PTR(x))->len, 0);
+    ASSERT(read_from_string("#u8(1 . 2)") == TOK_ERROR);
+    ASSERT_STR_EQ(ctx.last_error, "bytevector literal: improper list");
+    ASSERT(read_from_string("#u8(1 -1)") == TOK_ERROR);
+    ASSERT_STR_EQ(ctx.last_error, "bytevector literal: byte out of range");
+    ASSERT(read_from_string("#u") == TOK_ERROR);
+    ASSERT_STR_EQ(ctx.last_error, "unexpected end of file after #u");
+    ASSERT(read_from_string("#u8") == TOK_ERROR);
+    ASSERT_STR_EQ(ctx.last_error, "unexpected end of file after #u8");
+    ASSERT(read_from_string("#u9") == TOK_ERROR);
+    ASSERT_STR_EQ(ctx.last_error, "unknown # syntax: #u9");
+    PASS();
+}
+
+// Multi-byte sequences are decoded from the reader's byte stream in three
+// places - symbol tokens (which fold case), character literals, and string
+// literals (whose escapes can assemble UTF-8 one byte at a time).
+TEST(read_utf8_sequences_in_literals)
+{
+    unsigned x = read_from_string("\xC3\x84" "BC");
+    ASSERT(CELL_TYPE(x) == BT_ATOM);
+    ASSERT_STR_EQ(ctx.atom_table[CELL_ID(x)], "\xC3\xA4" "bc");
+
+    // Truncated by EOF or a delimiter, a stray continuation byte, a
+    // surrogate, a value past U+10FFFF, and a byte that never leads.
+    const char *bad_symbols[] = {"a\xC3",         "ab\xE2\x82 cd",
+                                 ("\x80" "abc"),  "\xED\xA0\x80",
+                                 "\xF4\x90\x80\x80", "\xF5\x80\x80\x80"};
+    for (size_t i = 0; i < sizeof(bad_symbols) / sizeof(bad_symbols[0]); i++) {
+        ASSERT(read_from_string(bad_symbols[i]) == TOK_ERROR);
+        ASSERT_STR_EQ(ctx.last_error, "symbol contains invalid UTF-8");
+    }
+
+    x = read_from_string("#\\\xF0\x9F\x98\x89");
+    ASSERT(CELL_TYPE(x) == BT_CHAR);
+    ASSERT_EQ(CELL_ID(x), 0x1F609);
+    x = read_from_string("(#\\\xC3\xA9)");
+    ASSERT(IS_PAIR(x));
+    ASSERT_EQ(CELL_ID(car(x)), 0xE9);
+    ASSERT(cdr(x) == 0);
+    ASSERT(read_from_string("#\\\xC3x") == TOK_ERROR);
+    ASSERT_STR_EQ(ctx.last_error,
+                  "character literal: invalid UTF-8 continuation byte");
+    ASSERT(read_from_string("#\\\xED\xA0\x80") == TOK_ERROR);
+    ASSERT_STR_EQ(ctx.last_error, "character literal: invalid UTF-8 sequence");
+    ASSERT(read_from_string("#\\\xC1\x81") == TOK_ERROR);
+    ASSERT_STR_EQ(ctx.last_error,
+                  "character literal: invalid UTF-8 leading byte");
+
+    x = read_from_string("\"\\303\\251\\x41;\"");
+    ASSERT(IS_STRING(x));
+    ASSERT_STR_EQ(GET_STRING_PTR(x), "\xC3\xA9" "A");
+    ASSERT(read_from_string("\"\xC3\"") == TOK_ERROR);
+    ASSERT_STR_EQ(ctx.last_error, "string literal contains invalid UTF-8");
+    ASSERT(read_from_string("\"\\x0;\"") == TOK_ERROR);
+    ASSERT_STR_EQ(ctx.last_error, "invalid string character scalar value");
+    PASS();
+}
+
 TEST(read_datum_label_number)
 {
     unsigned x = read_from_string("#0=42");
@@ -1532,6 +1595,8 @@ int main(void)
     RUN_TEST(read_bytevector_rejects_unterminated_literal);
     RUN_TEST(read_unknown_dispatch_has_valid_error_text);
     RUN_TEST(read_bytevector_rejects_incomplete_prefix);
+    RUN_TEST(read_bytevector_literal_shapes);
+    RUN_TEST(read_utf8_sequences_in_literals);
     RUN_TEST(read_datum_label_number);
     RUN_TEST(read_datum_label_empty_list);
     RUN_TEST(read_datum_label_cyclic_pair);

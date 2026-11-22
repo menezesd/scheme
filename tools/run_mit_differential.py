@@ -505,12 +505,19 @@ def main():
         results[name] = lines
 
     failures = []
+    deviations = 0
     for i, probe in enumerate(PROBES):
         vm, cps, ref = results["vm"][i], results["cps"][i], results["mit"][i]
         if not equivalent(vm, cps):
             failures.append((probe, "VM and CPS interpreter disagree", vm, cps, ref))
             continue
-        if not equivalent(vm, ref) and probe not in EXPECTED_DEVIATIONS:
+        if probe in EXPECTED_DEVIATIONS:
+            if equivalent(vm, ref):
+                failures.append((probe, "listed as an expected deviation but "
+                                 "now agrees with MIT", vm, cps, ref))
+            else:
+                deviations += 1
+        elif not equivalent(vm, ref):
             failures.append((probe, "vesper and MIT disagree", vm, cps, ref))
 
     for probe, why, vm, cps, ref in failures:
@@ -519,11 +526,14 @@ def main():
         print("      vm  : %s" % vm)
         print("      cps : %s" % cps)
         print("      mit : %s" % ref)
+    # An entry that matches no probe exempts nothing and hides a typo.
+    unused = [probe for probe in EXPECTED_DEVIATIONS if probe not in PROBES]
+    for probe in unused:
+        print("FAIL: expected deviation is not a probe: %s" % probe)
 
-    deviations = len(EXPECTED_DEVIATIONS)
     print("%d probes, %d failures (%d expected deviations skipped)"
-          % (len(PROBES), len(failures), deviations))
-    return 1 if failures else 0
+          % (len(PROBES), len(failures) + len(unused), deviations))
+    return 1 if failures or unused else 0
 
 
 if __name__ == "__main__":

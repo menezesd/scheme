@@ -165,34 +165,11 @@ static void mark_dead_until_target(const unsigned *code, unsigned len,
 // Common Subexpression Elimination (CSE)
 // ============================================================================
 
-// Helper: check if a constant is a small integer and get its value
-static bool get_small_int(code_object *code, unsigned const_idx, int64_t *val)
-{
-    if (const_idx >= code->const_len)
-        return false;
-    unsigned cell = code->constants[const_idx];
-    if (IS_FIXNUM(cell)) {
-        *val = FIXNUM_VALUE(cell);
-        return true;
-    }
-    if (!IS_NUM(cell))
-        return false;
-    int64_t boxed = CELL_ID(cell);
-    if (boxed < INT32_MIN || boxed > INT32_MAX)
-        return false;
-    *val = boxed;
-    return true;
-}
-
-// Helper: check if result fits in small integer range
-static bool fits_small_int(int64_t val)
-{
-    return val >= INT32_MIN && val <= INT32_MAX;
-}
-
-// CSE pass: detect consecutive identical CONST/LOOKUP and use DUP
-// Also performs constant folding for arithmetic on small integers
-// This pass rebuilds the code array to handle instruction size changes
+// CSE pass: detect consecutive identical CONST/LOOKUP and use DUP, and fuse
+// comparisons with a following JUMPIFNOT. This pass rebuilds the code array
+// to handle instruction size changes. (Constant arithmetic needs no pass
+// here: compile_call folds calls whose arguments are all constants, and a
+// mutable binding's GUARD_PRIMITIVE separates the operands from the opcode.)
 static void cse_pass(code_object *code)
 {
     if (!code || code->code_len < 4)
@@ -258,64 +235,6 @@ static void cse_pass(code_object *code)
             new_code[write++] = OP_DUP;
             i += 8;
             continue;
-        }
-
-        // ================================================================
-        // Constant Folding: evaluate constant expressions at compile time
-        // ================================================================
-
-        // Pattern: CONST a, CONST b, <arith-op> -> CONST (a op b)
-        // where arith-op is ADD, SUB, MUL and both are small integers
-        if (op == OP_CONST && i + 4 < len && c[i + 2] == OP_CONST &&
-            !is_jump_target[i + 2] && !is_jump_target[i + 4]) {
-            unsigned arith_op = c[i + 4];
-            int64_t a, b, result;
-            bool can_fold = false;
-
-            if ((arith_op == OP_ADD || arith_op == OP_SUB || arith_op == OP_MUL) &&
-                get_small_int(code, c[i + 1], &a) &&
-                get_small_int(code, c[i + 3], &b)) {
-
-                if (arith_op == OP_ADD) {
-                    result = a + b;
-                    can_fold = fits_small_int(result);
-                } else if (arith_op == OP_SUB) {
-                    result = a - b;
-                    can_fold = fits_small_int(result);
-                } else if (arith_op == OP_MUL) {
-                    // Check for overflow before computing
-                    if (a == 0 || b == 0) {
-                        result = 0;
-                        can_fold = true;
-                    } else if (a > 0 && b > 0 && a <= INT32_MAX / b) {
-                        result = a * b;
-                        can_fold = fits_small_int(result);
-                    } else if (a < 0 && b < 0 && -a <= INT32_MAX / -b) {
-                        result = a * b;
-                        can_fold = fits_small_int(result);
-                    } else if (a > 0 && b < 0 && a <= INT32_MAX / -b) {
-                        result = a * b;
-                        can_fold = fits_small_int(result);
-                    } else if (a < 0 && b > 0 && -a <= INT32_MAX / b) {
-                        result = a * b;
-                        can_fold = fits_small_int(result);
-                    }
-                }
-
-                if (can_fold) {
-                    // Create new constant for result
-                    unsigned result_cell = store(result);
-                    unsigned result_idx = code_add_const(code, result_cell);
-                    // Emit single CONST
-                    new_code[write++] = OP_CONST;
-                    new_code[write++] = result_idx;
-                    // Skip all 5 instructions (CONST, idx, CONST, idx, op)
-                    offset_map[i + 2] = write;
-                    offset_map[i + 4] = write;
-                    i += 5;
-                    continue;
-                }
-            }
         }
 
         // Fuse: CMP + JUMPIFNOT -> CMP_JUMPIFNOT (size-changing, in CSE pass)
@@ -764,7 +683,6 @@ static const char *opcode_names[] = {
     [OP_PRIM] = "PRIM",
     [OP_PUSHCONT] = "PUSHCONT",
     [OP_CALLCC] = "CALLCC",
-    [OP_APPLY] = "APPLY",
     [OP_PUSHENV] = "PUSHENV",
     [OP_POPENV] = "POPENV",
     [OP_VALUES] = "VALUES",
@@ -808,8 +726,6 @@ static const char *opcode_names[] = {
     // Additional list accessors
     [OP_CAAR] = "CAAR",
     [OP_CDAR] = "CDAR",
-    [OP_CADDR] = "CADDR",
-    [OP_CDDDR] = "CDDDR",
     // Type predicates
     [OP_SYMBOLP] = "SYMBOLP",
     [OP_NUMBERP] = "NUMBERP",

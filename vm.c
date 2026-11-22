@@ -23,7 +23,6 @@
 #include "prim_internal.h"
 #include "primitives.h"
 #include "reader.h"
-#include "utf8.h"
 #include "writer.h"
 #include <limits.h>
 #include <stdint.h>
@@ -121,28 +120,33 @@ static bool vm_expect_vector_index(vm_state *vm, unsigned vec, unsigned idx,
     return true;
 }
 
-static bool vm_integer_is_odd(vm_state *vm, unsigned n, const char *error_msg,
-                              bool *odd_out)
+// OP_NEG, OP_POSITIVE, OP_NEGATIVE, OP_EVEN and OP_ODD, computed the way the
+// procedures they stand for are: (- n), (> n 0), (< n 0), and
+// (= (remainder n 2) 0) or its negation. TOK_ERROR, reported, on failure.
+static unsigned vm_unary_numeric(unsigned op, unsigned n)
 {
-    if (IS_FIXNUM(n)) {
-        *odd_out = (FIXNUM_VALUE(n) & 1) != 0;
-        return true;
-    }
-    if (IS_NUM(n)) {
-        *odd_out = (CELL_ID(n) & 1) != 0;
-        return true;
-    }
-    if (IS_BIGNUM(n)) {
-        bignum *bn = get_bignum(n);
-        if (!bn) {
-            VM_ERROR(vm, error_msg);
-            return false;
-        }
-        *odd_out = bn->len > 0 && (bn->limbs[0] & 1) != 0;
-        return true;
-    }
-    VM_ERROR(vm, error_msg);
-    return false;
+    GC_GUARD;
+    n = ensure_boxed(n);
+    gc_protect(&n);
+    if (op == OP_NEG)
+        return prim_minus(1, &n);
+    unsigned zero = store(0);
+    gc_protect(&zero);
+    if (op == OP_POSITIVE)
+        return binary_gt(n, zero);
+    if (op == OP_NEGATIVE)
+        return binary_lt(n, zero);
+    unsigned argv[2] = {n, store(2)};
+    gc_protect(&argv[0]);
+    gc_protect(&argv[1]);
+    unsigned remainder = apply_primitive_argv(PREMAINDER, 2, argv);
+    if (remainder == TOK_ERROR)
+        return TOK_ERROR;
+    gc_protect(&remainder);
+    unsigned even = binary_numeq(remainder, zero);
+    if (even == TOK_ERROR || op == OP_EVEN)
+        return even;
+    return even == ctx.atom_true ? ctx.atom_false : ctx.atom_true;
 }
 
 static bool instruction_boundary(const unsigned char *boundaries,
@@ -264,9 +268,17 @@ static void vm_deopt_binary_op(vm_state *vm, unsigned opcode, unsigned a,
     vm->ip--;
 }
 
-static unsigned vm_apply_with_one(unsigned n,
-                                  unsigned (*prim)(unsigned, unsigned *))
+// n + delta for delta = 1 or -1: (+ n 1) or (- n 1), the slow path of
+// OP_ADD1 and OP_SUB1. A machine integer is done here; anything else,
+// overflow included, goes through the generic primitive. TOK_ERROR,
+// reported, if n is not a number.
+static unsigned vm_add_one(unsigned n, int delta)
 {
+    if (IS_FIXNUM(n))
+        return vm_store_integer_result((int64_t)FIXNUM_VALUE(n) + delta);
+    if (IS_NUM(n) && (delta > 0 ? CELL_ID(n) < INT64_MAX
+                                : CELL_ID(n) > INT64_MIN))
+        return vm_store_integer_result(CELL_ID(n) + delta);
     GC_GUARD;
     n = ensure_boxed(n);
     gc_protect(&n);
@@ -274,33 +286,7 @@ static unsigned vm_apply_with_one(unsigned n,
     unsigned argv[2] = {n, one};
     gc_protect(&argv[0]);
     gc_protect(&argv[1]);
-    return prim(2, argv);
-}
-
-static unsigned vm_store_bignum_add_one(vm_state *vm, bignum *bn)
-{
-    bignum *one = bn_from_int(1);
-    bignum *result = one ? bn_add(bn, one) : NULL;
-    bn_free(bn);
-    bn_free(one);
-    if (!result) {
-        VM_ERROR(vm, "add1: out of memory");
-        return TOK_ERROR;
-    }
-    return store_integer(result);
-}
-
-static unsigned vm_store_bignum_sub_one(vm_state *vm, bignum *bn)
-{
-    bignum *one = bn_from_int(1);
-    bignum *result = one ? bn_sub(bn, one) : NULL;
-    bn_free(bn);
-    bn_free(one);
-    if (!result) {
-        VM_ERROR(vm, "sub1: out of memory");
-        return TOK_ERROR;
-    }
-    return store_integer(result);
+    return delta > 0 ? prim_plus(2, argv) : prim_minus(2, argv);
 }
 
 static unsigned vm_store_bignum_neg(vm_state *vm, const bignum *bn,
@@ -314,16 +300,22 @@ static unsigned vm_store_bignum_neg(vm_state *vm, const bignum *bn,
     return store_integer(result);
 }
 
-// Type check macros that break on failure (handle fixnums safely)
+// (= n 0) for an n that is not a fixnum. TOK_ERROR, reported, if n is not a
+// number.
+static unsigned vm_numeq_zero(unsigned n)
+{
+    GC_GUARD;
+    n = ensure_boxed(n);
+    gc_protect(&n);
+    unsigned zero = store(0);
+    gc_protect(&zero);
+    return binary_numeq(n, zero);
+}
+
+// Type check macro that breaks on failure (handles fixnums safely)
 #define VM_CHECK_PAIR(vm, val, msg)                                            \
     do {                                                                       \
         if (IS_FIXNUM(val) || !IS_PAIR(val))                                   \
-            VM_ERROR_BREAK(vm, msg);                                           \
-    } while (0)
-
-#define VM_CHECK_TYPE(vm, val, expected_type, msg)                             \
-    do {                                                                       \
-        if (!IS_CELL(val) || CELL_TYPE(val) != (expected_type))                \
             VM_ERROR_BREAK(vm, msg);                                           \
     } while (0)
 
@@ -422,6 +414,45 @@ static bool vm_lookup_in_frame(unsigned frame, int64_t symbol,
     return vm_try_lookup_frame(symbol, car(frame), cdr(frame), value, NULL, offset);
 }
 
+// Below this many bindings a frame is searched directly: env.c indexes only
+// frames several times larger, so its index has nothing to say about one, and
+// a walk that reaches the end of the variable list has itself shown the list
+// is not cyclic. Such frames - a call's parameters, a let's bindings - are
+// what the inline cache below probes for shadowing definitions on every
+// lookup of a variable bound further out, so skipping the index probe and
+// the separate acyclicity pass there is most of the cost of that lookup.
+#define VM_SHORT_FRAME 16
+
+// vm_lookup_in_frame, answered by a single walk when the frame is short.
+static bool vm_probe_frame(unsigned frame, int64_t symbol, unsigned *value,
+                           unsigned *offset)
+{
+    unsigned vars = car(frame);
+    unsigned n = 0;
+    for (unsigned v = vars; IS_PAIR(v); v = cdr(v)) {
+        if (++n == VM_SHORT_FRAME)
+            return vm_lookup_in_frame(frame, symbol, value, offset);
+    }
+    unsigned vals = cdr(frame);
+    for (unsigned i = 0; vars; i++) {
+        bool rest = IS_ATOM(vars);
+        if ((!rest && !IS_PAIR(vars)) || !IS_PAIR(vals))
+            return false;
+        unsigned var = rest ? vars : car(vars);
+        if (!IS_ATOM(var))
+            return false;
+        if (CELL_ID(var) == symbol) {
+            *offset = i;
+            return vm_try_deref_binding_value(car(vals), value);
+        }
+        if (rest)
+            break;
+        vars = cdr(vars);
+        vals = cdr(vals);
+    }
+    return false;
+}
+
 static inline unsigned ic_lookup(int64_t sym_id, unsigned env,
                                  unsigned *cache_slot)
 {
@@ -443,7 +474,7 @@ static inline unsigned ic_lookup(int64_t sym_id, unsigned env,
                 // A cached outer binding is valid only if no nearer frame
                 // has acquired a shadowing definition since the last call.
                 unsigned value = 0, offset = 0;
-                if (vm_lookup_in_frame(frame, sym_id, &value, &offset)) {
+                if (vm_probe_frame(frame, sym_id, &value, &offset)) {
                     cache_slot[0] = d;
                     cache_slot[1] = offset;
                     return value;
@@ -1295,16 +1326,6 @@ static void vm_handle_eval(vm_state *vm, unsigned argc, unsigned *argv)
     vm->env = eval_env;
 }
 
-static bool vm_require_proper_list(vm_state *vm, unsigned list,
-                                   const char *msg)
-{
-    if (!list_length_checked(list, NULL, "apply")) {
-        VM_ERROR(vm, msg);
-        return false;
-    }
-    return true;
-}
-
 static bool vm_push_arg(vm_state *vm, unsigned val, unsigned *argc)
 {
     if (*argc == UINT_MAX) {
@@ -1351,11 +1372,9 @@ static bool vm_handle_apply(vm_state *vm, unsigned argc, unsigned *argv,
 
     unsigned proc = argv[0];
     unsigned last_list = argv[argc - 1];
-    if (!vm_require_proper_list(vm, last_list, "apply: expected proper list"))
-        return false;
     unsigned last_count = 0;
     if (!list_length_checked(last_list, &last_count, "apply")) {
-        VM_ERROR(vm, "apply: argument count overflow");
+        VM_ERROR(vm, ctx.last_error); // as the interpreter reports it
         return false;
     }
 
@@ -1997,20 +2016,9 @@ static unsigned vm_dispatch(vm_state *vm)
             continue; // continue the dispatch loop (handler may have been set up)
         }
 
+        // OP_CONST and OP_LOOKUP never reach the switch: the fast paths
+        // above handle every instance.
         switch (op) {
-        case OP_CONST: {
-            // Fallback (shouldn't reach here normally)
-            unsigned idx = vm->code->code[vm->ip++];
-            unsigned const_val;
-            if (!vm_get_const(vm->code, idx, &const_val)) {
-                VM_ERROR(vm, "constant index out of bounds");
-                break;
-            }
-            unsigned val = vm_unbox_fixnum_if_possible(const_val);
-            vm_push(vm, val);
-            break;
-        }
-
         case OP_POP:
             vm_pop(vm);
             break;
@@ -2024,22 +2032,6 @@ static unsigned vm_dispatch(vm_state *vm)
             unsigned b = vm_pop(vm);
             vm_push(vm, a);
             vm_push(vm, b);
-            break;
-        }
-
-        case OP_LOOKUP: {
-            // Fallback (shouldn't reach here normally - fast path above)
-            int64_t sym_id = vm->code->code[vm->ip];
-            unsigned *cache_slot = &vm->code->code[vm->ip + 1];
-            vm->ip += 3;
-            unsigned val = ic_lookup(sym_id, vm->env, cache_slot);
-            if (val == TOK_ERROR) {
-                vm_show_undefined_variable(sym_id);
-                vm_signal_error(vm, ctx.last_error[0] ? ctx.last_error
-                                                      : "undefined variable");
-                break;
-            }
-            vm_push(vm, vm_unbox_fixnum_if_possible(val));
             break;
         }
 
@@ -2662,28 +2654,6 @@ static unsigned vm_dispatch(vm_state *vm)
             break;
         }
 
-        case OP_APPLY: {
-            // Stack: [proc, args-list]
-            unsigned args_list = vm_pop(vm);
-            unsigned proc = vm_pop(vm);
-            if (!vm_require_proper_list(vm, args_list,
-                                        "apply: expected proper list"))
-                break;
-
-            // Push args from list
-            unsigned argc = 0;
-            FORLIST(a, args_list)
-            {
-                if (!vm_push_arg(vm, car(a), &argc))
-                    break;
-            }
-            if (vm->error)
-                break;
-
-            vm_apply(vm, proc, argc, false);
-            break;
-        }
-
         case OP_PUSHENV: {
             // Push new empty frame onto environment
             unsigned frame = alloc_cons(0, 0);
@@ -2824,44 +2794,15 @@ static unsigned vm_dispatch(vm_state *vm)
             unsigned n = vm_pop(vm);
             if (IS_FIXNUM(n)) {
                 int32_t val = FIXNUM_VALUE(n);
-                if (val < FIXNUM_MAX) {
-                    vm_push(vm, MAKE_FIXNUM(val + 1));
-                } else {
-                    vm_push(vm, store((int64_t)val + 1));
-                }
+                vm_push(vm, val < FIXNUM_MAX ? MAKE_FIXNUM(val + 1)
+                                             : store((int64_t)val + 1));
                 break;
             }
-            if (IS_NUM(n)) {
-                int64_t val = CELL_ID(n);
-                if (val < INT64_MAX) {
-                    vm_push(vm, store(val + 1));
-                } else {
-                    // Overflow to bignum
-                    bignum *bn = bn_from_int(val);
-                    unsigned result = bn ? vm_store_bignum_add_one(vm, bn)
-                                         : TOK_ERROR;
-                    if (result == TOK_ERROR) {
-                        VM_ERROR_BREAK(vm, "add1: out of memory");
-                    }
-                    vm_push(vm, result);
-                }
-            } else if (IS_BIGNUM(n)) {
-                bignum *bn = bn_copy(get_bignum(n));
-                unsigned result = bn ? vm_store_bignum_add_one(vm, bn)
-                                     : TOK_ERROR;
-                if (result == TOK_ERROR) {
-                    VM_ERROR_BREAK(vm, get_bignum(n) ? "add1: out of memory"
-                                                     : "add1: not a number");
-                }
-                vm_push(vm, result);
-            } else {
-                unsigned result = vm_apply_with_one(n, prim_plus);
-                if (result == TOK_ERROR) {
-                    VM_ERROR_BREAK(vm, ctx.last_error[0] ? ctx.last_error
-                                                         : "add1 failed");
-                }
-                vm_push(vm, result);
-            }
+            unsigned result = vm_add_one(n, 1);
+            if (result == TOK_ERROR)
+                VM_ERROR_BREAK(vm, ctx.last_error[0] ? ctx.last_error
+                                                     : "invalid operand");
+            vm_push(vm, result);
             break;
         }
 
@@ -2869,44 +2810,15 @@ static unsigned vm_dispatch(vm_state *vm)
             unsigned n = vm_pop(vm);
             if (IS_FIXNUM(n)) {
                 int32_t val = FIXNUM_VALUE(n);
-                if (val > FIXNUM_MIN) {
-                    vm_push(vm, MAKE_FIXNUM(val - 1));
-                } else {
-                    vm_push(vm, store((int64_t)val - 1));
-                }
+                vm_push(vm, val > FIXNUM_MIN ? MAKE_FIXNUM(val - 1)
+                                             : store((int64_t)val - 1));
                 break;
             }
-            if (IS_NUM(n)) {
-                int64_t val = CELL_ID(n);
-                if (val > INT64_MIN) {
-                    vm_push(vm, store(val - 1));
-                } else {
-                    // Underflow to bignum
-                    bignum *bn = bn_from_int(val);
-                    unsigned result = bn ? vm_store_bignum_sub_one(vm, bn)
-                                         : TOK_ERROR;
-                    if (result == TOK_ERROR) {
-                        VM_ERROR_BREAK(vm, "sub1: out of memory");
-                    }
-                    vm_push(vm, result);
-                }
-            } else if (IS_BIGNUM(n)) {
-                bignum *bn = bn_copy(get_bignum(n));
-                unsigned result = bn ? vm_store_bignum_sub_one(vm, bn)
-                                     : TOK_ERROR;
-                if (result == TOK_ERROR) {
-                    VM_ERROR_BREAK(vm, get_bignum(n) ? "sub1: out of memory"
-                                                     : "sub1: not a number");
-                }
-                vm_push(vm, result);
-            } else {
-                unsigned result = vm_apply_with_one(n, prim_minus);
-                if (result == TOK_ERROR) {
-                    VM_ERROR_BREAK(vm, ctx.last_error[0] ? ctx.last_error
-                                                         : "sub1 failed");
-                }
-                vm_push(vm, result);
-            }
+            unsigned result = vm_add_one(n, -1);
+            if (result == TOK_ERROR)
+                VM_ERROR_BREAK(vm, ctx.last_error[0] ? ctx.last_error
+                                                     : "invalid operand");
+            vm_push(vm, result);
             break;
         }
 
@@ -2916,12 +2828,7 @@ static unsigned vm_dispatch(vm_state *vm)
                 vm_push(vm, FIXNUM_VALUE(n) == 0 ? ctx.atom_true : ctx.atom_false);
                 break;
             }
-            n = ensure_boxed(n);
-            gc_protect(&n);
-            unsigned zero = store(0);
-            gc_protect(&zero);
-            unsigned result = binary_numeq(n, zero);
-            gc_unprotect(2);
+            unsigned result = vm_numeq_zero(n);
             if (result == TOK_ERROR)
                 VM_ERROR_BREAK(vm, "=: invalid operands");
             vm_push(vm, result);
@@ -3258,49 +3165,21 @@ static unsigned vm_dispatch(vm_state *vm)
             break;
         }
 
-        case OP_JUMPIFZERO: {
-            unsigned target = vm->code->code[vm->ip++];
-            unsigned n = vm_pop(vm);
-            bool is_zero = false;
-            if (IS_FIXNUM(n)) {
-                is_zero = FIXNUM_VALUE(n) == 0;
-            } else {
-                n = ensure_boxed(n);
-                gc_protect(&n);
-                unsigned zero = store(0);
-                gc_protect(&zero);
-                unsigned result = binary_numeq(n, zero);
-                gc_unprotect(2);
-                if (result == TOK_ERROR)
-                    VM_ERROR_BREAK(vm, "=: invalid operands");
-                is_zero = (result == ctx.atom_true);
-            }
-            if (is_zero) {
-                vm->ip = target;
-            }
-            break;
-        }
-
+        case OP_JUMPIFZERO:
         case OP_JUMPIFNOTZERO: {
             unsigned target = vm->code->code[vm->ip++];
             unsigned n = vm_pop(vm);
-            bool is_zero = false;
+            bool is_zero;
             if (IS_FIXNUM(n)) {
                 is_zero = FIXNUM_VALUE(n) == 0;
             } else {
-                n = ensure_boxed(n);
-                gc_protect(&n);
-                unsigned zero = store(0);
-                gc_protect(&zero);
-                unsigned result = binary_numeq(n, zero);
-                gc_unprotect(2);
+                unsigned result = vm_numeq_zero(n);
                 if (result == TOK_ERROR)
                     VM_ERROR_BREAK(vm, "=: invalid operands");
-                is_zero = (result == ctx.atom_true);
+                is_zero = result == ctx.atom_true;
             }
-            if (!is_zero) {
+            if (is_zero == (op == OP_JUMPIFZERO))
                 vm->ip = target;
-            }
             break;
         }
 
@@ -3320,28 +3199,6 @@ static unsigned vm_dispatch(vm_state *vm)
             unsigned inner = car(pair);
             VM_CHECK_PAIR(vm, inner, "cdar: car not a pair");
             vm_push(vm, cdr(inner));
-            break;
-        }
-
-        case OP_CADDR: {
-            unsigned pair = vm_pop(vm);
-            VM_CHECK_PAIR(vm, pair, "caddr: not a pair");
-            unsigned d = cdr(pair);
-            VM_CHECK_PAIR(vm, d, "caddr: cdr not a pair");
-            unsigned dd = cdr(d);
-            VM_CHECK_PAIR(vm, dd, "caddr: cddr not a pair");
-            vm_push(vm, car(dd));
-            break;
-        }
-
-        case OP_CDDDR: {
-            unsigned pair = vm_pop(vm);
-            VM_CHECK_PAIR(vm, pair, "cdddr: not a pair");
-            unsigned d = cdr(pair);
-            VM_CHECK_PAIR(vm, d, "cdddr: cdr not a pair");
-            unsigned dd = cdr(d);
-            VM_CHECK_PAIR(vm, dd, "cdddr: cddr not a pair");
-            vm_push(vm, cdr(dd));
             break;
         }
 
@@ -3425,106 +3282,24 @@ static unsigned vm_dispatch(vm_state *vm)
             break;
         }
 
-        // List operations
-        case OP_LENGTH: {
-            unsigned val = vm_pop(vm);
-            if (IS_FIXNUM(val)) {
-                VM_ERROR_BREAK(vm, "length: not a proper list");
-            }
-            if (IS_STRING(val)) {
-                char *s = require_string_ptr(val, "length");
-                if (!s) {
-                    VM_ERROR_BREAK(vm, ctx.last_error);
-                }
-                size_t len;
-                const char *error_msg = NULL;
-                if (!scheme_utf8_count_chars(s, &len, &error_msg)) {
-                    if (error_msg)
-                        snprintf(ctx.last_error, sizeof(ctx.last_error),
-                                 "length: %s", error_msg);
-                    VM_ERROR_BREAK(vm, error_msg ? ctx.last_error
-                                                 : "length: invalid string");
-                }
-                vm_push(vm, store(len));
-                break;
-            }
-            if (IS_VECTOR(val)) {
-                vm_push(vm, store(vector_len(val)));
-                break;
-            }
-            unsigned len = 0;
-            if (!list_length_checked(val, &len, "length"))
-                VM_ERROR_BREAK(vm, ctx.last_error[0] ? ctx.last_error
-                                                     : "length: invalid list");
-            vm_push(vm, store(len));
-            break;
-        }
-
-        case OP_APPEND: {
-            unsigned b = vm_pop(vm);
-            unsigned a = vm_pop(vm);
-            if (a == 0) {
-                vm_push(vm, b);
-                break;
-            }
-            if (!list_length_checked(a, NULL, "append"))
-                VM_ERROR_BREAK(vm, ctx.last_error[0] ? ctx.last_error
-                                                     : "append: invalid list");
-            // Build result by copying a, then appending b
-            protect_and_box2(&a, &b);
-            unsigned result = 0;
-            unsigned tail = 0;
-            gc_protect(&result);
-            gc_protect(&tail);
-            unsigned p = a;
-            gc_protect(&p);
-            for (; p != 0; p = cdr(p)) {
-                if (IS_FIXNUM(p) || !IS_PAIR(p)) {
-                    gc_unprotect(5);
-                    VM_ERROR(vm, "append: not a proper list");
-                    break;
-                }
-                unsigned new_cell = alloc_cons(car(p), 0);
-                if (result == 0) {
-                    result = new_cell;
-                    tail = new_cell;
-                } else {
-                    cell_set_cdr(tail, new_cell);
-                    tail = new_cell;
-                }
-            }
-            if (vm->running) {
-                if (tail != 0) {
-                    cell_set_cdr(tail, b);
-                }
-                gc_unprotect(5); // p, tail, result, a, b
-                vm_push(vm, result == 0 ? b : result);
-            }
-            break;
-        }
-
+        // List operations. These do no more than the primitives, so they
+        // call them: the two engines then cannot disagree on what is
+        // accepted or on what an error says.
+        case OP_LENGTH:
+        case OP_APPEND:
         case OP_REVERSE: {
-            unsigned list = vm_pop(vm);
-            if (!list_length_checked(list, NULL, "reverse"))
+            unsigned argc = op == OP_APPEND ? 2 : 1;
+            if (!vm_box_stack_args(vm, argc))
+                break;
+            // The arguments stay on the stack, rooted, during the call.
+            unsigned result = apply_primitive_argv(
+                op == OP_LENGTH ? PLENGTH : op == OP_APPEND ? PAPPEND : PREVERSE,
+                argc, &vm->stack[vm->sp - argc]);
+            vm->sp -= argc;
+            if (result == TOK_ERROR)
                 VM_ERROR_BREAK(vm, ctx.last_error[0] ? ctx.last_error
-                                                     : "reverse: invalid list");
-            gc_protect(&list);
-            unsigned result = 0;
-            gc_protect(&result);
-            unsigned p = list;
-            gc_protect(&p);
-            for (; p != 0; p = cdr(p)) {
-                if (IS_FIXNUM(p) || !IS_PAIR(p)) {
-                    gc_unprotect(3);
-                    VM_ERROR(vm, "reverse: not a proper list");
-                    break;
-                }
-                result = alloc_cons(car(p), result);
-            }
-            if (vm->running) {
-                gc_unprotect(3);
-                vm_push(vm, result);
-            }
+                                                     : "invalid list");
+            vm_push(vm, result);
             break;
         }
 
@@ -3626,60 +3401,22 @@ static unsigned vm_dispatch(vm_state *vm)
         }
 
         // Numeric operations
-        case OP_NEG: {
+        // Never emitted by the compiler: (- n) compiles to a primitive call
+        // and positive?, negative?, even? and odd? are stdlib procedures.
+        // Hand-built bytecode gets what those definitions compute.
+        case OP_NEG:
+        case OP_POSITIVE:
+        case OP_NEGATIVE:
+        case OP_EVEN:
+        case OP_ODD: {
             unsigned n = vm_pop(vm);
-            if (IS_FIXNUM(n)) {
-                int32_t val = FIXNUM_VALUE(n);
-                if (val != FIXNUM_MIN) {
-                    vm_push(vm, MAKE_FIXNUM(-val));
-                } else {
-                    vm_push(vm, store(-(int64_t)val));
-                }
+            if (vm->error)
                 break;
-            }
-            if (IS_NUM(n)) {
-                int64_t val = CELL_ID(n);
-                if (val == INT64_MIN) {
-                    // Overflow to bignum
-                    bignum *bn = bn_from_int(val);
-                    if (!bn) {
-                        VM_ERROR_BREAK(vm, "-: out of memory");
-                    }
-                    bn_neg_ip(bn);
-                    vm_push(vm, store_integer(bn));
-                } else {
-                    vm_push(vm, store(-val));
-                }
-            } else if (IS_BIGNUM(n)) {
-                bignum *bn = get_bignum(n);
-                if (!bn) {
-                    VM_ERROR_BREAK(vm, "-: not a number");
-                }
-                unsigned result = vm_store_bignum_neg(vm, bn, "-: out of memory");
-                if (result == TOK_ERROR) {
-                    VM_ERROR_BREAK(vm, "-: out of memory");
-                }
-                vm_push(vm, result);
-            } else if (IS_INEXACT(n)) {
-                vm_push(vm, store_inexact(-to_double(n)));
-            } else if (IS_RATIONAL(n)) {
-                GC_GUARD;
-                gc_protect(&n);
-                unsigned neg_num = negate_number(car(n));
-                if (neg_num == TOK_ERROR) {
-                    VM_ERROR_BREAK(vm, "-: out of memory");
-                }
-                gc_protect(&neg_num);
-                unsigned denom = cdr(n);
-                gc_protect(&denom);
-                unsigned result = alloc();
-                CELL_TYPE(result) = BT_RATIONAL;
-                CELL_CAR(result) = neg_num;
-                CELL_CDR(result) = denom;
-                vm_push(vm, result);
-            } else {
-                VM_ERROR(vm, "-: not a number");
-            }
+            unsigned result = vm_unary_numeric(op, n);
+            if (result == TOK_ERROR)
+                VM_ERROR_BREAK(vm, ctx.last_error[0] ? ctx.last_error
+                                                     : "invalid operand");
+            vm_push(vm, result);
             break;
         }
 
@@ -3747,73 +3484,6 @@ static unsigned vm_dispatch(vm_state *vm)
             } else {
                 VM_ERROR(vm, "abs: not a number");
             }
-            break;
-        }
-
-        case OP_POSITIVE: {
-            unsigned n = vm_pop(vm);
-            if (IS_FIXNUM(n)) {
-                vm_push(vm, FIXNUM_VALUE(n) > 0 ? ctx.atom_true : ctx.atom_false);
-                break;
-            }
-            bool positive = false;
-            if (IS_NUM(n)) {
-                positive = CELL_ID(n) > 0;
-            } else if (IS_BIGNUM(n)) {
-                bignum *bn = get_bignum(n);
-                if (!bn) {
-                    VM_ERROR_BREAK(vm, "positive?: not a real number");
-                }
-                positive = !bn->sign && bn->len > 0;
-            } else if (IS_INEXACT(n)) {
-                positive = to_double(n) > 0;
-            } else if (IS_RATIONAL(n)) {
-                positive = !is_negative_number(car(n)) &&
-                           !(IS_NUM(car(n)) && CELL_ID(car(n)) == 0);
-            }
-            vm_push(vm, positive ? ctx.atom_true : ctx.atom_false);
-            break;
-        }
-
-        case OP_NEGATIVE: {
-            unsigned n = vm_pop(vm);
-            if (IS_FIXNUM(n)) {
-                vm_push(vm, FIXNUM_VALUE(n) < 0 ? ctx.atom_true : ctx.atom_false);
-                break;
-            }
-            bool negative = false;
-            if (IS_NUM(n)) {
-                negative = CELL_ID(n) < 0;
-            } else if (IS_BIGNUM(n)) {
-                bignum *bn = get_bignum(n);
-                if (!bn) {
-                    VM_ERROR_BREAK(vm, "negative?: not a real number");
-                }
-                negative = bn_sign(bn) < 0;
-            } else if (IS_INEXACT(n)) {
-                negative = to_double(n) < 0;
-            } else if (IS_RATIONAL(n)) {
-                negative = is_negative_number(car(n));
-            }
-            vm_push(vm, negative ? ctx.atom_true : ctx.atom_false);
-            break;
-        }
-
-        case OP_EVEN: {
-            unsigned n = vm_pop(vm);
-            bool odd;
-            if (!vm_integer_is_odd(vm, n, "even?: not an integer", &odd))
-                goto vm_dispatch_error;
-            vm_push(vm, odd ? ctx.atom_false : ctx.atom_true);
-            break;
-        }
-
-        case OP_ODD: {
-            unsigned n = vm_pop(vm);
-            bool odd;
-            if (!vm_integer_is_odd(vm, n, "odd?: not an integer", &odd))
-                goto vm_dispatch_error;
-            vm_push(vm, odd ? ctx.atom_true : ctx.atom_false);
             break;
         }
 
@@ -3952,46 +3622,7 @@ static unsigned vm_dispatch(vm_state *vm)
         }
 
         // Superinstructions: fused LOOKUP + arithmetic
-        case OP_LOOKUP_ADD1: {
-            int64_t sym_id = vm->code->code[vm->ip];
-            unsigned *cache_slot = &vm->code->code[vm->ip + 1];
-            vm->ip += 3;
-            unsigned n = ic_lookup(sym_id, vm->env, cache_slot);
-            if (n == TOK_ERROR) {
-                vm_show_undefined_variable(sym_id);
-                vm_signal_error(vm, ctx.last_error[0] ? ctx.last_error
-                                                      : "undefined variable");
-                break;
-            }
-            if (IS_FIXNUM(n)) {
-                int32_t val = FIXNUM_VALUE(n);
-                vm_push(vm, val < FIXNUM_MAX ? MAKE_FIXNUM(val + 1)
-                                             : store((int64_t)val + 1));
-            } else if (IS_NUM(n)) {
-                int64_t val = CELL_ID(n);
-                if (val < INT64_MAX) {
-                    int64_t r = val + 1;
-                    vm_push(vm, vm_store_integer_result(r));
-                } else {
-                    bignum *bn = bn_from_int(val);
-                    unsigned result = bn ? vm_store_bignum_add_one(vm, bn)
-                                         : TOK_ERROR;
-                    if (result == TOK_ERROR) {
-                        VM_ERROR_BREAK(vm, "add1: out of memory");
-                    }
-                    vm_push(vm, result);
-                }
-            } else {
-                unsigned result = vm_apply_with_one(n, prim_plus);
-                if (result == TOK_ERROR) {
-                    VM_ERROR_BREAK(vm, ctx.last_error[0] ? ctx.last_error
-                                                         : "add1 failed");
-                }
-                vm_push(vm, result);
-            }
-            break;
-        }
-
+        case OP_LOOKUP_ADD1:
         case OP_LOOKUP_SUB1: {
             int64_t sym_id = vm->code->code[vm->ip];
             unsigned *cache_slot = &vm->code->code[vm->ip + 1];
@@ -3999,36 +3630,14 @@ static unsigned vm_dispatch(vm_state *vm)
             unsigned n = ic_lookup(sym_id, vm->env, cache_slot);
             if (n == TOK_ERROR) {
                 vm_show_undefined_variable(sym_id);
-                vm_signal_error(vm, ctx.last_error[0] ? ctx.last_error
-                                                      : "undefined variable");
+                vm_signal_error(vm, ctx.last_error);
                 break;
             }
-            if (IS_FIXNUM(n)) {
-                int32_t val = FIXNUM_VALUE(n);
-                vm_push(vm, val > FIXNUM_MIN ? MAKE_FIXNUM(val - 1)
-                                             : store((int64_t)val - 1));
-            } else if (IS_NUM(n)) {
-                int64_t val = CELL_ID(n);
-                if (val > INT64_MIN) {
-                    int64_t r = val - 1;
-                    vm_push(vm, vm_store_integer_result(r));
-                } else {
-                    bignum *bn = bn_from_int(val);
-                    unsigned result = bn ? vm_store_bignum_sub_one(vm, bn)
-                                         : TOK_ERROR;
-                    if (result == TOK_ERROR) {
-                        VM_ERROR_BREAK(vm, "sub1: out of memory");
-                    }
-                    vm_push(vm, result);
-                }
-            } else {
-                unsigned result = vm_apply_with_one(n, prim_minus);
-                if (result == TOK_ERROR) {
-                    VM_ERROR_BREAK(vm, ctx.last_error[0] ? ctx.last_error
-                                                         : "sub1 failed");
-                }
-                vm_push(vm, result);
-            }
+            unsigned result = vm_add_one(n, op == OP_LOOKUP_ADD1 ? 1 : -1);
+            if (result == TOK_ERROR)
+                VM_ERROR_BREAK(vm, ctx.last_error[0] ? ctx.last_error
+                                                     : "invalid operand");
+            vm_push(vm, result);
             break;
         }
 

@@ -2,6 +2,19 @@
 #include "context.h"
 #include <string.h>
 
+size_t scheme_utf8_sequence_length(unsigned char lead)
+{
+    if (lead < 0x80)
+        return 1;
+    if (lead >= 0xC2 && lead <= 0xDF)
+        return 2;
+    if (lead >= 0xE0 && lead <= 0xEF)
+        return 3;
+    if (lead >= 0xF0 && lead <= 0xF4)
+        return 4;
+    return 0;
+}
+
 bool scheme_utf8_decode_next(const char *s, size_t byte_len, size_t *offset,
                              uint32_t *codepoint, const char **error_msg)
 {
@@ -22,26 +35,17 @@ bool scheme_utf8_decode_next(const char *s, size_t byte_len, size_t *offset,
         return true;
     }
 
-    size_t needed;
-    uint32_t value;
-    if (b0 >= 0xC2 && b0 <= 0xDF) {
-        needed = 2;
-        value = b0 & 0x1F;
-    } else if (b0 >= 0xE0 && b0 <= 0xEF) {
-        needed = 3;
-        value = b0 & 0x0F;
-    } else if (b0 >= 0xF0 && b0 <= 0xF4) {
-        needed = 4;
-        value = b0 & 0x07;
-    } else {
+    size_t needed = scheme_utf8_sequence_length(b0);
+    if (needed == 0) {
         *error_msg = "invalid UTF-8 leading byte";
         return false;
     }
-
     if (byte_len - *offset < needed) {
         *error_msg = "truncated UTF-8 sequence";
         return false;
     }
+    // The lead byte keeps 7 - needed payload bits.
+    uint32_t value = b0 & (0x7Fu >> needed);
     for (size_t i = 1; i < needed; i++) {
         unsigned char b = bytes[*offset + i];
         if ((b & 0xC0) != 0x80) {
@@ -51,6 +55,7 @@ bool scheme_utf8_decode_next(const char *s, size_t byte_len, size_t *offset,
         value = (value << 6) | (uint32_t)(b & 0x3F);
     }
 
+    // Overlong two-byte forms are excluded by the lead bytes 0xC0 and 0xC1.
     if ((needed == 3 && value < 0x800) ||
         (needed == 4 && value < 0x10000) ||
         !is_valid_unicode_scalar((int64_t)value)) {
@@ -63,6 +68,32 @@ bool scheme_utf8_decode_next(const char *s, size_t byte_len, size_t *offset,
     return true;
 }
 
+bool scheme_utf8_count_range(const char *s, size_t byte_len, size_t *chars,
+                             bool *ascii, const char **error_msg)
+{
+    size_t offset = 0;
+    size_t count = 0;
+    bool all_ascii = true;
+    while (offset < byte_len) {
+        unsigned char b = (unsigned char)s[offset];
+        if (b != 0 && b < 0x80) {
+            offset++;
+        } else {
+            uint32_t codepoint;
+            if (!scheme_utf8_decode_next(s, byte_len, &offset, &codepoint,
+                                         error_msg))
+                return false;
+            all_ascii = false;
+        }
+        count++;
+    }
+    if (chars)
+        *chars = count;
+    if (ascii)
+        *ascii = all_ascii;
+    return true;
+}
+
 // Strings are UTF-8 without a length header, so counting characters or
 // finding the byte offset of an index is a scan from the start. For
 // registered string buffers the result of the first count is cached in the
@@ -71,27 +102,6 @@ bool scheme_utf8_decode_next(const char *s, size_t byte_len, size_t *offset,
 // Counts that do not fit the slot are simply not cached.
 #define STRING_INFO_ASCII 0x80000000u
 #define STRING_INFO_COUNT_MASK 0x7FFFFFFFu
-
-static bool count_chars_uncached(const char *s, size_t *chars, bool *ascii,
-                                 const char **error_msg)
-{
-    size_t byte_len = strlen(s);
-    size_t offset = 0;
-    size_t count = 0;
-    bool all_ascii = true;
-    while (offset < byte_len) {
-        uint32_t codepoint;
-        if (!scheme_utf8_decode_next(s, byte_len, &offset, &codepoint,
-                                     error_msg))
-            return false;
-        if (codepoint >= 0x80)
-            all_ascii = false;
-        count++;
-    }
-    *chars = count;
-    *ascii = all_ascii;
-    return true;
-}
 
 // Character count and ASCII-ness of a registered buffer, computed at most
 // once. Returns false for unregistered pointers and invalid UTF-8, leaving
@@ -105,7 +115,8 @@ static bool cached_string_info(const char *s, size_t *chars, bool *ascii)
         size_t count;
         bool all_ascii;
         const char *ignored = NULL;
-        if (!count_chars_uncached(s, &count, &all_ascii, &ignored))
+        if (!scheme_utf8_count_range(s, strlen(s), &count, &all_ascii,
+                                     &ignored))
             return false;
         if (count >= STRING_INFO_COUNT_MASK)
             return false;
@@ -122,7 +133,7 @@ bool scheme_utf8_count_chars(const char *s, size_t *chars,
     bool ascii;
     if (cached_string_info(s, chars, &ascii))
         return true;
-    return count_chars_uncached(s, chars, &ascii, error_msg);
+    return scheme_utf8_count_range(s, strlen(s), chars, NULL, error_msg);
 }
 
 // The most recent index lookup in a non-ASCII buffer, so a left-to-right
