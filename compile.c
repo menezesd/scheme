@@ -3407,8 +3407,6 @@ static bool code_reaches_symbol(const code_object *code, int64_t sym,
             return true;
         switch (op) {
         case OP_LOOKUP:
-        case OP_LOOKUP_ADD1:
-        case OP_LOOKUP_SUB1:
         case OP_SET:
         case OP_SET_VOID:
             if ((int64_t)code->code[ip + 1] == sym)

@@ -78,7 +78,6 @@ enum opcode {
     OP_POPENV,  // Pop frame from environment (for let scope exit)
 
     // Multiple values
-    OP_VALUES,         // Wrap N values: VALUES n -> pop n vals, push multival
     OP_CALLWITHVALUES, // Reserved (unused): call-with-values uses OP_PRIM
     OP_CWV_FINISH, // call-with-values finisher: stack is [consumer, result];
                    // unpack result (multival or single) and apply consumer.
@@ -156,7 +155,6 @@ enum opcode {
     OP_LENGTH,  // List length: pop list, push (length list)
     OP_APPEND,  // Append lists: pop b, pop a, push (append a b)
     OP_REVERSE, // Reverse list: pop list, push (reverse list)
-    OP_MEMQ,    // Member by eq?: pop obj, pop list, push (memq obj list)
 
     // Vector operations
     OP_VECTORREF, // Vector ref: pop idx, pop vec, push (vector-ref vec idx)
@@ -169,18 +167,7 @@ enum opcode {
     OP_RECORDREF, // pop who, idx, rtd, rec; push (%record-ref rec rtd idx who)
 
     // Numeric operations
-    OP_NEG,     // Unary negation: pop n, push (- n)
     OP_ABS,     // Absolute value: pop n, push (abs n)
-    // Never emitted (the stdlib defines these as procedures); kept for
-    // hand-built bytecode, which gets what those definitions compute.
-    OP_POSITIVE, // Positive check: pop n, push (positive? n)
-    OP_NEGATIVE, // Negative check: pop n, push (negative? n)
-    OP_EVEN,    // Even check: pop n, push (even? n)
-    OP_ODD,     // Odd check: pop n, push (odd? n)
-
-    // Superinstructions (fused opcode sequences)
-    OP_LOOKUP_ADD1,  // Lookup + add1: LOOKUP_ADD1 sym depth offset
-    OP_LOOKUP_SUB1,  // Lookup + sub1: LOOKUP_SUB1 sym depth offset
 
     // Fused opcodes for reduced dispatch
     OP_SET_VOID,          // Set variable, discard old value: SET_VOID sym_id

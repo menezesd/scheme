@@ -388,6 +388,29 @@ static unsigned magnitude_value(unsigned x, const char *name)
         return n < 0 ? store(-(int64_t)n) : store(n);
     }
     if (IS_COMPLEX(x)) {
+        // Exact parts give an exact magnitude when it is rational, as in MIT
+        // Scheme: (magnitude 3+4i) is 5 and (magnitude 3/4+i) is 5/4.
+        // sqrt already returns an exact root for an exact perfect square and
+        // a correctly rounded inexact one otherwise.
+        if (is_exact(x)) {
+            GC_GUARD;
+            unsigned real = CELL_CAR(x), imag = CELL_CDR(x);
+            gc_protect(&real);
+            gc_protect(&imag);
+            unsigned real_sq = binary_mul(real, real);
+            if (real_sq == TOK_ERROR)
+                return TOK_ERROR;
+            gc_protect(&real_sq);
+            unsigned imag_sq = binary_mul(imag, imag);
+            if (imag_sq == TOK_ERROR)
+                return TOK_ERROR;
+            gc_protect(&imag_sq);
+            unsigned sum = binary_add(real_sq, imag_sq);
+            if (sum == TOK_ERROR)
+                return TOK_ERROR;
+            gc_protect(&sum);
+            return apply_math_primitive(PSQRT, 1, &sum);
+        }
         double real = to_double(CELL_CAR(x));
         double imag = to_double(CELL_CDR(x));
         return store_inexact(hypot(real, imag));

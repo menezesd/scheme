@@ -120,35 +120,6 @@ static bool vm_expect_vector_index(vm_state *vm, unsigned vec, unsigned idx,
     return true;
 }
 
-// OP_NEG, OP_POSITIVE, OP_NEGATIVE, OP_EVEN and OP_ODD, computed the way the
-// procedures they stand for are: (- n), (> n 0), (< n 0), and
-// (= (remainder n 2) 0) or its negation. TOK_ERROR, reported, on failure.
-static unsigned vm_unary_numeric(unsigned op, unsigned n)
-{
-    GC_GUARD;
-    n = ensure_boxed(n);
-    gc_protect(&n);
-    if (op == OP_NEG)
-        return prim_minus(1, &n);
-    unsigned zero = store(0);
-    gc_protect(&zero);
-    if (op == OP_POSITIVE)
-        return binary_gt(n, zero);
-    if (op == OP_NEGATIVE)
-        return binary_lt(n, zero);
-    unsigned argv[2] = {n, store(2)};
-    gc_protect(&argv[0]);
-    gc_protect(&argv[1]);
-    unsigned remainder = apply_primitive_argv(PREMAINDER, 2, argv);
-    if (remainder == TOK_ERROR)
-        return TOK_ERROR;
-    gc_protect(&remainder);
-    unsigned even = binary_numeq(remainder, zero);
-    if (even == TOK_ERROR || op == OP_EVEN)
-        return even;
-    return even == ctx.atom_true ? ctx.atom_false : ctx.atom_true;
-}
-
 static bool instruction_boundary(const unsigned char *boundaries,
                                  unsigned offset)
 {
@@ -2695,17 +2666,6 @@ static unsigned vm_dispatch(vm_state *vm)
             break;
         }
 
-        case OP_VALUES: {
-            unsigned n = vm->code->code[vm->ip++];
-            // Box fixnums before building value list
-            if (!vm_box_stack_args(vm, n))
-                break;
-            unsigned value = values_from_argv(n, &vm->stack[vm->sp - n]);
-            vm->sp -= n;
-            vm_push(vm, value);
-            break;
-        }
-
         // OP_CALLWITHVALUES intentionally has no handler: no compiler path
         // emits it (call-with-values goes through OP_PRIM), and a bytecode
         // producer cannot be run to completion from the middle of the
@@ -3303,37 +3263,6 @@ static unsigned vm_dispatch(vm_state *vm)
             break;
         }
 
-        case OP_MEMQ: {
-            unsigned list = vm_pop(vm);
-            unsigned obj = vm_pop(vm);
-            if (!list_length_checked(list, NULL, "memq"))
-                VM_ERROR_BREAK(vm, ctx.last_error[0] ? ctx.last_error
-                                                     : "memq: invalid list");
-            // Box obj for comparison (list elements are always boxed)
-            gc_protect(&list);
-            obj = ensure_boxed(obj);
-            gc_unprotect(1);
-            unsigned result = ctx.atom_false;
-            for (unsigned p = list; p != 0; p = cdr(p)) {
-                if (IS_FIXNUM(p) || !IS_PAIR(p)) {
-                    break;
-                }
-                unsigned elem = car(p);
-                if (elem == obj ||
-                    (IS_CELL(elem) && IS_CELL(obj) &&
-                     CELL_TYPE(elem) == CELL_TYPE(obj) &&
-                     (CELL_TYPE(elem) == BT_ATOM ||
-                      CELL_TYPE(elem) == BT_NUM ||
-                      CELL_TYPE(elem) == BT_CHAR) &&
-                     CELL_ID(elem) == CELL_ID(obj))) {
-                    result = p;
-                    break;
-                }
-            }
-            vm_push(vm, result);
-            break;
-        }
-
         // Vector operations
         case OP_VECTORREF: {
             unsigned idx = vm_pop(vm);
@@ -3401,25 +3330,6 @@ static unsigned vm_dispatch(vm_state *vm)
         }
 
         // Numeric operations
-        // Never emitted by the compiler: (- n) compiles to a primitive call
-        // and positive?, negative?, even? and odd? are stdlib procedures.
-        // Hand-built bytecode gets what those definitions compute.
-        case OP_NEG:
-        case OP_POSITIVE:
-        case OP_NEGATIVE:
-        case OP_EVEN:
-        case OP_ODD: {
-            unsigned n = vm_pop(vm);
-            if (vm->error)
-                break;
-            unsigned result = vm_unary_numeric(op, n);
-            if (result == TOK_ERROR)
-                VM_ERROR_BREAK(vm, ctx.last_error[0] ? ctx.last_error
-                                                     : "invalid operand");
-            vm_push(vm, result);
-            break;
-        }
-
         case OP_ABS: {
             unsigned n = vm_pop(vm);
             if (IS_FIXNUM(n)) {
@@ -3622,25 +3532,6 @@ static unsigned vm_dispatch(vm_state *vm)
         }
 
         // Superinstructions: fused LOOKUP + arithmetic
-        case OP_LOOKUP_ADD1:
-        case OP_LOOKUP_SUB1: {
-            int64_t sym_id = vm->code->code[vm->ip];
-            unsigned *cache_slot = &vm->code->code[vm->ip + 1];
-            vm->ip += 3;
-            unsigned n = ic_lookup(sym_id, vm->env, cache_slot);
-            if (n == TOK_ERROR) {
-                vm_show_undefined_variable(sym_id);
-                vm_signal_error(vm, ctx.last_error);
-                break;
-            }
-            unsigned result = vm_add_one(n, op == OP_LOOKUP_ADD1 ? 1 : -1);
-            if (result == TOK_ERROR)
-                VM_ERROR_BREAK(vm, ctx.last_error[0] ? ctx.last_error
-                                                     : "invalid operand");
-            vm_push(vm, result);
-            break;
-        }
-
         default:
             VM_ERROR(vm, "unknown opcode");
             break;

@@ -1936,33 +1936,6 @@ TEST(vm_run_rejects_truncated_bytecode)
     PASS();
 }
 
-TEST(vm_memq_rejects_circular_list)
-{
-    unsigned obj = atom_from_string("memq-cycle");
-    unsigned list = alloc_cons(obj, 0);
-    cell_set_cdr(list, list);
-
-    code_object *code = code_new();
-    ASSERT(code != NULL);
-    unsigned obj_idx = code_add_const(code, obj);
-    unsigned list_idx = code_add_const(code, list);
-    code_emit(code, OP_CONST);
-    code_emit(code, obj_idx);
-    code_emit(code, OP_CONST);
-    code_emit(code, list_idx);
-    code_emit(code, OP_MEMQ);
-    code_emit(code, OP_HALT);
-
-    vm_state vm;
-    vm_init(&vm);
-    unsigned result = vm_run(&vm, code, empty_environment());
-    vm_free(&vm);
-    code_free(code);
-
-    ASSERT_EQ(result, TOK_ERROR);
-    PASS();
-}
-
 TEST(vm_run_rejects_inconsistent_code_storage_metadata)
 {
     code_object *code = code_new();
@@ -2119,24 +2092,6 @@ TEST(vm_stack_underflow_does_not_mutate_environment)
     PASS();
 }
 
-TEST(vm_run_rejects_values_stack_underflow)
-{
-    code_object *code = code_new();
-    ASSERT(code != NULL);
-    code_emit(code, OP_VALUES);
-    code_emit(code, 1);
-    code_emit(code, OP_HALT);
-
-    vm_state vm;
-    vm_init(&vm);
-    unsigned result = vm_run(&vm, code, empty_environment());
-    vm_free(&vm);
-
-    ASSERT_EQ(result, TOK_ERROR);
-    code_free(code);
-    PASS();
-}
-
 TEST(vm_run_rejects_local_get_out_of_bounds)
 {
     code_object *code = code_new();
@@ -2234,8 +2189,7 @@ TEST(vm_unary_numeric_ops_reject_malformed_bignum)
     CELL_TYPE(bad) = BT_BIGNUM;
     CELL_PTR(bad) = NULL;
 
-    unsigned opcodes[] = {OP_ADD1,     OP_SUB1,    OP_NEG, OP_ABS,
-                          OP_POSITIVE, OP_NEGATIVE, OP_EVEN, OP_ODD};
+    unsigned opcodes[] = {OP_ADD1, OP_SUB1, OP_ABS};
     for (size_t i = 0; i < sizeof(opcodes) / sizeof(opcodes[0]); i++) {
         ASSERT_EQ(run_unary_opcode_on_const(opcodes[i], bad), TOK_ERROR);
     }
@@ -4163,7 +4117,6 @@ int main(void)
     RUN_TEST(peephole_optimize_does_not_thread_into_operand);
     RUN_TEST(peephole_optimize_keeps_cdr_of_cadr);
     RUN_TEST(vm_run_rejects_truncated_bytecode);
-    RUN_TEST(vm_memq_rejects_circular_list);
     RUN_TEST(vm_run_rejects_inconsistent_code_storage_metadata);
     RUN_TEST(vm_run_rejects_invalid_constant_index);
     RUN_TEST(vm_run_rejects_unknown_opcode);
@@ -4171,7 +4124,6 @@ int main(void)
     RUN_TEST(vm_run_rejects_invalid_closure_child_index);
     RUN_TEST(vm_run_rejects_primitive_stack_underflow);
     RUN_TEST(vm_stack_underflow_does_not_mutate_environment);
-    RUN_TEST(vm_run_rejects_values_stack_underflow);
     RUN_TEST(vm_run_rejects_local_get_out_of_bounds);
     RUN_TEST(vm_run_rejects_local_get_fast_out_of_bounds);
     RUN_TEST(vm_run_rejects_local_set_out_of_bounds);

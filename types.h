@@ -152,9 +152,9 @@ enum tramp_mode {
 /**
  * Fundamental cell structure - all Scheme values are represented as cells.
  *
- * Each cell is 24 bytes (packed) containing:
+ * Each cell is 12 bytes (packed) containing:
  * - type: 4-byte enum identifying the cell type
- * - Either car/cdr pair (two 4-byte cell indices) or 8-byte id value
+ * - Either a car/cdr pair (two 4-byte cell indices) or an 8-byte id value
  *
  * The car/cdr fields are cell indices into ctx.cons_cells[], not pointers.
  * The id field shares storage with car/cdr and is used for:
@@ -173,6 +173,7 @@ typedef struct __attribute__((packed)) {
         void *ptr;   // External data pointer (strings, vectors, bignums, ports)
     };
 } cons_cell;
+_Static_assert(sizeof(cons_cell) == 12, "cells are documented as 12 bytes");
 
 /**
  * Trampoline state for the CPS evaluator.
@@ -803,6 +804,11 @@ const char *reader_get_filename(void);
 // recovery point, skipping the restore and silencing every diagnostic for the
 // rest of the session. (Assigning to `stderr` is also not portable C11; it
 // need not be a modifiable lvalue.)
+//
+// The message is formatted into a local buffer before ctx.last_error is
+// replaced: callers routinely pass ctx.last_error itself as an argument (to
+// prefix or re-report the previous error), and an snprintf whose argument
+// overlaps its destination is undefined behavior.
 #define show_error(...)                                                        \
     do {                                                                       \
         if (!ctx.suppress_error_output) {                                      \
@@ -811,7 +817,11 @@ const char *reader_get_filename(void);
             fprintf(stderr, __VA_ARGS__);                                      \
             fprintf(stderr, "\n");                                             \
         }                                                                      \
-        snprintf(ctx.last_error, sizeof(ctx.last_error), __VA_ARGS__);         \
+        char show_error_message_[sizeof(ctx.last_error)];                      \
+        snprintf(show_error_message_, sizeof(show_error_message_),             \
+                 __VA_ARGS__);                                                 \
+        snprintf(ctx.last_error, sizeof(ctx.last_error), "%s",                 \
+                 show_error_message_);                                         \
     } while (0)
 
 #define show_warning(...)                                                      \

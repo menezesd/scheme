@@ -1665,7 +1665,10 @@
 (section "Complex Numbers")
 
 ; Complex arithmetic
-(test "complex magnitude" 5.0 (magnitude (make-rectangular 3 4)))
+(test "complex magnitude" 5 (magnitude (make-rectangular 3 4)))
+(test "complex magnitude is exact when rational, like MIT" '(#t 5/4 #f 5.0 1.4142135623730951)
+      (list (exact? (magnitude 3+4i)) (magnitude 3/4+1i) (exact? (magnitude 1+i))
+            (magnitude 3.0+4i) (magnitude 1+i)))
 (test "complex real-part" 3 (real-part (make-rectangular 3 4)))
 (test "complex imag-part" 4 (imag-part (make-rectangular 3 4)))
 (test "real imag-part" 0 (imag-part 5))

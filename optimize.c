@@ -65,8 +65,6 @@ unsigned instruction_size(unsigned op)
         return 8;
     case OP_RECURSE:
     case OP_LOOKUP:
-    case OP_LOOKUP_ADD1:
-    case OP_LOOKUP_SUB1:
         return 4; // opcode + sym_id + cached_depth + cached_offset
     case OP_NUMEQ_JUMPIFNOT:
     case OP_NUMEQ_INT_JUMPIFNOT:
@@ -95,7 +93,6 @@ unsigned instruction_size(unsigned op)
     case OP_JUMPIFNOTNULL:
     case OP_JUMPIFZERO:
     case OP_JUMPIFNOTZERO:
-    case OP_VALUES:
     case OP_DEFSYNTAX:
     case OP_LETREC_MARK:
         return 2; // opcode + 1 operand
@@ -489,24 +486,6 @@ void peephole_optimize(code_object *code)
         // Fuse: NUMEQ, JUMPIFNOT target -> NUMEQ_JUMPIFNOT target
         // Handled in CSE pass (not peephole) since it changes instruction sizes
 
-        // Superinstruction: LOOKUP sym d o, ADD1 -> LOOKUP_ADD1 sym d o
-        if (op == OP_LOOKUP && i + 4 < len && c[i + 4] == OP_ADD1 &&
-            !is_jump_target[i + 4]) {
-            c[i] = OP_LOOKUP_ADD1;
-            remove[i + 4] = true;
-            i += 4;
-            continue;
-        }
-
-        // Superinstruction: LOOKUP sym d o, SUB1 -> LOOKUP_SUB1 sym d o
-        if (op == OP_LOOKUP && i + 4 < len && c[i + 4] == OP_SUB1 &&
-            !is_jump_target[i + 4]) {
-            c[i] = OP_LOOKUP_SUB1;
-            remove[i + 4] = true;
-            i += 4;
-            continue;
-        }
-
         // Pattern: CAR, CDR can be fused (if we add CADR) - already have
         // OP_CADR Pattern: CDR, CDR can be fused (if we add CDDR) - already
         // have OP_CDDR
@@ -685,7 +664,6 @@ static const char *opcode_names[] = {
     [OP_CALLCC] = "CALLCC",
     [OP_PUSHENV] = "PUSHENV",
     [OP_POPENV] = "POPENV",
-    [OP_VALUES] = "VALUES",
     [OP_CALLWITHVALUES] = "CALLWITHVALUES",
     [OP_CWV_FINISH] = "CWV_FINISH",
     [OP_DEFSYNTAX] = "DEFSYNTAX",
@@ -738,7 +716,6 @@ static const char *opcode_names[] = {
     [OP_LENGTH] = "LENGTH",
     [OP_APPEND] = "APPEND",
     [OP_REVERSE] = "REVERSE",
-    [OP_MEMQ] = "MEMQ",
     // Vector operations
     [OP_VECTORREF] = "VECTORREF",
     [OP_VECTORSET] = "VECTORSET",
@@ -746,14 +723,7 @@ static const char *opcode_names[] = {
     [OP_RECORDOF] = "RECORDOF",
     [OP_RECORDREF] = "RECORDREF",
     // Numeric operations
-    [OP_NEG] = "NEG",
     [OP_ABS] = "ABS",
-    [OP_POSITIVE] = "POSITIVE",
-    [OP_NEGATIVE] = "NEGATIVE",
-    [OP_EVEN] = "EVEN",
-    [OP_ODD] = "ODD",
-    [OP_LOOKUP_ADD1] = "LOOKUP_ADD1",
-    [OP_LOOKUP_SUB1] = "LOOKUP_SUB1",
     [OP_SET_VOID] = "SET_VOID",
     [OP_NUMEQ_JUMPIFNOT] = "NUMEQ_JUMPIFNOT",
     [OP_LT_JUMPIFNOT] = "LT_JUMPIFNOT",
@@ -867,8 +837,6 @@ void disassemble(code_object *code, const char *name)
             printf(" %u", code->code[start + 1]);
             break;
         case OP_LOOKUP:
-        case OP_LOOKUP_ADD1:
-        case OP_LOOKUP_SUB1:
             printf(" %s", disassemble_atom_name(code->code[start + 1]));
             if (code->code[start + 2] != 0xFFFFFFFF)
                 printf(" [d=%u o=%u]", code->code[start + 2],
@@ -894,7 +862,6 @@ void disassemble(code_object *code, const char *name)
         case OP_CALL:
         case OP_TAILCALL:
         case OP_TAILCALL_TRMC:
-        case OP_VALUES:
         case OP_LETREC_MARK:
         case OP_RETURN_LOCALS:
         case OP_LOCAL_GET:

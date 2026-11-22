@@ -2239,13 +2239,18 @@ unsigned list_length(unsigned lst)
 
 bool list_length_checked(unsigned lst, unsigned *len_out, const char *name)
 {
+    // Count the fast pointer's steps while it checks for a cycle, so the
+    // list is walked once rather than once to validate and again to count.
     unsigned slow = lst;
     unsigned fast = lst;
+    unsigned len = 0;
     while (IS_PAIR(fast)) {
         fast = cdr(fast);
+        len++;
         if (!IS_PAIR(fast))
             break;
         fast = cdr(fast);
+        len++;
         slow = cdr(slow);
         if (slow == fast) {
             show_error("%s: circular list", name);
@@ -2255,11 +2260,6 @@ bool list_length_checked(unsigned lst, unsigned *len_out, const char *name)
     if (fast) {
         show_error("%s: improper list", name);
         return false;
-    }
-
-    unsigned len = 0;
-    for (unsigned it = lst; it; it = cdr(it)) {
-        len++;
     }
     if (len_out)
         *len_out = len;
