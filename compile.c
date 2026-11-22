@@ -6068,7 +6068,8 @@ static void compile_qq_rec(unsigned x, compile_ctx *cctx, int depth)
     }
 
     if (!IS_PAIR(x)) {
-        // Non-pair: just quote it
+        // Non-pair: just quote it. Quoted data never shows a core alias.
+        x = macros_strip_core_aliases(x);
         emit2(cctx, OP_CONST, code_add_const(cctx->code, x));
         return;
     }
@@ -6238,7 +6239,10 @@ static compile_result compile_quasiquote(unsigned expr, compile_ctx *cctx)
             emit(cctx, OP_HALT);
             return dynamic_result();
         }
+        expanded = macros_strip_core_aliases(expanded);
+        gc_protect(&expanded);
         emit2(cctx, OP_CONST, code_add_const(cctx->code, expanded));
+        gc_unprotect(1);
         return const_result(expanded);
     }
 

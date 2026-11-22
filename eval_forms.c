@@ -135,6 +135,8 @@ static unsigned build_lambda_closure(unsigned params, unsigned body,
 bool handle_lambda(unsigned id, unsigned env, unsigned cont)
 {
     GC_GUARD;
+    // Read before lambda_params_valid allocates: id is not rooted.
+    bool pre_expanded = car(id) == CELL_EXPANDED_LAMBDA;
     unsigned rest = cdr(id);
     if (!IS_PAIR(rest)) {
         show_error("lambda: expected formals and body");
@@ -156,8 +158,7 @@ bool handle_lambda(unsigned id, unsigned env, unsigned cont)
         cps_signal_current_error(env, cont);
         return true;
     }
-    unsigned p = build_lambda_closure(params, body, env,
-                                      car(id) == CELL_EXPANDED_LAMBDA);
+    unsigned p = build_lambda_closure(params, body, env, pre_expanded);
     if (p == TOK_ERROR) {
         cps_signal_current_error(env, cont);
         return true;

@@ -2496,6 +2496,29 @@ b")
 (test "letrec binder named like a macro" 1
     (guard (e (#t 'error)) ((lambda () (letrec ((when 1)) when)))))
 
+;; Quoted data and quasiquote templates never expose a core alias, however
+;; large the datum.
+(define-syntax regress-ck-qq (syntax-rules () ((_ x) `x)))
+(define-syntax regress-ck-q (syntax-rules () ((_ x) 'x)))
+(define-syntax regress-ck-pass
+  (syntax-rules () ((_ k d) (k (if d)))))
+(test "quasiquoted renamed keyword is the plain symbol" '((if 1) #t)
+    (let ((if list))
+      (let ((r (regress-ck-pass regress-ck-qq 1)))
+        (list r (eq? (car r) 'if)))))
+(test "renamed keyword in large quoted data is the plain symbol" #t
+    (let ((if list))
+      (let ((r (regress-ck-pass regress-ck-q
+                 (0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9
+                  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9))))
+        (eq? (car r) 'if))))
+;; Every body form of a template's (define (f ...) ...) is renamed.
+(define-syntax regress-ck-mdef
+  (syntax-rules ()
+    ((_ n) (define (n a) (define b (* a 2)) (set! b (+ b 1)) b))))
+(test "later body forms of a template define see core set!" 11
+    (let ((set! list)) (regress-ck-mdef g) (g 5)))
+
 ;;; ============================================================================
 ;;; Summary
 ;;; ============================================================================

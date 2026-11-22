@@ -500,6 +500,13 @@ PROGRAMS = [
 (%emit (lambda () (call-with-output-string (lambda (p) (write 'still-printing p)))))
 (%emit (lambda () (unless #f 'unless-works)))
 """,
+    # The stdlib's case keeps matching its else and => literals after a
+    # top-level definition of those names (a binding comparison, as in MIT).
+    """(define else #f)
+(%emit (lambda () (case 3 ((1) 'a) (else 'b))))
+(define => #f)
+(%emit (lambda () (case 2 ((2) => (lambda (x) (* x 3))) (else 0))))
+""",
 ]
 
 

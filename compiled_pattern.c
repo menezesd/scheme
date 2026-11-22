@@ -1109,9 +1109,17 @@ static bool literal_matches(const pat_match_state *state, unsigned input,
     if (kw_canon(id) != kw_canon(literal) ||
         !(atom_is_core_alias(id) || atom_is_core_alias(literal)))
         return false;
-    return !state->check_literal_bindings ||
-           (macros_binding_is_core(literal, state->literal_closure_env) &&
-            macros_binding_is_core(id, state->literal_use_env));
+    if (!state->check_literal_bindings)
+        return true;
+    // A frozen stdlib literal (an alias) against the plain keyword at the use
+    // site: compare bindings as for any literal, so a top-level
+    // (define else #f) still lets stdlib case match its else clause, as in
+    // MIT, while (let ((else #f)) ...) does not.
+    if (atom_is_core_alias(literal) && !atom_is_core_alias(id))
+        return macros_same_binding(id, state->literal_closure_env,
+                                   state->literal_use_env);
+    return macros_binding_is_core(literal, state->literal_closure_env) &&
+           macros_binding_is_core(id, state->literal_use_env);
 }
 
 static unsigned execute_pattern_impl(compiled_pattern *pat, unsigned input,

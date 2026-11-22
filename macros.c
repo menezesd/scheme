@@ -311,10 +311,17 @@ static int64_t unwrap_template_ellipsis_id = 0;
 
 static int expansion_depth = 0;
 
+static bool core_heads_only;
+
 void macros_reset_expansion_depth(void)
 {
+    // Also called after a lisp_panic longjmp, which skips the save/restore
+    // pairs around the state below.
     expansion_depth = 0;
     unwrap_template_ellipsis_id = 0;
+    expansion_real_env = 0;
+    expansion_real_env_set = false;
+    core_heads_only = false;
 }
 
 static unsigned expand_form_inner(unsigned expr, unsigned syn_env,
@@ -398,6 +405,9 @@ static bool collect_form_atoms(unsigned form, unsigned *atoms, unsigned *count,
 {
     if (depth > 256)
         return false;
+    // The recursive calls allocate, so the spine being walked must be rooted.
+    GC_GUARD;
+    gc_protect(&form);
     for (; IS_PAIR(form); form = cdr(form)) {
         if (!collect_form_atoms(car(form), atoms, count, depth + 1))
             return false;
@@ -406,8 +416,6 @@ static bool collect_form_atoms(unsigned form, unsigned *atoms, unsigned *count,
         return true; // (), a vector or other datum: no define target in it
     if (++*count > MAX_DEFINITION_SCAN_ATOMS)
         return false;
-    GC_GUARD;
-    gc_protect(&form);
     *atoms = alloc_cons(form, *atoms);
     return true;
 }
@@ -474,6 +482,9 @@ static int bind_internal_definitions_at(unsigned env, unsigned body,
             if (expansions >= MAX_DEFINITION_SCAN_EXPANSIONS ||
                 *saw_define_syntax)
                 return 0;
+            // Both are read again after the scans below allocate.
+            gc_protect(&form);
+            gc_protect(&head_binding);
             unsigned atoms = user_atoms;
             gc_protect(&atoms);
             if (!atoms) {
@@ -493,7 +504,7 @@ static int bind_internal_definitions_at(unsigned env, unsigned body,
             int status = bind_internal_definitions_at(
                 env, as_body, frame, expansions + 1, atoms,
                 cdr(head_binding), saw_define_syntax);
-            gc_unprotect(3);
+            gc_unprotect(5);
             if (status != 1)
                 return status;
             continue;
@@ -696,6 +707,7 @@ static unsigned expand_core_let(unsigned expr, int form, unsigned syn_env,
     }
 
     unsigned body_env = form == CF_LETSTAR ? init_env : all_env;
+    gc_protect(&body_env); // read again after alloc_cons below
     if (name) {
         unsigned one = alloc_cons(name, 0);
         gc_protect(&one);
@@ -2054,12 +2066,15 @@ static unsigned collect_free_ids(unsigned tmpl, unsigned bindings,
                                                  ellipsis_id, closure_env);
                     gc_protect(&collected);
                 }
-                unsigned expr = cddr(tmpl);
-                if (IS_PAIR(expr)) {
-                    return collect_free_ids(car(expr), bindings, collected,
-                                            ellipsis_id, closure_env);
-                }
-                return collected;
+                // Every body form, not just the first: (define (f a) e1 e2)
+                // is a procedure whose later forms need the same renaming,
+                // with its formals bound as in the lambda case above.
+                unsigned body_bindings =
+                    IS_PAIR(target) ? add_lambda_bounds(bindings, cdr(target))
+                                    : bindings;
+                gc_protect(&body_bindings);
+                return collect_free_ids(cddr(tmpl), body_bindings, collected,
+                                        ellipsis_id, closure_env);
             }
         }
         if (template_case_form(tmpl)) {
@@ -4862,7 +4877,9 @@ unsigned macros_freeze_core_keywords(unsigned transformer_form,
 // Core aliases in quoted data
 // ============================================================================
 
-#define CORE_ALIAS_SCAN_LIMIT 4096
+// The scan only bounds work on circular data (datum labels); it walks list
+// spines iteratively, so the limit is not a C stack bound.
+#define CORE_ALIAS_SCAN_LIMIT (1u << 20)
 
 // 1 if datum holds a core alias, 0 if not, -1 if it is too large (or
 // circular) to tell within *budget nodes. Allocates nothing.
@@ -4910,13 +4927,21 @@ static unsigned datum_without_core_aliases(unsigned datum)
     GC_GUARD;
     gc_protect(&datum);
     if (IS_PAIR(datum)) {
-        unsigned a = datum_without_core_aliases(car(datum));
-        gc_protect(&a);
-        unsigned d = datum_without_core_aliases(cdr(datum));
-        if (a == car(datum) && d == cdr(datum))
-            return datum;
-        gc_protect(&d);
-        return alloc_cons(a, d);
+        // Rebuild the spine iteratively: a quoted list can be far longer
+        // than the C stack is deep. Only data known to hold an alias gets
+        // here, so copying its spine is cheap and harmless.
+        unsigned head = 0, tail = 0, it = datum, elem = 0;
+        gc_protect(&head);
+        gc_protect(&tail);
+        gc_protect(&it);
+        gc_protect(&elem);
+        for (; IS_PAIR(it); it = cdr(it)) {
+            elem = datum_without_core_aliases(car(it));
+            list_append(&head, &tail, elem);
+        }
+        elem = datum_without_core_aliases(it);
+        cell_set_cdr(tail, elem);
+        return head;
     }
     if (IS_VECTOR(datum)) {
         unsigned as_list = vector_to_list_copy(datum);
