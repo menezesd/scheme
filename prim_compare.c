@@ -4,6 +4,7 @@
  */
 
 #include "prim_internal.h"
+#include <float.h>
 
 static bool is_exact_real_number(unsigned x)
 {
@@ -12,6 +13,15 @@ static bool is_exact_real_number(unsigned x)
 
 static bool compare_exact_reals(unsigned a, unsigned b, int *cmp_out)
 {
+    // Only rationals need cross-multiplying; integers compare directly
+    // without allocating any products.
+    if (IS_EXACT_INT(a) && IS_EXACT_INT(b)) {
+        if (compare_exact_integers(a, b, cmp_out))
+            return true;
+        show_error("comparison: invalid exact integer");
+        return false;
+    }
+
     GC_GUARD;
     gc_protect(&a);
     gc_protect(&b);
@@ -118,6 +128,17 @@ static bool compare_number_pair(unsigned prev, unsigned curr, cmp_op op,
             // An infinity is beyond every exact (finite) value
             int cmp = prev_exact ? (d > 0 ? -1 : 1) : (d > 0 ? 1 : -1);
             *ok_out = APPLY_CMP_OP(op, cmp, 0);
+            return true;
+        }
+        // An integer of at most 53 bits converts to double exactly, so the
+        // double comparison is already the mathematical one.
+        int64_t small;
+        if (exact_int64_value(prev_exact ? prev : curr, &small) &&
+            small >= -(INT64_C(1) << DBL_MANT_DIG) &&
+            small <= (INT64_C(1) << DBL_MANT_DIG)) {
+            double e = (double)small;
+            *ok_out = prev_exact ? APPLY_CMP_OP(op, e, d)
+                                 : APPLY_CMP_OP(op, d, e);
             return true;
         }
         GC_GUARD;

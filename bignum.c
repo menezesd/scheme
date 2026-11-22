@@ -102,6 +102,19 @@ static void bn_normalize(bignum *b)
     }
 }
 
+// The largest power of base that fits in a limb, and its exponent: the most
+// digits one single-limb multiplication or division can handle at once.
+static limb_t bn_digit_chunk(int base, int *digits)
+{
+    limb_t chunk = (limb_t)base;
+    *digits = 1;
+    while (chunk <= LIMB_MAX / (limb_t)base) {
+        chunk *= (limb_t)base;
+        (*digits)++;
+    }
+    return chunk;
+}
+
 // ============================================================================
 // Creation and Destruction
 // ============================================================================
@@ -175,35 +188,40 @@ bignum *bn_from_string(const char *str, int base)
         str++;
     }
 
-    // Use in-place operations to avoid allocations per digit
-    // Since base <= 36 fits in a single limb, we can use bn_mul_limb_ip
-    // and bn_add_limb_ip for efficient parsing
+    // Gather digits a limb's worth at a time and fold each chunk into the
+    // result with one in-place multiply-add, rather than one pass over the
+    // result per digit.
+    int chunk_digits;
+    bn_digit_chunk(base, &chunk_digits);
     bool saw_digit = false;
     while (*str) {
-        int digit;
-        if (isdigit((unsigned char)*str)) {
-            digit = *str - '0';
-        } else if (isalpha((unsigned char)*str)) {
-            digit = tolower((unsigned char)*str) - 'a' + 10;
-        } else {
-            bn_free(result);
-            return NULL;
+        limb_t chunk = 0, scale = 1;
+        for (int i = 0; i < chunk_digits && *str; i++, str++) {
+            int digit;
+            if (isdigit((unsigned char)*str)) {
+                digit = *str - '0';
+            } else if (isalpha((unsigned char)*str)) {
+                digit = tolower((unsigned char)*str) - 'a' + 10;
+            } else {
+                bn_free(result);
+                return NULL;
+            }
+
+            if (digit >= base) {
+                bn_free(result);
+                return NULL;
+            }
+            chunk = chunk * (limb_t)base + (limb_t)digit;
+            scale *= (limb_t)base;
         }
 
-        if (digit >= base) {
-            bn_free(result);
-            return NULL;
-        }
-
-        // result = result * base + digit
-        if (!bn_mul_limb_ip_checked(result, (limb_t)base) ||
-            !bn_add_limb_ip_checked(result, (limb_t)digit)) {
+        // result = result * base^(digits in chunk) + chunk
+        if (!bn_mul_limb_ip_checked(result, scale) ||
+            !bn_add_limb_ip_checked(result, chunk)) {
             bn_free(result);
             return NULL;
         }
         saw_digit = true;
-
-        str++;
     }
     if (!saw_digit) {
         bn_free(result);
@@ -213,6 +231,19 @@ bignum *bn_from_string(const char *str, int base)
     result->sign = sign;
     bn_normalize(result);
     return result;
+}
+
+bignum *bn_from_limbs(const limb_t *limbs, size_t len, int sign)
+{
+    bignum *b = bn_alloc(len > 0 ? len : 1);
+    if (!b)
+        return NULL;
+    if (len > 0)
+        memcpy(b->limbs, limbs, len * sizeof(limb_t));
+    b->len = len;
+    b->sign = sign != 0;
+    bn_normalize(b);
+    return b;
 }
 
 bignum *bn_copy(const bignum *a)
@@ -298,7 +329,9 @@ int bn_to_uint64(const bignum *a, uint64_t *out)
     return 0;
 }
 
-// Simple digit-by-digit conversion for small numbers
+static limb_t bn_div_limb(bignum *a, limb_t d);
+
+// Digit-by-digit conversion for small numbers
 static char *bn_to_string_simple(const bignum *a, int base)
 {
     // Check for potential overflow in size calculation
@@ -318,42 +351,24 @@ static char *bn_to_string_simple(const bignum *a, int base)
         free(buf);
         return NULL;
     }
-    tmp->sign = 0; // Work with absolute value
 
+    // Divide in place by the largest power of base that fits in a limb, so
+    // each pass over the number yields a whole chunk of digits.
+    int chunk_digits;
+    limb_t chunk = bn_digit_chunk(base, &chunk_digits);
     size_t pos = 0;
-    bignum *base_bn = bn_from_int(base);
-    if (!base_bn) {
-        bn_free(tmp);
-        free(buf);
-        return NULL;
-    }
-
     while (!bn_is_zero(tmp)) {
-        bignum *rem = NULL;
-        bignum *quot = bn_div(tmp, base_bn, &rem);
-        if (!quot || !rem) {
-            bn_free(quot);
-            bn_free(rem);
-            bn_free(tmp);
-            bn_free(base_bn);
-            free(buf);
-            return NULL;
+        limb_t rem = bn_div_limb(tmp, chunk);
+        // Every chunk but the most significant is zero padded to full width
+        for (int i = 0; i < chunk_digits && (rem != 0 || !bn_is_zero(tmp));
+             i++) {
+            int digit = (int)(rem % (limb_t)base);
+            rem /= (limb_t)base;
+            buf[pos++] = (char)(digit < 10 ? '0' + digit : 'a' + (digit - 10));
         }
-
-        int digit = rem->len > 0 ? (int)rem->limbs[0] : 0;
-        if (digit < 10) {
-            buf[pos++] = '0' + digit;
-        } else {
-            buf[pos++] = 'a' + (digit - 10);
-        }
-
-        bn_free(rem);
-        bn_free(tmp);
-        tmp = quot;
     }
 
     bn_free(tmp);
-    bn_free(base_bn);
 
     // Add sign
     if (a->sign) {
@@ -650,13 +665,11 @@ bignum *bn_add(const bignum *a, const bignum *b)
 
 bignum *bn_sub(const bignum *a, const bignum *b)
 {
-    // a - b = a + (-b)
-    bignum *neg_b = bn_copy(b);
-    if (!neg_b)
-        return NULL;
-    neg_b->sign = !neg_b->sign;
-    bignum *result = bn_add(a, neg_b);
-    bn_free(neg_b);
+    // a - b = a + (-b). bn_add only reads its operands, so a negated view
+    // of b sharing its limbs does instead of a copy.
+    bignum neg_b = *b;
+    neg_b.sign = !b->sign;
+    bignum *result = bn_add(a, &neg_b);
     if (!result)
         return NULL;
     bn_normalize(result);
@@ -717,57 +730,77 @@ static bignum *bn_mul_schoolbook(const bignum *a, const bignum *b)
     return result;
 }
 
-// Split bignum at position k: low = a mod B^k, high = a / B^k
-static bool bn_split(const bignum *a, size_t k, bignum **low, bignum **high)
+// Limbs [start, start + len) of |a| as a non-negative bignum, trimmed of
+// leading zero limbs. The view shares a's storage: it must only be read,
+// never freed or grown.
+static bignum bn_limb_view(const bignum *a, size_t start, size_t len)
 {
-    *low = bn_alloc(k > a->len ? a->len : k);
-    *high = bn_alloc(a->len > k ? a->len - k : 1);
-    if (!*low || !*high) {
-        bn_free(*low);
-        bn_free(*high);
-        *low = NULL;
-        *high = NULL;
-        return false;
-    }
-
-    size_t low_len = k < a->len ? k : a->len;
-    memcpy((*low)->limbs, a->limbs, low_len * sizeof(limb_t));
-    (*low)->len = low_len;
-    bn_normalize(*low);
-
-    if (a->len > k) {
-        memcpy((*high)->limbs, a->limbs + k, (a->len - k) * sizeof(limb_t));
-        (*high)->len = a->len - k;
-        bn_normalize(*high);
-    }
-    return true;
+    bignum view = {.limbs = a->limbs + start, .len = len, .cap = len};
+    bn_normalize(&view);
+    return view;
 }
 
-// Shift left by k limbs (multiply by B^k)
-static bignum *bn_lshift_limbs(const bignum *a, size_t k)
+// dst[offset...] += |src|. The caller guarantees the sum fits in dst_len limbs.
+static void bn_add_at(limb_t *dst, size_t dst_len, const bignum *src,
+                      size_t offset)
 {
-    if (a->len == 0)
-        return bn_new();
+    dlimb_t carry = 0;
+    size_t i = offset;
+    for (size_t j = 0; j < src->len; j++, i++) {
+        dlimb_t sum = (dlimb_t)dst[i] + src->limbs[j] + carry;
+        dst[i] = (limb_t)sum;
+        carry = sum >> LIMB_BITS;
+    }
+    for (; carry && i < dst_len; i++) {
+        dlimb_t sum = (dlimb_t)dst[i] + carry;
+        dst[i] = (limb_t)sum;
+        carry = sum >> LIMB_BITS;
+    }
+}
 
-    if (k > SIZE_MAX - a->len)
-        return NULL;
-    bignum *result = bn_alloc(a->len + k);
+static bignum *bn_mul_karatsuba(const bignum *a, const bignum *b);
+
+// |a| * |b| for a at least twice as long as b: multiply b by successive
+// b-sized slices of a. Splitting both operands at half of a's length would
+// recurse on b's all-zero high half instead, which made such products
+// several times slower than schoolbook multiplication.
+static bignum *bn_mul_unbalanced(const bignum *a, const bignum *b)
+{
+    bignum *result = bn_alloc(a->len + b->len);
     if (!result)
         return NULL;
-
-    memset(result->limbs, 0, k * sizeof(limb_t));
-    memcpy(result->limbs + k, a->limbs, a->len * sizeof(limb_t));
-    result->len = a->len + k;
+    result->len = a->len + b->len;
+    for (size_t offset = 0; offset < a->len; offset += b->len) {
+        size_t remaining = a->len - offset;
+        bignum slice =
+            bn_limb_view(a, offset, remaining < b->len ? remaining : b->len);
+        bignum *part = bn_mul_karatsuba(&slice, b);
+        if (!part) {
+            bn_free(result);
+            return NULL;
+        }
+        bn_add_at(result->limbs, result->len, part, offset);
+        bn_free(part);
+    }
+    bn_normalize(result);
     return result;
 }
 
-// Karatsuba multiplication O(n^1.585)
+// Karatsuba multiplication O(n^1.585) of |a| and |b|
 static bignum *bn_mul_karatsuba(const bignum *a, const bignum *b)
 {
-    // Base case: use schoolbook for small numbers
-    if (a->len < KARATSUBA_THRESHOLD || b->len < KARATSUBA_THRESHOLD) {
-        return bn_mul_schoolbook(a, b);
+    if (a->len < b->len) {
+        const bignum *shorter = a;
+        a = b;
+        b = shorter;
     }
+    // Base case: use schoolbook when the shorter operand is small
+    if (b->len < KARATSUBA_THRESHOLD)
+        return bn_mul_schoolbook(a, b);
+    if (a->len > SIZE_MAX - b->len)
+        return NULL;
+    if (a->len >= 2 * b->len)
+        return bn_mul_unbalanced(a, b);
 
     /*
      * The Toom-3 interpolation path is not used here: it has historically
@@ -776,62 +809,39 @@ static bignum *bn_mul_karatsuba(const bignum *a, const bignum *b)
      * preserves exact arithmetic for every operand shape.
      */
 
-    // Split at half of the larger length
-    size_t k = (a->len > b->len ? a->len : b->len) / 2;
+    // Split both operands at half of the longer length. The halves are
+    // views into the operands, so splitting copies nothing.
+    size_t k = a->len / 2;
+    bignum a0 = bn_limb_view(a, 0, k);
+    bignum a1 = bn_limb_view(a, k, a->len - k);
+    bignum b0 = bn_limb_view(b, 0, k);
+    bignum b1 = bn_limb_view(b, k, b->len - k);
 
-    bignum *a0 = NULL, *a1 = NULL, *b0 = NULL, *b1 = NULL;
-    if (!bn_split(a, k, &a0, &a1) || !bn_split(b, k, &b0, &b1)) {
-        bn_free(a0);
-        bn_free(a1);
-        bn_free(b0);
-        bn_free(b1);
-        return NULL;
+    // z0 = a0 * b0, z2 = a1 * b1, z1 = (a0 + a1) * (b0 + b1) - z0 - z2
+    bignum *z0 = bn_mul_karatsuba(&a0, &b0);
+    bignum *z2 = z0 ? bn_mul_karatsuba(&a1, &b1) : NULL;
+    bignum *a_sum = z2 ? bn_add(&a0, &a1) : NULL;
+    bignum *b_sum = a_sum ? bn_add(&b0, &b1) : NULL;
+    bignum *z1 = b_sum ? bn_mul_karatsuba(a_sum, b_sum) : NULL;
+    bn_free(a_sum);
+    bn_free(b_sum);
+    // z1 >= z0 + z2, so both subtractions happen in place
+    bignum *result = z1 && bn_sub_ip_checked(z1, z0) &&
+                             bn_sub_ip_checked(z1, z2)
+                         ? bn_alloc(a->len + b->len)
+                         : NULL;
+    if (result) {
+        // result = z0 + z1 * B^k + z2 * B^(2k). z0 has at most 2k limbs, so
+        // z0 and z2 can be copied side by side before z1 is added across.
+        result->len = a->len + b->len;
+        memcpy(result->limbs, z0->limbs, z0->len * sizeof(limb_t));
+        memcpy(result->limbs + 2 * k, z2->limbs, z2->len * sizeof(limb_t));
+        bn_add_at(result->limbs, result->len, z1, k);
+        bn_normalize(result);
     }
-
-    // z0 = a0 * b0
-    bignum *z0 = bn_mul_karatsuba(a0, b0);
-
-    // z2 = a1 * b1
-    bignum *z2 = bn_mul_karatsuba(a1, b1);
-
-    // z1 = (a0 + a1) * (b0 + b1) - z0 - z2
-    bignum *a0_plus_a1 = bn_add(a0, a1);
-    bignum *b0_plus_b1 = bn_add(b0, b1);
-    bignum *z1_temp = (a0_plus_a1 && b0_plus_b1)
-                          ? bn_mul_karatsuba(a0_plus_a1, b0_plus_b1)
-                          : NULL;
-    bignum *z1_temp2 = (z1_temp && z0) ? bn_sub(z1_temp, z0) : NULL;
-    bignum *z1 = (z1_temp2 && z2) ? bn_sub(z1_temp2, z2) : NULL;
-
-    bn_free(a0);
-    bn_free(a1);
-    bn_free(b0);
-    bn_free(b1);
-    bn_free(a0_plus_a1);
-    bn_free(b0_plus_b1);
-    bn_free(z1_temp);
-    bn_free(z1_temp2);
-    if (!z0 || !z2 || !z1) {
-        bn_free(z0);
-        bn_free(z1);
-        bn_free(z2);
-        return NULL;
-    }
-
-    // result = z0 + z1 * B^k + z2 * B^(2k)
-    bignum *z1_shifted = bn_lshift_limbs(z1, k);
-    bignum *z2_shifted = bn_lshift_limbs(z2, 2 * k);
-
-    bignum *temp = (z1_shifted && z2_shifted) ? bn_add(z0, z1_shifted) : NULL;
-    bignum *result = temp ? bn_add(temp, z2_shifted) : NULL;
-
     bn_free(z0);
     bn_free(z1);
     bn_free(z2);
-    bn_free(z1_shifted);
-    bn_free(z2_shifted);
-    bn_free(temp);
-
     return result;
 }
 
@@ -873,7 +883,7 @@ static int clz_limb(limb_t x)
 #endif
 }
 
-static size_t bn_bit_length(const bignum *a)
+size_t bn_bit_length(const bignum *a)
 {
     if (bn_is_zero(a))
         return 0;
@@ -996,81 +1006,50 @@ bignum *bn_div(const bignum *a, const bignum *b, bignum **remainder)
 
     int result_sign = (a->sign != b->sign);
 
-    // Work with absolute values
-    bignum *dividend = bn_abs(a);
-    bignum *divisor = bn_abs(b);
-    if (!dividend || !divisor) {
-        bn_free(dividend);
-        bn_free(divisor);
-        return NULL;
-    }
-
-    int cmp = bn_cmp_abs(dividend, divisor);
-    if (cmp < 0) {
+    // The magnitudes are read directly: every path below either copies the
+    // operand limbs it modifies or sets the signs of its results explicitly.
+    if (bn_cmp_abs(a, b) < 0) {
         // |a| < |b|, quotient is 0
         if (remainder) {
             *remainder = bn_copy(a);
-            if (!*remainder) {
-                bn_free(dividend);
-                bn_free(divisor);
+            if (!*remainder)
                 return NULL;
-            }
         }
-        bignum *zero = bn_new();
-        bn_free(dividend);
-        bn_free(divisor);
-        return zero;
+        return bn_new();
     }
 
-    if (divisor->len == 1) {
+    if (b->len == 1) {
         // Single-limb divisor - use fast path
-        bignum *quot = bn_copy(dividend);
-        if (!quot) {
-            bn_free(dividend);
-            bn_free(divisor);
+        bignum *quot = bn_copy(a);
+        if (!quot)
             return NULL;
-        }
-        limb_t rem = bn_div_limb(quot, divisor->limbs[0]);
+        limb_t rem = bn_div_limb(quot, b->limbs[0]);
         quot->sign = result_sign && !bn_is_zero(quot);
         if (remainder) {
             *remainder = bn_from_int(rem);
             if (!*remainder) {
                 bn_free(quot);
-                bn_free(dividend);
-                bn_free(divisor);
                 return NULL;
             }
             (*remainder)->sign = a->sign && rem != 0;
         }
-        bn_free(dividend);
-        bn_free(divisor);
         return quot;
     }
 
     // Knuth's Algorithm D
-    size_t n = divisor->len;
-    size_t m = dividend->len - n;
+    size_t n = b->len;
+    size_t m = a->len - n;
 
     // D1: Normalize - shift so divisor's top bit is set
-    int shift = clz_limb(divisor->limbs[n - 1]);
+    int shift = clz_limb(b->limbs[n - 1]);
 
     // Shift both dividend and divisor left by 'shift' bits
-    bignum *u = bn_lshift(dividend, shift);
-    bignum *v = bn_lshift(divisor, shift);
-    if (!u || !v || dividend->len == SIZE_MAX) {
-        bn_free(u);
-        bn_free(v);
-        bn_free(dividend);
-        bn_free(divisor);
-        return NULL;
-    }
-
+    bignum *u = bn_lshift(a, shift);
+    bignum *v = bn_lshift(b, shift);
     // Ensure u has m+n+1 limbs (may need extra limb from shift)
-    if (!bn_ensure_cap(u, m + n + 1)) {
+    if (!u || !v || a->len == SIZE_MAX || !bn_ensure_cap(u, m + n + 1)) {
         bn_free(u);
         bn_free(v);
-        bn_free(dividend);
-        bn_free(divisor);
         return NULL;
     }
     while (u->len < m + n + 1) {
@@ -1082,8 +1061,6 @@ bignum *bn_div(const bignum *a, const bignum *b, bignum **remainder)
     if (!q) {
         bn_free(u);
         bn_free(v);
-        bn_free(dividend);
-        bn_free(divisor);
         return NULL;
     }
     q->len = m + 1;
@@ -1152,8 +1129,6 @@ bignum *bn_div(const bignum *a, const bignum *b, bignum **remainder)
             bn_free(q);
             bn_free(u);
             bn_free(v);
-            bn_free(dividend);
-            bn_free(divisor);
             return NULL;
         }
         rem->sign = a->sign && !bn_is_zero(rem);
@@ -1162,8 +1137,6 @@ bignum *bn_div(const bignum *a, const bignum *b, bignum **remainder)
 
     bn_free(u);
     bn_free(v);
-    bn_free(dividend);
-    bn_free(divisor);
 
     return q;
 }

@@ -721,6 +721,75 @@
   gen-int)
 
 ;; ============================================================================
+;; Bignums and rationals
+;; ============================================================================
+
+;; Up to 20000 bits, either sign. Independent sizes give both balanced and
+;; very unbalanced products, on both sides of the Karatsuba threshold.
+(define (gen-big)
+  (let ((n (random-integer (expt 2 (+ 1 (random-integer 20000))))))
+    (if (= (random-integer 2) 0) n (- n))))
+
+(define (gen-big-triple)
+  (list (gen-big) (gen-big) (gen-big)))
+
+(define (gen-wide-rational)
+  (/ (+ 1 (random-integer (expt 2 (random-integer 300))))
+     (+ 1 (random-integer (expt 2 (random-integer 300))))))
+
+(check "bignum multiplication distributes over addition"
+  (lambda (t)
+    (let ((a (car t)) (b (cadr t)) (c (caddr t)))
+      (= (* a (+ b c)) (+ (* a b) (* a c)))))
+  gen-big-triple)
+
+(check "bignum product divides back exactly"
+  (lambda (t)
+    (let ((a (car t)) (b (cadr t)))
+      (or (zero? b) (= (quotient (* a b) b) a))))
+  gen-big-triple)
+
+(check "bignum number->string round trips in bases 2, 10 and 16"
+  (lambda (n)
+    (and (= (string->number (number->string n 2) 2) n)
+         (= (string->number (number->string n 10) 10) n)
+         (= (string->number (number->string n 16) 16) n)))
+  gen-big)
+
+;; Integers on both sides of 2^53, where doubles stop representing every
+;; integer, against nearby doubles: comparing with the double must agree
+;; with comparing with its exact value.
+(define (gen-int-near-double)
+  (let* ((n (- (random-integer (expt 2 55)) (expt 2 54)))
+         (d (exact->inexact (+ n (- (random-integer 9) 4)))))
+    (cons n d)))
+
+(check "mixed exact/inexact comparison is exact"
+  (lambda (p)
+    (let* ((n (car p)) (d (cdr p)) (e (exact d)))
+      (and (eq? (< n d) (< n e)) (eq? (= n d) (= n e)) (eq? (> n d) (> n e))
+           (eq? (<= d n) (<= e n)) (eq? (>= d n) (>= e n)))))
+  gen-int-near-double)
+
+;; Where a rational fits in a double, its square root is that of the
+;; correctly rounded double, as in MIT Scheme.
+(check "sqrt of a rational is sqrt of its inexact value"
+  (lambda (q)
+    (let ((r (sqrt q)))
+      (or (exact? r) (= r (sqrt (exact->inexact q))))))
+  gen-wide-rational)
+
+;; Beyond the double range the root still scales exactly with the operand.
+;; (Integers beyond that range take the integer square root instead.)
+(check "sqrt of a rational beyond the double range scales exactly"
+  (lambda (q)
+    (let ((r (sqrt q)))
+      (or (exact? r) (integer? q)
+          (and (= (sqrt (* q (expt 4 800))) (* r (expt 2. 800)))
+               (= (sqrt (/ q (expt 4 800))) (/ r (expt 2. 800)))))))
+  gen-wide-rational)
+
+;; ============================================================================
 ;; Summary
 ;; ============================================================================
 

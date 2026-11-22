@@ -70,77 +70,56 @@ static uint64_t xoshiro256ss(void)
     return result;
 }
 
+// A uniform random integer in [0, limit) for a positive limit: draw limbs,
+// most significant first, masked to limit's bit length, until one is below.
 static bignum *random_bignum_below(const bignum *limit)
 {
-    if (!limit || limit->len == 0)
-        return NULL;
-
-    limb_t top = limit->limbs[limit->len - 1];
-    unsigned top_bits = 0;
-    while (top) {
-        top_bits++;
-        top >>= 1;
-    }
+    size_t len = limit->len;
+    unsigned top_bits =
+        (unsigned)(bn_bit_length(limit) - (len - 1) * LIMB_BITS);
     limb_t top_mask = top_bits == LIMB_BITS
                            ? LIMB_MAX
                            : (((limb_t)1 << top_bits) - 1);
+    limb_t *limbs = malloc(len * sizeof(limb_t));
+    if (!limbs)
+        return NULL;
 
     for (;;) {
-        bignum *candidate = bn_from_int(0);
-        if (!candidate)
-            return NULL;
-        for (size_t i = limit->len; i > 0; i--) {
-            bignum *shifted = bn_lshift(candidate, LIMB_BITS);
-            bn_free(candidate);
-            if (!shifted)
-                return NULL;
-            limb_t word = (limb_t)xoshiro256ss();
-            if (i == limit->len)
-                word &= top_mask;
-            bignum *part = bn_from_uint(word);
-            if (!part) {
-                bn_free(shifted);
-                return NULL;
-            }
-            candidate = bn_add(shifted, part);
-            bn_free(shifted);
-            bn_free(part);
-            if (!candidate)
-                return NULL;
-        }
-        if (bn_cmp(candidate, limit) < 0)
+        for (size_t i = len; i > 0; i--)
+            limbs[i - 1] = (limb_t)xoshiro256ss();
+        limbs[len - 1] &= top_mask;
+        bignum *candidate = bn_from_limbs(limbs, len, 0);
+        if (!candidate || bn_cmp(candidate, limit) < 0) {
+            free(limbs);
             return candidate;
+        }
         bn_free(candidate);
     }
 }
 
 static unsigned random_integer_value(unsigned x, const char *name)
 {
-    bignum *limit = to_bignum(x);
-    if (!limit) {
-        show_error("%s: expected exact integer", name);
-        return TOK_ERROR;
-    }
     int64_t n;
-    if (bn_to_int64(limit, &n) == 0 && n <= 0) {
-        bn_free(limit);
-        show_error("%s: expected positive integer", name);
-        return TOK_ERROR;
-    }
-    if (bn_sign(limit) <= 0) {
-        bn_free(limit);
-        show_error("%s: expected positive integer", name);
-        return TOK_ERROR;
-    }
-
-    if (bn_to_int64(limit, &n) != 0) {
-        bignum *result = random_bignum_below(limit);
-        bn_free(limit);
+    bignum *bn = get_bignum(x);
+    if (!exact_int64_value(x, &n) && !(bn && bn_to_int64(bn, &n) == 0)) {
+        if (!bn) {
+            show_error("%s: expected exact integer", name);
+            return TOK_ERROR;
+        }
+        if (bn_sign(bn) <= 0) {
+            show_error("%s: expected positive integer", name);
+            return TOK_ERROR;
+        }
+        bignum *result = random_bignum_below(bn);
         if (!result) {
             show_error("%s: out of memory", name);
             return TOK_ERROR;
         }
         return store_integer(result);
+    }
+    if (n <= 0) {
+        show_error("%s: expected positive integer", name);
+        return TOK_ERROR;
     }
 
     // Reject the small prefix that would make the 2^64-sized generator
@@ -152,7 +131,6 @@ static unsigned random_integer_value(unsigned x, const char *name)
     do {
         r = xoshiro256ss();
     } while (r < threshold);
-    bn_free(limit);
     return store((int64_t)(r % (uint64_t)n));
 }
 
@@ -248,29 +226,23 @@ static unsigned exact_rational_round(unsigned x, round_mode mode,
     }
 
     // q is the truncated quotient; rem has the sign of num, |rem| < den
+    limb_t one_limb = 1;
+    const bignum one = {.limbs = &one_limb, .len = 1, .cap = 1};
     bool ok = true;
     if (!bn_is_zero(rem)) {
         switch (mode) {
         case ROUND_TRUNCATE:
             break;
         case ROUND_FLOOR:
-            if (bn_sign(num) < 0) {
-                bignum one = {.limbs = (limb_t[]){1}, .len = 1, .cap = 1,
-                              .sign = 0};
+            if (bn_sign(num) < 0)
                 ok = bn_sub_ip_checked(q, &one);
-            }
             break;
         case ROUND_CEILING:
-            if (bn_sign(num) > 0) {
-                bignum one = {.limbs = (limb_t[]){1}, .len = 1, .cap = 1,
-                              .sign = 0};
+            if (bn_sign(num) > 0)
                 ok = bn_add_ip_checked(q, &one);
-            }
             break;
         case ROUND_NEAREST: {
             // Work with the floor quotient qf and remainder rf in [0, den)
-            bignum one = {.limbs = (limb_t[]){1}, .len = 1, .cap = 1,
-                          .sign = 0};
             if (bn_sign(num) < 0) {
                 ok = bn_sub_ip_checked(q, &one); // q = floor(num/den)
                 if (ok)
@@ -670,15 +642,7 @@ static bignum *bn_approx_nth_root(const bignum *base, int64_t n)
      */
     if ((uint64_t)n > SIZE_MAX || base->len > SIZE_MAX / LIMB_BITS)
         return NULL;
-    limb_t high_limb = base->limbs[base->len - 1];
-    if (high_limb == 0)
-        return NULL;
-    size_t high_bits = 0;
-    while (high_limb) {
-        high_bits++;
-        high_limb >>= 1;
-    }
-    size_t bit_length = (base->len - 1) * LIMB_BITS + high_bits;
+    size_t bit_length = bn_bit_length(base);
     size_t root_degree = (size_t)n;
     if (bit_length > SIZE_MAX - (root_degree - 1))
         return NULL;
@@ -792,32 +756,35 @@ static bignum *bn_exact_nth_root(const bignum *base, int64_t n)
     return NULL; // Not a perfect nth power
 }
 
-static unsigned inexact_rational_sqrt(unsigned numerator, unsigned denominator,
+// Inexact square root of the non-negative rational num/den. Dividing by
+// 4^half first brings the quotient near 1, so its correctly rounded
+// conversion cannot overflow or underflow, and multiplying the root by
+// 2^half is exact. Where num/den fits in a double this equals
+// (sqrt (exact->inexact x)); beyond that range the root stays finite.
+static unsigned inexact_rational_sqrt(const bignum *num, const bignum *den,
                                       const char *name)
 {
-    double num_top, den_top;
-    size_t num_scale, den_scale;
-    bool num_negative, den_negative;
-    if (!exact_integer_top_double(numerator, &num_top, &num_scale,
-                                  &num_negative) ||
-        !exact_integer_top_double(denominator, &den_top, &den_scale,
-                                  &den_negative) ||
-        den_top == 0.0 || num_negative != den_negative) {
+    if (!num || !den || bn_sign(num) < 0 || bn_sign(den) <= 0) {
         show_error("%s: invalid nonnegative rational", name);
         return TOK_ERROR;
     }
-    // Limbs have an even number of bits, so halving their exponent is exact.
-    // Taking the root before restoring the scale avoids overflow/underflow
-    // of the rational itself when its square root is still representable.
-    double result = sqrt(num_top / den_top);
-    size_t delta = num_scale >= den_scale ? num_scale - den_scale
-                                         : den_scale - num_scale;
-    if (delta > (size_t)INT_MAX / (LIMB_BITS / 2)) {
-        result = num_scale >= den_scale ? HUGE_VAL : 0.0;
-    } else {
-        int exponent = (int)(delta * (LIMB_BITS / 2));
-        result = scalbn(result, num_scale >= den_scale ? exponent : -exponent);
+    size_t num_bits = bn_bit_length(num), den_bits = bn_bit_length(den);
+    bool large = num_bits >= den_bits;
+    size_t half = (large ? num_bits - den_bits : den_bits - num_bits) / 2;
+    bignum *scaled = bn_lshift(large ? den : num, 2 * half);
+    double quotient;
+    bool ok = scaled && bn_ratio_to_double(large ? num : scaled,
+                                           large ? scaled : den, &quotient);
+    bn_free(scaled);
+    if (!ok) {
+        show_error("%s: out of memory", name);
+        return TOK_ERROR;
     }
+    double result = sqrt(quotient);
+    if (half > INT_MAX)
+        result = large ? HUGE_VAL : 0.0;
+    else
+        result = scalbn(result, large ? (int)half : -(int)half);
     return store_inexact(result);
 }
 
@@ -854,28 +821,28 @@ static unsigned sqrt_value(unsigned arg, const char *name)
     }
 
     if (IS_RATIONAL(arg)) {
-        unsigned num_cell = CELL_CAR(arg);
-        unsigned denom_cell = CELL_CDR(arg);
-        if (!is_negative_number(num_cell)) {
-            bignum *num_bn = to_bignum(num_cell);
-            bignum *denom_bn = to_bignum(denom_cell);
-            bignum *sqrt_num = num_bn ? bn_exact_nth_root(num_bn, 2) : NULL;
-            bignum *sqrt_denom =
-                denom_bn ? bn_exact_nth_root(denom_bn, 2) : NULL;
+        // The numerator is positive: negative rationals were handled above.
+        // The denominator's root only matters if the numerator has one.
+        bignum *num_bn = to_bignum(CELL_CAR(arg));
+        bignum *denom_bn = to_bignum(CELL_CDR(arg));
+        bignum *sqrt_num =
+            num_bn && denom_bn ? bn_exact_nth_root(num_bn, 2) : NULL;
+        bignum *sqrt_denom = sqrt_num ? bn_exact_nth_root(denom_bn, 2) : NULL;
+        if (sqrt_denom) {
             bn_free(num_bn);
             bn_free(denom_bn);
-            if (sqrt_num && sqrt_denom) {
-                GC_GUARD;
-                unsigned root_num = store_integer(sqrt_num);
-                gc_protect(&root_num);
-                unsigned root_denom = store_integer(sqrt_denom);
-                gc_protect(&root_denom);
-                return normalize_rational_cells(root_num, root_denom);
-            }
-            bn_free(sqrt_num);
-            bn_free(sqrt_denom);
-            return inexact_rational_sqrt(num_cell, denom_cell, name);
+            GC_GUARD;
+            unsigned root_num = store_integer(sqrt_num);
+            gc_protect(&root_num);
+            unsigned root_denom = store_integer(sqrt_denom);
+            gc_protect(&root_denom);
+            return normalize_rational_cells(root_num, root_denom);
         }
+        bn_free(sqrt_num);
+        unsigned result = inexact_rational_sqrt(num_bn, denom_bn, name);
+        bn_free(num_bn);
+        bn_free(denom_bn);
+        return result;
     }
 
     int64_t n;
@@ -902,24 +869,23 @@ static unsigned sqrt_value(unsigned arg, const char *name)
 
     if (IS_BIGNUM(arg)) {
         bignum *bn = get_bignum(arg);
-        if (bn && !bn->sign) {
-            bignum *root = bn_exact_nth_root(bn, 2);
-            if (root)
+        // The integer square root answers both questions below, so compute
+        // it once: the root is exact if it squares back to the operand.
+        bignum *root = bn && !bn->sign ? bn_approx_nth_root(bn, 2) : NULL;
+        if (root) {
+            bignum *square = bn_mul(root, root);
+            bool perfect = square && bn_cmp(square, bn) == 0;
+            bn_free(square);
+            if (perfect)
                 return store_integer(root);
             // Operands beyond double range would convert to infinity below;
             // approximate through the integer square root instead, which
             // halves the exponent back into double range
-            if (isinf(to_double(arg))) {
-                bignum *approx = bn_approx_nth_root(bn, 2);
-                if (approx) {
-                    GC_GUARD;
-                    unsigned root_cell = store_integer(approx);
-                    if (root_cell == TOK_ERROR)
-                        return TOK_ERROR;
-                    gc_protect(&root_cell);
-                    return store_inexact(to_double(root_cell));
-                }
-            }
+            bool out_of_range = isinf(bn_to_double(bn));
+            double approx = bn_to_double(root);
+            bn_free(root);
+            if (out_of_range)
+                return store_inexact(approx);
         }
     }
 

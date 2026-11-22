@@ -35,6 +35,8 @@ bignum *bn_new(void);
 bignum *bn_from_int(int64_t val);
 bignum *bn_from_uint(uint64_t val);
 bignum *bn_from_string(const char *str, int base);
+// From len little-endian limbs (leading zero limbs allowed); sign as above
+bignum *bn_from_limbs(const limb_t *limbs, size_t len, int sign);
 bignum *bn_copy(const bignum *a);
 void bn_free(bignum *a);
 
@@ -60,6 +62,7 @@ int bn_cmp(const bignum *a, const bignum *b);     // -1, 0, 1
 int bn_cmp_abs(const bignum *a, const bignum *b); // Compare absolute values
 bool bn_is_zero(const bignum *a);
 int bn_sign(const bignum *a); // -1, 0, 1
+size_t bn_bit_length(const bignum *a); // Bits in |a|; 0 for zero
 
 // ============================================================================
 // Arithmetic Operations

@@ -36,6 +36,8 @@ unsigned prim_append(unsigned argc, unsigned *argv)
     gc_protect(&tail);
 
     for (unsigned i = 0; i + 1 < argc; i++) {
+        // list_length_checked rejects improper and circular lists, so the
+        // walk below always ends at the empty list
         unsigned lst = argv[i];
         if (!list_length_checked(lst, NULL, "append"))
             return TOK_ERROR;
@@ -44,16 +46,10 @@ unsigned prim_append(unsigned argc, unsigned *argv)
             list_append(&result, &tail, car(lst));
             lst = cdr(lst);
         }
-        if (lst) {
-            gc_unprotect(1);
-            show_error("append: improper list");
-            return TOK_ERROR;
-        }
         gc_unprotect(1);
     }
 
     unsigned last = argv[argc - 1];
-    gc_protect(&last);
     if (tail) {
         cell_set_cdr(tail, last);
     }
@@ -72,9 +68,5 @@ unsigned prim_reverse(unsigned argc, unsigned *argv)
     gc_protect(&result);
     for (; IS_PAIR(lst); lst = cdr(lst))
         result = alloc_cons(car(lst), result);
-    if (lst) {
-        show_error("reverse: improper list");
-        return TOK_ERROR;
-    }
     return result;
 }

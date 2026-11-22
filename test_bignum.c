@@ -614,6 +614,280 @@ TEST(bn_gcd_large)
 }
 
 // ============================================================================
+// Randomized Cross-checks
+// ============================================================================
+
+static uint64_t test_rng_state = 0x9e3779b97f4a7c15ULL;
+
+static limb_t test_random_limb(void)
+{
+    test_rng_state ^= test_rng_state << 13;
+    test_rng_state ^= test_rng_state >> 7;
+    test_rng_state ^= test_rng_state << 17;
+    return (limb_t)(test_rng_state >> 16);
+}
+
+// Operand shapes that stress the multiplication splits: dense random limbs,
+// all ones, runs of zero limbs, and a zero low half.
+static void fill_test_limbs(limb_t *out, size_t len, int pattern)
+{
+    for (size_t i = 0; i < len; i++) {
+        switch (pattern) {
+        case 0:
+            out[i] = test_random_limb();
+            break;
+        case 1:
+            out[i] = LIMB_MAX;
+            break;
+        case 2:
+            out[i] = (i / 7) % 2 ? 0 : test_random_limb();
+            break;
+        default:
+            out[i] = i < len / 2 ? 0 : test_random_limb();
+            break;
+        }
+    }
+    out[len - 1] |= 1; // Keep the top limb nonzero so len is exact
+}
+
+static bignum *random_test_bignum(size_t len, int pattern, int sign)
+{
+    limb_t *limbs = malloc(len * sizeof(limb_t));
+    if (!limbs)
+        return NULL;
+    fill_test_limbs(limbs, len, pattern);
+    bignum *result = bn_from_limbs(limbs, len, sign);
+    free(limbs);
+    return result;
+}
+
+TEST(bn_from_limbs_normalizes)
+{
+    const limb_t five[] = {5, 0, 0};
+    bignum *a = bn_from_limbs(five, 3, 1);
+    bignum *expected = bn_from_int(-5);
+    ASSERT(a != NULL && expected != NULL);
+    ASSERT_EQ(a->len, 1);
+    ASSERT_EQ(bn_cmp(a, expected), 0);
+    bn_free(a);
+    bn_free(expected);
+
+    const limb_t zeros[] = {0, 0};
+    bignum *zero = bn_from_limbs(zeros, 2, 1);
+    ASSERT(zero != NULL);
+    ASSERT(bn_is_zero(zero));
+    ASSERT_EQ(bn_sign(zero), 0);
+    ASSERT_EQ(zero->sign, 0);
+    bn_free(zero);
+
+    const limb_t two_32[] = {0, 1};
+    bignum *b = bn_from_limbs(two_32, 2, 0);
+    bignum *expected_b = bn_from_int(INT64_C(1) << 32);
+    ASSERT(b != NULL && expected_b != NULL);
+    ASSERT_EQ(bn_cmp(b, expected_b), 0);
+    bn_free(b);
+    bn_free(expected_b);
+    PASS();
+}
+
+static size_t reference_product(const bignum *a, const bignum *b, limb_t *out)
+{
+    size_t len = a->len + b->len;
+    memset(out, 0, len * sizeof(limb_t));
+    for (size_t i = 0; i < a->len; i++) {
+        uint64_t carry = 0;
+        for (size_t j = 0; j < b->len; j++) {
+            uint64_t t =
+                (uint64_t)a->limbs[i] * b->limbs[j] + out[i + j] + carry;
+            out[i + j] = (limb_t)t;
+            carry = t >> LIMB_BITS;
+        }
+        out[i + b->len] = (limb_t)carry;
+    }
+    while (len > 0 && out[len - 1] == 0)
+        len--;
+    return len;
+}
+
+TEST(bn_mul_matches_reference_for_all_shapes)
+{
+    // Lengths around the Karatsuba threshold and its multiples, including
+    // pairs at least twice as long as each other (the unbalanced path).
+    static const size_t lengths[] = {1,  5,  31, 32,  33,  47,  64,
+                                     65, 96, 127, 200, 333, 700};
+    const size_t count = sizeof(lengths) / sizeof(lengths[0]);
+    limb_t *expected = malloc(2 * 700 * sizeof(limb_t));
+    ASSERT(expected != NULL);
+    for (size_t i = 0; i < count; i++) {
+        for (size_t j = 0; j < count; j++) {
+            int pattern_a = (int)((i + j) % 4);
+            int pattern_b = (int)((i * 3 + j) % 4);
+            int sign_a = (int)(i & 1), sign_b = (int)((j >> 1) & 1);
+            bignum *a = random_test_bignum(lengths[i], pattern_a, sign_a);
+            bignum *b = random_test_bignum(lengths[j], pattern_b, sign_b);
+            ASSERT(a != NULL && b != NULL);
+            ASSERT_EQ(a->len, lengths[i]);
+            ASSERT_EQ(b->len, lengths[j]);
+            bignum *prod = bn_mul(a, b);
+            ASSERT(prod != NULL);
+            size_t expected_len = reference_product(a, b, expected);
+            ASSERT_EQ(prod->len, expected_len);
+            ASSERT(memcmp(prod->limbs, expected,
+                          expected_len * sizeof(limb_t)) == 0);
+            ASSERT_EQ(prod->sign, sign_a != sign_b);
+            bn_free(a);
+            bn_free(b);
+            bn_free(prod);
+        }
+    }
+    free(expected);
+    PASS();
+}
+
+TEST(bn_div_random_identity)
+{
+    static const size_t lengths[] = {1, 2, 3, 17, 40, 41, 120};
+    const size_t count = sizeof(lengths) / sizeof(lengths[0]);
+    for (size_t i = 0; i < count; i++) {
+        for (size_t j = 0; j < count; j++) {
+            int sign_a = (int)(i & 1), sign_b = (int)(j % 3 == 1);
+            bignum *a = random_test_bignum(lengths[i], (int)(i % 4), sign_a);
+            bignum *b = random_test_bignum(lengths[j], (int)(j % 3), sign_b);
+            ASSERT(a != NULL && b != NULL);
+            bignum *r = NULL;
+            bignum *q = bn_div(a, b, &r);
+            ASSERT(q != NULL && r != NULL);
+            // Truncating division: a = q*b + r, |r| < |b|, r has a's sign
+            ASSERT(bn_cmp_abs(r, b) < 0);
+            ASSERT(bn_is_zero(r) || r->sign == a->sign);
+            ASSERT(bn_is_zero(q) || q->sign == (sign_a != sign_b));
+            bignum *qb = bn_mul(q, b);
+            ASSERT(qb != NULL);
+            bignum *sum = bn_add(qb, r);
+            ASSERT(sum != NULL);
+            ASSERT_EQ(bn_cmp(sum, a), 0);
+            bignum *q_only = bn_div(a, b, NULL);
+            ASSERT(q_only != NULL);
+            ASSERT_EQ(bn_cmp(q_only, q), 0);
+            bn_free(a);
+            bn_free(b);
+            bn_free(q);
+            bn_free(r);
+            bn_free(qb);
+            bn_free(sum);
+            bn_free(q_only);
+        }
+    }
+    PASS();
+}
+
+// Conversion one digit per division: the obviously correct algorithm.
+static char *reference_to_string(const bignum *a, int base)
+{
+    size_t cap = a->len * LIMB_BITS + 3;
+    char *buf = malloc(cap);
+    bignum *divisor = bn_from_int(base);
+    bignum *value = bn_abs(a);
+    size_t pos = 0;
+    if (!buf || !divisor || !value) {
+        free(buf);
+        bn_free(divisor);
+        bn_free(value);
+        return NULL;
+    }
+    do {
+        bignum *rem = NULL;
+        bignum *quot = bn_div(value, divisor, &rem);
+        int digit = rem && rem->len ? (int)rem->limbs[0] : 0;
+        buf[pos++] = (char)(digit < 10 ? '0' + digit : 'a' + digit - 10);
+        bn_free(rem);
+        bn_free(value);
+        value = quot;
+    } while (value && !bn_is_zero(value));
+    if (a->sign)
+        buf[pos++] = '-';
+    buf[pos] = '\0';
+    for (size_t i = 0; i < pos / 2; i++) {
+        char t = buf[i];
+        buf[i] = buf[pos - 1 - i];
+        buf[pos - 1 - i] = t;
+    }
+    bn_free(divisor);
+    bn_free(value);
+    return buf;
+}
+
+TEST(bn_string_conversion_matches_reference)
+{
+    static const size_t lengths[] = {1, 2, 3, 15, 16, 17, 40, 150};
+    static const int bases[] = {2, 3, 7, 10, 16, 36};
+    for (size_t i = 0; i < sizeof(lengths) / sizeof(lengths[0]); i++) {
+        for (size_t k = 0; k < sizeof(bases) / sizeof(bases[0]); k++) {
+            bignum *a = random_test_bignum(lengths[i], (int)(i % 4),
+                                           (int)((i + k) & 1));
+            ASSERT(a != NULL);
+            char *expected = reference_to_string(a, bases[k]);
+            char *actual = bn_to_string(a, bases[k]);
+            ASSERT(expected != NULL && actual != NULL);
+            ASSERT_STR_EQ(actual, expected);
+            bignum *parsed = bn_from_string(actual, bases[k]);
+            ASSERT(parsed != NULL);
+            ASSERT_EQ(bn_cmp(parsed, a), 0);
+            free(expected);
+            free(actual);
+            bn_free(parsed);
+            bn_free(a);
+        }
+    }
+    PASS();
+}
+
+// Values at the edges of the digit chunks that conversion handles per limb
+// (9 decimal digits, 7 hex digits): interior chunks must be zero padded and
+// the leading chunk must not be.
+TEST(bn_string_conversion_chunk_boundaries)
+{
+    static const struct {
+        const char *text;
+        int base;
+    } cases[] = {
+        {"999999999", 10},
+        {"1000000000", 10},
+        {"1000000001", 10},
+        {"999999999999999999", 10},
+        {"1000000000000000000", 10},
+        {"-1000000000000000000000000001", 10},
+        {"100000000000000000000000000000000000000000000000000", 10},
+        {"fffffff", 16},
+        {"10000000", 16},
+        {"-100000000000000000000000000000000000000f", 16},
+        {"10000000000000000000000000000000000000000000000000000000000000000",
+         2},
+        {"zzzzzz", 36},
+        {"1000000", 36},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        bignum *a = bn_from_string(cases[i].text, cases[i].base);
+        ASSERT(a != NULL);
+        char *expected = reference_to_string(a, cases[i].base);
+        char *actual = bn_to_string(a, cases[i].base);
+        ASSERT(expected != NULL && actual != NULL);
+        ASSERT_STR_EQ(expected, cases[i].text);
+        ASSERT_STR_EQ(actual, cases[i].text);
+        free(expected);
+        free(actual);
+        bn_free(a);
+    }
+    bignum *billion = bn_from_string("1000000000", 10);
+    bignum *expected = bn_from_int(1000000000);
+    ASSERT(billion != NULL && expected != NULL);
+    ASSERT_EQ(bn_cmp(billion, expected), 0);
+    bn_free(billion);
+    bn_free(expected);
+    PASS();
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -663,6 +937,13 @@ int main(void)
     RUN_TEST(bn_checked_in_place_ops);
     RUN_TEST(bn_checked_add_limb_negative);
     RUN_TEST(bn_gcd_large);
+
+    // Randomized cross-checks against reference algorithms
+    RUN_TEST(bn_from_limbs_normalizes);
+    RUN_TEST(bn_mul_matches_reference_for_all_shapes);
+    RUN_TEST(bn_div_random_identity);
+    RUN_TEST(bn_string_conversion_matches_reference);
+    RUN_TEST(bn_string_conversion_chunk_boundaries);
 
     TEST_SUMMARY("bignum");
 }

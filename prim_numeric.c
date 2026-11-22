@@ -151,72 +151,53 @@ static unsigned bignum_floor_divrem_values(unsigned xa, unsigned xb,
     return divrem_values(qv, rv);
 }
 
-static bool bignum_add_args_ip(bignum *result, unsigned argc, unsigned *argv,
-                               unsigned start, const char *name)
+// An exact integer argument as a read-only bignum. A bignum argument is
+// borrowed rather than copied; any other integer is converted into *owned,
+// which the caller frees.
+static const bignum *integer_operand(unsigned x, bignum **owned)
+{
+    *owned = NULL;
+    if (IS_BIGNUM(x))
+        return get_bignum(x);
+    *owned = to_bignum(x);
+    return *owned;
+}
+
+// result += argv[start], argv[start + 1], ... in place (-= when subtracting)
+static bool bignum_accumulate_args(bignum *result, unsigned argc,
+                                   unsigned *argv, unsigned start,
+                                   bool subtract, const char *name)
 {
     for (unsigned i = start; i < argc; i++) {
-        bignum *operand = to_bignum(argv[i]);
-        if (!operand) {
+        bignum *owned;
+        const bignum *operand = integer_operand(argv[i], &owned);
+        bool ok = operand && (subtract ? bn_sub_ip_checked(result, operand)
+                                       : bn_add_ip_checked(result, operand));
+        bn_free(owned);
+        if (!ok) {
             show_error("%s: out of memory", name);
             return false;
         }
-        if (!bn_add_ip_checked(result, operand)) {
-            bn_free(operand);
-            show_error("%s: out of memory", name);
-            return false;
-        }
-        bn_free(operand);
     }
     return true;
 }
 
+// The product of argc >= 1 exact integer arguments
 static bignum *bignum_multiply_args(unsigned argc, unsigned *argv,
                                     const char *name)
 {
-    bignum *result = bn_from_int(1);
-    if (!result) {
-        show_error("%s: out of memory", name);
-        return NULL;
-    }
-
-    for (unsigned i = 0; i < argc; i++) {
-        bignum *operand = to_bignum(argv[i]);
-        if (!operand) {
-            show_error("%s: out of memory", name);
-            bn_free(result);
-            return NULL;
-        }
-        bignum *tmp = bn_mul(result, operand);
+    bignum *result = to_bignum(argv[0]);
+    for (unsigned i = 1; result && i < argc; i++) {
+        bignum *owned;
+        const bignum *operand = integer_operand(argv[i], &owned);
+        bignum *product = operand ? bn_mul(result, operand) : NULL;
+        bn_free(owned);
         bn_free(result);
-        bn_free(operand);
-        if (!tmp) {
-            show_error("%s: out of memory", name);
-            return NULL;
-        }
-        result = tmp;
+        result = product;
     }
-
+    if (!result)
+        show_error("%s: out of memory", name);
     return result;
-}
-
-static bool bignum_subtract_args_ip(bignum *result, unsigned argc,
-                                    unsigned *argv, unsigned start,
-                                    const char *name)
-{
-    for (unsigned i = start; i < argc; i++) {
-        bignum *operand = to_bignum(argv[i]);
-        if (!operand) {
-            show_error("%s: out of memory", name);
-            return false;
-        }
-        if (!bn_sub_ip_checked(result, operand)) {
-            bn_free(operand);
-            show_error("%s: out of memory", name);
-            return false;
-        }
-        bn_free(operand);
-    }
-    return true;
 }
 
 static double rescale_complex_quotient_component(double component,
@@ -394,52 +375,19 @@ slow_path:;
         }
         return normalize_rational_cells(num, denom);
     }
-    case NUM_BIGNUM: {
-        bignum *result = bn_from_int(0);
+    case NUM_BIGNUM:
+    case NUM_INTEGER: {
+        // All-small-integer sums only get here when the fast path overflowed
+        bignum *result = to_bignum(argv[0]);
         if (!result) {
             show_error("+: out of memory");
             return TOK_ERROR;
         }
-        if (!bignum_add_args_ip(result, argc, argv, 0, "+")) {
+        if (!bignum_accumulate_args(result, argc, argv, 1, false, "+")) {
             bn_free(result);
             return TOK_ERROR;
         }
         return store_integer(result);
-    }
-    case NUM_INTEGER: {
-        int64_t sum = 0;
-        for (unsigned i = 0; i < argc; i++) {
-            int64_t x;
-            if (!exact_int64_value(argv[i], &x)) {
-                show_error("+: invalid integer operand");
-                return TOK_ERROR;
-            }
-            int64_t new_sum;
-            if (__builtin_add_overflow(sum, x, &new_sum)) {
-                bignum *result = bn_from_int(sum);
-                bignum *operand = bn_from_int(x);
-                if (!result || !operand) {
-                    bn_free(result);
-                    bn_free(operand);
-                    show_error("+: out of memory");
-                    return TOK_ERROR;
-                }
-                if (!bn_add_ip_checked(result, operand)) {
-                    bn_free(result);
-                    bn_free(operand);
-                    show_error("+: out of memory");
-                    return TOK_ERROR;
-                }
-                bn_free(operand);
-                if (!bignum_add_args_ip(result, argc, argv, i + 1, "+")) {
-                    bn_free(result);
-                    return TOK_ERROR;
-                }
-                return store_integer(result);
-            }
-            sum = new_sum;
-        }
-        return store(sum);
     }
     }
     return store(0);
@@ -675,7 +623,10 @@ slow_path:;
         }
         return normalize_rational_cells(num, denom);
     }
-    case NUM_BIGNUM: {
+    case NUM_BIGNUM:
+    case NUM_INTEGER: {
+        // All-small-integer differences only get here when the fast path
+        // overflowed (including negating INT64_MIN)
         bignum *result = to_bignum(argv[0]);
         if (!result) {
             show_error("-: out of memory");
@@ -685,63 +636,11 @@ slow_path:;
             bn_neg_ip(result);
             return store_integer(result);
         }
-        if (!bignum_subtract_args_ip(result, argc, argv, 1, "-")) {
+        if (!bignum_accumulate_args(result, argc, argv, 1, true, "-")) {
             bn_free(result);
             return TOK_ERROR;
         }
         return store_integer(result);
-    }
-    case NUM_INTEGER: {
-        int64_t res;
-        if (!exact_int64_value(argv[0], &res)) {
-            show_error("-: invalid integer operand");
-            return TOK_ERROR;
-        }
-        if (argc == 1) {
-            if (res == INT64_MIN) {
-                bignum *result = bn_from_int(res);
-                if (!result) {
-                    show_error("-: out of memory");
-                    return TOK_ERROR;
-                }
-                bn_neg_ip(result);
-                return store_integer(result);
-            }
-            return store(-res);
-        }
-        for (unsigned i = 1; i < argc; i++) {
-            int64_t x;
-            if (!exact_int64_value(argv[i], &x)) {
-                show_error("-: invalid integer operand");
-                return TOK_ERROR;
-            }
-            int64_t new_res;
-            if (__builtin_sub_overflow(res, x, &new_res)) {
-                bignum *result = bn_from_int(res);
-                bignum *operand = bn_from_int(x);
-                if (!result || !operand) {
-                    bn_free(result);
-                    bn_free(operand);
-                    show_error("-: out of memory");
-                    return TOK_ERROR;
-                }
-                if (!bn_sub_ip_checked(result, operand)) {
-                    bn_free(result);
-                    bn_free(operand);
-                    show_error("-: out of memory");
-                    return TOK_ERROR;
-                }
-                bn_free(operand);
-                if (!bignum_subtract_args_ip(result, argc, argv, i + 1,
-                                             "-")) {
-                    bn_free(result);
-                    return TOK_ERROR;
-                }
-                return store_integer(result);
-            }
-            res = new_res;
-        }
-        return store(res);
     }
     }
     return store(0);

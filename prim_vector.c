@@ -46,8 +46,7 @@ static unsigned make_filled_vector(unsigned len_arg, unsigned fill,
         show_error("%s: length too large", name);
         return TOK_ERROR;
     }
-    unsigned vec = make_vector((unsigned)len64, fill);
-    return vec == TOK_ERROR ? TOK_ERROR : vec;
+    return make_vector((unsigned)len64, fill);
 }
 
 // Parse optional start/end arguments (argv[first], argv[first+1]) against
@@ -92,15 +91,13 @@ static unsigned make_list_from_vector(unsigned vec, int64_t start,
 {
     GC_GUARD;
     gc_protect(&vec);
-    unsigned result = 0, tail = 0;
+    unsigned result = 0;
     gc_protect(&result);
-    gc_protect(&tail);
-    for (int64_t i = start; i < end; i++) {
-        unsigned elem = vector_data_ptr(vec)[i];
-        gc_protect(&elem);
-        list_append(&result, &tail, elem);
-        gc_unprotect(1);
-    }
+    // Build from the end so each element is simply consed on the front.
+    // alloc_cons roots its arguments, and the data pointer is re-read after
+    // every allocation because a collection can move the vector.
+    for (int64_t i = end; i > start; i--)
+        result = alloc_cons(vector_data_ptr(vec)[i - 1], result);
     return result;
 }
 
