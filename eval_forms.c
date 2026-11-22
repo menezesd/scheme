@@ -42,8 +42,11 @@ bool handle_quote(unsigned id, unsigned env, unsigned cont)
     // expanded; a quoted alias that a macro use evaluated here produced is
     // cheap to catch (see macros_strip_core_aliases).
     unsigned datum = cadr(id);
-    if (IS_ATOM(datum) && atom_is_core_alias(CELL_ID(datum)))
+    GC_GUARD;
+    if (IS_ATOM(datum) && atom_is_core_alias(CELL_ID(datum))) {
+        gc_protect(&cont); // the stripped copy is allocated
         datum = macros_strip_core_aliases(datum);
+    }
     tramp_apply(datum, cont);
     return true;
 }

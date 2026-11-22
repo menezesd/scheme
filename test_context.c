@@ -4121,6 +4121,77 @@ TEST(make_error_object_needs_a_condition_type)
     PASS();
 }
 
+// A char-set as stdlib.scm builds it: a (kind payload) record of the type
+// registered as BRT_CHAR_SET.
+static unsigned test_char_set(unsigned rtd, const char *kind, unsigned payload)
+{
+    GC_GUARD;
+    gc_protect(&rtd);
+    gc_protect(&payload);
+    unsigned kind_symbol = test_symbol(kind);
+    gc_protect(&kind_symbol);
+    unsigned set = make_record(rtd);
+    vector_set_elem(set, RECORD_FIELDS_START, kind_symbol);
+    vector_set_elem(set, RECORD_FIELDS_START + 1, payload);
+    return set;
+}
+
+// ((start . end)) as a freshly allocated range list.
+static unsigned test_range_list(int64_t start, int64_t end)
+{
+    unsigned range = alloc_cons(store(start), store(end));
+    return alloc_cons(range, 0);
+}
+
+TEST(equal_compares_char_sets_by_contents)
+{
+    GC_GUARD;
+    unsigned rtd = test_record_type("char-set", "kind", "payload");
+    gc_protect(&rtd);
+    unsigned other_rtd = test_record_type("other", "kind", "payload");
+    gc_protect(&other_rtd);
+    unsigned payload = test_range_list(97, 99);
+    gc_protect(&payload);
+    unsigned same = 0, different = 0, other = 0, pred_a = 0, pred_b = 0;
+    gc_protect(&same);
+    gc_protect(&different);
+    gc_protect(&other);
+    gc_protect(&pred_a);
+    gc_protect(&pred_b);
+    unsigned a = test_char_set(rtd, "ranges", payload);
+    gc_protect(&a);
+    unsigned b = test_range_list(97, 99);
+    gc_protect(&b);
+    b = test_char_set(rtd, "ranges", b);
+    // Unregistered, a char-set is a record like any other: equal? only to
+    // itself.
+    ASSERT(deep_equal(a, a));
+    ASSERT(!deep_equal(a, b));
+    ctx.builtin_record_types[BRT_CHAR_SET] = rtd;
+    ASSERT(deep_equal(a, b));
+    different = test_range_list(97, 100);
+    different = test_char_set(rtd, "ranges", different);
+    ASSERT(!deep_equal(a, different));
+    // Same payload, other kind; same fields, other record type.
+    other = test_char_set(rtd, "predicate", payload);
+    ASSERT(!deep_equal(a, other));
+    other = test_char_set(other_rtd, "ranges", payload);
+    ASSERT(!deep_equal(a, other));
+    ASSERT(!deep_equal(other, a));
+    // A predicate-based set's payload is a procedure: only the very same one
+    // makes two sets equal.
+    unsigned proc = mk_primop(PCAR);
+    gc_protect(&proc);
+    pred_a = test_char_set(rtd, "predicate", proc);
+    pred_b = test_char_set(rtd, "predicate", proc);
+    ASSERT(deep_equal(pred_a, pred_b));
+    unsigned other_proc = mk_primop(PCDR);
+    pred_b = test_char_set(rtd, "predicate", other_proc);
+    ASSERT(!deep_equal(pred_a, pred_b));
+    ctx.builtin_record_types[BRT_CHAR_SET] = 0;
+    PASS();
+}
+
 TEST(gc_stress_many_allocations)
 {
     // Allocate a long list of numbers
@@ -4786,6 +4857,7 @@ int main(void)
     RUN_TEST(writer_prints_records_with_stable_hash_numbers);
     RUN_TEST(gc_sweep_frees_record_payload_and_hash_number);
     RUN_TEST(make_error_object_needs_a_condition_type);
+    RUN_TEST(equal_compares_char_sets_by_contents);
     RUN_TEST(gc_stress_many_allocations);
     RUN_TEST(gc_stress_deep_nesting);
     RUN_TEST(gc_stress_multiple_collections);

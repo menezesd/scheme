@@ -2217,6 +2217,15 @@ static uint64_t hash_key_bounded(unsigned key, unsigned *remaining)
         free(s);
         return h;
     }
+    case BT_RECORD: {
+        // equal? compares char-sets by kind and payload (deep_equal_seen),
+        // so hash them by those too; other records by identity.
+        unsigned kind, payload;
+        if (!char_set_record_fields(key, &kind, &payload))
+            return scheme_hash(key);
+        uint64_t h = hash_key_bounded(kind, remaining);
+        return hash_combine(h, hash_key_bounded(payload, remaining));
+    }
     default:
         return scheme_hash(key);
     }

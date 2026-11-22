@@ -311,6 +311,10 @@ const char *record_type_name_string(unsigned rtd);
 // The type of a well-formed record instance, else 0.
 unsigned record_rtd(unsigned rec);
 bool record_is_builtin(unsigned rec, enum builtin_record_type which);
+// The kind and payload fields of a char-set (stdlib.scm's %char-set-type), or
+// false if rec is not one. equal? and equal hash tables compare char-sets by
+// them.
+bool char_set_record_fields(unsigned rec, unsigned *kind, unsigned *payload);
 // MIT-style object-hash number of a record or record type: assigned on first
 // request from one global counter, stable for the object's lifetime. 0 for
 // any other object.

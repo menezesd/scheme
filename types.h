@@ -233,6 +233,7 @@ enum builtin_record_type {
     BRT_PROMISE,
     BRT_BINARY_INPUT_PORT,
     BRT_BINARY_OUTPUT_PORT,
+    BRT_CHAR_SET,
     BRT_COUNT
 };
 

@@ -789,6 +789,7 @@ static unsigned expand_procedure(unsigned params, unsigned body,
             *expanded = true;
             return full;
         }
+        gc_unprotect(1); // local: its slot dies here, the walk below allocates
     }
     bool saved_heads_only = core_heads_only;
     core_heads_only = true;
@@ -942,6 +943,9 @@ static unsigned expand_form_inner(unsigned expr, unsigned syn_env,
                 unsigned datum_tail = alloc_cons(datum, 0);
                 gc_protect(&datum_tail);
                 expr = alloc_cons(car(expr), datum_tail);
+                // datum_tail's slot dies with this block, and with_core_head
+                // allocates; datum is not needed past here.
+                gc_unprotect(2);
             }
             return with_core_head(expr, form, syn_env);
         }
@@ -1044,6 +1048,9 @@ static unsigned expand_form_inner(unsigned expr, unsigned syn_env,
                 gc_protect(&lambda_form);
                 rest = alloc_cons(lambda_form, 0);
                 target = car(target);
+                // Both slots die with this block; rest and target, which
+                // hold what is still needed, are rooted above.
+                gc_unprotect(2);
             }
         } else {
             if (!IS_ATOM(target) || !IS_PAIR(cddr(expr)) || cdr(cddr(expr)))
@@ -1288,6 +1295,7 @@ static unsigned unwrap_syntax_rules_form(unsigned expr)
             list_append(&out, &tail, literals);
             rest = cdr(rest);
         }
+        gc_unprotect(1); // first: its slot dies here, the rules allocate
     }
 
     for (;;) {
@@ -2382,6 +2390,10 @@ static unsigned rename_free_ids_inner(unsigned tmpl, unsigned rename_map,
             // A head renamed to its core alias still heads the core form,
             // rebuilt with the alias; one renamed to a definition alias
             // names whatever that binding is, so the form is a plain list.
+            // new_head's slot dies with this block, and a form handled by
+            // none of the cases below falls through to the spine walk,
+            // which allocates: release it here, not at function exit.
+            GC_GUARD;
             unsigned new_head = rename_free_ids_inner(head, rename_map, false,
                                                       false);
             gc_protect(&new_head);
@@ -4877,14 +4889,22 @@ unsigned macros_freeze_core_keywords(unsigned transformer_form,
 // Core aliases in quoted data
 // ============================================================================
 
-// The scan only bounds work on circular data (datum labels); it walks list
-// spines iteratively, so the limit is not a C stack bound.
+// The node limit bounds work on circular data (datum labels); list spines
+// are walked iteratively. The scan - and the stripper after it - recurses
+// into cars and vector elements, so their nesting is bounded separately: a
+// datum circular through a car or a vector element, '#0=#(#0#) say, used to
+// recurse until the node budget ran out, far past the C stack.
 #define CORE_ALIAS_SCAN_LIMIT (1u << 20)
+#define CORE_ALIAS_SCAN_DEPTH 1000
 
-// 1 if datum holds a core alias, 0 if not, -1 if it is too large (or
-// circular) to tell within *budget nodes. Allocates nothing.
-static int datum_core_alias_scan(unsigned datum, unsigned *budget)
+// 1 if datum holds a core alias, 0 if not, -1 if it is too large, too
+// deeply nested (or circular) to tell within *budget nodes. Allocates
+// nothing.
+static int datum_core_alias_scan(unsigned datum, unsigned *budget,
+                                 unsigned depth)
 {
+    if (depth > CORE_ALIAS_SCAN_DEPTH)
+        return -1;
     int found = 0;
     for (;;) {
         if (*budget == 0)
@@ -4896,7 +4916,7 @@ static int datum_core_alias_scan(unsigned datum, unsigned *budget)
             unsigned len = vector_len(datum);
             for (unsigned i = 0; i < len; i++) {
                 int r = datum_core_alias_scan(vector_data_ptr(datum)[i],
-                                              budget);
+                                              budget, depth + 1);
                 if (r < 0)
                     return -1;
                 found |= r;
@@ -4905,7 +4925,7 @@ static int datum_core_alias_scan(unsigned datum, unsigned *budget)
         }
         if (!IS_PAIR(datum))
             return found;
-        int r = datum_core_alias_scan(car(datum), budget);
+        int r = datum_core_alias_scan(car(datum), budget, depth + 1);
         if (r < 0)
             return -1;
         found |= r;
@@ -4960,7 +4980,7 @@ static unsigned datum_without_core_aliases(unsigned datum)
 unsigned macros_strip_core_aliases(unsigned datum)
 {
     unsigned budget = CORE_ALIAS_SCAN_LIMIT;
-    if (datum_core_alias_scan(datum, &budget) != 1)
+    if (datum_core_alias_scan(datum, &budget, 0) != 1)
         return datum;
     return datum_without_core_aliases(datum);
 }

@@ -1302,6 +1302,9 @@ static unsigned rename_template_vars_quasiquote(unsigned tmpl,
             if ((head_id == ctx.kw_unquote ||
                  head_id == ctx.kw_unquote_splicing) &&
                 IS_PAIR(cdr(tmpl))) {
+                // The renaming allocates, and tmpl is read after it.
+                GC_GUARD;
+                gc_protect(&tmpl);
                 unsigned body = cadr(tmpl);
                 unsigned new_body;
                 if (depth == 1)
@@ -1314,11 +1317,11 @@ static unsigned rename_template_vars_quasiquote(unsigned tmpl,
                 gc_protect(&new_body);
                 unsigned result_tail = alloc_cons(new_body, cddr(tmpl));
                 gc_protect(&result_tail);
-                unsigned result = alloc_cons(head, result_tail);
-                gc_unprotect(2);
-                return result;
+                return alloc_cons(car(tmpl), result_tail);
             }
             if (head_id == ctx.kw_quasiquote && IS_PAIR(cdr(tmpl))) {
+                GC_GUARD;
+                gc_protect(&tmpl);
                 unsigned new_body = rename_template_vars_quasiquote(
                     cadr(tmpl), rename_map, depth + 1);
                 if (new_body == TOK_ERROR)
@@ -1326,9 +1329,7 @@ static unsigned rename_template_vars_quasiquote(unsigned tmpl,
                 gc_protect(&new_body);
                 unsigned result_tail = alloc_cons(new_body, cddr(tmpl));
                 gc_protect(&result_tail);
-                unsigned result = alloc_cons(head, result_tail);
-                gc_unprotect(2);
-                return result;
+                return alloc_cons(car(tmpl), result_tail);
             }
         }
 
@@ -2446,7 +2447,7 @@ next_free_var:
             gc_unprotect(1); // var_atom
             fv = cdr(fv);
         }
-        gc_unprotect(2); // free_vars, pattern_vars
+        gc_unprotect(3); // fv, free_vars, pattern_vars
         r = cdr(r);
     }
     gc_unprotect(1); // r
@@ -2521,6 +2522,7 @@ static unsigned rebuild_syntax_rules_renamed(unsigned transformer_form,
         unsigned rules_tail = alloc_cons(literals, renamed_rules);
         gc_protect(&rules_tail);
         sr_tail = alloc_cons(second, rules_tail);
+        gc_unprotect(1); // rules_tail's slot dies here; the cons below allocates
     } else {
         sr_tail = alloc_cons(literals, renamed_rules);
     }
@@ -4090,13 +4092,11 @@ static unsigned is_internal_define(unsigned expr, unsigned env)
     if (!IS_PAIR(cdr(expr)))
         return 0;
     unsigned second = cadr(expr);
-    if (IS_PAIR(second)) {
-        // (define (name params...) body...)
-        return car(second);
-    } else {
-        // (define name expr)
-        return second;
-    }
+    // (define (name params...) body...) or (define name expr). A name that
+    // is no identifier is left to compile_define to report: bound into the
+    // compile-time frame it corrupted that frame for every later define.
+    unsigned name = IS_PAIR(second) ? car(second) : second;
+    return identifier_valid(name) ? name : 0;
 }
 
 // Splice nested begins while collecting the leading definitions. Return
@@ -5562,6 +5562,9 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
         if (!syntax_arity_checked(fn_expr, 2, UINT_MAX, "lambda"))
             return emit_syntax_error(cctx, "lambda: invalid syntax");
 
+        // Released when this block ends: a call it cannot inline falls
+        // through to the general case, which allocates.
+        GC_GUARD;
         unsigned lambda_params = cadr(fn_expr);
         unsigned lambda_body = cddr(fn_expr);
         gc_protect(&lambda_params);

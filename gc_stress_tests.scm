@@ -474,6 +474,38 @@
            (set! n (+ n 1))
            (if (< n 3) (gc-ls-k n))
            (reverse out))))
+;; Each of these went through code that rooted a local inside a block and
+;; kept allocating after the block ended, so a collection wrote through the
+;; dead stack slot: a call the compiler cannot inline as a let, a body macro
+;; with a custom ellipsis, free locals and a quasiquote, a macro-defining
+;; macro, and a procedure whose body macro needs an alias of a local (the
+;; expander's fallback walk).
+(define (gc-scope-not-inlined)
+  (guard (e (#t 'arity))
+    ((lambda (a b) (list a b)) 1)))
+(define (gc-scope-body-macro x)
+  (define-syntax twice
+    (syntax-rules ::: ()
+      ((_ e :::) (list (list x e) ::: `(x ,x)))))
+  (twice 1 2))
+(define-syntax gc-scope-def-macro
+  (syntax-rules ()
+    ((_ name v)
+     (define-syntax name
+       (syntax-rules ::: () ((_ a :::) (list v a :::)))))))
+(gc-scope-def-macro gc-scope-m 0)
+(define (gc-scope-placeholder n)
+  (let ((k n))
+    (define-syntax get-k (syntax-rules () ((_) k)))
+    (let ((k 'shadow))
+      (lambda () (list k (get-k))))))
+(check "block-scoped roots"
+       '(arity ((5 1) (5 2) (x 5)) (0 1 2) (shadow 4) #t)
+       (list (gc-scope-not-inlined)
+             (gc-scope-body-macro 5)
+             (gc-scope-m 1 2)
+             ((gc-scope-placeholder 4))
+             (equal? (char-set #\a #\b) (char-set #\b #\a))))
 
 ;; (command-line) is the script's own view of its invocation - its name and
 ;; arguments - without vesper's options. make test-gcstress runs this file as

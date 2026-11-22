@@ -295,6 +295,7 @@ static unsigned prim_register_builtin_record_type(unsigned name, unsigned rtd)
         [BRT_PROMISE] = "promise",
         [BRT_BINARY_INPUT_PORT] = "binary-input-port",
         [BRT_BINARY_OUTPUT_PORT] = "binary-output-port",
+        [BRT_CHAR_SET] = "char-set",
     };
     const char *who = "%register-builtin-record-type!";
     if (!require_record_type(rtd, who))

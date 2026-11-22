@@ -983,16 +983,22 @@
   (and (error-object? obj) (eq? (%error-object-kind obj) 'file)))
 
 ;; MIT's report of a condition: the message, then each irritant as write
-;; shows it.
+;; shows it. make-error-object takes any irritants object; one that is not a
+;; list is written as a whole.
 (define (condition/report-string condition)
   (if (not (error-object? condition))
       (primitive-error "condition/report-string: not a condition"))
-  (let ((port (open-output-string)))
+  (let ((port (open-output-string))
+        (irritants (error-object-irritants condition)))
     (display (error-object-message condition) port)
-    (for-each (lambda (irritant)
-                (display " " port)
-                (write irritant port))
-              (error-object-irritants condition))
+    (if (list? irritants)
+        (for-each (lambda (irritant)
+                    (display " " port)
+                    (write irritant port))
+                  irritants)
+        (begin
+          (display " " port)
+          (write irritants port)))
     (get-output-string port)))
 
 ;; Simple exception system using continuations
@@ -2944,15 +2950,19 @@
        predicate-name
        field-spec ...)
      (begin
+       ;; Validated before anything is defined, so that a bad name is
+       ;; reported as define-record-type's error, not define's. A definition
+       ;; (of a name only this expansion can see) keeps the expansion all
+       ;; definitions.
+       (define spec-valid
+         (validate-record-type-spec 'type-name
+                                    'constructor-name
+                                    '(constructor-field ...)
+                                    'predicate-name
+                                    '(field-spec ...)))
        (define type-name
-         (begin
-           (validate-record-type-spec 'type-name
-                                      'constructor-name
-                                      '(constructor-field ...)
-                                      'predicate-name
-                                      '(field-spec ...))
-           (%make-record-type 'type-name
-                              (map record-field-spec-name '(field-spec ...)))))
+         (%make-record-type 'type-name
+                            (map record-field-spec-name '(field-spec ...))))
        (define constructor-name
          (let ((rtd type-name)
                (layout (%record-layout type-name '(constructor-field ...)
@@ -2965,12 +2975,12 @@
        (%define-record-field type-name field-spec) ...))
     ((define-record-type type-name #f predicate-name field-spec ...)
      (begin
+       (define spec-valid
+         (validate-record-type-spec 'type-name #f '() 'predicate-name
+                                    '(field-spec ...)))
        (define type-name
-         (begin
-           (validate-record-type-spec 'type-name #f '() 'predicate-name
-                                      '(field-spec ...))
-           (%make-record-type 'type-name
-                              (map record-field-spec-name '(field-spec ...)))))
+         (%make-record-type 'type-name
+                            (map record-field-spec-name '(field-spec ...))))
        (define predicate-name
          (let ((rtd type-name))
            (lambda (obj) (%record-of? obj rtd))))
@@ -3412,6 +3422,8 @@
 
 (define %char-set-type
   (%make-record-type 'char-set '(kind payload) '(sealed)))
+; equal? (and so equal hash tables) compares char-sets by kind and payload.
+(%register-builtin-record-type! 'char-set %char-set-type)
 
 (define (%make-char-set kind payload)
   (%make-record %char-set-type #f kind payload))

@@ -1969,6 +1969,19 @@ bool record_is_builtin(unsigned rec, enum builtin_record_type which)
     return rtd != 0 && IS_RECORD(rec) && record_rtd(rec) == rtd;
 }
 
+bool char_set_record_fields(unsigned rec, unsigned *kind, unsigned *payload)
+{
+    // record_rtd has checked the record's length against its type's field
+    // count, so a two-field type makes both reads in bounds.
+    if (!record_is_builtin(rec, BRT_CHAR_SET) ||
+        record_type_field_count(record_rtd(rec)) != 2)
+        return false;
+    vector_data *vd = GET_VECTOR_PTR(rec);
+    *kind = vd->data[RECORD_FIELDS_START];
+    *payload = vd->data[RECORD_FIELDS_START + 1];
+    return true;
+}
+
 unsigned object_hash_number(unsigned obj)
 {
     static unsigned next_object_hash = 1;
@@ -3209,6 +3222,21 @@ static bool deep_equal_seen(unsigned a, unsigned b, equal_seen_set *seen)
             }
             for (unsigned i = 0; result && i < len_a; i++)
                 result = equal_worklist_push(&pending, da[i], db[i]);
+            break;
+        }
+        case BT_RECORD: {
+            // A record is equal? only to itself (as in MIT), except that
+            // char-sets compare by contents, as they did before they were
+            // records and as MIT's do. A finite set's payload is its range
+            // list, kept sorted and coalesced, so equal lists are equal sets;
+            // a predicate-based set's payload is a procedure, which only
+            // equals itself.
+            unsigned kind_a, payload_a, kind_b, payload_b;
+            if (!char_set_record_fields(a, &kind_a, &payload_a) ||
+                !char_set_record_fields(b, &kind_b, &payload_b) ||
+                !equal_worklist_push(&pending, payload_a, payload_b) ||
+                !equal_worklist_push(&pending, kind_a, kind_b))
+                result = false;
             break;
         }
         default:

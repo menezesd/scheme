@@ -2313,6 +2313,35 @@
          (equal? (char-set->list set) (list #\a #\b))
          (equal? (char-set->string set) "ab")
          (char-set? (->char-set #\a)))))
+; Char-sets are records, but equal? compares them by contents, as MIT does:
+; finite sets by their (sorted, coalesced) ranges, predicate-based sets by
+; identity. member, assoc and equal hash tables follow.
+(test "equal? on character sets" '(#t #t #t #f #f #t #t #f)
+      (let ((inverted (char-set-invert (char-set #\a))))
+        (list (equal? (char-set #\a #\b) (char-set #\b #\a))
+              (equal? (char-set "abc") (char-set #\c (cons 97 99)))
+              (equal? (char-set-union (char-set #\a) (char-set #\b))
+                      (char-set #\a #\b))
+              (equal? (char-set #\a #\b) (char-set #\a #\c))
+              (equal? (char-set #\a) (char-set))
+              (equal? inverted inverted)
+              (equal? (list (char-set #\x)) (list (char-set #\x)))
+              (equal? inverted (char-set-invert (char-set #\a))))))
+(test "member, assoc and equal hash tables find equal character sets"
+      '((#t) found ab none)
+      (let ((table (make-equal-hash-table)))
+        (hash-table-set! table (char-set #\a #\b) 'ab)
+        (list (map char-set?
+                   (member (char-set #\y #\x) (list 1 (char-set #\x #\y))))
+              (cdr (assoc (char-set "xy")
+                          (list (cons (char-set #\y #\x) 'found))))
+              (hash-table-ref/default table (char-set #\b #\a) 'none)
+              (hash-table-ref/default table (char-set #\a) 'none))))
+(test "other records are equal? only to themselves" '(#f #t)
+      (let ()
+        (define-record-type cell (make-cell v) cell? (v cell-v))
+        (let ((c (make-cell 1)))
+          (list (equal? (make-cell 1) (make-cell 1)) (equal? c c)))))
 (test "SRFI-14 character set updates" '(#t #f #t #t)
       (let* ((base (char-set #\a))
              (added (char-set-adjoin base #\b))
@@ -3028,6 +3057,25 @@
             (x make-bad-record))
           #f)))
 
+; The names are checked before anything is defined, so a bad one is
+; define-record-type's error, not define's.
+(test "define-record-type reports a bad name itself"
+      '("define-record-type: type name must be a symbol \"p\""
+        "define-record-type: predicate name must be a symbol 5")
+      (list (guard (e (#t (condition/report-string e)))
+              (eval '(define-record-type "p" (mk a) p? (a pa))
+                    (interaction-environment)))
+            (guard (e (#t (condition/report-string e)))
+              (let ()
+                (define-record-type q #f 5 (a qa))
+                #f))))
+(test "define-record-type reports a bad type name in a body too"
+      "define-record-type: type name must be a symbol 7"
+      (guard (e (#t (condition/report-string e)))
+        (let ()
+          (define-record-type 7 (mk a) p? (a pa))
+          #f)))
+
 (section "Opaque Records")
 
 ; Records are their own type (R7RS 3.2): no other predicate accepts one, and
@@ -3286,6 +3334,25 @@
                          (set-current-output-port! old))))))
           ; The handler resets the wind stack, as it does when it ends a
           ; computation; this one continues.
+          (set! *wind-stack* saved)
+          text)))
+; make-error-object takes any irritants object, as R7RS raise takes any
+; object; a non-list one is written whole, not walked as a list.
+(test "condition/report-string with irritants that are not a list"
+      '("x 5" "x (1 . 2)" "x")
+      (list (condition/report-string (make-error-object 'error "x" 5))
+            (condition/report-string (make-error-object 'error "x" '(1 . 2)))
+            (condition/report-string (make-error-object 'error "x" '()))))
+(test "the default handler reports non-list irritants"
+      "Unhandled exception: x 5\n"
+      (let ((e (guard (e (#t e)) (raise (make-error-object 'error "x" 5))))
+            (saved *wind-stack*))
+        (let ((text (call-with-output-string
+                     (lambda (port)
+                       (let ((old (current-output-port)))
+                         (set-current-output-port! port)
+                         (*default-exception-handler* e)
+                         (set-current-output-port! old))))))
           (set! *wind-stack* saved)
           text)))
 (test "promises are opaque" '(#f #f #t #f)
