@@ -75,6 +75,8 @@ enum lisp_type {
     BT_MULTIVAL,        // Multiple return values: car = list of values
     BT_BUILTIN,         // Built-in primitive: id = primitive_id enum value
     BT_EOF,             // End-of-file object (distinct singleton type)
+    BT_UNASSIGNED,      // The unassigned marker (CELL_UNASSIGNED); never a
+                        // value: reading a variable that holds it is an error
     BT_CLOSURE = 100,   // VM closure (bytecode)
     BT_VMCONT = 101,    // VM continuation (distinct from CPS BT_CONT)
     BT_COMPILED_PATTERN = 102, // Compiled pattern: ptr = compiled_pattern*
@@ -368,7 +370,13 @@ enum core_form {
 // A second core alias of lambda, heading a lambda whose body the expander
 // has already expanded (see expand_procedure in macros.c).
 #define CELL_EXPANDED_LAMBDA (CELL_CORE_ALIAS_BASE + CF_COUNT)
-#define HEAP_RESERVED (CELL_EXPANDED_LAMBDA + 1) // Reserved cells
+// The value of a variable that is bound but not yet assigned: a letrec or
+// named-let variable, or an internal definition, before its initializer
+// has run. Reading such a variable reports "Unassigned variable" (env.c's
+// lookup, the VM's inline-cached lookup); set! and define overwrite it. It
+// is never a Scheme value: no read path hands it out.
+#define CELL_UNASSIGNED (CELL_EXPANDED_LAMBDA + 1)
+#define HEAP_RESERVED (CELL_UNASSIGNED + 1) // Reserved cells
 #define NUMBER_BUF_SIZE 128   // Buffer size for number->string conversion
 #define CHAR_NAME_BUF_SIZE 16 // Buffer size for character name parsing
 

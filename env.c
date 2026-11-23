@@ -813,16 +813,46 @@ static unsigned lookup_internal(int64_t var, unsigned env)
     return TOK_ERROR;
 }
 
+static void show_variable_error(const char *what, int64_t var)
+{
+    // Bounds check before accessing atom_table
+    if (var >= 0 && (unsigned)var < ctx.atom_table_cap && ctx.atom_table[var])
+        show_error("%s: %s", what, ctx.atom_table[var]);
+    else
+        show_error("%s: <invalid id %ld>", what, (long)var);
+}
+
+// var is bound in env, to CELL_UNASSIGNED. Report the variable by its own
+// name: a macro's renamed reference reaches it through an alias (a binding
+// reference, whose cdr is the variable it stands for), and the alias's name
+// is a gensym.
+static void show_unassigned_variable(int64_t var, unsigned env)
+{
+    unsigned cell = env_find_binding_cell(var, env);
+    if (IS_PAIR(cell) && IS_BINDING_REF(car(cell)) &&
+        IS_ATOM(CELL_CDR(car(cell))))
+        var = CELL_ID(CELL_CDR(car(cell)));
+    show_variable_error("Unassigned variable", var);
+}
+
+void show_variable_read_error(int64_t var, unsigned env)
+{
+    if (lookup_internal(var, env) == CELL_UNASSIGNED)
+        show_unassigned_variable(var, env);
+    else
+        show_variable_error("undefined variable", var);
+}
+
 unsigned lookup(int64_t var, unsigned env)
 {
     unsigned result = lookup_internal(var, env);
-    if (result == TOK_ERROR) {
-        // Bounds check before accessing atom_table
-        if (var >= 0 && (unsigned)var < ctx.atom_table_cap && ctx.atom_table[var]) {
-            show_error("undefined variable: %s", ctx.atom_table[var]);
-        } else {
-            show_error("undefined variable: <invalid id %ld>", (long)var);
-        }
+    if (__builtin_expect(result == TOK_ERROR || result == CELL_UNASSIGNED,
+                         0)) {
+        if (result == TOK_ERROR)
+            show_variable_error("undefined variable", var);
+        else
+            show_unassigned_variable(var, env);
+        return TOK_ERROR;
     }
     return result;
 }

@@ -133,6 +133,8 @@ const char *type_name(unsigned cell)
         return "primitive";
     case BT_EOF:
         return "eof-object";
+    case BT_UNASSIGNED:
+        return "unassigned";
     case BT_CLOSURE:
         return "bytecode-closure";
     case BT_VMCLOSURE:
@@ -1087,6 +1089,11 @@ static void write_obj_fp_inner(unsigned s, bool with_quotes, FILE *fp)
         break;
     case BT_EOF:
         fprintf(fp, "#[eof]");
+        break;
+    case BT_UNASSIGNED:
+        // Not a value; printed only if a bug lets it escape (or in bytecode
+        // listings of letrec placeholders).
+        fprintf(fp, "#!unassigned");
         break;
     case BT_MULTIVAL: {
         // Print multiple values

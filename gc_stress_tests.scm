@@ -507,6 +507,28 @@
              ((gc-scope-placeholder 4))
              (equal? (char-set #\a #\b) (char-set #\b #\a))))
 
+;; Unassigned letrec variables and internal definitions: the marker is a
+;; permanent cell, so it must survive every collection as itself, and the
+;; error raised on reading it must be an ordinary, catchable error object.
+(define (gc-unassigned thunk)
+  (guard (e ((error-object? e) (error-object-message e))) (thunk)))
+(define (gc-unassigned-defs flag)
+  (define (get) v)
+  (define w (if flag (get) (make-list 50 'w)))
+  (define v (make-list 50 'v))
+  (list (length w) (length (get))))
+(check "unassigned variables"
+       '("Unassigned variable: y" "Unassigned variable: v" (50 50)
+         "Unassigned variable: b" 5 (1 2 3))
+       (list (gc-unassigned
+              (lambda () (letrec ((x (list 1 2 y)) (y (make-list 9 0))) x)))
+             (gc-unassigned (lambda () (gc-unassigned-defs #t)))
+             (gc-unassigned-defs #f)
+             (gc-unassigned
+              (lambda () (letrec* ((a (lambda () b)) (c (a)) (b 1)) c)))
+             (letrec ((x (begin (set! x (make-list 5 0)) (length x)))) x)
+             (letrec ((a 1) (b (+ a 1)) (c (list a b 3))) c)))
+
 ;; (command-line) is the script's own view of its invocation - its name and
 ;; arguments - without vesper's options. make test-gcstress runs this file as
 ;; `vesper [--interpreter] gc_stress_tests.scm`.

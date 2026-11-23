@@ -5680,6 +5680,198 @@
                  (lambda () (procedure-arity)))))
 
 ;;; ============================================================================
+;;; Unassigned variables
+;;; ============================================================================
+
+;; A letrec/letrec*/named-let variable or internal definition is bound, but
+;; unassigned, until its initializer has run. Reading it then is the error
+;; "Unassigned variable: NAME" (MIT Scheme's), not a placeholder value.
+
+(section "Unassigned variables")
+
+(define (ua-msg thunk)
+  (guard (e ((error-object? e) (error-object-message e))
+            (#t (list 'non-error e)))
+    (thunk)))
+
+(test "letrec: forward reference" "Unassigned variable: y"
+      (ua-msg (lambda () (letrec ((x y) (y 1)) x))))
+(test "letrec: self reference" "Unassigned variable: x"
+      (ua-msg (lambda () (letrec ((x (+ x 1))) x))))
+(test "letrec: reference inside a constructor" "Unassigned variable: x"
+      (ua-msg (lambda () (letrec ((v (vector 1 x)) (x 2)) v))))
+(test "letrec: through a procedure called early" "Unassigned variable: y"
+      (ua-msg (lambda () (letrec ((f (lambda () y)) (z (f)) (y 1)) z))))
+(test "letrec: unassigned in operator position" "Unassigned variable: g"
+      (ua-msg (lambda () (letrec ((x (g)) (g (lambda () 1))) x))))
+(test "letrec: in a test position" "Unassigned variable: y"
+      (ua-msg (lambda () (letrec ((x (if y 1 2)) (y #t)) x))))
+(test "letrec: read by map's procedure" "Unassigned variable: y"
+      (ua-msg (lambda () (letrec ((x (map (lambda (i) y) '(1 2))) (y 1)) x))))
+(test "letrec: read by apply's procedure" "Unassigned variable: y"
+      (ua-msg (lambda () (letrec ((x (apply (lambda () y) '())) (y 1)) x))))
+(test "letrec: mutual recursion still works" #t
+      (letrec ((ev? (lambda (n) (if (= n 0) #t (od? (- n 1)))))
+               (od? (lambda (n) (if (= n 0) #f (ev? (- n 1))))))
+        (ev? 100)))
+(test "letrec: closure over a later binding" 1
+      (letrec ((x (lambda () y)) (y 1)) (x)))
+(test "letrec: earlier binding visible to a later init" 2
+      (letrec ((a 1) (b (+ a 1))) b))
+(test "letrec: nested, inner forward reference" "Unassigned variable: z"
+      (ua-msg (lambda () (letrec ((x (letrec ((y z) (z 1)) y))) x))))
+(test "letrec: inner binding shadows an assigned outer one"
+      "Unassigned variable: x"
+      (ua-msg (lambda () (letrec ((x 1)) (letrec ((y x) (x 2)) y)))))
+(test "letrec: the variable escapes once assigned" 5
+      (let ((p (letrec ((x (lambda () y)) (y 5)) x))) (p)))
+(test "letrec*: forward reference through a procedure"
+      "Unassigned variable: b"
+      (ua-msg (lambda () (letrec* ((a (lambda () b)) (c (a)) (b 1)) c))))
+(test "letrec*: sequential inits" '(1 2 3)
+      (letrec* ((a 1) (b (+ a 1)) (c (+ b 1))) (list a b c)))
+(test "letrec*: forward reference" "Unassigned variable: y"
+      (ua-msg (lambda () (letrec* ((x y) (y 1)) x))))
+(test "a macro's renamed reference reports the variable's own name"
+      "Unassigned variable: w"
+      (ua-msg (lambda ()
+                (letrec ((z (let-syntax ((m (syntax-rules () ((_) w))))
+                              (m)))
+                         (w 2))
+                  z))))
+
+(test "set! of an unassigned variable" 5
+      (letrec ((x (begin (set! x 5) x))) x))
+(test "set! of an unassigned variable, then the init assigns" 7
+      (letrec ((x (begin (set! x 5) 7))) x))
+(test "set! through a procedure before the init" 5
+      (letrec ((f (lambda () (set! y 5) y)) (z (f)) (y z)) y))
+
+(define (ua-define-self) (define a (+ a 1)) a)
+(test "internal define: self reference" "Unassigned variable: a"
+      (ua-msg ua-define-self))
+(define (ua-define-later) (define a 1) (define b (+ b a)) b)
+(test "internal define: later self reference" "Unassigned variable: b"
+      (ua-msg ua-define-later))
+(define (ua-define-forward) (define (a) c) (define b (a)) (define c 2) b)
+(test "internal define: forward reference through a procedure"
+      "Unassigned variable: c" (ua-msg ua-define-forward))
+(define (ua-define-direct) (define a b) (define b 2) a)
+(test "internal define: direct forward reference" "Unassigned variable: b"
+      (ua-msg ua-define-direct))
+(define (ua-define-param x) (define x (+ x 1)) x)
+(test "internal define shadows a parameter" "Unassigned variable: x"
+      (ua-msg (lambda () (ua-define-param 1))))
+(define (ua-define-param2 x) (define (g) x) (define y (g)) (define x 10) y)
+(test "internal define shadows a parameter, read through a procedure"
+      "Unassigned variable: x" (ua-msg (lambda () (ua-define-param2 1))))
+(define (ua-define-param3 x) (define (g) x) (define x 10) (g))
+(test "internal define of a parameter, read after" 10 (ua-define-param3 1))
+(test "internal define in let ()" "Unassigned variable: c"
+      (ua-msg (lambda ()
+                (let () (define a 1) (define b (lambda () c)) (define c (b))
+                  c))))
+(test "internal define in a let body shadowing its variable"
+      "Unassigned variable: x"
+      (ua-msg (lambda () (let ((x 1)) (define x (+ x 1)) x))))
+(test "internal define in a letrec body" "Unassigned variable: q"
+      (ua-msg (lambda () (letrec ((p 1)) (define r q) (define q p) r))))
+(define (ua-define-mutual n)
+  (define (ev? n) (if (= n 0) #t (od? (- n 1))))
+  (define (od? n) (if (= n 0) #f (ev? (- n 1))))
+  (ev? n))
+(test "internal defines: mutual recursion" #t (ua-define-mutual 10))
+(define (ua-define-loop n)
+  (define (loop i acc) (if (= i n) acc (loop (+ i 1) (+ acc i))))
+  (define total (loop 0 0))
+  total)
+(test "internal defines: recursive helper then a use" 45 (ua-define-loop 10))
+(define (ua-define-each-call flag)
+  (define (get) v)
+  (define w (if flag (get) 'skipped))
+  (define v 'set)
+  (list w (get)))
+(test "internal defines are unassigned again on each call"
+      (list '(skipped set) "Unassigned variable: v" '(skipped set))
+      (list (ua-define-each-call #f)
+            (ua-msg (lambda () (ua-define-each-call #t)))
+            (ua-define-each-call #f)))
+
+(test "named let" 3 (let loop ((i 0)) (if (< i 3) (loop (+ i 1)) i)))
+(test "named let: name not visible to the inits" "symbol"
+      (let ((loop 'symbol))
+        (let loop ((x (symbol->string loop))) x)))
+(test "do loop" '(3 (2 1 0))
+      (do ((i 0 (+ i 1)) (acc '() (cons i acc))) ((= i 3) (list i acc))))
+
+(test "error object: message and irritants"
+      '(#t "Unassigned variable: y" ())
+      (guard (e (#t (list (error-object? e) (error-object-message e)
+                          (error-object-irritants e))))
+        (letrec ((x y) (y 1)) x)))
+(test "condition/report-string" "Unassigned variable: y"
+      (guard (e (#t (condition/report-string e)))
+        (letrec ((x y) (y 1)) x)))
+(test "with-exception-handler sees the error" "Unassigned variable: y"
+      (call-with-current-continuation
+       (lambda (k)
+         (with-exception-handler
+          (lambda (e) (k (error-object-message e)))
+          (lambda () (letrec ((x y) (y 1)) x))))))
+(test "unbound is still undefined variable" "undefined variable: ua-nowhere"
+      (ua-msg (lambda () ua-nowhere)))
+
+;; Re-entering a letrec init with a continuation: the bindings assigned when
+;; it was captured stay assigned.
+(define ua-k #f)
+(define ua-n 0)
+(test "call/cc re-entry into a letrec init" '(3 12 12)
+      (letrec ((a (call-with-current-continuation
+                   (lambda (k) (set! ua-k k) 1)))
+               (b (lambda () a)))
+        (set! ua-n (+ ua-n 1))
+        (if (< ua-n 3) (ua-k (+ ua-n 10)) (list ua-n a (b)))))
+(define ua-r '())
+(define ua-kk #f)
+(test "call/cc re-entry into a middle letrec init" '((2 1 0) 7)
+      (letrec ((f (lambda () g))
+               (v (call-with-current-continuation
+                   (lambda (k) (set! ua-kk k) 0)))
+               (g 7))
+        (set! ua-r (cons v ua-r))
+        (if (< v 2) (ua-kk (+ v 1)) (list ua-r (f)))))
+;; A continuation captured in an init, re-entered after the letrec failed
+;; on an unassigned read: the later binding is still unassigned.
+(define ua-k3 #f)
+(define ua-tries 0)
+(test "call/cc re-entry after an unassigned read"
+      '("Unassigned variable: z" "Unassigned variable: z")
+      (let ((msgs '()))
+        (let ((m (ua-msg
+                  (lambda ()
+                    (letrec ((y (call-with-current-continuation
+                                 (lambda (k) (set! ua-k3 k) 1)))
+                             (w (list y z))
+                             (z 2))
+                      w)))))
+          (set! msgs (cons m msgs))
+          (set! ua-tries (+ ua-tries 1))
+          (if (< ua-tries 2) (ua-k3 5))
+          msgs)))
+
+(test "eval inside a letrec init" "Unassigned variable: y"
+      (ua-msg (lambda ()
+                (letrec ((x (eval '(+ 1 2) (interaction-environment)))
+                         (z (+ x y))
+                         (y 1))
+                  z))))
+(test "never a value: let-bound from an unassigned variable"
+      "Unassigned variable: y"
+      (ua-msg (lambda () (letrec ((x (let ((v y)) v)) (y 1)) x))))
+(test "never a value: passed as an argument" "Unassigned variable: y"
+      (ua-msg (lambda () (letrec ((x (list 1 y)) (y 1)) x))))
+
+;;; ============================================================================
 ;;; Summary
 ;;; ============================================================================
 

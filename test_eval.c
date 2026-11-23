@@ -8068,6 +8068,123 @@ TEST(eval_record_primitives_check_their_arguments)
     PASS();
 }
 
+// ============================================================================
+// Unassigned variables
+// ============================================================================
+
+// A letrec or named-let variable, or an internal definition, is bound to
+// CELL_UNASSIGNED until its initializer has run; reading it then fails with
+// "Unassigned variable: NAME" in both engines, as in MIT Scheme.
+static const struct {
+    const char *src;
+    const char *message;
+} unassigned_reads[] = {
+    {"(letrec ((x y) (y 1)) x)", "Unassigned variable: y"},
+    {"(letrec ((x (+ x 1))) x)", "Unassigned variable: x"},
+    {"(letrec ((f (lambda () y)) (z (f)) (y 1)) z)", "Unassigned variable: y"},
+    {"(letrec ((x (g)) (g (lambda () 1))) x)", "Unassigned variable: g"},
+    {"(letrec ((x (if y 1 2)) (y #t)) x)", "Unassigned variable: y"},
+    {"(letrec ((x (letrec ((y z) (z 1)) y))) x)", "Unassigned variable: z"},
+    {"((lambda () (define a (+ a 1)) a))", "Unassigned variable: a"},
+    {"((lambda () (define (g) c) (define b (g)) (define c 2) b))",
+     "Unassigned variable: c"},
+    {"((lambda () (define a b) (define b 2) a))", "Unassigned variable: b"},
+    {"((lambda (x) (define x (+ x 1)) x) 1)", "Unassigned variable: x"},
+    {"(let ((x 1)) (define x (+ x 1)) x)", "Unassigned variable: x"},
+};
+
+TEST(eval_unassigned_variable_read_is_an_error)
+{
+    for (size_t i = 0;
+         i < sizeof(unassigned_reads) / sizeof(unassigned_reads[0]); i++) {
+        ASSERT_EQ(eval_in_engine(unassigned_reads[i].src, false), TOK_ERROR);
+        ASSERT_STR_EQ(ctx.last_error, unassigned_reads[i].message);
+    }
+    PASS();
+}
+
+TEST(compiled_unassigned_variable_read_is_an_error)
+{
+    for (size_t i = 0;
+         i < sizeof(unassigned_reads) / sizeof(unassigned_reads[0]); i++) {
+        ASSERT_EQ(eval_in_engine(unassigned_reads[i].src, true), TOK_ERROR);
+        // The VM may wrap the message on its way out; it must still be there.
+        ASSERT(strstr(ctx.last_error, unassigned_reads[i].message) != NULL);
+    }
+    PASS();
+}
+
+// set! and define assign an unassigned binding; the marker itself never
+// becomes a value either engine hands out.
+TEST(eval_and_compiled_assign_unassigned_variables)
+{
+    static const struct {
+        const char *src;
+        int64_t value;
+    } cases[] = {
+        {"(letrec ((x (begin (set! x 5) x))) x)", 5},
+        {"(letrec ((x (begin (set! x 5) 7))) x)", 7},
+        {"(letrec ((f (lambda () (set! y 5) y)) (z (f)) (y z)) y)", 5},
+        {"(letrec ((a 1) (b (+ a 1))) b)", 2},
+        {"(letrec ((x (lambda () y)) (y 3)) (x))", 3},
+        {"((lambda () (define (g) c) (define c 4) (g)))", 4},
+        {"((lambda (x) (define (g) x) (define x 10) (g)) 1)", 10},
+        {"(let loop ((i 0)) (if (< i 3) (loop (+ i 1)) i))", 3},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        for (int compiled = 0; compiled < 2; compiled++) {
+            unsigned result = eval_in_engine(cases[i].src, compiled);
+            ASSERT(result != CELL_UNASSIGNED);
+            ASSERT(is_int(result, cases[i].value));
+        }
+    }
+    PASS();
+}
+
+// The compiler binds an internal definition unassigned at the start of its
+// body only when something could read it before the definition runs: an
+// earlier definition mentions it, or its own initializer does outside a
+// lambda that is the whole initializer. The rest cost no code.
+static unsigned compiled_define_count(const char *src)
+{
+    GC_GUARD;
+    unsigned env = default_environment();
+    gc_protect(&env);
+    unsigned expr = read_expr_from_string(src);
+    gc_protect(&expr);
+    code_object *code = compile_toplevel(expr, env);
+    unsigned count = code ? code_count_opcode(code, OP_DEFINE) : 0xFFFFFFFFu;
+    gc_sweep_code_objects();
+    return count;
+}
+
+TEST(compiled_internal_defines_prebind_only_names_read_early)
+{
+    // Helpers used only later, and a self-recursive one: no prebinding.
+    ASSERT_EQ(compiled_define_count(
+                  "(lambda (n) (define (sq x) (* x x)) (define k (+ n 1))"
+                  "  (sq k))"),
+              2);
+    ASSERT_EQ(compiled_define_count(
+                  "(lambda () (define (loop i) (if (= i 0) 0 (loop (- i 1))))"
+                  "  (define r (loop 3)) r)"),
+              2);
+    ASSERT_EQ(compiled_define_count("(lambda () (define f (lambda () (f))) 1)"),
+              1);
+    // A forward reference, a self reference outside a lambda, and mutual
+    // recursion each bind one name first.
+    ASSERT_EQ(compiled_define_count("(lambda () (define a b) (define b 2) a)"),
+              3);
+    ASSERT_EQ(compiled_define_count("(lambda () (define a (+ a 1)) a)"), 2);
+    ASSERT_EQ(compiled_define_count(
+                  "(lambda () (define (ev n) (od n)) (define (od n) (ev n))"
+                  "  (ev 1))"),
+              3);
+    // Top-level definitions are globals: nothing is bound ahead of them.
+    ASSERT_EQ(compiled_define_count("(begin (define a b) (define b 2))"), 2);
+    PASS();
+}
+
 // The predicate and accessor every define-record-type generates compile to
 // inline opcodes; rebinding the primitive still takes effect through the
 // guard in front of them.
@@ -8706,6 +8823,10 @@ int main(void)
     RUN_TEST(compile_inlines_record_predicate_and_accessor);
     RUN_TEST(eval_vector_operations_reject_records);
     RUN_TEST(eval_shadowed_keyword_head_is_applied);
+    RUN_TEST(eval_unassigned_variable_read_is_an_error);
+    RUN_TEST(compiled_unassigned_variable_read_is_an_error);
+    RUN_TEST(eval_and_compiled_assign_unassigned_variables);
+    RUN_TEST(compiled_internal_defines_prebind_only_names_read_early);
 
     TEST_SUMMARY("evaluator");
 }

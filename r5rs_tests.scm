@@ -2520,6 +2520,41 @@ b")
     (let ((set! list)) (regress-ck-mdef g) (g 5)))
 
 ;;; ============================================================================
+;;; Unassigned letrec variables and internal definitions
+;;; ============================================================================
+
+;; R7RS 4.2.2 / 5.3.2: it is an error to read a letrec, letrec* or internal
+;; definition variable before its init has been evaluated. Vesper reports it
+;; as MIT does: "Unassigned variable: NAME", an ordinary error object.
+(test-section "Unassigned variables")
+(define (r5-unassigned thunk)
+  (call-with-current-continuation
+   (lambda (k)
+     (with-exception-handler
+      (lambda (e) (k (if (error-object? e) (error-object-message e) e)))
+      thunk))))
+(test "letrec init reads a later variable" "Unassigned variable: b"
+    (r5-unassigned (lambda () (letrec ((a b) (b 1)) a))))
+(test "letrec init reads its own variable" "Unassigned variable: a"
+    (r5-unassigned (lambda () (letrec ((a (list a))) a))))
+(test "letrec init calls a procedure reading a later variable"
+    "Unassigned variable: c"
+    (r5-unassigned (lambda () (letrec ((f (lambda () c)) (b (f)) (c 1)) b))))
+(test "letrec* init reads a later variable" "Unassigned variable: b"
+    (r5-unassigned (lambda () (letrec* ((a (lambda () b)) (c (a)) (b 1)) c))))
+(test "internal definition reads a later one" "Unassigned variable: y"
+    (r5-unassigned (lambda () (define (g) y) (define x (g)) (define y 1) x)))
+(test "internal definition reads itself" "Unassigned variable: n"
+    (r5-unassigned (lambda () (define n (+ n 1)) n)))
+(test "letrec variables are assigned by the body" '(1 2)
+    (letrec ((a 1) (b 2)) (list a b)))
+(test "set! assigns an unassigned letrec variable" 3
+    (letrec ((a (begin (set! a 3) a))) a))
+(test "do and named let are unaffected" '(10 10)
+    (list (do ((i 0 (+ i 1))) ((= i 10) i))
+          (let loop ((i 0)) (if (= i 10) i (loop (+ i 1))))))
+
+;;; ============================================================================
 ;;; Summary
 ;;; ============================================================================
 

@@ -5771,11 +5771,14 @@
     ((include-ci filename ...)
      (include filename ...))))
 
+; The built-in letrec already evaluates its inits left to right, assigning
+; each variable as its init returns, with every variable bound (unassigned)
+; from the start - which is letrec*. Reading one before its init has run is
+; an "Unassigned variable" error, not a placeholder value.
 (define-syntax letrec*
   (syntax-rules ()
     ((letrec* ((var init) ...) body ...)
-     (let ((var #f) ...)
-       (set! var init) ...
+     (letrec ((var init) ...)
        body ...))))
 
 (define (list-set! lst k obj)

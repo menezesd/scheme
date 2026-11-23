@@ -218,14 +218,12 @@ static unsigned vm_store_integer_result(int64_t n)
     return FITS_FIXNUM(n) ? MAKE_FIXNUM((int32_t)n) : store(n);
 }
 
-static void vm_show_undefined_variable(int64_t sym_id)
+// A variable read from env failed: it is unbound, or bound but unassigned
+// (ic_lookup reports both as TOK_ERROR; this tells them apart, off the hot
+// path).
+static void vm_show_undefined_variable(int64_t sym_id, unsigned env)
 {
-    if (sym_id >= 0 && (unsigned)sym_id < ctx.atom_table_cap &&
-        ctx.atom_table[sym_id]) {
-        show_error("undefined variable: %s", ctx.atom_table[sym_id]);
-    } else {
-        show_error("undefined variable: <id %ld>", (long)sym_id);
-    }
+    show_variable_read_error(sym_id, env);
 }
 
 static void vm_deopt_binary_op(vm_state *vm, unsigned opcode, unsigned a,
@@ -625,14 +623,18 @@ ic_lookup_slow(code_object *code, unsigned word, int64_t symbol, unsigned env)
                                           : ic_revalidate(e, symbol, env);
             unsigned value = 0;
             if (cell && vm_try_deref_binding_value(car(cell), &value))
-                return value;
+                return value == CELL_UNASSIGNED ? TOK_ERROR : value;
         }
     }
-    return ic_lookup_miss(code, word, symbol, env);
+    unsigned value = ic_lookup_miss(code, word, symbol, env);
+    return value == CELL_UNASSIGNED ? TOK_ERROR : value;
 }
 
 // Look up symbol from env through the cache whose first word is
-// code->code[word]. TOK_ERROR if unbound.
+// code->code[word]. TOK_ERROR if unbound or unassigned (the caller tells
+// them apart with vm_show_undefined_variable). A cached cell holding the
+// unassigned marker - a letrec variable or internal definition read before
+// its initializer ran - takes the slow path, which rejects it.
 static inline unsigned ic_lookup(code_object *code, unsigned word,
                                  int64_t symbol, unsigned env)
 {
@@ -643,7 +645,9 @@ static inline unsigned ic_lookup(code_object *code, unsigned word,
                                  e->stamp == env_binding_stamp(symbol),
                              1)) {
             unsigned value = car(e->cell);
-            if (__builtin_expect(!IS_BINDING_REF(value), 1))
+            if (__builtin_expect(value != CELL_UNASSIGNED &&
+                                     !IS_BINDING_REF(value),
+                                 1))
                 return value;
         }
     }
@@ -2121,7 +2125,7 @@ static unsigned vm_dispatch(vm_state *vm)
                 }
                 continue;
             }
-            vm_show_undefined_variable(sym_id);
+            vm_show_undefined_variable(sym_id, vm->env);
             vm_signal_error(vm, ctx.last_error);
             continue; // continue the dispatch loop (handler may have been set up)
         }
@@ -2387,8 +2391,8 @@ static unsigned vm_dispatch(vm_state *vm)
                     unsigned binding = cdr(pending);
                     int64_t symbol = CELL_ID(car(binding));
                     unsigned fn = lookup_silent(symbol, cdr(binding));
-                    if (fn == TOK_ERROR) {
-                        vm_show_undefined_variable(symbol);
+                    if (fn == TOK_ERROR || fn == CELL_UNASSIGNED) {
+                        vm_show_undefined_variable(symbol, cdr(binding));
                         vm_signal_error(vm, ctx.last_error);
                         break;
                     }
@@ -2544,7 +2548,7 @@ static unsigned vm_dispatch(vm_state *vm)
             vm->ip += 2;
             unsigned fn = ic_lookup(vm->code, cache_word, symbol, vm->env);
             if (fn == TOK_ERROR) {
-                vm_show_undefined_variable(symbol);
+                vm_show_undefined_variable(symbol, vm->env);
                 vm_signal_error(vm, ctx.last_error);
             } else if (!IS_BUILTIN(fn) || CELL_ID(fn) != expected) {
                 vm->ip = target;

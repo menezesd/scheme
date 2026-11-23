@@ -355,6 +355,30 @@ PROBES = [
     "(procedure-arity 5)",
     # Ordinary non-tail recursion should not hit an engine limit at this depth.
     "(let ((f (lambda (f n) (if (= n 0) '() (cons n (f f (- n 1))))))) (length (f f 100000)))",
+    # --- unassigned variables: a letrec, letrec* or internal-definition
+    # variable read before its init has run is "Unassigned variable: NAME".
+    "(call-with-current-continuation (lambda (k) (with-exception-handler (lambda (e) (k (condition/report-string e))) (lambda () (letrec ((x y) (y 1)) x)))))",
+    "(call-with-current-continuation (lambda (k) (with-exception-handler (lambda (e) (k (condition/report-string e))) (lambda () (letrec ((x (+ x 1))) x)))))",
+    "(call-with-current-continuation (lambda (k) (with-exception-handler (lambda (e) (k (condition/report-string e))) (lambda () (letrec ((v (vector 1 x)) (x 2)) v)))))",
+    "(call-with-current-continuation (lambda (k) (with-exception-handler (lambda (e) (k (condition/report-string e))) (lambda () (letrec ((x (lambda () y)) (y 1)) (x))))))",
+    "(call-with-current-continuation (lambda (k) (with-exception-handler (lambda (e) (k (condition/report-string e))) (lambda () (letrec ((x (if y 1 2)) (y #t)) x)))))",
+    "(call-with-current-continuation (lambda (k) (with-exception-handler (lambda (e) (k (condition/report-string e))) (lambda () (letrec ((x (letrec ((y z) (z 1)) y))) x)))))",
+    "(call-with-current-continuation (lambda (k) (with-exception-handler (lambda (e) (k (condition/report-string e))) (lambda () (letrec ((x 1)) (letrec ((y x) (x 2)) y))))))",
+    "(call-with-current-continuation (lambda (k) (with-exception-handler (lambda (e) (k (condition/report-string e))) (lambda () (letrec ((x (begin (set! x 5) x))) x)))))",
+    "(call-with-current-continuation (lambda (k) (with-exception-handler (lambda (e) (k (condition/report-string e))) (lambda () (letrec ((x (begin (set! x 5) 7))) x)))))",
+    "(call-with-current-continuation (lambda (k) (with-exception-handler (lambda (e) (k (condition/report-string e))) (lambda () (letrec ((x (map (lambda (i) y) '(1 2))) (y 1)) x)))))",
+    "(call-with-current-continuation (lambda (k) (with-exception-handler (lambda (e) (k (condition/report-string e))) (lambda () (letrec ((x (apply (lambda () y) '())) (y 1)) x)))))",
+    "(call-with-current-continuation (lambda (k) (with-exception-handler (lambda (e) (k (condition/report-string e))) (lambda () (letrec* ((a (lambda () b)) (c (a)) (b 1)) c)))))",
+    "(call-with-current-continuation (lambda (k) (with-exception-handler (lambda (e) (k (condition/report-string e))) (lambda () (letrec* ((a 1) (b (+ a 1))) b)))))",
+    "(call-with-current-continuation (lambda (k) (with-exception-handler (lambda (e) (k (condition/report-string e))) (lambda () ((lambda () (define a (+ a 1)) a))))))",
+    "(call-with-current-continuation (lambda (k) (with-exception-handler (lambda (e) (k (condition/report-string e))) (lambda () ((lambda () (define a 1) (define b (+ b a)) b))))))",
+    "(call-with-current-continuation (lambda (k) (with-exception-handler (lambda (e) (k (condition/report-string e))) (lambda () ((lambda () (define (a) c) (define b (a)) (define c 2) b))))))",
+    "(call-with-current-continuation (lambda (k) (with-exception-handler (lambda (e) (k (condition/report-string e))) (lambda () ((lambda () (define a (lambda () b)) (define c (a)) (define b 2) c))))))",
+    "(call-with-current-continuation (lambda (k) (with-exception-handler (lambda (e) (k (condition/report-string e))) (lambda () ((lambda (x) (define x (+ x 1)) x) 1)))))",
+    "(call-with-current-continuation (lambda (k) (with-exception-handler (lambda (e) (k (condition/report-string e))) (lambda () ((lambda (x) (define (g) x) (define y (g)) (define x 10) y) 1)))))",
+    "(call-with-current-continuation (lambda (k) (with-exception-handler (lambda (e) (k (condition/report-string e))) (lambda () ((lambda (x) (define (g) x) (define x 10) (g)) 1)))))",
+    "(call-with-current-continuation (lambda (k) (with-exception-handler (lambda (e) (k (condition/report-string e))) (lambda () (let () (define a 1) (define b (lambda () c)) (define c (b)) c)))))",
+    "(call-with-current-continuation (lambda (k) (with-exception-handler (lambda (e) (k (condition/report-string e))) (lambda () (let loop ((i 0)) (if (< i 3) (loop (+ i 1)) i))))))",
 ]
 
 def list_boundary_probes():

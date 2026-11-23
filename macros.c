@@ -535,8 +535,10 @@ static int bind_internal_definitions_at(unsigned env, unsigned body,
         gc_protect(&name);
         if (!*frame)
             *frame = extend_env_empty(env);
+        // Unassigned until the definition runs: reading it before then is
+        // an "Unassigned variable" error, as in MIT Scheme.
         if (*frame == TOK_ERROR ||
-            defvar(name, ctx.atom_false, *frame) == TOK_ERROR)
+            defvar(name, CELL_UNASSIGNED, *frame) == TOK_ERROR)
             return -1;
         gc_unprotect(1);
     }

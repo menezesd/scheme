@@ -675,7 +675,8 @@ bool handle_letstar(unsigned id, unsigned env, unsigned cont)
  *
  * Recursive binding: all variables are bound before any expressions
  * are evaluated. This allows mutually recursive definitions.
- * Variables initially bound to undefined, then set! to their values.
+ * Variables start out unassigned (CELL_UNASSIGNED: reading one is an
+ * "Unassigned variable" error) and are assigned as their inits finish.
  */
 bool handle_letrec(unsigned id, unsigned env, unsigned cont)
 {
@@ -724,7 +725,8 @@ bool handle_letrec(unsigned id, unsigned env, unsigned cont)
         unsigned vc = 0;
         gc_protect(&vc);
         vc = alloc_cons(var, 0);
-        unsigned vlc = alloc_cons(0, 0);
+        // Unassigned until its init has run (see CELL_UNASSIGNED)
+        unsigned vlc = alloc_cons(CELL_UNASSIGNED, 0);
         gc_unprotect(1); // vc
         if (!vars) {
             vars = vc;
@@ -961,8 +963,10 @@ bool dispatch_special_form(int64_t kw, unsigned id, unsigned env, unsigned cont,
         }
         // An ordinary binding shadows the keyword: hand the value back so
         // the application does not walk the environment chain a second time
-        // to evaluate its head.
-        *head_value = binding;
+        // to evaluate its head. Not an unassigned one: evaluating the head
+        // looks it up again and reports it.
+        if (binding != CELL_UNASSIGNED)
+            *head_value = binding;
         return false;
     }
 

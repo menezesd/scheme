@@ -74,11 +74,19 @@ bool env_binding_list_acyclic(unsigned vars);
 // Set an existing variable (error if not found)
 unsigned setvar(int64_t var, unsigned aval, unsigned env);
 
-// Look up a variable (prints error if not found)
+// Look up a variable (prints error if not found). TOK_ERROR, with an
+// "Unassigned variable" error, if it is bound to CELL_UNASSIGNED.
 unsigned lookup(int64_t var, unsigned env);
 
-// Look up a variable silently (no error if not found)
+// Look up a variable silently (no error if not found). Returns the binding
+// as it is, CELL_UNASSIGNED included: callers that take the result as a
+// variable's value must reject that themselves.
 unsigned lookup_silent(int64_t var, unsigned env);
+
+// Report reading var, not found or found unassigned in env: show_error with
+// "Unassigned variable: NAME" if env binds it to CELL_UNASSIGNED, else with
+// "undefined variable: NAME". For read paths that do their own lookup.
+void show_variable_read_error(int64_t var, unsigned env);
 
 // Invalidate lookup cache (call after GC or major environment changes)
 void env_invalidate_cache(void);

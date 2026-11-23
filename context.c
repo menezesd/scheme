@@ -3838,6 +3838,10 @@ void init_keywords(void)
     CELL_TYPE(CELL_EOF_OBJECT) = BT_EOF;
     CELL_ID(CELL_EOF_OBJECT) = 0;
 
+    // So is the unassigned marker (see CELL_UNASSIGNED in types.h)
+    CELL_TYPE(CELL_UNASSIGNED) = BT_UNASSIGNED;
+    CELL_ID(CELL_UNASSIGNED) = 0;
+
     // Initialize permanent atoms in reserved cells (never GC'd)
     init_boolean_atom(CELL_ATOM_FALSE, "#f");
     init_boolean_atom(CELL_ATOM_TRUE, "#t");

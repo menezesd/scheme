@@ -703,6 +703,7 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx);
 static compile_result compile_if(unsigned expr, compile_ctx *cctx);
 static compile_result compile_lambda(unsigned expr, compile_ctx *cctx);
 static compile_result compile_begin(unsigned exprs, compile_ctx *cctx);
+static compile_result compile_body(unsigned body, compile_ctx *cctx);
 static compile_result compile_let(unsigned expr, compile_ctx *cctx);
 static compile_result compile_letstar(unsigned expr, compile_ctx *cctx);
 static compile_result compile_letrec(unsigned expr, compile_ctx *cctx);
@@ -3949,7 +3950,7 @@ static compile_result compile_lambda(unsigned expr, compile_ctx *cctx)
             reserve_operand = lambda_cctx->code->code_len - 1;
         }
 
-        compile_begin(body, lambda_cctx);
+        compile_body(body, lambda_cctx);
 
         if (lambda_cctx->let_slot_retry) {
             // A let scope needs an environment frame after all; its ordinal
@@ -4189,9 +4190,99 @@ static void emit_pending_define_aliases(compile_ctx *cctx, unsigned pending,
     cell_set_cdr(pending, kept_aliases);
 }
 
+// Set by compile_body for the compile_begin call it makes; see there.
+static bool compiling_body_scope = false;
+
+// A <body>: a lambda's, or a let-family form's in the frame it pushes (not
+// let-syntax's, which the interpreter runs form by form too). Its
+// leading internal definitions are one letrec* scope, so each name is bound
+// - unassigned - from the start of the body, and reading it before its
+// definition has run is an "Unassigned variable" error, as in the
+// interpreter (which binds them all up front, macros.c) and MIT Scheme.
+// A begin spliced into a body or at top level is no scope of its own and is
+// compiled by compile_begin directly.
+static compile_result compile_body(unsigned body, compile_ctx *cctx)
+{
+    compiling_body_scope = true;
+    return compile_begin(body, cctx);
+}
+
+// Before a body's first form runs, bind (to CELL_UNASSIGNED) each of its
+// internal definitions that could be read before its definition has run;
+// the definition itself then assigns the binding in place. OP_DEFINE adds
+// the others where they are, as before: nothing can reach them sooner.
+//
+// A name can be read early only if it occurs in an earlier definition (a
+// procedure defined there may be called before this one runs) or in its own
+// initializer - except inside a lambda that is the whole initializer, which
+// cannot run before the definition gives it out. Occurrence is textual, so
+// a nested begin or a define-syntax counts every name in it, and quoted
+// data too. Only a non-hygienic macro could hide a reference; reading the
+// name then finds no binding yet ("undefined variable"), as it always did.
+// Most bodies need nothing here: self-recursive helpers and definitions
+// used only by later ones or by the body's expressions cost no code.
+static void emit_unassigned_prebinds(compile_ctx *cctx, unsigned exprs,
+                                     unsigned names, unsigned env)
+{
+    // Collections move cells: everything held across an allocation below
+    // is rooted, loop cursors included.
+    GC_GUARD;
+    gc_protect(&exprs);
+    gc_protect(&env);
+    unsigned later = names; // defined in this form or one after it
+    gc_protect(&later);
+    unsigned emitted = 0, defined = 0, kept = 0, scanned = 0, n = 0;
+    gc_protect(&emitted);
+    gc_protect(&defined); // names the current form defines
+    gc_protect(&kept);
+    gc_protect(&scanned); // the part of the current form that may run early
+    gc_protect(&n);
+    for (; IS_PAIR(exprs) && later; exprs = cdr(exprs)) {
+        unsigned form = car(exprs);
+        unsigned own = is_internal_define(form, env);
+        int64_t own_id = own ? CELL_ID(own) : -1;
+        // The initializer is a lambda: its body runs only once called.
+        bool self_safe =
+            own && (IS_PAIR(cadr(form)) ||
+                    (IS_PAIR(cddr(form)) && !cdr(cddr(form)) &&
+                     form_is_core(car(cddr(form)), ctx.kw_lambda, env)));
+        scanned = own ? cddr(form) : form;
+        defined = 0;
+        if (own) {
+            defined = alloc_cons(own, 0);
+        } else if (IS_PAIR(form) && IS_KEYWORD(car(form), ctx.kw_begin) &&
+                   !is_keyword_shadowed(CELL_ID(car(form)), env)) {
+            defined = scan_internal_defines(cdr(form), env);
+        }
+        for (n = later; IS_PAIR(n); n = cdr(n)) {
+            int64_t id = CELL_ID(car(n));
+            if ((self_safe && id == own_id) ||
+                atom_list_contains_id(emitted, id) ||
+                !contains_reference(scanned, id))
+                continue;
+            emitted = alloc_cons(car(n), emitted);
+            emit2(cctx, OP_CONST, code_add_const(cctx->code, CELL_UNASSIGNED));
+            emit2(cctx, OP_DEFINE, (unsigned)id);
+        }
+        // The names this form defines are not "later" for the next one.
+        if (defined) {
+            kept = 0;
+            for (n = later; IS_PAIR(n); n = cdr(n)) {
+                if (!atom_list_contains_id(defined, CELL_ID(car(n))))
+                    kept = alloc_cons(car(n), kept);
+            }
+            later = kept;
+        }
+    }
+}
+
 // Compile sequence of expressions
 static compile_result compile_begin(unsigned exprs, compile_ctx *cctx)
 {
+    // First, before anything can compile a nested body: is this one?
+    bool body_scope = compiling_body_scope;
+    compiling_body_scope = false;
+
     if (!list_length_checked(exprs, NULL, "begin"))
         return emit_syntax_error(cctx, "begin: invalid syntax");
 
@@ -4207,6 +4298,8 @@ static compile_result compile_begin(unsigned exprs, compile_ctx *cctx)
     // this context (see the empty-syntax-binding splice tests).
     GC_GUARD;
     gc_protect(&exprs);
+    unsigned scan_env = cctx->env;
+    gc_protect(&scan_env);
     unsigned internal_defs = scan_internal_defines(exprs, cctx->env);
     gc_protect(&internal_defs);
 
@@ -4259,6 +4352,9 @@ static compile_result compile_begin(unsigned exprs, compile_ctx *cctx)
         defvar(marker, binding, cctx->env);
         gc_unprotect(2);
     }
+
+    if (body_scope && internal_defs)
+        emit_unassigned_prebinds(cctx, exprs, internal_defs, scan_env);
 
     bool tail = cctx->tail_position;
     compile_result result = dynamic_result();
@@ -4368,7 +4464,8 @@ static compile_result compile_named_let(unsigned expr, compile_ctx *cctx)
     gc_unprotect(1);
 
     emit_pushenv(cctx);
-    emit2(cctx, OP_CONST, code_add_const(cctx->code, 0));
+    // Bound but unassigned until the SET below: the lambda is its init.
+    emit2(cctx, OP_CONST, code_add_const(cctx->code, CELL_UNASSIGNED));
     emit2(cctx, OP_DEFINE, CELL_ID(name));
 
     unsigned saved_env = cctx->env;
@@ -4490,7 +4587,7 @@ static compile_result compile_let(unsigned expr, compile_ctx *cctx)
 
     // Compile body in the same tail context as the let expression.
     cctx->tail_position = tail;
-    compile_result result = compile_begin(body, cctx);
+    compile_result result = compile_body(body, cctx);
 
     // Restore compile-time environment and known_lambdas
     cctx->env = saved_env;
@@ -4550,7 +4647,7 @@ static compile_result compile_letstar(unsigned expr, compile_ctx *cctx)
 
     // Compile body in the same tail context as the let* expression.
     cctx->tail_position = tail;
-    compile_begin(body, cctx);
+    compile_body(body, cctx);
 
     // Restore compile-time environment
     cctx->env = saved_env;
@@ -4584,12 +4681,13 @@ static compile_result compile_letrec(unsigned expr, compile_ctx *cctx)
     // Push new environment frame
     emit_pushenv(cctx);
 
-    // First pass: define all variables with undefined values
+    // First pass: bind all variables, unassigned until their inits run, so
+    // reading one early reports "Unassigned variable" (see CELL_UNASSIGNED)
     unsigned b = bindings;
     gc_protect(&b);
     for (; b; b = cdr(b)) {
         unsigned binding = car(b);
-        emit2(cctx, OP_CONST, code_add_const(cctx->code, 0));
+        emit2(cctx, OP_CONST, code_add_const(cctx->code, CELL_UNASSIGNED));
         emit2(cctx, OP_DEFINE, CELL_ID(car(binding)));
     }
 
@@ -4685,7 +4783,7 @@ static compile_result compile_letrec(unsigned expr, compile_ctx *cctx)
 
     // Compile body with correct tail position from enclosing context
     cctx->tail_position = tail;
-    compile_begin(body, cctx);
+    compile_body(body, cctx);
 
     // Restore compile-time environment
     cctx->env = saved_env;
@@ -5761,7 +5859,7 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
             cctx->tail_position = tail;
             unsigned body_code_start = cctx->code->code_len;
             unsigned body_children_start = cctx->code->children_len;
-            compile_begin(lambda_body, cctx);
+            compile_body(lambda_body, cctx);
             cctx->num_locals = saved_num_locals;
             if (saved_num_locals > 0)
                 memcpy(cctx->local_ids, saved_local_ids,
