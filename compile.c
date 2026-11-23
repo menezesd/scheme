@@ -5097,6 +5097,465 @@ static bool emit_unary_arithmetic(compile_ctx *cctx, int64_t prim,
     return false;
 }
 
+// (f args ...) where f is bound to primitive prim: inlined as an opcode, or
+// folded to a constant, behind a guard that falls back to an ordinary call
+// unless the binding is immutable.
+static compile_result compile_primitive_call(unsigned fn_expr, unsigned args,
+                                             int64_t prim, compile_ctx *cctx)
+{
+    GC_GUARD;
+    gc_protect(&fn_expr);
+    gc_protect(&args);
+    unsigned argc = list_length(args);
+    bool tail = cctx->tail_position;
+    bool immutable = cctx->immutable_base &&
+        env_binding_is_immutable(CELL_ID(fn_expr), cctx->env);
+    cctx->tail_position = false;
+    unsigned saved_pos = cctx->code->code_len;
+    compile_result results[256] = {0};
+    bool all_const = argc <= 256 && is_foldable_primitive(prim);
+    unsigned a = args, i = 0;
+    gc_protect(&a);
+    for (; a; a = cdr(a), i++) {
+        compile_result result = compile_expr_internal(car(a), cctx);
+        if (i < 256) {
+            results[i] = result;
+            if (result.is_const)
+                gc_protect(&results[i].value);
+        }
+        if (!result.is_const)
+            all_const = false;
+    }
+
+    unsigned guard = 0;
+    if (!immutable) {
+        guard = cctx->code->code_len;
+        emit(cctx, OP_GUARD_PRIMITIVE);
+        code_emit(cctx->code, 0); // fallback resumes after the fast path
+        code_emit(cctx->code, CELL_ID(fn_expr));
+        code_emit(cctx->code, prim);
+        code_emit(cctx->code, argc);
+        code_emit(cctx->code, tail);
+        code_emit(cctx->code, 0xFFFFFFFF); // lookup cache
+        code_emit(cctx->code, 0xFFFFFFFF);
+    }
+
+    bool folded = false;
+    unsigned constant = 0;
+    gc_protect(&constant);
+    if (all_const) {
+        unsigned values = 0;
+        gc_protect(&values);
+        for (unsigned j = argc; j > 0; j--)
+            values = alloc_cons(results[j - 1].value, values);
+        bool suppress = ctx.suppress_error_output;
+        ctx.suppress_error_output = true;
+        constant = apply_primitive(prim, values);
+        ctx.suppress_error_output = suppress;
+        ctx.last_error[0] = '\0';
+        folded = constant != TOK_ERROR;
+        if (folded) {
+            if (immutable)
+                code_truncate(cctx->code, saved_pos, cctx->code->children_len);
+            else
+                for (unsigned j = 0; j < argc; j++)
+                    emit(cctx, OP_POP);
+            emit2(cctx, OP_CONST, code_add_const(cctx->code, constant));
+        }
+        gc_unprotect(1);
+    }
+    if (!folded && !emit_unary_arithmetic(cctx, prim, results, argc))
+        emit_primitive_operation(cctx, prim, argc, tail);
+    if (!immutable)
+        code_patch(cctx->code, guard + 1, cctx->code->code_len);
+    return immutable && folded ? const_result(constant) : dynamic_result();
+}
+
+// (f args ...) where f is a let-bound lambda known at compile time
+// (escape analysis): compiled as ((lambda ...) args ...). False when f's
+// binding may have changed since it was registered.
+static bool compile_known_lambda_call(unsigned fn_expr, unsigned args,
+                                      compile_ctx *cctx, compile_result *result)
+{
+    int64_t var_id = CELL_ID(fn_expr);
+    unsigned reg_env_len = 0;
+    unsigned lambda_expr =
+        lookup_known_lambda(var_id, cctx->known_lambdas, &reg_env_len);
+    // Inline only while the compile-time environment is unchanged: a
+    // scope pushed since registration (nested lambda, let, begin with
+    // internal defines) may rebind var, and inlining would then use
+    // the wrong binding (non-capture-avoiding substitution).
+    if (!lambda_expr || compile_env_length(cctx->env) != reg_env_len)
+        return false;
+
+    GC_GUARD;
+    // Found a known lambda - construct ((lambda ...) args) and recurse to use
+    // the existing lambda inlining code. Remove this binding from
+    // known_lambdas to prevent infinite recursion if the lambda calls itself
+    // (recursive functions).
+    unsigned saved_known = cctx->known_lambdas;
+    gc_protect(&saved_known);
+    gc_protect(&lambda_expr);
+    gc_protect(&args);
+    unsigned new_known = 0;
+    gc_protect(&new_known);
+    unsigned entry = cctx->known_lambdas;
+    gc_protect(&entry);
+    while (entry) {
+        unsigned pair = car(entry);
+        gc_protect(&pair);
+        if (!IS_PAIR(pair) || !IS_ATOM(car(pair)) ||
+            CELL_ID(car(pair)) != var_id) {
+            new_known = alloc_cons(pair, new_known);
+        }
+        gc_unprotect(1);
+        entry = cdr(entry);
+    }
+    gc_unprotect(1);
+    cctx->known_lambdas = new_known;
+
+    unsigned inlined_call = alloc_cons(lambda_expr, args);
+    gc_protect(&inlined_call);
+    *result = compile_call(inlined_call, cctx);
+
+    cctx->known_lambdas = saved_known;
+    return true;
+}
+
+// ((lambda (params) body) args): inlined as a let, which avoids closure
+// allocation and function call overhead. False, having compiled nothing,
+// when the arguments do not fit the parameters.
+static bool compile_lambda_application(unsigned fn_expr, unsigned args,
+                                       compile_ctx *cctx,
+                                       compile_result *result)
+{
+    if (!syntax_arity_checked(fn_expr, 2, UINT_MAX, "lambda")) {
+        *result = emit_syntax_error(cctx, "lambda: invalid syntax");
+        return true;
+    }
+
+    GC_GUARD;
+    gc_protect(&fn_expr);
+    gc_protect(&args);
+    unsigned lambda_params = cadr(fn_expr);
+    unsigned lambda_body = cddr(fn_expr);
+    gc_protect(&lambda_params);
+    gc_protect(&lambda_body);
+    // lambda_params_valid allocates, so locals must be protected first
+    if (!list_length_checked(lambda_body, NULL, "lambda")) {
+        *result = emit_syntax_error(cctx, "lambda: invalid syntax");
+        return true;
+    }
+    if (!lambda_params_valid(lambda_params)) {
+        *result = emit_syntax_error(cctx, "lambda: invalid formals");
+        return true;
+    }
+
+    // Count params and check for rest parameter
+    // Handle two cases:
+    // 1. (lambda args body) - params is just an atom, all args go to rest
+    // 2. (lambda (x y . rest) body) - some fixed params, then rest
+    unsigned param_count = 0;
+    bool has_rest = false;
+    unsigned rest_param = 0;
+
+    if (IS_ATOM(lambda_params)) {
+        // Case 1: (lambda args body) - entire params is the rest param
+        has_rest = true;
+        rest_param = lambda_params;
+        param_count = 0;
+    } else {
+        // Case 2: (lambda (x y ...) body) or (lambda (x y . rest) body)
+        for (unsigned p = lambda_params; p; p = IS_PAIR(p) ? cdr(p) : 0) {
+            if (IS_ATOM(p)) {
+                // Found rest param at end of dotted list
+                has_rest = true;
+                rest_param = p;
+                break;
+            }
+            param_count++;
+        }
+    }
+
+    // Count arguments
+    unsigned arg_count = list_length(args);
+
+    // Inline if: exact match, OR rest param with enough args
+    bool can_inline = (!has_rest && param_count == arg_count) ||
+                      (has_rest && arg_count >= param_count);
+    if (!can_inline)
+        return false;
+
+    // Save tail position before compiling arguments
+    bool tail = cctx->tail_position;
+    cctx->tail_position = false;
+
+    // Compile fixed arguments first
+    unsigned args_remaining = args;
+    gc_protect(&args_remaining);
+    for (unsigned i = 0; i < param_count; i++) {
+        compile_expr_internal(car(args_remaining), cctx);
+        args_remaining = cdr(args_remaining);
+    }
+
+    // For rest parameters, build a list from remaining args
+    if (has_rest) {
+        unsigned rest_count = arg_count - param_count;
+        if (rest_count == 0) {
+            // Empty rest list
+            emit2(cctx, OP_CONST, code_add_const(cctx->code, 0));
+        } else {
+            // Compile rest args and build list
+            // Stack after compiling: [arg1 arg2 arg3]
+            // We want (arg1 arg2 arg3) = (cons arg1 (cons arg2 (cons arg3 '())))
+            unsigned a = args_remaining;
+            gc_protect(&a);
+            while (a) {
+                compile_expr_internal(car(a), cctx);
+                a = cdr(a);
+            }
+            gc_unprotect(1);
+            // Push nil: [arg1 arg2 arg3 nil]
+            emit2(cctx, OP_CONST, code_add_const(cctx->code, 0));
+            // CONS takes car from second-top, cdr from top
+            // After CONS: [arg1 arg2 (arg3 . nil)] = [arg1 arg2 (arg3)]
+            // After CONS: [arg1 (arg2 . (arg3))] = [arg1 (arg2 arg3)]
+            // After CONS: [(arg1 . (arg2 arg3))] = [(arg1 arg2 arg3)]
+            for (unsigned i = 0; i < rest_count; i++) {
+                emit(cctx, OP_CONS);
+            }
+        }
+    }
+    gc_unprotect(1);
+
+    // The bindings, fixed parameters first and the rest parameter
+    // last, and for each the stack slot holding it (-1: the frame).
+    unsigned var_count = param_count + (has_rest ? 1 : 0);
+    int64_t *param_ids = NULL;
+    int *param_slots = NULL;
+    if (var_count > 0) {
+        param_ids = checked_malloc_array(var_count, sizeof *param_ids);
+        param_slots =
+            checked_malloc_array(var_count, sizeof *param_slots);
+        if (!param_ids || !param_slots) {
+            free(param_ids);
+            free(param_slots);
+            show_error("lambda: out of memory for parameters");
+            emit(cctx, OP_HALT);
+            *result = dynamic_result();
+            return true;
+        }
+    }
+
+    // Collect parameter names (only if params is a list)
+    unsigned i = 0;
+    if (param_count > 0 && IS_PAIR(lambda_params)) {
+        for (unsigned p = lambda_params; p && i < param_count;
+             p = cdr(p)) {
+            if (IS_ATOM(p))
+                break; // Stop at rest param
+            param_ids[i++] = CELL_ID(car(p));
+        }
+    }
+    if (i != param_count) {
+        free(param_ids);
+        free(param_slots);
+        *result = emit_syntax_error(cctx, "lambda: invalid syntax");
+        return true;
+    }
+    if (has_rest)
+        param_ids[param_count] = CELL_ID(rest_param);
+
+    GC_GUARD;
+    // Extend compile-time environment with params for body compilation
+    unsigned saved_env = cctx->env;
+    gc_protect(&saved_env);
+    {
+        GC_GUARD;
+        gc_protect(&lambda_params);
+        gc_protect(&lambda_body);
+        gc_protect(&rest_param);
+        unsigned frame_vars = 0, frame_vals = 0;
+        gc_protect(&frame_vars);
+        gc_protect(&frame_vals);
+
+        // Add fixed params (only if lambda_params is a list)
+        if (IS_PAIR(lambda_params)) {
+            unsigned p = lambda_params;
+            gc_protect(&p);
+            for (; p; p = IS_PAIR(p) ? cdr(p) : 0) {
+                if (IS_ATOM(p))
+                    break;
+                unsigned var = car(p);
+                gc_protect(&var);
+                unsigned vc = alloc_cons(var, frame_vars);
+                frame_vars = vc;
+                unsigned val = alloc_cons(0, frame_vals);
+                frame_vals = val;
+                gc_unprotect(1);
+            }
+            gc_unprotect(1);
+        }
+
+        // Add rest param if present
+        if (has_rest) {
+            unsigned vc = alloc_cons(rest_param, frame_vars);
+            frame_vars = vc;
+            unsigned val = alloc_cons(0, frame_vals);
+            frame_vals = val;
+        }
+
+        unsigned frame = alloc_cons(frame_vars, frame_vals);
+        gc_protect(&frame);
+        cctx->env = alloc_cons(frame, cctx->env);
+    }
+
+    // Let slots. In a stack-local body a binding that no closure
+    // captures and nothing assigns can live in a stack slot (see the
+    // prediction walks near the top of this file), so a let - the
+    // stdlib's let, let* and named let all arrive here - costs no
+    // environment frame, no defvar and no lookups. The scope still
+    // needs a frame if its body defines anything, or if any binding
+    // must stay in one; a scope with none pushes nothing, which also
+    // keeps the loop optimization's self calls at env_depth 0.
+    unsigned scope = 0;
+    bool frameless = false;
+    unsigned saved_slot_next = cctx->let_slot_next;
+    unsigned saved_binding_count = cctx->let_binding_count;
+    if (cctx->let_slots) {
+        scope = cctx->let_scope_counter++;
+        frameless = !let_scope_banned(cctx, scope) &&
+                    !body_defines_internally(lambda_body, cctx->env) &&
+                    !body_has_define_syntax(lambda_body, cctx->env);
+    }
+    unsigned frame_pos = frameless ? compile_env_length(cctx->env) : 0;
+    bool needs_frame = !frameless;
+    for (unsigned k = 0; k < var_count; k++) {
+        param_slots[k] = -1;
+        if (frameless && cctx->let_slot_next < LET_SLOT_LIMIT &&
+            !captured_by_inner_lambda(lambda_body, param_ids[k],
+                                      cctx->env) &&
+            !assigned_in_body(lambda_body, param_ids[k], cctx->env) &&
+            let_binding_push(cctx, frame_pos, param_ids[k],
+                             cctx->let_slot_next, scope)) {
+            param_slots[k] = (int)cctx->let_slot_next++;
+        } else {
+            needs_frame = true;
+        }
+    }
+    if (cctx->let_slot_next > cctx->let_slot_max)
+        cctx->let_slot_max = cctx->let_slot_next;
+
+    // Bind in reverse, popping the values just computed: the rest
+    // parameter's list is on top.
+    if (needs_frame)
+        emit_pushenv(cctx);
+    for (unsigned k = var_count; k-- > 0;) {
+        if (param_slots[k] >= 0)
+            emit2(cctx, OP_LOCAL_SET_VOID, (unsigned)param_slots[k]);
+        else
+            emit2(cctx, OP_DEFINE, (unsigned)param_ids[k]);
+    }
+
+    // Track lambda arguments for escape analysis inlining
+    // When ((lambda (var) body) (lambda ...)) is inlined, we can inline
+    // calls to var within body if the lambda doesn't self-reference var
+    unsigned saved_known = cctx->known_lambdas;
+    gc_protect(&saved_known);
+    {
+        unsigned a = args;
+        gc_protect(&a);
+        if (IS_PAIR(lambda_params)) {
+            unsigned p = lambda_params;
+            gc_protect(&p);
+            for (; p && a; p = IS_PAIR(p) ? cdr(p) : 0) {
+                if (IS_ATOM(p))
+                    break;
+                unsigned var = car(p);
+                unsigned val_expr = car(a);
+                // Check if arg is a lambda that doesn't self-reference
+                if (form_is_core(val_expr, ctx.kw_lambda,
+                                 cctx->env)) {
+                    unsigned arg_body = cddr(val_expr);
+                    if (!contains_reference(arg_body, CELL_ID(var)))
+                        register_known_lambda(cctx, var, val_expr);
+                }
+                a = cdr(a);
+            }
+            gc_unprotect(1);
+        }
+        gc_unprotect(1);
+    }
+
+    // Compile body — IIFE params shadow any same-named stack locals
+    int saved_num_locals = cctx->num_locals;
+    int64_t saved_local_ids[8];
+    if (saved_num_locals > 0)
+        memcpy(saved_local_ids, cctx->local_ids,
+               sizeof(int64_t) * saved_num_locals);
+    // Remove locals that are shadowed by IIFE params, including a
+    // rest parameter. Otherwise a reference to the rest binding can
+    // incorrectly compile as LOCAL_GET of an outer parameter.
+    if (cctx->num_locals > 0) {
+        unsigned p = lambda_params;
+        while (p) {
+            unsigned param = IS_PAIR(p) ? car(p) : p;
+            int64_t pid = CELL_ID(param);
+            for (int k = 0; k < cctx->num_locals; k++) {
+                if (cctx->local_ids[k] == pid)
+                    cctx->local_ids[k] = -1; // disable this slot
+            }
+            if (!IS_PAIR(p))
+                break;
+            p = cdr(p);
+        }
+    }
+    cctx->tail_position = tail;
+    unsigned body_code_start = cctx->code->code_len;
+    unsigned body_children_start = cctx->code->children_len;
+    compile_body(lambda_body, cctx);
+    cctx->num_locals = saved_num_locals;
+    if (saved_num_locals > 0)
+        memcpy(cctx->local_ids, saved_local_ids,
+               sizeof(int64_t) * saved_num_locals);
+
+    // The decisions above were made from the unexpanded body. Check
+    // what it compiled to, as compile_lambda does for parameters: a
+    // definition with no frame of this scope's to land in, a closure
+    // reaching a slot binding by name, or an assignment to one (a
+    // macro's doing, all three) means this scope needs its frame.
+    if (frameless) {
+        bool unsafe = !needs_frame &&
+                      code_defines_outside_own_frames(cctx->code,
+                                                      body_code_start);
+        for (unsigned k = saved_binding_count;
+             !unsafe && k < cctx->let_binding_count; k++) {
+            struct let_slot_binding *b = &cctx->let_bindings[k];
+            unsafe = b->assigned ||
+                     children_reach_symbol(cctx->code,
+                                           body_children_start,
+                                           b->var_id);
+        }
+        if (unsafe)
+            let_scope_ban(cctx, scope);
+    }
+    cctx->let_binding_count = saved_binding_count;
+    cctx->let_slot_next = saved_slot_next;
+    free(param_ids);
+    free(param_slots);
+
+    // Restore compile-time environment and known_lambdas
+    cctx->env = saved_env;
+    cctx->known_lambdas = saved_known;
+
+    // Pop environment frame
+    if (needs_frame)
+        emit_popenv(cctx);
+
+    *result = dynamic_result();
+    return true;
+}
+
 static compile_result compile_call(unsigned expr, compile_ctx *cctx)
 {
     unsigned fn_expr = car(expr);
@@ -5147,72 +5606,8 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
 
     if (IS_ATOM(fn_expr)) {
         unsigned fn = lookup_silent(CELL_ID(fn_expr), cctx->env);
-        if (fn != TOK_ERROR && IS_BUILTIN(fn)) {
-            int64_t prim = CELL_ID(fn);
-            unsigned argc = list_length(args);
-            bool tail = cctx->tail_position;
-            bool immutable = cctx->immutable_base &&
-                env_binding_is_immutable(CELL_ID(fn_expr), cctx->env);
-            cctx->tail_position = false;
-            unsigned saved_pos = cctx->code->code_len;
-            compile_result results[256] = {0};
-            bool all_const = argc <= 256 && is_foldable_primitive(prim);
-            unsigned a = args, i = 0;
-            gc_protect(&a);
-            for (; a; a = cdr(a), i++) {
-                compile_result result = compile_expr_internal(car(a), cctx);
-                if (i < 256) {
-                    results[i] = result;
-                    if (result.is_const)
-                        gc_protect(&results[i].value);
-                }
-                if (!result.is_const)
-                    all_const = false;
-            }
-
-            unsigned guard = 0;
-            if (!immutable) {
-                guard = cctx->code->code_len;
-                emit(cctx, OP_GUARD_PRIMITIVE);
-                code_emit(cctx->code, 0); // fallback resumes after the fast path
-                code_emit(cctx->code, CELL_ID(fn_expr));
-                code_emit(cctx->code, prim);
-                code_emit(cctx->code, argc);
-                code_emit(cctx->code, tail);
-                code_emit(cctx->code, 0xFFFFFFFF); // lookup cache
-                code_emit(cctx->code, 0xFFFFFFFF);
-            }
-
-            bool folded = false;
-            unsigned constant = 0;
-            gc_protect(&constant);
-            if (all_const) {
-                unsigned values = 0;
-                gc_protect(&values);
-                for (unsigned j = argc; j > 0; j--)
-                    values = alloc_cons(results[j - 1].value, values);
-                bool suppress = ctx.suppress_error_output;
-                ctx.suppress_error_output = true;
-                constant = apply_primitive(prim, values);
-                ctx.suppress_error_output = suppress;
-                ctx.last_error[0] = '\0';
-                folded = constant != TOK_ERROR;
-                if (folded) {
-                    if (immutable)
-                        code_truncate(cctx->code, saved_pos, cctx->code->children_len);
-                    else
-                        for (unsigned j = 0; j < argc; j++)
-                            emit(cctx, OP_POP);
-                    emit2(cctx, OP_CONST, code_add_const(cctx->code, constant));
-                }
-                gc_unprotect(1);
-            }
-            if (!folded && !emit_unary_arithmetic(cctx, prim, results, argc))
-                emit_primitive_operation(cctx, prim, argc, tail);
-            if (!immutable)
-                code_patch(cctx->code, guard + 1, cctx->code->code_len);
-            return immutable && folded ? const_result(constant) : dynamic_result();
-        }
+        if (fn != TOK_ERROR && IS_BUILTIN(fn))
+            return compile_primitive_call(fn_expr, args, CELL_ID(fn), cctx);
     }
 
     // ========================================================================
@@ -5238,49 +5633,9 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
     // ========================================================================
     // If f is bound to a lambda in a let, we can inline it at the call site
     if (IS_ATOM(fn_expr) && cctx->known_lambdas) {
-        int64_t var_id = CELL_ID(fn_expr);
-        unsigned reg_env_len = 0;
-        unsigned lambda_expr =
-            lookup_known_lambda(var_id, cctx->known_lambdas, &reg_env_len);
-        // Inline only while the compile-time environment is unchanged: a
-        // scope pushed since registration (nested lambda, let, begin with
-        // internal defines) may rebind var, and inlining would then use
-        // the wrong binding (non-capture-avoiding substitution).
-        if (lambda_expr &&
-            compile_env_length(cctx->env) == reg_env_len) {
-            GC_GUARD;
-            // Found a known lambda - construct ((lambda ...) args) and recurse
-            // to use the existing lambda inlining code.
-            // Remove this binding from known_lambdas to prevent infinite
-            // recursion if the lambda calls itself (recursive functions).
-            unsigned saved_known = cctx->known_lambdas;
-            gc_protect(&saved_known);
-            gc_protect(&lambda_expr);
-            gc_protect(&args);
-            unsigned new_known = 0;
-            gc_protect(&new_known);
-            unsigned entry = cctx->known_lambdas;
-            gc_protect(&entry);
-            while (entry) {
-                unsigned pair = car(entry);
-                gc_protect(&pair);
-                if (!IS_PAIR(pair) || !IS_ATOM(car(pair)) ||
-                    CELL_ID(car(pair)) != var_id) {
-                    new_known = alloc_cons(pair, new_known);
-                }
-                gc_unprotect(1);
-                entry = cdr(entry);
-            }
-            gc_unprotect(1);
-            cctx->known_lambdas = new_known;
-
-            unsigned inlined_call = alloc_cons(lambda_expr, args);
-            gc_protect(&inlined_call);
-            compile_result result = compile_call(inlined_call, cctx);
-
-            cctx->known_lambdas = saved_known;
+        compile_result result;
+        if (compile_known_lambda_call(fn_expr, args, cctx, &result))
             return result;
-        }
     }
 
     // ========================================================================
@@ -5288,323 +5643,9 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
     // ========================================================================
     // This avoids closure allocation and function call overhead
     if (form_is_core(fn_expr, ctx.kw_lambda, cctx->env)) {
-
-        if (!syntax_arity_checked(fn_expr, 2, UINT_MAX, "lambda"))
-            return emit_syntax_error(cctx, "lambda: invalid syntax");
-
-        // Released when this block ends: a call it cannot inline falls
-        // through to the general case, which allocates.
-        GC_GUARD;
-        unsigned lambda_params = cadr(fn_expr);
-        unsigned lambda_body = cddr(fn_expr);
-        gc_protect(&lambda_params);
-        gc_protect(&lambda_body);
-        // lambda_params_valid allocates, so locals must be protected first
-        if (!list_length_checked(lambda_body, NULL, "lambda"))
-            return emit_syntax_error(cctx, "lambda: invalid syntax");
-        if (!lambda_params_valid(lambda_params))
-            return emit_syntax_error(cctx, "lambda: invalid formals");
-
-        // Count params and check for rest parameter
-        // Handle two cases:
-        // 1. (lambda args body) - params is just an atom, all args go to rest
-        // 2. (lambda (x y . rest) body) - some fixed params, then rest
-        unsigned param_count = 0;
-        bool has_rest = false;
-        unsigned rest_param = 0;
-
-        if (IS_ATOM(lambda_params)) {
-            // Case 1: (lambda args body) - entire params is the rest param
-            has_rest = true;
-            rest_param = lambda_params;
-            param_count = 0;
-        } else {
-            // Case 2: (lambda (x y ...) body) or (lambda (x y . rest) body)
-            for (unsigned p = lambda_params; p; p = IS_PAIR(p) ? cdr(p) : 0) {
-                if (IS_ATOM(p)) {
-                    // Found rest param at end of dotted list
-                    has_rest = true;
-                    rest_param = p;
-                    break;
-                }
-                param_count++;
-            }
-        }
-
-        // Count arguments
-        unsigned arg_count = list_length(args);
-
-        // Inline if: exact match, OR rest param with enough args
-        bool can_inline = (!has_rest && param_count == arg_count) ||
-                          (has_rest && arg_count >= param_count);
-
-        if (can_inline) {
-            // Save tail position before compiling arguments
-            bool tail = cctx->tail_position;
-            cctx->tail_position = false;
-
-            // Compile fixed arguments first
-            unsigned args_remaining = args;
-            gc_protect(&args_remaining);
-            for (unsigned i = 0; i < param_count; i++) {
-                compile_expr_internal(car(args_remaining), cctx);
-                args_remaining = cdr(args_remaining);
-            }
-
-            // For rest parameters, build a list from remaining args
-            if (has_rest) {
-                unsigned rest_count = arg_count - param_count;
-                if (rest_count == 0) {
-                    // Empty rest list
-                    emit2(cctx, OP_CONST, code_add_const(cctx->code, 0));
-                } else {
-                    // Compile rest args and build list
-                    // Stack after compiling: [arg1 arg2 arg3]
-                    // We want (arg1 arg2 arg3) = (cons arg1 (cons arg2 (cons arg3 '())))
-                    unsigned a = args_remaining;
-                    gc_protect(&a);
-                    while (a) {
-                        compile_expr_internal(car(a), cctx);
-                        a = cdr(a);
-                    }
-                    gc_unprotect(1);
-                    // Push nil: [arg1 arg2 arg3 nil]
-                    emit2(cctx, OP_CONST, code_add_const(cctx->code, 0));
-                    // CONS takes car from second-top, cdr from top
-                    // After CONS: [arg1 arg2 (arg3 . nil)] = [arg1 arg2 (arg3)]
-                    // After CONS: [arg1 (arg2 . (arg3))] = [arg1 (arg2 arg3)]
-                    // After CONS: [(arg1 . (arg2 arg3))] = [(arg1 arg2 arg3)]
-                    for (unsigned i = 0; i < rest_count; i++) {
-                        emit(cctx, OP_CONS);
-                    }
-                }
-            }
-            gc_unprotect(1);
-
-            // The bindings, fixed parameters first and the rest parameter
-            // last, and for each the stack slot holding it (-1: the frame).
-            unsigned var_count = param_count + (has_rest ? 1 : 0);
-            int64_t *param_ids = NULL;
-            int *param_slots = NULL;
-            if (var_count > 0) {
-                param_ids = checked_malloc_array(var_count, sizeof *param_ids);
-                param_slots =
-                    checked_malloc_array(var_count, sizeof *param_slots);
-                if (!param_ids || !param_slots) {
-                    free(param_ids);
-                    free(param_slots);
-                    show_error("lambda: out of memory for parameters");
-                    emit(cctx, OP_HALT);
-                    return dynamic_result();
-                }
-            }
-
-            // Collect parameter names (only if params is a list)
-            unsigned i = 0;
-            if (param_count > 0 && IS_PAIR(lambda_params)) {
-                for (unsigned p = lambda_params; p && i < param_count;
-                     p = cdr(p)) {
-                    if (IS_ATOM(p))
-                        break; // Stop at rest param
-                    param_ids[i++] = CELL_ID(car(p));
-                }
-            }
-            if (i != param_count) {
-                free(param_ids);
-                free(param_slots);
-                return emit_syntax_error(cctx, "lambda: invalid syntax");
-            }
-            if (has_rest)
-                param_ids[param_count] = CELL_ID(rest_param);
-
-            GC_GUARD;
-            // Extend compile-time environment with params for body compilation
-            unsigned saved_env = cctx->env;
-            gc_protect(&saved_env);
-            {
-                GC_GUARD;
-                gc_protect(&lambda_params);
-                gc_protect(&lambda_body);
-                gc_protect(&rest_param);
-                unsigned frame_vars = 0, frame_vals = 0;
-                gc_protect(&frame_vars);
-                gc_protect(&frame_vals);
-
-                // Add fixed params (only if lambda_params is a list)
-                if (IS_PAIR(lambda_params)) {
-                    unsigned p = lambda_params;
-                    gc_protect(&p);
-                    for (; p; p = IS_PAIR(p) ? cdr(p) : 0) {
-                        if (IS_ATOM(p))
-                            break;
-                        unsigned var = car(p);
-                        gc_protect(&var);
-                        unsigned vc = alloc_cons(var, frame_vars);
-                        frame_vars = vc;
-                        unsigned val = alloc_cons(0, frame_vals);
-                        frame_vals = val;
-                        gc_unprotect(1);
-                    }
-                    gc_unprotect(1);
-                }
-
-                // Add rest param if present
-                if (has_rest) {
-                    unsigned vc = alloc_cons(rest_param, frame_vars);
-                    frame_vars = vc;
-                    unsigned val = alloc_cons(0, frame_vals);
-                    frame_vals = val;
-                }
-
-                unsigned frame = alloc_cons(frame_vars, frame_vals);
-                gc_protect(&frame);
-                cctx->env = alloc_cons(frame, cctx->env);
-            }
-
-            // Let slots. In a stack-local body a binding that no closure
-            // captures and nothing assigns can live in a stack slot (see the
-            // prediction walks near the top of this file), so a let - the
-            // stdlib's let, let* and named let all arrive here - costs no
-            // environment frame, no defvar and no lookups. The scope still
-            // needs a frame if its body defines anything, or if any binding
-            // must stay in one; a scope with none pushes nothing, which also
-            // keeps the loop optimization's self calls at env_depth 0.
-            unsigned scope = 0;
-            bool frameless = false;
-            unsigned saved_slot_next = cctx->let_slot_next;
-            unsigned saved_binding_count = cctx->let_binding_count;
-            if (cctx->let_slots) {
-                scope = cctx->let_scope_counter++;
-                frameless = !let_scope_banned(cctx, scope) &&
-                            !body_defines_internally(lambda_body, cctx->env) &&
-                            !body_has_define_syntax(lambda_body, cctx->env);
-            }
-            unsigned frame_pos = frameless ? compile_env_length(cctx->env) : 0;
-            bool needs_frame = !frameless;
-            for (unsigned k = 0; k < var_count; k++) {
-                param_slots[k] = -1;
-                if (frameless && cctx->let_slot_next < LET_SLOT_LIMIT &&
-                    !captured_by_inner_lambda(lambda_body, param_ids[k],
-                                              cctx->env) &&
-                    !assigned_in_body(lambda_body, param_ids[k], cctx->env) &&
-                    let_binding_push(cctx, frame_pos, param_ids[k],
-                                     cctx->let_slot_next, scope)) {
-                    param_slots[k] = (int)cctx->let_slot_next++;
-                } else {
-                    needs_frame = true;
-                }
-            }
-            if (cctx->let_slot_next > cctx->let_slot_max)
-                cctx->let_slot_max = cctx->let_slot_next;
-
-            // Bind in reverse, popping the values just computed: the rest
-            // parameter's list is on top.
-            if (needs_frame)
-                emit_pushenv(cctx);
-            for (unsigned k = var_count; k-- > 0;) {
-                if (param_slots[k] >= 0)
-                    emit2(cctx, OP_LOCAL_SET_VOID, (unsigned)param_slots[k]);
-                else
-                    emit2(cctx, OP_DEFINE, (unsigned)param_ids[k]);
-            }
-
-            // Track lambda arguments for escape analysis inlining
-            // When ((lambda (var) body) (lambda ...)) is inlined, we can inline
-            // calls to var within body if the lambda doesn't self-reference var
-            unsigned saved_known = cctx->known_lambdas;
-            gc_protect(&saved_known);
-            {
-                unsigned a = args;
-                gc_protect(&a);
-                if (IS_PAIR(lambda_params)) {
-                    unsigned p = lambda_params;
-                    gc_protect(&p);
-                    for (; p && a; p = IS_PAIR(p) ? cdr(p) : 0) {
-                        if (IS_ATOM(p))
-                            break;
-                        unsigned var = car(p);
-                        unsigned val_expr = car(a);
-                        // Check if arg is a lambda that doesn't self-reference
-                        if (form_is_core(val_expr, ctx.kw_lambda,
-                                         cctx->env)) {
-                            unsigned arg_body = cddr(val_expr);
-                            if (!contains_reference(arg_body, CELL_ID(var)))
-                                register_known_lambda(cctx, var, val_expr);
-                        }
-                        a = cdr(a);
-                    }
-                    gc_unprotect(1);
-                }
-                gc_unprotect(1);
-            }
-
-            // Compile body — IIFE params shadow any same-named stack locals
-            int saved_num_locals = cctx->num_locals;
-            int64_t saved_local_ids[8];
-            if (saved_num_locals > 0)
-                memcpy(saved_local_ids, cctx->local_ids,
-                       sizeof(int64_t) * saved_num_locals);
-            // Remove locals that are shadowed by IIFE params, including a
-            // rest parameter. Otherwise a reference to the rest binding can
-            // incorrectly compile as LOCAL_GET of an outer parameter.
-            if (cctx->num_locals > 0) {
-                unsigned p = lambda_params;
-                while (p) {
-                    unsigned param = IS_PAIR(p) ? car(p) : p;
-                    int64_t pid = CELL_ID(param);
-                    for (int k = 0; k < cctx->num_locals; k++) {
-                        if (cctx->local_ids[k] == pid)
-                            cctx->local_ids[k] = -1; // disable this slot
-                    }
-                    if (!IS_PAIR(p))
-                        break;
-                    p = cdr(p);
-                }
-            }
-            cctx->tail_position = tail;
-            unsigned body_code_start = cctx->code->code_len;
-            unsigned body_children_start = cctx->code->children_len;
-            compile_body(lambda_body, cctx);
-            cctx->num_locals = saved_num_locals;
-            if (saved_num_locals > 0)
-                memcpy(cctx->local_ids, saved_local_ids,
-                       sizeof(int64_t) * saved_num_locals);
-
-            // The decisions above were made from the unexpanded body. Check
-            // what it compiled to, as compile_lambda does for parameters: a
-            // definition with no frame of this scope's to land in, a closure
-            // reaching a slot binding by name, or an assignment to one (a
-            // macro's doing, all three) means this scope needs its frame.
-            if (frameless) {
-                bool unsafe = !needs_frame &&
-                              code_defines_outside_own_frames(cctx->code,
-                                                              body_code_start);
-                for (unsigned k = saved_binding_count;
-                     !unsafe && k < cctx->let_binding_count; k++) {
-                    struct let_slot_binding *b = &cctx->let_bindings[k];
-                    unsafe = b->assigned ||
-                             children_reach_symbol(cctx->code,
-                                                   body_children_start,
-                                                   b->var_id);
-                }
-                if (unsafe)
-                    let_scope_ban(cctx, scope);
-            }
-            cctx->let_binding_count = saved_binding_count;
-            cctx->let_slot_next = saved_slot_next;
-            free(param_ids);
-            free(param_slots);
-
-            // Restore compile-time environment and known_lambdas
-            cctx->env = saved_env;
-            cctx->known_lambdas = saved_known;
-
-            // Pop environment frame
-            if (needs_frame)
-                emit_popenv(cctx);
-
-            return dynamic_result();
-        }
+        compile_result result;
+        if (compile_lambda_application(fn_expr, args, cctx, &result))
+            return result;
     }
 
     // General case: compile function and arguments
