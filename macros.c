@@ -1684,9 +1684,9 @@ bool template_case_form(unsigned tmpl)
 // ...)) stopped matching + once + was a definition alias. A clause headed by
 // an identifier - else - is walked like the expressions: an else the use
 // site rebinds has to become else's core alias to stay the keyword.
-typedef unsigned (*case_walker)(unsigned form, void *arg);
+typedef unsigned (*form_walker)(unsigned form, void *arg);
 
-static unsigned map_case_form(unsigned tmpl, case_walker walk, void *arg)
+static unsigned map_case_form(unsigned tmpl, form_walker walk, void *arg)
 {
     GC_GUARD;
     gc_protect(&tmpl);
@@ -1722,6 +1722,129 @@ static unsigned map_case_form(unsigned tmpl, case_walker walk, void *arg)
         list_append(&out, &tail, new_clause);
     }
     return out;
+}
+
+// Map the unquoted parts of quasiquoted data at the given depth through
+// unquoted(form, arg), returning the rebuilt datum, or tmpl itself where
+// nothing changed. A form headed by no_nesting_id is not taken as a nested
+// quasiquote (a rename of that identifier makes it an ordinary one).
+static unsigned map_quasiquote(unsigned tmpl, unsigned depth,
+                               form_walker unquoted, void *arg,
+                               int64_t no_nesting_id)
+{
+    if (!tmpl)
+        return 0;
+
+    GC_GUARD;
+    gc_protect(&tmpl);
+
+    if (IS_PAIR(tmpl)) {
+        unsigned head = car(tmpl);
+        if (IS_ATOM(head) && IS_PAIR(cdr(tmpl))) {
+            int64_t head_id = CELL_ID(head);
+            bool unquote = head_id == ctx.kw_unquote ||
+                           head_id == ctx.kw_unquote_splicing;
+            if (unquote || (head_id == ctx.kw_quasiquote &&
+                            head_id != no_nesting_id)) {
+                unsigned body = cadr(tmpl);
+                unsigned new_body;
+                if (unquote && depth == 1)
+                    new_body = unquoted(body, arg);
+                else
+                    new_body = map_quasiquote(body, unquote ? depth - 1
+                                                            : depth + 1,
+                                              unquoted, arg, no_nesting_id);
+                if (new_body == TOK_ERROR)
+                    return TOK_ERROR;
+                gc_protect(&new_body);
+                unsigned result_tail = alloc_cons(new_body, cddr(tmpl));
+                gc_protect(&result_tail);
+                return alloc_cons(car(tmpl), result_tail);
+            }
+        }
+
+        unsigned original = tmpl;
+        unsigned result = 0, result_tail = 0;
+        bool changed = false;
+        gc_protect(&original);
+        gc_protect(&result);
+        gc_protect(&result_tail);
+        for (;;) {
+            unsigned new_car = map_quasiquote(car(tmpl), depth, unquoted, arg,
+                                              no_nesting_id);
+            if (new_car == TOK_ERROR)
+                return TOK_ERROR;
+            // Compare with the cell as it is now, not the car passed in: a
+            // collection in the call moves the original and can hand its old
+            // index to the renamed copy, which then looked unchanged and was
+            // dropped.
+            if (new_car != car(tmpl))
+                changed = true;
+            gc_protect(&new_car);
+            list_append(&result, &result_tail, new_car);
+            gc_unprotect(1);
+
+            unsigned next = cdr(tmpl);
+            bool last = !IS_PAIR(next);
+            if (!last && IS_ATOM(car(next))) {
+                int64_t next_id = CELL_ID(car(next));
+                last = next_id == ctx.kw_unquote ||
+                       next_id == ctx.kw_unquote_splicing ||
+                       next_id == ctx.kw_quasiquote;
+            }
+            if (last) {
+                unsigned new_tail =
+                    map_quasiquote(next, depth, unquoted, arg, no_nesting_id);
+                if (new_tail == TOK_ERROR)
+                    return TOK_ERROR;
+                if (new_tail != cdr(tmpl))
+                    changed = true;
+                if (!changed)
+                    return original;
+                if (new_tail)
+                    cell_set_cdr(result_tail, new_tail);
+                return result;
+            }
+            tmpl = next;
+        }
+    }
+
+    if (IS_VECTOR(tmpl)) {
+        unsigned len = vector_len(tmpl);
+        bool changed = false;
+        for (unsigned i = 0; i < len && !changed; i++) {
+            unsigned orig = vector_data_ptr(tmpl)[i];
+            gc_protect(&orig);
+            unsigned mapped =
+                map_quasiquote(orig, depth, unquoted, arg, no_nesting_id);
+            if (mapped == TOK_ERROR)
+                return TOK_ERROR;
+            if (mapped != orig)
+                changed = true;
+            gc_unprotect(1);
+        }
+        if (!changed)
+            return tmpl;
+
+        unsigned new_vec = make_vector(len, 0);
+        if (new_vec == TOK_ERROR)
+            return TOK_ERROR;
+        gc_protect(&new_vec);
+        for (unsigned i = 0; i < len; i++) {
+            unsigned elem = vector_data_ptr(tmpl)[i];
+            unsigned mapped =
+                map_quasiquote(elem, depth, unquoted, arg, no_nesting_id);
+            if (mapped == TOK_ERROR)
+                return TOK_ERROR;
+            // Through the write barrier: new_vec may have been promoted by a
+            // collection during the recursive call, and a raw store would hide
+            // this nursery element from the next minor GC.
+            vector_set_elem(new_vec, i, mapped);
+        }
+        return new_vec;
+    }
+
+    return tmpl;
 }
 
 static bool binding_shadows_special(int64_t sym_id, unsigned bindings)
@@ -2177,143 +2300,7 @@ static bool id_in_rename_map(int64_t id, unsigned rename_map)
 }
 
 static unsigned rename_free_ids_quasiquote(unsigned tmpl, unsigned rename_map,
-                                           unsigned depth)
-{
-    if (!tmpl || !rename_map)
-        return tmpl;
-
-    GC_GUARD;
-    gc_protect(&tmpl);
-    gc_protect(&rename_map);
-
-    if (IS_PAIR(tmpl)) {
-        unsigned head = car(tmpl);
-        if (IS_ATOM(head)) {
-            int64_t head_id = CELL_ID(head);
-            if ((head_id == ctx.kw_unquote ||
-                 head_id == ctx.kw_unquote_splicing) &&
-                IS_PAIR(cdr(tmpl))) {
-                unsigned body = cadr(tmpl);
-                unsigned new_body;
-                if (depth == 1)
-                    new_body = rename_free_ids(body, rename_map);
-                else
-                    new_body = rename_free_ids_quasiquote(body, rename_map,
-                                                          depth - 1);
-                if (new_body == TOK_ERROR)
-                    return TOK_ERROR;
-                gc_protect(&new_body);
-                unsigned result_tail = alloc_cons(new_body, cddr(tmpl));
-                gc_protect(&result_tail);
-                return alloc_cons(head, result_tail);
-            }
-            if (head_id == ctx.kw_quasiquote && IS_PAIR(cdr(tmpl))) {
-                unsigned new_body = rename_free_ids_quasiquote(
-                    cadr(tmpl), rename_map, depth + 1);
-                if (new_body == TOK_ERROR)
-                    return TOK_ERROR;
-                gc_protect(&new_body);
-                unsigned result_tail = alloc_cons(new_body, cddr(tmpl));
-                gc_protect(&result_tail);
-                return alloc_cons(head, result_tail);
-            }
-        }
-
-        unsigned original = tmpl;
-        unsigned result = 0, result_tail = 0;
-        bool changed = false;
-        gc_protect(&original);
-        gc_protect(&result);
-        gc_protect(&result_tail);
-        for (;;) {
-            unsigned old_car = car(tmpl);
-            unsigned new_car =
-                rename_free_ids_quasiquote(old_car, rename_map, depth);
-            if (new_car == TOK_ERROR)
-                return TOK_ERROR;
-            // Compare with the cell as it is now, not old_car: a collection
-            // in the call moves the original and can hand its old index to
-            // the renamed copy, which then looked unchanged and was dropped.
-            if (new_car != car(tmpl))
-                changed = true;
-            gc_protect(&new_car);
-            list_append(&result, &result_tail, new_car);
-            gc_unprotect(1);
-
-            unsigned next = cdr(tmpl);
-            if (!IS_PAIR(next)) {
-                unsigned new_tail =
-                    rename_free_ids_quasiquote(next, rename_map, depth);
-                if (new_tail == TOK_ERROR)
-                    return TOK_ERROR;
-                if (new_tail != cdr(tmpl))
-                    changed = true;
-                if (!changed)
-                    return original;
-                if (new_tail)
-                    cell_set_cdr(result_tail, new_tail);
-                return result;
-            }
-            if (IS_ATOM(car(next))) {
-                int64_t next_id = CELL_ID(car(next));
-                if (next_id == ctx.kw_unquote ||
-                    next_id == ctx.kw_unquote_splicing ||
-                    next_id == ctx.kw_quasiquote) {
-                    unsigned new_tail = rename_free_ids_quasiquote(
-                        next, rename_map, depth);
-                    if (new_tail == TOK_ERROR)
-                        return TOK_ERROR;
-                    if (new_tail != cdr(tmpl))
-                        changed = true;
-                    if (!changed)
-                        return original;
-                    cell_set_cdr(result_tail, new_tail);
-                    return result;
-                }
-            }
-            tmpl = next;
-        }
-    }
-
-    if (IS_VECTOR(tmpl)) {
-        unsigned len = vector_len(tmpl);
-        bool changed = false;
-        for (unsigned i = 0; i < len && !changed; i++) {
-            unsigned *data = vector_data_ptr(tmpl);
-            unsigned orig = data[i];
-            gc_protect(&orig);
-            unsigned renamed =
-                rename_free_ids_quasiquote(orig, rename_map, depth);
-            if (renamed == TOK_ERROR)
-                return TOK_ERROR;
-            if (renamed != orig)
-                changed = true;
-            gc_unprotect(1);
-        }
-        if (!changed)
-            return tmpl;
-
-        unsigned new_vec = make_vector(len, 0);
-        if (new_vec == TOK_ERROR)
-            return TOK_ERROR;
-        gc_protect(&new_vec);
-        for (unsigned i = 0; i < len; i++) {
-            unsigned *data = vector_data_ptr(tmpl);
-            unsigned elem = data[i];
-            unsigned renamed =
-                rename_free_ids_quasiquote(elem, rename_map, depth);
-            if (renamed == TOK_ERROR)
-                return TOK_ERROR;
-            // Through the write barrier: new_vec may have been promoted by a
-            // collection during the recursive call, and a raw store would hide
-            // this nursery element from the next minor GC.
-            vector_set_elem(new_vec, i, renamed);
-        }
-        return new_vec;
-    }
-
-    return tmpl;
-}
+                                           unsigned depth);
 
 static unsigned rename_free_ids_inner(unsigned tmpl, unsigned rename_map,
                                       bool quote_shadowed,
@@ -2384,6 +2371,17 @@ static unsigned rename_free_ids_walk(unsigned form, void *arg)
     struct rename_free_ids_arg *a = arg;
     return rename_free_ids_inner(form, a->rename_map, a->quote_shadowed,
                                  a->quasiquote_shadowed);
+}
+
+static unsigned rename_free_ids_quasiquote(unsigned tmpl, unsigned rename_map,
+                                           unsigned depth)
+{
+    if (!tmpl || !rename_map)
+        return tmpl;
+    struct rename_free_ids_arg arg = {rename_map, false, false};
+    GC_GUARD;
+    gc_protect(&arg.rename_map);
+    return map_quasiquote(tmpl, depth, rename_free_ids_walk, &arg, -1);
 }
 
 static unsigned rename_free_ids_inner(unsigned tmpl, unsigned rename_map,
@@ -2695,146 +2693,6 @@ static bool syntax_rule_pattern_binds_id(unsigned pattern, int64_t old_id,
     return pattern_binds_id(pattern, old_id, literals, ellipsis_id);
 }
 
-static unsigned rename_in_quasiquote(unsigned tmpl, int64_t old_id,
-                                     unsigned new_sym, unsigned depth)
-{
-    if (!tmpl)
-        return 0;
-
-    GC_GUARD;
-    gc_protect(&tmpl);
-    gc_protect(&new_sym);
-
-    if (IS_PAIR(tmpl)) {
-        unsigned head = car(tmpl);
-        if (IS_ATOM(head)) {
-            int64_t head_id = CELL_ID(head);
-            if ((head_id == ctx.kw_unquote ||
-                 head_id == ctx.kw_unquote_splicing) &&
-                IS_PAIR(cdr(tmpl))) {
-                unsigned body = cadr(tmpl);
-                unsigned new_body;
-                if (depth == 1)
-                    new_body = rename_in_template(body, old_id, new_sym);
-                else
-                    new_body =
-                        rename_in_quasiquote(body, old_id, new_sym, depth - 1);
-                if (new_body == TOK_ERROR)
-                    return TOK_ERROR;
-                gc_protect(&new_body);
-                unsigned result_tail = alloc_cons(new_body, cddr(tmpl));
-                gc_protect(&result_tail);
-                return alloc_cons(head, result_tail);
-            }
-            if (head_id == ctx.kw_quasiquote && head_id != old_id &&
-                IS_PAIR(cdr(tmpl))) {
-                unsigned new_body =
-                    rename_in_quasiquote(cadr(tmpl), old_id, new_sym,
-                                         depth + 1);
-                if (new_body == TOK_ERROR)
-                    return TOK_ERROR;
-                gc_protect(&new_body);
-                unsigned result_tail = alloc_cons(new_body, cddr(tmpl));
-                gc_protect(&result_tail);
-                return alloc_cons(head, result_tail);
-            }
-        }
-
-        unsigned original = tmpl;
-        unsigned result = 0, result_tail = 0;
-        bool changed = false;
-        gc_protect(&original);
-        gc_protect(&result);
-        gc_protect(&result_tail);
-        for (;;) {
-            unsigned old_car = car(tmpl);
-            unsigned new_car =
-                rename_in_quasiquote(old_car, old_id, new_sym, depth);
-            if (new_car == TOK_ERROR)
-                return TOK_ERROR;
-            // Compare with the cell as it is now, not old_car: a collection
-            // in the call moves the original and can hand its old index to
-            // the renamed copy, which then looked unchanged and was dropped.
-            if (new_car != car(tmpl))
-                changed = true;
-            gc_protect(&new_car);
-            list_append(&result, &result_tail, new_car);
-            gc_unprotect(1);
-
-            unsigned next = cdr(tmpl);
-            if (!IS_PAIR(next)) {
-                unsigned new_tail =
-                    rename_in_quasiquote(next, old_id, new_sym, depth);
-                if (new_tail == TOK_ERROR)
-                    return TOK_ERROR;
-                if (new_tail != cdr(tmpl))
-                    changed = true;
-                if (!changed)
-                    return original;
-                if (new_tail)
-                    cell_set_cdr(result_tail, new_tail);
-                return result;
-            }
-            if (IS_ATOM(car(next))) {
-                int64_t next_id = CELL_ID(car(next));
-                if (next_id == ctx.kw_unquote ||
-                    next_id == ctx.kw_unquote_splicing ||
-                    next_id == ctx.kw_quasiquote) {
-                    unsigned new_tail = rename_in_quasiquote(
-                        next, old_id, new_sym, depth);
-                    if (new_tail == TOK_ERROR)
-                        return TOK_ERROR;
-                    if (new_tail != cdr(tmpl))
-                        changed = true;
-                    if (!changed)
-                        return original;
-                    cell_set_cdr(result_tail, new_tail);
-                    return result;
-                }
-            }
-            tmpl = next;
-        }
-    }
-
-    if (IS_VECTOR(tmpl)) {
-        unsigned len = vector_len(tmpl);
-        bool changed = false;
-        for (unsigned i = 0; i < len && !changed; i++) {
-            unsigned *data = vector_data_ptr(tmpl);
-            unsigned orig = data[i];
-            gc_protect(&orig);
-            unsigned renamed =
-                rename_in_quasiquote(orig, old_id, new_sym, depth);
-            if (renamed == TOK_ERROR)
-                return TOK_ERROR;
-            if (renamed != orig)
-                changed = true;
-            gc_unprotect(1);
-        }
-        if (!changed)
-            return tmpl;
-
-        unsigned new_vec = make_vector(len, 0);
-        if (new_vec == TOK_ERROR)
-            return TOK_ERROR;
-        gc_protect(&new_vec);
-        for (unsigned i = 0; i < len; i++) {
-            unsigned *data = vector_data_ptr(tmpl);
-            unsigned elem = data[i];
-            unsigned renamed =
-                rename_in_quasiquote(elem, old_id, new_sym, depth);
-            if (renamed == TOK_ERROR)
-                return TOK_ERROR;
-            // Through the write barrier: new_vec may have been promoted by a
-            // collection during the recursive call, and a raw store would hide
-            // this nursery element from the next minor GC.
-            vector_set_elem(new_vec, i, renamed);
-        }
-        return new_vec;
-    }
-
-    return tmpl;
-}
 
 struct rename_in_template_arg {
     int64_t old_id;
@@ -2845,6 +2703,15 @@ static unsigned rename_in_template_walk(unsigned form, void *arg)
 {
     struct rename_in_template_arg *a = arg;
     return rename_in_template(form, a->old_id, a->new_sym);
+}
+
+static unsigned rename_in_quasiquote(unsigned tmpl, int64_t old_id,
+                                     unsigned new_sym, unsigned depth)
+{
+    struct rename_in_template_arg arg = {old_id, new_sym};
+    GC_GUARD;
+    gc_protect(&arg.new_sym);
+    return map_quasiquote(tmpl, depth, rename_in_template_walk, &arg, old_id);
 }
 
 static unsigned rename_in_template(unsigned tmpl, int64_t old_id,
@@ -3035,141 +2902,17 @@ static unsigned rename_in_syntax_rules(unsigned tmpl, int64_t old_id,
 static unsigned hygienize_template(unsigned tmpl, unsigned bindings);
 static unsigned hygienize_body_sequence(unsigned body, unsigned bindings);
 
+static unsigned hygienize_template_walk(unsigned form, void *arg)
+{
+    return hygienize_template(form, *(unsigned *)arg);
+}
+
 static unsigned hygienize_quasiquote(unsigned tmpl, unsigned bindings,
                                      unsigned depth)
 {
-    if (!tmpl)
-        return 0;
-
     GC_GUARD;
-    gc_protect(&tmpl);
     gc_protect(&bindings);
-
-    if (IS_PAIR(tmpl)) {
-        unsigned head = car(tmpl);
-        if (IS_ATOM(head)) {
-            int64_t head_id = CELL_ID(head);
-            if ((head_id == ctx.kw_unquote ||
-                 head_id == ctx.kw_unquote_splicing) &&
-                IS_PAIR(cdr(tmpl))) {
-                unsigned body = cadr(tmpl);
-                unsigned new_body;
-                if (depth == 1)
-                    new_body = hygienize_template(body, bindings);
-                else
-                    new_body =
-                        hygienize_quasiquote(body, bindings, depth - 1);
-                if (new_body == TOK_ERROR)
-                    return TOK_ERROR;
-                gc_protect(&new_body);
-                unsigned result_tail = alloc_cons(new_body, cddr(tmpl));
-                gc_protect(&result_tail);
-                return alloc_cons(head, result_tail);
-            }
-            if (head_id == ctx.kw_quasiquote && IS_PAIR(cdr(tmpl))) {
-                unsigned new_body =
-                    hygienize_quasiquote(cadr(tmpl), bindings, depth + 1);
-                if (new_body == TOK_ERROR)
-                    return TOK_ERROR;
-                gc_protect(&new_body);
-                unsigned result_tail = alloc_cons(new_body, cddr(tmpl));
-                gc_protect(&result_tail);
-                return alloc_cons(head, result_tail);
-            }
-        }
-
-        unsigned original = tmpl;
-        unsigned result = 0, result_tail = 0;
-        bool changed = false;
-        gc_protect(&original);
-        gc_protect(&result);
-        gc_protect(&result_tail);
-        for (;;) {
-            unsigned old_car = car(tmpl);
-            unsigned new_car =
-                hygienize_quasiquote(old_car, bindings, depth);
-            if (new_car == TOK_ERROR)
-                return TOK_ERROR;
-            // Compare with the cell as it is now, not old_car: a collection
-            // in the call moves the original and can hand its old index to
-            // the renamed copy, which then looked unchanged and was dropped.
-            if (new_car != car(tmpl))
-                changed = true;
-            gc_protect(&new_car);
-            list_append(&result, &result_tail, new_car);
-            gc_unprotect(1);
-
-            unsigned next = cdr(tmpl);
-            if (!IS_PAIR(next)) {
-                unsigned new_tail =
-                    hygienize_quasiquote(next, bindings, depth);
-                if (new_tail == TOK_ERROR)
-                    return TOK_ERROR;
-                if (new_tail != cdr(tmpl))
-                    changed = true;
-                if (!changed)
-                    return original;
-                if (new_tail)
-                    cell_set_cdr(result_tail, new_tail);
-                return result;
-            }
-            if (IS_ATOM(car(next))) {
-                int64_t next_id = CELL_ID(car(next));
-                if (next_id == ctx.kw_unquote ||
-                    next_id == ctx.kw_unquote_splicing ||
-                    next_id == ctx.kw_quasiquote) {
-                    unsigned new_tail =
-                        hygienize_quasiquote(next, bindings, depth);
-                    if (new_tail == TOK_ERROR)
-                        return TOK_ERROR;
-                    if (new_tail != cdr(tmpl))
-                        changed = true;
-                    if (!changed)
-                        return original;
-                    cell_set_cdr(result_tail, new_tail);
-                    return result;
-                }
-            }
-            tmpl = next;
-        }
-    }
-
-    if (IS_VECTOR(tmpl)) {
-        unsigned len = vector_len(tmpl);
-        bool changed = false;
-        for (unsigned i = 0; i < len && !changed; i++) {
-            unsigned *data = vector_data_ptr(tmpl);
-            unsigned orig = data[i];
-            gc_protect(&orig);
-            unsigned h = hygienize_quasiquote(orig, bindings, depth);
-            if (h == TOK_ERROR)
-                return TOK_ERROR;
-            if (h != orig)
-                changed = true;
-            gc_unprotect(1);
-        }
-        if (!changed)
-            return tmpl;
-
-        unsigned new_vec = make_vector(len, 0);
-        if (new_vec == TOK_ERROR)
-            return TOK_ERROR;
-        gc_protect(&new_vec);
-        for (unsigned i = 0; i < len; i++) {
-            unsigned *data = vector_data_ptr(tmpl);
-            unsigned elem = data[i];
-            unsigned hygienized = hygienize_quasiquote(elem, bindings, depth);
-            if (hygienized == TOK_ERROR)
-                return TOK_ERROR;
-            // Through the write barrier: new_vec may have been promoted by a
-            // collection during the recursive call, and a raw store would hide
-            // this nursery element from the next minor GC.
-            vector_set_elem(new_vec, i, hygienized);
-        }
-        return new_vec;
-    }
-
-    return tmpl;
+    return map_quasiquote(tmpl, depth, hygienize_template_walk, &bindings, -1);
 }
 
 // binding_list with each binding's init hygienized.
