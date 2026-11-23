@@ -5776,6 +5776,15 @@
       (letrec* ((a 1)) (define b 5) (list b a)))
 (test "letrec*: forward reference" "Unassigned variable: b"
       (ua-msg (lambda () (letrec* ((a (lambda () b)) (c (a)) (b 1)) c))))
+(define (%ua-through-macro)
+  (define-syntax get-y (syntax-rules () ((_) y)))
+  (define x (get-y))
+  (define y 2)
+  x)
+(test "an early read through a macro names the variable, not its alias" "y"
+      (let ((m (ua-msg %ua-through-macro)))
+        (and (string? m)
+             (substring m (- (string-length m) 1) (string-length m)))))
 (test "letrec: forward reference" "Unassigned variable: y"
       (ua-msg (lambda () (letrec ((x y) (y 1)) x))))
 (test "letrec: self reference" "Unassigned variable: x"

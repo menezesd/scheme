@@ -1592,6 +1592,11 @@ static int64_t identifier_origin(int64_t id)
     return id;
 }
 
+int64_t macros_identifier_origin(int64_t id)
+{
+    return identifier_origin(id);
+}
+
 // The keyword a template walker should take a form head for: a core alias
 // is its core keyword, and an alias standing for a syntax binding (the
 // stdlib's let, renamed past a use site that rebinds let) is the name it

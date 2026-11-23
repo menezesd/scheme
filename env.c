@@ -31,6 +31,7 @@
 #include "env.h"
 #include "context.h"
 #include "primitive_table.h"
+#include "macros.h"
 #include <string.h>
 
 // Atom IDs are allocated from the nonnegative range.  Keep environment
@@ -815,6 +816,9 @@ static unsigned lookup_internal(int64_t var, unsigned env)
 
 static void show_variable_error(const char *what, int64_t var)
 {
+    // A macro's renamed reference is an alias gensym: name the identifier
+    // it stands for, not ##gensym##N.
+    var = macros_identifier_origin(var);
     // Bounds check before accessing atom_table
     if (var >= 0 && (unsigned)var < ctx.atom_table_cap && ctx.atom_table[var])
         show_error("%s: %s", what, ctx.atom_table[var]);

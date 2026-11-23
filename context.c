@@ -825,6 +825,10 @@ void hold_error_diagnostic(const char *text)
 {
     if (ctx.suppress_error_output)
         return;
+    // The same error reported again (a lookup retried on a slower path, an
+    // operation redone to word its error) is still one error.
+    if (ctx.error_diagnostic_pending && strcmp(ctx.error_diagnostic, text) == 0)
+        return;
     flush_error_diagnostic();
     snprintf(ctx.error_diagnostic, sizeof(ctx.error_diagnostic), "%s", text);
     ctx.error_diagnostic_pending = true;
