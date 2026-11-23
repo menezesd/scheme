@@ -3172,6 +3172,78 @@ static unsigned hygienize_quasiquote(unsigned tmpl, unsigned bindings,
     return tmpl;
 }
 
+// binding_list with each binding's init hygienized.
+static unsigned hygienize_binding_inits(unsigned binding_list,
+                                        unsigned bindings)
+{
+    GC_GUARD;
+    gc_protect(&binding_list);
+    gc_protect(&bindings);
+    unsigned result = 0, tail = 0;
+    gc_protect(&result);
+    gc_protect(&tail);
+
+    unsigned bl = binding_list;
+    gc_protect(&bl);
+    for (; IS_PAIR(bl); bl = cdr(bl)) {
+        unsigned binding = car(bl);
+        if (!let_binding_has_value(binding)) {
+            list_append(&result, &tail, binding);
+            continue;
+        }
+        unsigned var = car(binding);
+        unsigned val = cadr(binding);
+        gc_protect(&var);
+        gc_protect(&val);
+        unsigned new_val = hygienize_template(val, bindings);
+        if (new_val == TOK_ERROR)
+            return TOK_ERROR;
+        gc_protect(&new_val);
+        unsigned binding_tail = alloc_cons(new_val, 0);
+        gc_protect(&binding_tail);
+        unsigned new_binding = alloc_cons(var, binding_tail);
+        gc_protect(&new_binding);
+        list_append(&result, &tail, new_binding);
+        gc_unprotect(5);
+    }
+    return result;
+}
+
+// binding_list with each variable named old_id replaced by new_sym.
+static unsigned rename_binding_vars(unsigned binding_list, int64_t old_id,
+                                    unsigned new_sym)
+{
+    GC_GUARD;
+    gc_protect(&binding_list);
+    gc_protect(&new_sym);
+    unsigned result = 0, tail = 0;
+    gc_protect(&result);
+    gc_protect(&tail);
+
+    unsigned bl = binding_list;
+    gc_protect(&bl);
+    for (; IS_PAIR(bl); bl = cdr(bl)) {
+        unsigned binding = car(bl);
+        if (!let_binding_has_value(binding)) {
+            list_append(&result, &tail, binding);
+            continue;
+        }
+        unsigned var = car(binding);
+        unsigned val = cadr(binding);
+        unsigned new_var =
+            IS_ATOM(var) && CELL_ID(var) == old_id ? new_sym : var;
+        gc_protect(&new_var);
+        gc_protect(&val);
+        unsigned bind_tail = alloc_cons(val, 0);
+        gc_protect(&bind_tail);
+        unsigned new_bind = alloc_cons(new_var, bind_tail);
+        gc_protect(&new_bind);
+        list_append(&result, &tail, new_bind);
+        gc_unprotect(4);
+    }
+    return result;
+}
+
 // Hygienize a let-style binding form: (let ((var val) ...) body ...)
 // Renames introduced bindings (not pattern variables) to gensyms
 static unsigned hygienize_let(unsigned tmpl, unsigned bindings, bool is_letrec)
@@ -3200,75 +3272,22 @@ static unsigned hygienize_let(unsigned tmpl, unsigned bindings, bool is_letrec)
     // Skip ellipsis (...) which appears in macro templates
     unsigned bl = binding_list;
     gc_protect(&bl);
-    while (IS_PAIR(bl)) {
+    for (; IS_PAIR(bl); bl = cdr(bl)) {
         unsigned binding = car(bl);
         if (!let_binding_has_value(binding))
-            goto next_intro_binding;
-        // Skip ellipsis in binding list
-        if (IS_ATOM(binding) && CELL_ID(binding) == ctx.kw_ellipsis)
-            goto next_intro_binding;
+            continue;
         unsigned var = car(binding);
-        if (identifier_valid(var)) {
-            int64_t var_id = CELL_ID(var);
-            // Skip ellipsis
-            if (var_id == ctx.kw_ellipsis)
-                goto next_intro_binding;
-            if (!is_pattern_var(var_id, bindings)) {
-                // This is an introduced binding - generate gensym
-                gc_protect(&var);
-                unsigned new_sym = do_gensym();
-                gc_protect(&new_sym);
-                unsigned rename_pair = alloc_cons(var, new_sym);
-                gc_protect(&rename_pair);
-                renames = alloc_cons(rename_pair, renames);
-                gc_unprotect(3);
-            }
-        }
-next_intro_binding:
-        bl = cdr(bl);
-    }
-    gc_unprotect(1);
-
-    if (!renames) {
-        // No introduced bindings - just hygienize nested templates
-        unsigned new_bindings = 0, new_bindings_tail = 0;
-        gc_protect(&new_bindings);
-        gc_protect(&new_bindings_tail);
-
-        bl = binding_list;
-        gc_protect(&bl);
-        while (IS_PAIR(bl)) {
-            unsigned binding = car(bl);
-            if (!let_binding_has_value(binding)) {
-                list_append(&new_bindings, &new_bindings_tail, binding);
-                bl = cdr(bl);
-                continue;
-            }
-            unsigned var = car(binding);
-            unsigned val = cadr(binding);
+        if (identifier_valid(var) && CELL_ID(var) != ctx.kw_ellipsis &&
+            !is_pattern_var(CELL_ID(var), bindings)) {
+            // This is an introduced binding - generate gensym
             gc_protect(&var);
-            gc_protect(&val);
-            unsigned new_val = hygienize_template(val, bindings);
-            if (new_val == TOK_ERROR)
-                return TOK_ERROR;
-            gc_protect(&new_val);
-            unsigned binding_tail = alloc_cons(new_val, 0);
-            gc_protect(&binding_tail);
-            unsigned new_binding = alloc_cons(var, binding_tail);
-            gc_protect(&new_binding);
-            list_append(&new_bindings, &new_bindings_tail, new_binding);
-            gc_unprotect(5);
-            bl = cdr(bl);
+            unsigned new_sym = do_gensym();
+            gc_protect(&new_sym);
+            unsigned rename_pair = alloc_cons(var, new_sym);
+            gc_protect(&rename_pair);
+            renames = alloc_cons(rename_pair, renames);
+            gc_unprotect(3);
         }
-        gc_unprotect(1);
-
-        unsigned new_body = hygienize_body_sequence(body, bindings);
-        gc_protect(&new_body);
-        unsigned result_tail = alloc_cons(new_bindings, new_body);
-        gc_protect(&result_tail);
-        unsigned result = alloc_cons(keyword, result_tail);
-        gc_unprotect(10);
-        return result;
     }
 
     // Apply renames to binding list and body
@@ -3279,101 +3298,42 @@ next_intro_binding:
 
     unsigned r = renames;
     gc_protect(&r);
-    while (r) {
+    for (; r; r = cdr(r)) {
         unsigned rename = car(r);
         unsigned old_sym = car(rename);
         unsigned new_sym = cdr(rename);
         int64_t old_id = CELL_ID(old_sym);
         gc_protect(&new_sym);
 
-        if (is_letrec) {
-            // For letrec, rename in all binding vals
+        // For letrec, rename in all binding vals; for let, only the var,
+        // and the body sees the rename
+        if (is_letrec)
             new_binding_list =
                 rename_in_template(new_binding_list, old_id, new_sym);
-            if (new_binding_list == TOK_ERROR)
-                return TOK_ERROR;
-        } else {
-            // For let/let*, only rename var in binding, body sees the rename
-            unsigned renamed_bindings = 0, renamed_tail = 0;
-            gc_protect(&renamed_bindings);
-            gc_protect(&renamed_tail);
-            bl = new_binding_list;
-            gc_protect(&bl);
-            while (IS_PAIR(bl)) {
-                unsigned binding = car(bl);
-                if (!let_binding_has_value(binding)) {
-                    list_append(&renamed_bindings, &renamed_tail, binding);
-                    bl = cdr(bl);
-                    continue;
-                }
-                unsigned var = car(binding);
-                unsigned val = cadr(binding);
-                unsigned new_var = var;
-                if (IS_ATOM(var) && CELL_ID(var) == old_id)
-                    new_var = new_sym;
-                gc_protect(&new_var);
-                gc_protect(&val);
-                unsigned bind_tail = alloc_cons(val, 0);
-                gc_protect(&bind_tail);
-                unsigned new_bind = alloc_cons(new_var, bind_tail);
-                gc_protect(&new_bind);
-                list_append(&renamed_bindings, &renamed_tail, new_bind);
-                gc_unprotect(4);
-                bl = cdr(bl);
-            }
-            gc_unprotect(3);
-            new_binding_list = renamed_bindings;
-        }
+        else
+            new_binding_list =
+                rename_binding_vars(new_binding_list, old_id, new_sym);
+        if (new_binding_list == TOK_ERROR)
+            return TOK_ERROR;
         new_body = rename_in_template(new_body, old_id, new_sym);
         if (new_body == TOK_ERROR)
             return TOK_ERROR;
         gc_unprotect(1);
-        r = cdr(r);
     }
-    gc_unprotect(1);
 
     // Now hygienize nested templates in the binding values
-    unsigned final_bindings = 0, final_tail = 0;
+    unsigned final_bindings =
+        hygienize_binding_inits(new_binding_list, bindings);
+    if (final_bindings == TOK_ERROR)
+        return TOK_ERROR;
     gc_protect(&final_bindings);
-    gc_protect(&final_tail);
-
-    bl = new_binding_list;
-    gc_protect(&bl);
-    while (IS_PAIR(bl)) {
-        unsigned binding = car(bl);
-        if (!let_binding_has_value(binding)) {
-            list_append(&final_bindings, &final_tail, binding);
-            bl = cdr(bl);
-            continue;
-        }
-        unsigned var = car(binding);
-        unsigned val = cadr(binding);
-        gc_protect(&var);
-        gc_protect(&val);
-        unsigned new_val = hygienize_template(val, bindings);
-        if (new_val == TOK_ERROR)
-            return TOK_ERROR;
-        gc_protect(&new_val);
-        unsigned binding_tail = alloc_cons(new_val, 0);
-        gc_protect(&binding_tail);
-        unsigned new_binding = alloc_cons(var, binding_tail);
-        gc_protect(&new_binding);
-        list_append(&final_bindings, &final_tail, new_binding);
-        gc_unprotect(5);
-        bl = cdr(bl);
-    }
-    gc_unprotect(1);
-
     unsigned final_body = hygienize_body_sequence(new_body, bindings);
     if (final_body == TOK_ERROR)
         return TOK_ERROR;
     gc_protect(&final_body);
     unsigned result_tail = alloc_cons(final_bindings, final_body);
     gc_protect(&result_tail);
-    unsigned result = alloc_cons(keyword, result_tail);
-    gc_unprotect(12); // 5 initial + renames + new_binding_list + new_body +
-                      // final_bindings + final_tail + final_body + result_tail
-    return result;
+    return alloc_cons(keyword, result_tail);
 }
 
 // (let* (b1 b2 ...) body ...): each binder scopes over the later inits as
@@ -3479,85 +3439,27 @@ static unsigned hygienize_named_let(unsigned tmpl, unsigned bindings)
         unsigned rename = car(r);
         unsigned old_sym = car(rename);
         unsigned new_sym = cdr(rename);
-        // new_sym is reachable only through `r`, so the allocations below
-        // (alloc_cons and list_append in the binding loop) can relocate the
-        // cell and leave this raw local stale - which is then spliced into
-        // the rebuilt binding list and the renamed body. hygienize_let and
-        // hygienize_lambda protect the same value for the same reason.
+        // new_sym is reachable only through `r`, so the allocations below can
+        // relocate the cell and leave this raw local stale - which is then
+        // spliced into the renamed body.
         gc_protect(&new_sym);
         int64_t old_id = CELL_ID(old_sym);
 
         if (IS_ATOM(new_name) && CELL_ID(new_name) == old_id)
             new_name = new_sym;
-
-        unsigned renamed_bindings = 0, renamed_tail = 0;
-        gc_protect(&renamed_bindings);
-        gc_protect(&renamed_tail);
-        unsigned bl = new_binding_list;
-        gc_protect(&bl);
-        for (; IS_PAIR(bl); bl = cdr(bl)) {
-            unsigned binding = car(bl);
-            if (!let_binding_has_value(binding)) {
-                list_append(&renamed_bindings, &renamed_tail, binding);
-                continue;
-            }
-
-            unsigned var = car(binding);
-            unsigned val = cadr(binding);
-            unsigned new_var = var;
-            if (IS_ATOM(var) && CELL_ID(var) == old_id)
-                new_var = new_sym;
-            gc_protect(&new_var);
-            gc_protect(&val);
-            unsigned bind_tail = alloc_cons(val, 0);
-            gc_protect(&bind_tail);
-            unsigned new_bind = alloc_cons(new_var, bind_tail);
-            gc_protect(&new_bind);
-            list_append(&renamed_bindings, &renamed_tail, new_bind);
-            gc_unprotect(4);
-        }
-        gc_unprotect(1);
-        gc_unprotect(2);
-        new_binding_list = renamed_bindings;
-
+        new_binding_list =
+            rename_binding_vars(new_binding_list, old_id, new_sym);
         new_body = rename_in_template(new_body, old_id, new_sym);
-        if (new_body == TOK_ERROR) {
-            gc_unprotect(1);
+        if (new_body == TOK_ERROR)
             return TOK_ERROR;
-        }
         gc_unprotect(1); // new_sym
     }
-    gc_unprotect(1);
 
-    unsigned final_bindings = 0, final_tail = 0;
+    unsigned final_bindings =
+        hygienize_binding_inits(new_binding_list, bindings);
+    if (final_bindings == TOK_ERROR)
+        return TOK_ERROR;
     gc_protect(&final_bindings);
-    gc_protect(&final_tail);
-    unsigned bl = new_binding_list;
-    gc_protect(&bl);
-    for (; IS_PAIR(bl); bl = cdr(bl)) {
-        unsigned binding = car(bl);
-        if (!let_binding_has_value(binding)) {
-            list_append(&final_bindings, &final_tail, binding);
-            continue;
-        }
-
-        unsigned var = car(binding);
-        unsigned val = cadr(binding);
-        gc_protect(&var);
-        gc_protect(&val);
-        unsigned new_val = hygienize_template(val, bindings);
-        if (new_val == TOK_ERROR)
-            return TOK_ERROR;
-        gc_protect(&new_val);
-        unsigned binding_tail = alloc_cons(new_val, 0);
-        gc_protect(&binding_tail);
-        unsigned new_binding = alloc_cons(var, binding_tail);
-        gc_protect(&new_binding);
-        list_append(&final_bindings, &final_tail, new_binding);
-        gc_unprotect(5);
-    }
-    gc_unprotect(1);
-
     unsigned final_body = hygienize_body_sequence(new_body, bindings);
     if (final_body == TOK_ERROR)
         return TOK_ERROR;
