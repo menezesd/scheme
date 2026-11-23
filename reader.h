@@ -72,4 +72,19 @@ const char *reader_get_filename(void);
 // Set current filename (for error messages)
 void reader_set_filename(const char *name);
 
+// Where the reader saw a procedure or a top-level form (see "Source
+// positions" in reader.c). Keys are the body list of a lambda, named-lambda,
+// procedure define or named let, and each top-level list datum.
+typedef struct {
+    const char *file; // interned for the life of the process; "?" if unknown
+    unsigned line;    // 1-based line of the form's opening parenthesis
+    int64_t name;     // atom id of the procedure's name, or -1
+} source_info;
+bool reader_source_info(unsigned key, source_info *out);
+// Give `to` (a macro-expanded copy of the list `from`) from's position.
+void reader_source_alias(unsigned from, unsigned to);
+// Name the procedure whose body is `body`, if nothing named it yet; a body
+// without a recorded position gets an entry with the name alone.
+void reader_source_name(unsigned body, unsigned name);
+
 #endif // READER_H

@@ -2092,12 +2092,165 @@ unsigned read_obj(void)
     return result;
 }
 
+// ============================================================================
+// Source positions
+// ============================================================================
+//
+// Backtraces and procedure names need to know where a procedure was read.
+// Cells have no room for a position, so the reader records one in a side
+// table for the few lists that matter: the body of every lambda,
+// named-lambda, procedure define and named let (keyed by the body list,
+// which both engines keep: the compiler sees it in compile_lambda, and an
+// interpreter closure holds it), and every top-level list datum. The table is
+// a weak_cell_map, so the collector forwards the keys as the cells move and
+// drops an entry when its list dies - the source of a compiled form goes
+// soon after compilation, an interpreted procedure's stays with the closure.
+// A position recorded per cell rather than rebuilt per compile is what
+// survives the collections that run between reading a batch of forms and
+// compiling it.
+
+#define SRC_LINE_BITS 24
+#define SRC_FILE_SHIFT 32
+#define SRC_FILE_BITS 11
+#define SRC_NAME_SHIFT 43
+
+static weak_cell_map source_positions;
+static char *source_files[(1u << SRC_FILE_BITS) - 1];
+static unsigned source_file_count;
+
+// Filenames are interned: a code object keeps a pointer to its file's name
+// for as long as the process runs, long after the reader's own copy is gone.
+static unsigned source_file_id(const char *name)
+{
+    if (!name)
+        return 0;
+    unsigned id = 0;
+    for (unsigned i = 0; i < source_file_count && !id; i++)
+        if (strcmp(source_files[i], name) == 0)
+            id = i + 1;
+    if (!id &&
+        source_file_count < sizeof(source_files) / sizeof(source_files[0])) {
+        char *copy = strdup(name);
+        if (copy) {
+            source_files[source_file_count++] = copy;
+            id = source_file_count;
+        }
+    }
+    return id;
+}
+
+static void source_note(unsigned key, unsigned line, int64_t name)
+{
+    if (!IS_PAIR(key))
+        return;
+    uint64_t file = source_file_id(reader_filename);
+    uint64_t packed = (line < (1u << SRC_LINE_BITS) ? line : 0) |
+                      (file << SRC_FILE_SHIFT) |
+                      ((uint64_t)(name + 1) << SRC_NAME_SHIFT);
+    weak_cell_map_put(&source_positions, key, packed);
+}
+
+bool reader_source_info(unsigned key, source_info *out)
+{
+    uint64_t packed;
+    if (!IS_PAIR(key) || !weak_cell_map_get(&source_positions, key, &packed))
+        return false;
+    unsigned file = (unsigned)(packed >> SRC_FILE_SHIFT) &
+                    ((1u << SRC_FILE_BITS) - 1);
+    out->file = file && file <= source_file_count ? source_files[file - 1]
+                                                  : "?";
+    out->line = (unsigned)(packed & ((1u << SRC_LINE_BITS) - 1));
+    out->name = (int64_t)(packed >> SRC_NAME_SHIFT) - 1;
+    return true;
+}
+
+void reader_source_alias(unsigned from, unsigned to)
+{
+    uint64_t packed;
+    if (from != to && IS_PAIR(to) && IS_PAIR(from) &&
+        weak_cell_map_get(&source_positions, from, &packed))
+        weak_cell_map_put(&source_positions, to, packed);
+}
+
+void reader_source_name(unsigned body, unsigned name)
+{
+    uint64_t packed = 0;
+    if (!IS_PAIR(body) || !IS_ATOM(name))
+        return;
+    if (weak_cell_map_get(&source_positions, body, &packed) &&
+        (packed >> SRC_NAME_SHIFT) != 0)
+        return;
+    packed |= (uint64_t)(CELL_ID(name) + 1) << SRC_NAME_SHIFT;
+    weak_cell_map_put(&source_positions, body, packed);
+}
+
+// Name an anonymous lambda form recorded earlier, as (define f (lambda ...))
+// and a letrec binding (f (lambda ...)) do.
+static void source_name_lambda(unsigned form, unsigned name)
+{
+    if (!IS_ATOM(name) || !IS_PAIR(form) || !IS_ATOM(car(form)) ||
+        CELL_ID(car(form)) != ctx.kw_lambda || !IS_PAIR(cdr(form)))
+        return;
+    unsigned body = cddr(form);
+    uint64_t packed;
+    if (!IS_PAIR(body) ||
+        !weak_cell_map_get(&source_positions, body, &packed) ||
+        (packed >> SRC_NAME_SHIFT) != 0)
+        return;
+    packed |= (uint64_t)(CELL_ID(name) + 1) << SRC_NAME_SHIFT;
+    weak_cell_map_put(&source_positions, body, packed);
+}
+
+// Called for each list as it is completed; line is where it opened.
+static unsigned source_note_list(unsigned list, int line)
+{
+    if (!IS_PAIR(list) || line <= 0)
+        return list;
+    unsigned l = (unsigned)line;
+    if (reader_obj_depth == 1)
+        source_note(list, l, -1); // a top-level datum
+    unsigned head = car(list);
+    if (!IS_ATOM(head) || !IS_PAIR(cdr(list)))
+        return list;
+    static int64_t named_lambda_id = -1, letrec_star_id = -1;
+    if (named_lambda_id < 0) {
+        named_lambda_id = intern("named-lambda");
+        letrec_star_id = intern("letrec*");
+    }
+    int64_t kw = CELL_ID(head);
+    unsigned second = cadr(list);
+    if (kw == ctx.kw_lambda) {
+        source_note(cddr(list), l, -1);
+    } else if (kw == named_lambda_id || kw == ctx.kw_define) {
+        if (IS_PAIR(second) && IS_ATOM(car(second)))
+            source_note(cddr(list), l, CELL_ID(car(second)));
+        else if (kw == ctx.kw_define && IS_ATOM(second) &&
+                 IS_PAIR(cddr(list)))
+            source_name_lambda(caddr(list), second);
+    } else if (kw == ctx.kw_let && IS_ATOM(second) && second != 0) {
+        if (IS_PAIR(cddr(list)))
+            source_note(cdddr(list), l, CELL_ID(second));
+    }
+    // MIT names letrec-bound lambdas but leaves let-bound ones anonymous.
+    if (kw == ctx.kw_letrec || kw == letrec_star_id) {
+        unsigned bindings = second;
+        for (unsigned depth = 0; IS_PAIR(bindings) && depth < 10000;
+             bindings = cdr(bindings), depth++) {
+            unsigned b = car(bindings);
+            if (IS_PAIR(b) && IS_PAIR(cdr(b)))
+                source_name_lambda(cadr(b), car(b));
+        }
+    }
+    return list;
+}
+
 unsigned read_list(void)
 {
     GC_GUARD;
     unsigned head = 0, tail = 0;
     gc_protect(&head);
     gc_protect(&tail);
+    int start_line = reader_line;
 
     for (;;) {
         unsigned item = read_obj();
@@ -2105,7 +2258,7 @@ unsigned read_list(void)
         if (item == TOK_ERROR)
             return TOK_ERROR;
         if (item == TOK_CLOSE)
-            return head;
+            return source_note_list(head, start_line);
         if (item == TOK_EOF) {
             show_error("unexpected end of file in list");
             return TOK_ERROR;
@@ -2141,7 +2294,7 @@ unsigned read_list(void)
             return TOK_ERROR;
         }
         cell_set_cdr(tail, rest);
-        return head;
+        return source_note_list(head, start_line);
     }
 }
 

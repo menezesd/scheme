@@ -2741,16 +2741,18 @@
         (after)
         (apply values results)))))
 
-; Wrap call/cc to handle dynamic-wind
+; Wrap call/cc to handle dynamic-wind. The procedure handed to proc is
+; named %continuation so that it prints as #[continuation N] (see writer.c).
 (define call-with-current-continuation
   (let ((primitive-call/cc call-with-current-continuation))
     (lambda (proc)
       (let ((winds *wind-stack*))
         (primitive-call/cc
          (lambda (cont)
-           (proc (lambda vals
-                   (do-wind *wind-stack* winds)
-                   (apply cont vals)))))))))
+           (define (%continuation . vals)
+             (do-wind *wind-stack* winds)
+             (apply cont vals))
+           (proc %continuation)))))))
 
 (define call/cc call-with-current-continuation)
 

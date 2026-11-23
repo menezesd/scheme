@@ -2145,7 +2145,11 @@ TEST(compiled_write_to_string_hides_bytecode_closure)
     unsigned result =
         compiled_eval_string("(write-to-string (lambda (x) x))", env);
     ASSERT(IS_STRING(result));
-    ASSERT_STR_EQ(GET_STRING_PTR(result), "[function]");
+    // An anonymous compound procedure, as MIT prints one: the number only.
+    const char *text = GET_STRING_PTR(result);
+    ASSERT(strncmp(text, "#[compound-procedure ", 21) == 0);
+    ASSERT(strchr(text + 21, ' ') == NULL);
+    ASSERT(text[strlen(text) - 1] == ']');
     PASS();
 }
 

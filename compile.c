@@ -20,6 +20,7 @@
 #include "macros.h"
 #include "prim_internal.h"
 #include "primitives.h"
+#include "reader.h"
 #include "writer.h"
 #include <limits.h>
 #include <stdint.h>
@@ -2618,6 +2619,19 @@ static void extend_env_with_syntax_gensyms(compile_ctx *cctx,
 
 static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
 {
+    // Top-level code is one code object per batch of forms; note where each
+    // form starts so a frame in it reports its own form's line.
+    if (!cctx->parent && IS_PAIR(expr)) {
+        source_info info;
+        if (reader_source_info(expr, &info)) {
+            code_note_line(cctx->code, info.line);
+            code_source *src = code_source_of(cctx->code);
+            if (src && !src->file) {
+                src->file = info.file;
+                cctx->code->source_line = info.line;
+            }
+        }
+    }
     if (!expr) {
         // nil - constant
         emit2(cctx, OP_CONST, code_add_const(cctx->code, 0));
@@ -3862,6 +3876,60 @@ static bool locals_body_needs_environment(const code_object *code,
     return false;
 }
 
+// The name compile_lambda gives the code object of procedure_name_expr:
+// define, letrec and named let set it around compiling a binding's value, so
+// only a lambda that IS the value is named - (define f (let (...) (lambda
+// ...))) stays anonymous, as in MIT. compile_lambda clears it on use, so a
+// lambda nested in the value can never pick it up.
+static unsigned procedure_name_expr;
+static int64_t procedure_name_id = -1;
+
+static compile_result compile_named_value(unsigned value, unsigned name,
+                                          compile_ctx *cctx)
+{
+    GC_GUARD;
+    unsigned saved_expr = procedure_name_expr;
+    int64_t saved_id = procedure_name_id;
+    gc_protect(&saved_expr);
+    procedure_name_expr = value;
+    procedure_name_id = IS_ATOM(name) ? CELL_ID(name) : -1;
+    gc_protect(&procedure_name_expr);
+    compile_result result = compile_expr_internal(value, cctx);
+    procedure_name_expr = saved_expr;
+    procedure_name_id = saved_id;
+    return result;
+}
+
+// Record a procedure's name and where it was read. The position comes from
+// the reader (keyed by the body list, which define and named let pass on
+// unchanged); a lambda a macro built has a fresh body, so it gets the
+// position of the code it is compiled within instead.
+static void note_procedure_source(code_object *code, int64_t name_id,
+                                  unsigned body, compile_ctx *parent)
+{
+    source_info info;
+    bool found = reader_source_info(body, &info);
+    if (name_id < 0 && found)
+        name_id = info.name;
+    const char *file = NULL;
+    if (found && info.line) {
+        file = info.file;
+        code->source_line = info.line;
+    } else if (parent && parent->code) {
+        file = code_file(parent->code);
+        code->source_line =
+            code_line_at(parent->code, parent->code->code_len);
+    }
+    bool named = name_id >= 0 && (uint64_t)name_id < ctx.atom_table_cap;
+    if (!named && !file)
+        return;
+    code_source *src = code_source_of(code);
+    if (!src)
+        return;
+    src->name = named ? ctx.atom_table[name_id] : NULL;
+    src->file = file;
+}
+
 static compile_result compile_lambda(unsigned expr, compile_ctx *cctx)
 {
     GC_GUARD;
@@ -3870,6 +3938,11 @@ static compile_result compile_lambda(unsigned expr, compile_ctx *cctx)
         return emit_syntax_error(cctx, "lambda: expected formals and body");
     unsigned params = car(rest);
     unsigned body = cdr(rest);
+    int64_t name_id = -1;
+    if (procedure_name_expr && procedure_name_expr == expr) {
+        name_id = procedure_name_id;
+        procedure_name_expr = 0;
+    }
 
     // Create compile-time environment that shadows lambda parameters
     // This prevents the compiler from inlining builtins that are shadowed
@@ -3960,6 +4033,8 @@ static compile_result compile_lambda(unsigned expr, compile_ctx *cctx)
         }
         arity++;
     }
+
+    note_procedure_source(lambda_cctx->code, name_id, body, cctx);
 
     // Store params in constant pool so they survive GC
     lambda_cctx->code->params = code_add_const(lambda_cctx->code, params);
@@ -4589,7 +4664,10 @@ static compile_result compile_named_let(unsigned expr, compile_ctx *cctx)
     gc_protect(&lambda_expr);
     lambda_tail = alloc_cons(params, body);
     lambda_expr = alloc_cons(atom_from_string("lambda"), lambda_tail);
+    procedure_name_expr = lambda_expr;
+    procedure_name_id = CELL_ID(name);
     compile_lambda(lambda_expr, cctx);
+    procedure_name_expr = 0;
     emit2(cctx, OP_SET, CELL_ID(name));
     emit2(cctx, OP_CALL, argc);
 
@@ -4871,7 +4949,7 @@ static compile_result compile_letrec(unsigned expr, compile_ctx *cctx)
     for (; b; b = cdr(b)) {
         unsigned binding = car(b);
         gc_protect(&binding);
-        compile_expr_internal(cadr(binding), cctx);
+        compile_named_value(cadr(binding), car(binding), cctx);
         emit2(cctx, OP_SET, CELL_ID(car(binding)));
         emit(cctx, OP_POP); // Discard set! result
         gc_unprotect(1);
@@ -5302,7 +5380,7 @@ static compile_result compile_define(unsigned expr, compile_ctx *cctx)
         gc_protect(&lambda_expr);
 
         cctx->tail_position = false;
-        compile_expr_internal(lambda_expr, cctx);
+        compile_named_value(lambda_expr, name, cctx);
         emit2(cctx, OP_DEFINE, CELL_ID(name));
 
         // Return the name
@@ -5315,7 +5393,7 @@ static compile_result compile_define(unsigned expr, compile_ctx *cctx)
         GC_GUARD;
         gc_protect(&second);
         cctx->tail_position = false;
-        compile_expr_internal(caddr(expr), cctx);
+        compile_named_value(caddr(expr), second, cctx);
         emit2(cctx, OP_DEFINE, CELL_ID(second));
 
         // Return the name
@@ -6417,6 +6495,8 @@ static code_object *compile_unit(unsigned expr, unsigned env,
     if (!cctx)
         return NULL;
     cctx->tail_position = false;
+    procedure_name_expr = 0; // a panic may have left it set
+    cctx->code->toplevel = true;
 
     compile_expr_internal(expr, cctx);
     emit(cctx, terminator);

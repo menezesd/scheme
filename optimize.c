@@ -598,6 +598,11 @@ void peephole_optimize(code_object *code)
     }
 
     code->code_len = write;
+    for (unsigned i = 0; code->source && i + 1 < code->source->line_table_len;
+         i += 2) {
+        unsigned ip = code->source->line_table[i];
+        code->source->line_table[i] = ip < len ? offset_map[ip] : final_len;
+    }
 
     free(offset_map);
     free(remove);

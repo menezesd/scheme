@@ -36,6 +36,11 @@ bool display_obj_port_checked(unsigned s, FILE *port);
 // Get type name for error messages
 const char *type_name(unsigned cell);
 
+// The name a procedure prints with (its define, letrec binding or named let;
+// a builtin's primitive name), or NULL for an anonymous procedure.
+const char *procedure_name(unsigned proc);
+const char *primitive_name(int64_t prim);
+
 // Format a double using the shortest representation that reads back exactly
 void format_double_repr(char *buf, size_t size, double d);
 

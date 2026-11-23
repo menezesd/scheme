@@ -32,7 +32,7 @@ UBSAN_OBJS = $(SRCS:.c=.ubsan.o)
 UBSAN_CFLAGS = $(DEBUG_CFLAGS) -fsanitize=undefined
 UBSAN_LDFLAGS = $(LDFLAGS) -fsanitize=undefined
 
-.PHONY: all clean distclean debug sanitize ubsan test test-interpreter test-c test-prop test-r5rs test-stress test-sanitize test-ubsan test-repl-exit test-diff test-gcstress test-atom-growth test-all unicode-tables \
+.PHONY: all clean distclean debug sanitize ubsan test test-interpreter test-c test-prop test-r5rs test-stress test-sanitize test-ubsan test-repl-exit test-backtrace test-diff test-gcstress test-atom-growth test-all unicode-tables \
         lint test-fuzz test-lineedit
 
 all: $(TARGET)
@@ -252,6 +252,33 @@ test-repl-exit: $(TARGET)
 	done
 	@echo "PASS: REPL exit codes, input boundaries and error reports"
 
+# An unhandled error prints a backtrace after its report, in both engines:
+# innermost first, a recursion collapsed into one run, top-level code by its
+# form's line (the VM; the interpreter has no frame for it), errors caught by
+# guard or with-exception-handler silent, and a deep stack cut off at
+# BACKTRACE_MAX_LINES lines with a count of what was left out.
+test-backtrace: $(TARGET)
+	@for mode in "" "--interpreter"; do \
+		out=$$(./$(TARGET) $$mode tools/backtrace_fixture.scm 2>/dev/null); \
+		[ $$? -eq 1 ] || { echo "FAIL: unhandled error should exit 1 (mode=$$mode)"; exit 1; }; \
+		expected=$$(printf '%s\n' 'caught' '11' \
+			'Unhandled exception: car: not a pair' \
+			'  in (bt-leaf x) at tools/backtrace_fixture.scm:4' \
+			'  in (bt-middle x) at tools/backtrace_fixture.scm:5' \
+			'  in (bt-recur n) at tools/backtrace_fixture.scm:7' \
+			'  ... 49 more frames in (bt-recur n)'); \
+		[ -n "$$mode" ] || expected=$$(printf '%s\n%s\n' "$$expected" \
+			'  in <top-level> at tools/backtrace_fixture.scm:15'); \
+		[ "$$out" = "$$expected" ] || { echo "FAIL: backtrace (mode=$$mode):"; echo "$$out"; exit 1; }; \
+		out=$$(./$(TARGET) $$mode tools/backtrace_mutual.scm 2>/dev/null | \
+			sed -n '/^Unhandled exception:/,$$p'); \
+		lines=$$(printf '%s\n' "$$out" | grep -c '^  '); \
+		last=$$(printf '%s\n' "$$out" | tail -n 1); \
+		[ "$$lines" -eq 21 ] && printf '%s\n' "$$last" | grep -Eq '^  \.\.\. [0-9]+ more frames$$' || \
+			{ echo "FAIL: backtrace line budget (mode=$$mode):"; echo "$$out"; exit 1; }; \
+	done
+	@echo "PASS: backtraces of unhandled errors"
+
 # Compare a stable semantic probe set against MIT/GNU Scheme.
 test-diff: $(TARGET)
 	@python3 tools/test_mit_differential.py
@@ -321,7 +348,7 @@ test-lineedit: $(TARGET)
 
 # Run all tests, including the UBSan-only smoke path that works on macOS
 # systems where ASan can hang before main.
-test-all: lint test test-interpreter test-c test-prop test-r5rs test-stress test-ubsan test-repl-exit test-lineedit test-fuzz test-diff test-gcstress test-atom-growth
+test-all: lint test test-interpreter test-c test-prop test-r5rs test-stress test-ubsan test-repl-exit test-backtrace test-lineedit test-fuzz test-diff test-gcstress test-atom-growth
 
 clean:
 	rm -f $(OBJS) $(DEBUG_OBJS) $(SAN_OBJS) $(UBSAN_OBJS) $(TARGET) \

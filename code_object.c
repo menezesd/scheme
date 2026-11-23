@@ -216,6 +216,9 @@ static void code_destroy_shallow(code_object *code)
     free(code->children);
     free(code->instruction_boundaries);
     free(code->ic_entries);
+    if (code->source)
+        free(code->source->line_table);
+    free(code->source);
     free(code);
 }
 
@@ -361,6 +364,59 @@ void code_truncate(code_object *code, unsigned code_len, unsigned children_len)
     // Dropped children are unreferenced from here on; the top-level code
     // sweep reclaims them like any other unreachable code object.
     code->children_len = children_len;
+}
+
+code_source *code_source_of(code_object *code)
+{
+    if (!code->source)
+        code->source = calloc(1, sizeof(code_source));
+    return code->source;
+}
+
+void code_note_line(code_object *code, unsigned line)
+{
+    if (!code || !line)
+        return;
+    code_source *src = code_source_of(code);
+    if (!src)
+        return; // debugging information only
+    // Drop entries for code a recompile threw away, then skip a repeat.
+    while (src->line_table_len >= 2 &&
+           src->line_table[src->line_table_len - 2] > code->code_len)
+        src->line_table_len -= 2;
+    if (src->line_table_len >= 2 &&
+        src->line_table[src->line_table_len - 1] == line)
+        return;
+    if (src->line_table_len >= 2 &&
+        src->line_table[src->line_table_len - 2] == code->code_len) {
+        src->line_table[src->line_table_len - 1] = line;
+        return;
+    }
+    if (src->line_table_len + 2 > src->line_table_cap) {
+        unsigned cap = src->line_table_cap ? src->line_table_cap * 2 : 16;
+        unsigned *table =
+            checked_realloc_array(src->line_table, cap, sizeof(unsigned));
+        if (!table)
+            return;
+        src->line_table = table;
+        src->line_table_cap = cap;
+    }
+    src->line_table[src->line_table_len++] = code->code_len;
+    src->line_table[src->line_table_len++] = line;
+}
+
+unsigned code_line_at(const code_object *code, unsigned ip)
+{
+    if (!code)
+        return 0;
+    unsigned line = code->source_line;
+    const code_source *src = code->source;
+    for (unsigned i = 0; src && i + 1 < src->line_table_len; i += 2) {
+        if (src->line_table[i] > ip)
+            break;
+        line = src->line_table[i + 1];
+    }
+    return line;
 }
 
 // ============================================================================

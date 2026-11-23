@@ -805,12 +805,11 @@ unsigned vm_call_closure(unsigned closure, unsigned args)
     if (!list_length_checked(args, &argc, "closure arguments"))
         return TOK_ERROR;
 
-    if (!code->has_rest && argc != code->arity) {
-        show_error("wrong number of arguments to closure");
-        return TOK_ERROR;
-    }
-    if (code->has_rest && argc < code->arity) {
-        show_error("too few arguments to closure");
+    if (code->has_rest ? argc < code->arity : argc != code->arity) {
+        char message[256];
+        format_arity_error(message, sizeof(message), closure, argc,
+                           code->arity, code->has_rest);
+        show_error("%s", message);
         return TOK_ERROR;
     }
 
@@ -1313,6 +1312,252 @@ static code_object *get_error_return_code(void)
     return code;
 }
 
+// ============================================================================
+// Backtraces of unhandled errors
+// ============================================================================
+
+// The backtrace being built (bt) and the last one finished, waiting for the
+// default handler to print its report (pending_backtrace).
+static struct {
+    FILE *out;
+    char *text;
+    size_t text_len;
+    const void *run_key; // the frame the current run repeats
+    unsigned run_line;
+    unsigned run_count;
+    char run_label[160];
+    unsigned lines;    // lines written so far
+    unsigned overflow; // frames past the line budget
+} bt;
+static char *pending_backtrace;
+
+void backtrace_start(void)
+{
+    free(pending_backtrace);
+    pending_backtrace = NULL;
+    if (bt.out)
+        fclose(bt.out);
+    free(bt.text);
+    memset(&bt, 0, sizeof(bt));
+    bt.out = open_memstream(&bt.text, &bt.text_len);
+}
+
+static void backtrace_flush_run(void)
+{
+    if (bt.run_count > 1) {
+        if (bt.lines < BACKTRACE_MAX_LINES && bt.run_label[0]) {
+            fprintf(bt.out, "  ... %u more frame%s in %s\n", bt.run_count - 1,
+                    bt.run_count == 2 ? "" : "s", bt.run_label);
+            bt.lines++;
+        } else {
+            bt.overflow += bt.run_count - 1;
+        }
+    }
+    bt.run_count = 0;
+}
+
+bool backtrace_next(const void *key, unsigned line)
+{
+    if (!bt.out)
+        return false;
+    if (bt.run_count && key == bt.run_key && line == bt.run_line) {
+        bt.run_count++;
+        return false;
+    }
+    backtrace_flush_run();
+    bt.run_key = key;
+    bt.run_line = line;
+    bt.run_count = 1;
+    bt.run_label[0] = '\0';
+    if (bt.lines >= BACKTRACE_MAX_LINES) {
+        bt.overflow++;
+        return false;
+    }
+    return true;
+}
+
+void backtrace_describe(const char *label, const char *file, unsigned line)
+{
+    if (!bt.out)
+        return;
+    snprintf(bt.run_label, sizeof(bt.run_label), "%s", label);
+    fprintf(bt.out, "  in %s", label);
+    if (file && line)
+        fprintf(bt.out, " at %s:%u", file, line);
+    fputc('\n', bt.out);
+    bt.lines++;
+}
+
+void backtrace_end(void)
+{
+    if (!bt.out)
+        return;
+    backtrace_flush_run();
+    if (bt.overflow)
+        fprintf(bt.out, "  ... %u more frame%s\n", bt.overflow,
+                bt.overflow == 1 ? "" : "s");
+    fclose(bt.out);
+    bt.out = NULL;
+    if (bt.text && bt.text_len)
+        pending_backtrace = bt.text;
+    else
+        free(bt.text);
+    bt.text = NULL;
+}
+
+void backtrace_print_pending(void)
+{
+    if (!pending_backtrace)
+        return;
+    FILE *fp = ctx.current_output ? ctx.current_output : stdout;
+    fputs(pending_backtrace, fp);
+    fflush(fp);
+    free(pending_backtrace);
+    pending_backtrace = NULL;
+}
+
+bool backtrace_hides(const char *name, const char *file)
+{
+    if (!file || strcmp(file, "<stdlib>") != 0)
+        return false;
+    if (!name)
+        return true; // the stdlib's anonymous helpers
+    static const char *const machinery[] = {
+        "raise", "raise-continuable", "error", "syntax-error",
+        "with-exception-handler", "dynamic-wind", "%continuation",
+        "call-with-current-continuation", "call/cc", "do-wind",
+    };
+    for (size_t i = 0; i < sizeof(machinery) / sizeof(machinery[0]); i++)
+        if (strcmp(name, machinery[i]) == 0)
+            return true;
+    return false;
+}
+
+static void label_append(char *buf, size_t size, size_t *len, const char *s)
+{
+    if (*len + 1 >= size)
+        return;
+    int n = snprintf(buf + *len, size - *len, "%s", s);
+    if (n > 0)
+        *len = *len + (size_t)n < size ? *len + (size_t)n : size - 1;
+}
+
+void backtrace_lambda_label(char *buf, size_t size, const char *name,
+                            unsigned params)
+{
+    size_t len = 0;
+    buf[0] = '\0';
+    label_append(buf, size, &len, name ? "(" : "(lambda ");
+    if (name)
+        label_append(buf, size, &len, name);
+    else if (!IS_PAIR(params) && params)
+        ; // (lambda args): the rest symbol stands alone below
+    else
+        label_append(buf, size, &len, "(");
+    bool first = !name;
+    unsigned p = params;
+    for (unsigned n = 0; n < 64 && IS_PAIR(p); n++, p = cdr(p)) {
+        if (!first)
+            label_append(buf, size, &len, " ");
+        first = false;
+        unsigned var = car(p);
+        label_append(buf, size, &len,
+                     IS_ATOM(var) && atom_is_valid(var)
+                         ? ctx.atom_table[CELL_ID(var)]
+                         : "?");
+    }
+    if (p && IS_ATOM(p) && atom_is_valid(p)) {
+        if (IS_PAIR(params) || name)
+            label_append(buf, size, &len, " . ");
+        label_append(buf, size, &len, ctx.atom_table[CELL_ID(p)]);
+    }
+    if (!name && (IS_PAIR(params) || !params))
+        label_append(buf, size, &len, ")");
+    label_append(buf, size, &len, ")");
+}
+
+void format_arity_error(char *buf, size_t size, unsigned proc, unsigned argc,
+                        unsigned required, bool rest)
+{
+    const char *name = procedure_name(proc);
+    char anonymous[64];
+    if (!name) {
+        snprintf(anonymous, sizeof(anonymous), "#[compound-procedure %u]",
+                 object_hash_number(proc));
+        name = anonymous;
+    }
+    snprintf(buf, size, "%s: expected %s%u argument%s, got %u", name,
+             rest ? "at least " : "", required, required == 1 ? "" : "s",
+             argc);
+}
+
+// A call with the wrong number of arguments. Out of line and cold, so the
+// call path in vm_apply stays as small as it was. VM_ERROR keeps a pointer
+// to its message until the error is dispatched, which copies it into the
+// error object, so the message lives in a static buffer.
+static __attribute__((noinline, cold)) void
+vm_arity_error(vm_state *vm, unsigned fn, unsigned argc, const code_object *code)
+{
+    static char message[256];
+    format_arity_error(message, sizeof(message), fn, argc, code->arity,
+                       code->has_rest);
+    VM_ERROR(vm, message);
+}
+
+// One VM frame: the code it runs and the ip it is at (for a saved frame, its
+// return address).
+static void vm_backtrace_frame(code_object *code, unsigned ip)
+{
+    if (!code || !code_object_is_registered(code))
+        return;
+    // Internal singletons (the call-with-values finisher, the error-return
+    // marker, the load driver) and code compiled from data have no source.
+    const char *name = code_name(code), *file = code_file(code);
+    if (!name && !file)
+        return;
+    if (backtrace_hides(name, file))
+        return;
+    // A procedure reports where it was defined, so the frames of a recursion
+    // collapse into one run; top-level code reports the form it is in.
+    unsigned line = code->toplevel ? code_line_at(code, ip ? ip - 1 : 0)
+                                   : code->source_line;
+    if (!backtrace_next(code, line))
+        return;
+    char label[160];
+    if (code->toplevel) {
+        snprintf(label, sizeof(label), "<top-level>");
+    } else {
+        unsigned params = code->params < code->const_len
+                              ? code->constants[code->params]
+                              : 0;
+        backtrace_lambda_label(label, sizeof(label), name, params);
+    }
+    backtrace_describe(label, file, line);
+}
+
+// Called where an error is dispatched, before the handler runs: if the
+// handler is the default one the error is unhandled, so record the frames
+// that are about to be reported, the whole chain of active VMs included.
+// Kept out of line: inlined into the dispatch loop it would cost the hot
+// path registers for code that runs once per unhandled error.
+static __attribute__((noinline, cold)) void
+vm_capture_backtrace(vm_state *vm, unsigned handler)
+{
+    unsigned dflt = lookup_silent(intern("*default-exception-handler*"),
+                                  exception_state_env(vm->env));
+    if (dflt == TOK_ERROR || handler != dflt)
+        return;
+    backtrace_start();
+    for (vm_state *v = vm; v; v = v->parent) {
+        vm_backtrace_frame(v->code, v->ip);
+        if (!v->frames || v->fp > v->frames_cap)
+            continue;
+        for (unsigned i = v->fp; i-- > 0;)
+            vm_backtrace_frame(v->frames[i].code, v->frames[i].ip);
+    }
+    backtrace_end();
+}
+
 // Route a C-level error (primitive failure, undefined variable) through the
 // Scheme exception system instead of aborting the VM: build an error object
 // and invoke the current *current-exception-handler* in a new frame whose
@@ -1343,6 +1588,7 @@ static bool vm_signal_error(vm_state *vm, const char *msg)
         VM_ERROR(vm, msg);
         return false;
     }
+    vm_capture_backtrace(vm, handler);
     // Run the handler with the marker as its return address.
     vm->signal_handler = handler;
     vm->code = marker;
@@ -1382,6 +1628,7 @@ static void vm_handle_raise(vm_state *vm, unsigned argc, unsigned *argv)
     GC_GUARD;
     gc_protect(&handler);
     gc_protect(&obj);
+    vm_capture_backtrace(vm, handler);
     vm->signal_handler = handler;
     vm->code = marker;
     vm->ip = 0;
@@ -1853,11 +2100,11 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
 
         // Check arity
         if (!code->has_rest && argc != code->arity) {
-            VM_ERROR(vm, "wrong number of arguments");
+            vm_arity_error(vm, fn, argc, code);
             return;
         }
         if (code->has_rest && argc < code->arity) {
-            VM_ERROR(vm, "too few arguments");
+            vm_arity_error(vm, fn, argc, code);
             return;
         }
 
@@ -2627,6 +2874,7 @@ static unsigned vm_dispatch(vm_state *vm)
                 intern("*default-exception-handler*"),
                 exception_state_env(vm->env));
             if (dflt != TOK_ERROR && vm->signal_handler == dflt) {
+                backtrace_print_pending();
                 VM_ERROR_BREAK(vm, NULL);
             } else {
                 VM_ERROR_BREAK(

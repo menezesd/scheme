@@ -19,7 +19,9 @@
  * update these local copies. Root every copy used after an allocation.
  */
 
+#include "bytecode.h"
 #include "eval_internal.h"
+#include "reader.h"
 
 // ============================================================================
 // Continuation Handlers
@@ -377,6 +379,10 @@ void handle_cont_letrec_init(unsigned val, unsigned data, unsigned env,
 
     // Store the new value
     cell_set_car(vals_ptr, val);
+    // A letrec-bound procedure is named after its binding (named let is a
+    // letrec in expanded code, where the reader's own record is lost).
+    if (IS_FUNCTION(val) && IS_PAIR(bindings) && IS_PAIR(car(bindings)))
+        reader_source_name(car(CELL_CDR(val)), car(car(bindings)));
 
     unsigned rest = cdr(bindings);
     if (!rest) {
@@ -502,7 +508,7 @@ void handle_cont_eval_fn(unsigned val, unsigned data, unsigned env,
     unsigned inner = 0, fn_and_args = 0;
     gc_protect(&inner);
     gc_protect(&fn_and_args);
-    inner = alloc_cons(0, cdr(arg_exprs));
+    inner = alloc_cons(0, arg_exprs);
     fn_and_args = alloc_cons(fn, inner);
     unsigned k2 = make_cont(CONT_EVAL_ARGS, fn_and_args, env, next);
     tramp_eval(first_arg, env, k2);
@@ -521,7 +527,11 @@ void handle_cont_eval_args(unsigned val, unsigned data, unsigned env,
     unsigned fn = car(data);
     unsigned evaled_and_rest = cdr(data);
     unsigned evaled_rev = car(evaled_and_rest);
-    unsigned remaining = cdr(evaled_and_rest);
+    // The frame holds the argument list from the one just evaluated on, not
+    // the ones after it: a source pointer into the call even while its last
+    // argument is evaluated, which is what lets a backtrace find the
+    // procedure the call is in (see cps_capture_backtrace).
+    unsigned remaining = cdr(cdr(evaled_and_rest));
 
     // Protect fn, evaled_rev, and remaining before allocation
     gc_protect(&fn);
@@ -546,7 +556,7 @@ void handle_cont_eval_args(unsigned val, unsigned data, unsigned env,
         unsigned inner = 0, new_data = 0;
         gc_protect(&inner);
         gc_protect(&new_data);
-        inner = alloc_cons(new_evaled_rev, cdr(remaining));
+        inner = alloc_cons(new_evaled_rev, remaining);
         new_data = alloc_cons(fn, inner);
         unsigned k2 = make_cont(CONT_EVAL_ARGS, new_data, env, next);
         tramp_eval(first_arg, env, k2);
@@ -627,6 +637,7 @@ void handle_cont_err_return(unsigned val, unsigned data, unsigned env,
     unsigned dflt = lookup_silent(intern("*default-exception-handler*"),
                                   exception_state_env(env));
     if (dflt != TOK_ERROR && data == dflt) {
+        backtrace_print_pending();
         tramp_error();
         return;
     }

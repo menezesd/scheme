@@ -315,10 +315,32 @@ bool record_is_builtin(unsigned rec, enum builtin_record_type which);
 // false if rec is not one. equal? and equal hash tables compare char-sets by
 // them.
 bool char_set_record_fields(unsigned rec, unsigned *kind, unsigned *payload);
-// MIT-style object-hash number of a record or record type: assigned on first
-// request from one global counter, stable for the object's lifetime. 0 for
-// any other object.
+// MIT-style object-hash number of a record, record type, procedure or
+// continuation: assigned on first request from one global counter, stable for
+// the object's lifetime. 0 for any other object.
 unsigned object_hash_number(unsigned obj);
+
+// A map from heap cells to 64-bit payloads that does not keep its keys alive.
+// The collectors forward each key to its copy and drop the entries of keys
+// that died (see weak_cell_maps_after_gc), so an entry lives exactly as long
+// as its cell. Used for debugging metadata attached to cells that have no
+// room for it: the reader's source positions and object-hash numbers of
+// procedures. Maps must have static storage and be registered before use.
+typedef struct weak_cell_map {
+    unsigned *keys;
+    uint64_t *vals;
+    unsigned len, cap;
+    unsigned *index; // open addressing over entry positions + 1; 0 = empty
+    unsigned index_cap;
+    unsigned added_since_gc; // entries a minor collection may need to move
+    bool registered;
+    struct weak_cell_map *next;
+} weak_cell_map;
+bool weak_cell_map_get(weak_cell_map *map, unsigned cell, uint64_t *val);
+void weak_cell_map_put(weak_cell_map *map, unsigned cell, uint64_t val);
+// Called by gc() and minor_gc() after tracing, while the reclaimed space
+// still holds its forwarding pointers.
+void weak_cell_maps_after_gc(bool major);
 
 // ============================================================================
 // Continuation Helpers

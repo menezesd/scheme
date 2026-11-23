@@ -20,6 +20,7 @@
  */
 
 #include "eval_internal.h"
+#include "reader.h"
 #include "prim_internal.h"
 #include <limits.h>
 
@@ -129,6 +130,8 @@ static unsigned build_lambda_closure(unsigned params, unsigned body,
         closure_env = extend_env_empty(env);
     if (macro_bindings)
         apply_syntax_bindings(closure_env, macro_bindings);
+    // Keep the source position and name the reader gave the body.
+    reader_source_alias(body, expanded_body);
 
     unsigned body_env = alloc_cons(expanded_body, closure_env);
     gc_protect(&body_env);
@@ -545,6 +548,8 @@ static bool handle_named_let(unsigned id, unsigned env, unsigned cont)
     unsigned fn = make_typed_cell(BT_FUNCTION, params, body_env);
     gc_protect(&fn);
     cell_set_car(val_cell, fn);
+    // The body is often an expanded copy the reader never saw; name it.
+    reader_source_name(body, name);
 
     if (!args) {
         apply_function(fn, 0, env, cont);
@@ -558,7 +563,7 @@ static bool handle_named_let(unsigned id, unsigned env, unsigned cont)
     unsigned inner = 0, data = 0;
     gc_protect(&inner);
     gc_protect(&data);
-    inner = alloc_cons(0, rest_args);
+    inner = alloc_cons(0, args);
     data = alloc_cons(fn, inner);
     unsigned k = make_cont(CONT_EVAL_ARGS, data, env, cont);
     tramp_eval(first_arg, env, k);

@@ -676,7 +676,9 @@ TEST(writer_handles_vm_continuation)
 
     write_obj_port(cont, mem);
     fclose(mem);
-    ASSERT_STR_EQ(buf, "[continuation]");
+    // MIT's form, numbered by object hash: #[continuation N]
+    ASSERT(strncmp(buf, "#[continuation ", 15) == 0);
+    ASSERT(buf[len - 1] == ']');
     free(buf);
     PASS();
 }

@@ -28,6 +28,8 @@
 #include "bignum.h"
 #include "bytecode.h"
 #include "context.h"
+#include "primitive_table.h"
+#include "reader.h"
 #include "utf8.h"
 #include <inttypes.h>
 #include <math.h>
@@ -782,6 +784,70 @@ static void write_list_tail_fp(unsigned st, bool with_quotes, FILE *fp)
     free(active_cells);
 }
 
+// ============================================================================
+// Procedures
+// ============================================================================
+
+// Procedures print like MIT's, numbered by object hash:
+//   #[compound-procedure 12 fact]    a closure, named by its define, letrec
+//   #[compound-procedure 13]         binding or named let; else anonymous
+//   #[compiled-procedure 17 ("car") car]
+//                                    a builtin. MIT's form also gives the
+//                                    compiled block's number and offsets,
+//                                    ("list" #x10) #xbc, which mean nothing
+//                                    here, so the block is named after the
+//                                    primitive and the offsets are left out.
+//                                    display drops the quotes, as MIT's does.
+//   #[continuation 14]
+
+const char *primitive_name(int64_t prim)
+{
+    if (prim < 0 || prim >= PRIM_COUNT)
+        return NULL;
+    return primitive_table[prim].name;
+}
+
+const char *procedure_name(unsigned proc)
+{
+    if (is_bytecode_closure_object(proc))
+        return code_name(GET_CLOSURE_CODE(proc));
+    if (IS_FUNCTION(proc) && IS_PAIR(CELL_CDR(proc))) {
+        source_info info;
+        if (reader_source_info(CELL_CAR(CELL_CDR(proc)), &info) &&
+            info.name >= 0 && (uint64_t)info.name < ctx.atom_table_cap)
+            return ctx.atom_table[info.name];
+        return NULL;
+    }
+    if (IS_BUILTIN(proc))
+        return primitive_name(CELL_ID(proc));
+    return NULL;
+}
+
+static void write_procedure(FILE *fp, unsigned s, bool with_quotes)
+{
+    unsigned number = object_hash_number(s);
+    if (IS_BUILTIN(s)) {
+        const char *name = primitive_name(CELL_ID(s));
+        if (!name)
+            name = "primitive";
+        if (with_quotes)
+            fprintf(fp, "#[compiled-procedure %u (\"%s\") %s]", number, name,
+                    name);
+        else
+            fprintf(fp, "#[compiled-procedure %u (%s) %s]", number, name,
+                    name);
+        return;
+    }
+    const char *name = procedure_name(s);
+    // call/cc's dynamic-wind wrapper around the raw continuation
+    if (name && strcmp(name, "%continuation") == 0)
+        fprintf(fp, "#[continuation %u]", number);
+    else if (name)
+        fprintf(fp, "#[compound-procedure %u %s]", number, name);
+    else
+        fprintf(fp, "#[compound-procedure %u]", number);
+}
+
 static void write_obj_fp_inner(unsigned s, bool with_quotes, FILE *fp);
 
 static void write_obj_fp(unsigned s, bool with_quotes, FILE *fp)
@@ -818,7 +884,7 @@ static void write_obj_fp_inner(unsigned s, bool with_quotes, FILE *fp)
         return;
     }
     if (is_bytecode_closure_object(s)) {
-        fprintf(fp, "[function]");
+        write_procedure(fp, s, with_quotes);
         return;
     }
 
@@ -1061,7 +1127,8 @@ static void write_obj_fp_inner(unsigned s, bool with_quotes, FILE *fp)
         fprintf(fp, "[string-output-port]");
         break;
     case BT_FUNCTION:
-        fprintf(fp, "[function]");
+    case BT_BUILTIN:
+        write_procedure(fp, s, with_quotes);
         break;
     case BT_MACRO:
         fprintf(fp, "[macro]");
@@ -1070,10 +1137,8 @@ static void write_obj_fp_inner(unsigned s, bool with_quotes, FILE *fp)
         fprintf(fp, "[syntax-transformer]");
         break;
     case BT_CONT:
-        fprintf(fp, "[continuation]");
-        break;
     case BT_VMCONT:
-        fprintf(fp, "[continuation]");
+        fprintf(fp, "#[continuation %u]", object_hash_number(s));
         break;
     case BT_CLOSURE:
         fprintf(fp, "[bytecode-closure]");
@@ -1083,9 +1148,6 @@ static void write_obj_fp_inner(unsigned s, bool with_quotes, FILE *fp)
         break;
     case BT_BROKENHEART:
         fprintf(fp, "[broken-heart]");
-        break;
-    case BT_BUILTIN:
-        fprintf(fp, "[builtin]");
         break;
     case BT_EOF:
         fprintf(fp, "#[eof]");

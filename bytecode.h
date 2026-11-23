@@ -293,9 +293,11 @@ typedef struct code_object {
     unsigned char trmc_mode; // TRMC_MODE_*, 0 when the body has no accumulator
     unsigned trmc_slot;      // First accumulator slot (HOLE also uses +1)
 
-    // Source info for debugging
-    const char *name;     // Function name (if known)
-    unsigned source_line; // Source line number
+    // Source info for backtraces and procedure printing, recorded at compile
+    // time. The rest of it is out of line (see code_source): code_object is
+    // two cache lines, and growing it slowed every call measurably.
+    struct code_source *source; // NULL when nothing is known
+    unsigned source_line;       // Line of its lambda/define, 0 if unknown
 
     // GC integration: linked list of all code objects
     struct code_object *gc_next;
@@ -315,7 +317,30 @@ typedef struct code_object {
     bool gc_updating; // True while recursively updating GC references
     bool optimizing;  // True while recursively optimizing this code graph
     bool disassembling; // True while recursively printing this code graph
+    bool toplevel; // a compiled top-level form or eval unit, not a lambda
 } code_object;
+
+// Where a code object came from. The strings are permanent and not owned:
+// name is an atom-table entry, file the reader's interned copy.
+typedef struct code_source {
+    const char *name; // Procedure name, NULL if anonymous
+    const char *file; // File it was read from, NULL if unknown
+    // (ip, line) pairs, ascending by ip: where each top-level form of a
+    // batch starts, so a frame in top-level code reports its own form.
+    unsigned *line_table;
+    unsigned line_table_len; // number of unsigned words (twice the pairs)
+    unsigned line_table_cap;
+} code_source;
+
+static inline const char *code_name(const code_object *code)
+{
+    return code->source ? code->source->name : NULL;
+}
+
+static inline const char *code_file(const code_object *code)
+{
+    return code->source ? code->source->file : NULL;
+}
 
 // Global registry of all code objects (for GC)
 extern code_object *code_object_registry;
@@ -551,6 +576,13 @@ void code_patch(code_object *code, unsigned pos, unsigned val);
 // children_len onward), e.g. to recompile a body. Clears the verified flag.
 void code_truncate(code_object *code, unsigned code_len,
                    unsigned children_len);
+// A code object's source record, created on first use; NULL only when it
+// cannot be allocated.
+code_source *code_source_of(code_object *code);
+// Note that the code from the current position on came from source line
+// `line` (see code_source.line_table), and the line a saved ip maps to.
+void code_note_line(code_object *code, unsigned line);
+unsigned code_line_at(const code_object *code, unsigned ip);
 
 // Compiler
 code_object *compile_toplevel(unsigned expr, unsigned env);
@@ -587,5 +619,33 @@ vm_state *get_active_vm(void);         // Get currently running VM (for GC)
 
 // Disassembler
 void disassemble(code_object *code, const char *name);
+
+// Backtraces of unhandled errors (vm.c). When an error is about to reach the
+// default exception handler, the engine walks its frames into a pending
+// backtrace - innermost first, runs of one procedure collapsed, at most
+// BACKTRACE_MAX_LINES lines - and prints it after the handler's report, when
+// the handler returns into the engine's error-return marker. Nothing is
+// captured for an error some other handler will see.
+#define BACKTRACE_MAX_LINES 20
+void backtrace_start(void);
+// Whether a frame starts a new line; false when it repeats the previous
+// frame (same key and line) or the line budget is spent. Call
+// backtrace_describe for a true result.
+bool backtrace_next(const void *key, unsigned line);
+void backtrace_describe(const char *label, const char *file, unsigned line);
+void backtrace_end(void);
+void backtrace_print_pending(void);
+// A frame of the stdlib's exception and control machinery (raise, error,
+// with-exception-handler, ...), which a backtrace leaves out.
+bool backtrace_hides(const char *name, const char *file);
+// The message for calling proc with argc arguments when it takes `required`
+// (at least, with a rest parameter): "f: expected 2 arguments, got 1", the
+// procedure written as #[compound-procedure 12] when it has no name.
+void format_arity_error(char *buf, size_t size, unsigned proc, unsigned argc,
+                        unsigned required, bool rest);
+// Append a procedure's lambda list, (name a b . rest) or (lambda (a b)), to
+// buf.
+void backtrace_lambda_label(char *buf, size_t size, const char *name,
+                            unsigned params);
 
 #endif // BYTECODE_H

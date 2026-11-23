@@ -5872,6 +5872,79 @@
       (ua-msg (lambda () (letrec ((x (list 1 y)) (y 1)) x))))
 
 ;;; ============================================================================
+;;; Procedure printing and names
+;;; ============================================================================
+
+(section "Procedure printing and names")
+;; Procedures print as MIT's do, numbered by the object-hash counter that
+;; records use: #[compound-procedure 12 name], #[compound-procedure 12] when
+;; anonymous, #[compiled-procedure 17 ("car") car] for a builtin (MIT's block
+;; offsets left out) and #[continuation 13].
+(define (pp-display-string x)
+  (call-with-output-string (lambda (port) (display x port))))
+(define (pp-named? name s)
+  (and (string-prefix? "#[compound-procedure " s)
+       (string-suffix? (string-append " " name "]") s)))
+(define (pp-anonymous? s)
+  (and (string-prefix? "#[compound-procedure " s)
+       (string-suffix? "]" s)
+       (let ((n (substring s 21 (- (string-length s) 1))))
+         (and (string->number n) #t))))
+(define (pp-proc x) x)
+(define pp-lambda (lambda (x) x))
+(define (pp-outer) (define (pp-inner y) y) pp-inner)
+(define (pp-make) (lambda (z) z))
+(define (pp-loop) (let pp-iter ((i 0)) pp-iter))
+(define (pp-letrec) (letrec ((pp-rec (lambda (n) n))) pp-rec))
+(define (pp-let) (let ((pp-l (lambda (n) n))) pp-l))
+(define pp-wrapped (let ((k 1)) (lambda () k)))
+(test "a defined procedure prints with its name" #t
+      (pp-named? "pp-proc" (write-to-string pp-proc)))
+(test "display shows a compound procedure as write does" #t
+      (string=? (write-to-string pp-proc) (pp-display-string pp-proc)))
+(test "(define f (lambda ...)) names the lambda" #t
+      (pp-named? "pp-lambda" (write-to-string pp-lambda)))
+(test "internal defines, named let and letrec name their procedures"
+      '(#t #t #t)
+      (list (pp-named? "pp-inner" (write-to-string (pp-outer)))
+            (pp-named? "pp-iter" (write-to-string (pp-loop)))
+            (pp-named? "pp-rec" (write-to-string (pp-letrec)))))
+(test "lambdas that are not a definition's value are anonymous" '(#t #t #t #t)
+      (list (pp-anonymous? (write-to-string (lambda (x) x)))
+            (pp-anonymous? (write-to-string (pp-make)))
+            (pp-anonymous? (write-to-string (pp-let)))
+            (pp-anonymous? (write-to-string pp-wrapped))))
+(test "a procedure keeps its hash number; another closure gets a new one"
+      '(#t #f)
+      (let ((f (pp-make)))
+        (list (string=? (write-to-string f) (write-to-string f))
+              (string=? (write-to-string f) (write-to-string (pp-make))))))
+(test "procedure numbers survive a collection" #t
+      (let* ((f (pp-make))
+             (before (write-to-string f)))
+        (let loop ((i 0) (junk '()))
+          (if (< i 200000)
+              (loop (+ i 1) (if (= 0 (modulo i 1000)) '() (cons i junk)))))
+        (string=? before (write-to-string f))))
+(test "builtins print as compiled procedures" '(#t #t #t)
+      (let ((w (write-to-string car)) (d (pp-display-string car)))
+        (list (string-prefix? "#[compiled-procedure " w)
+              (string-suffix? " (\"car\") car]" w)
+              (string-suffix? " (car) car]" d))))
+(test "a builtin's number is stable" #t
+      (string=? (write-to-string vector-ref) (write-to-string vector-ref)))
+(test "continuations print as continuations" '(#t #t)
+      (call/cc
+       (lambda (k)
+         (let ((s (write-to-string k)))
+           (list (string-prefix? "#[continuation " s)
+                 (string=? s (write-to-string k)))))))
+(test "procedures inside data print the same way" #t
+      (string=? (write-to-string (list pp-proc car))
+                (string-append "(" (write-to-string pp-proc) " "
+                               (write-to-string car) ")")))
+
+;;; ============================================================================
 ;;; Summary
 ;;; ============================================================================
 

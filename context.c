@@ -1982,9 +1982,176 @@ bool char_set_record_fields(unsigned rec, unsigned *kind, unsigned *payload)
     return true;
 }
 
+// ============================================================================
+// Weak cell maps
+// ============================================================================
+
+static weak_cell_map *weak_cell_maps; // every registered map
+
+static unsigned weak_cell_slot(const weak_cell_map *map, unsigned cell)
+{
+    return (unsigned)((cell * 2654435761u) & (map->index_cap - 1));
+}
+
+static void weak_cell_map_index_entry(weak_cell_map *map, unsigned pos)
+{
+    unsigned i = weak_cell_slot(map, map->keys[pos]);
+    while (map->index[i])
+        i = (i + 1) & (map->index_cap - 1);
+    map->index[i] = pos + 1;
+}
+
+// Rebuild the index from the entry arrays, sized for at most half full.
+static void weak_cell_map_reindex(weak_cell_map *map)
+{
+    unsigned cap = 64;
+    while (cap / 2 <= map->len)
+        cap *= 2;
+    if (cap != map->index_cap) {
+        unsigned *index = checked_calloc_array(cap, sizeof(unsigned));
+        LISP_ASSERT_MSG(index != NULL, "weak_cell_map: index malloc failed");
+        free(map->index);
+        map->index = index;
+        map->index_cap = cap;
+    } else {
+        memset(map->index, 0, (size_t)cap * sizeof(unsigned));
+    }
+    for (unsigned pos = 0; pos < map->len; pos++)
+        weak_cell_map_index_entry(map, pos);
+}
+
+bool weak_cell_map_get(weak_cell_map *map, unsigned cell, uint64_t *val)
+{
+    if (!map->index_cap)
+        return false;
+    for (unsigned i = weak_cell_slot(map, cell); map->index[i];
+         i = (i + 1) & (map->index_cap - 1)) {
+        unsigned pos = map->index[i] - 1;
+        if (map->keys[pos] == cell) {
+            if (val)
+                *val = map->vals[pos];
+            return true;
+        }
+    }
+    return false;
+}
+
+void weak_cell_map_put(weak_cell_map *map, unsigned cell, uint64_t val)
+{
+    if (!map->registered) {
+        map->registered = true;
+        map->next = weak_cell_maps;
+        weak_cell_maps = map;
+    }
+    if (map->index_cap) {
+        for (unsigned i = weak_cell_slot(map, cell); map->index[i];
+             i = (i + 1) & (map->index_cap - 1)) {
+            unsigned pos = map->index[i] - 1;
+            if (map->keys[pos] == cell) {
+                map->vals[pos] = val;
+                return;
+            }
+        }
+    }
+    if (map->len == map->cap) {
+        unsigned cap = map->cap ? map->cap * 2 : 64;
+        unsigned *keys = checked_realloc_array(map->keys, cap, sizeof(unsigned));
+        LISP_ASSERT_MSG(keys != NULL, "weak_cell_map: malloc failed");
+        map->keys = keys;
+        uint64_t *vals = checked_realloc_array(map->vals, cap, sizeof(uint64_t));
+        LISP_ASSERT_MSG(vals != NULL, "weak_cell_map: malloc failed");
+        map->vals = vals;
+        map->cap = cap;
+    }
+    map->keys[map->len] = cell;
+    map->vals[map->len] = val;
+    map->len++;
+    map->added_since_gc++;
+    if (map->index_cap / 2 <= map->len)
+        weak_cell_map_reindex(map);
+    else
+        weak_cell_map_index_entry(map, map->len - 1);
+}
+
+// Settle every map after a collection has traced the heap. A key in the
+// reclaimed space (all of it for a major collection, the nursery for a minor
+// one) was either copied - follow its forwarding pointer - or is dead, and
+// its entry goes. A minor collection only moves nursery cells, and a key can
+// only be one if its entry was added since the last collection, so a map
+// with no new entries is left alone and the common case costs nothing.
+void weak_cell_maps_after_gc(bool major)
+{
+    unsigned lo = major ? HEAP_RESERVED : ctx.nursery_start;
+    unsigned hi = major ? UINT_MAX : ctx.nursery_ptr;
+    for (weak_cell_map *map = weak_cell_maps; map; map = map->next) {
+        if (!major && map->added_since_gc == 0)
+            continue;
+        unsigned out = 0;
+        for (unsigned pos = 0; pos < map->len; pos++) {
+            unsigned key = map->keys[pos];
+            if (key >= lo && key < hi) {
+                if (CELL_TYPE(key) != BT_BROKENHEART)
+                    continue; // dead
+                key = CELL_CAR(key);
+            }
+            map->keys[out] = key;
+            map->vals[out] = map->vals[pos];
+            out++;
+        }
+        map->len = out;
+        map->added_since_gc = 0;
+        weak_cell_map_reindex(map);
+    }
+}
+
+static unsigned next_object_hash = 1;
+// Procedures and continuations have no payload to key a number by (or, for
+// VM continuations, one the registry below does not cover), so their numbers
+// follow the cell itself.
+static weak_cell_map object_hash_cells;
+// Builtins are numbered per primitive: a primitive's cells are
+// interchangeable, and eq? on them compares the primitive.
+static unsigned *builtin_hash_numbers;
+
+static bool object_hash_by_cell(unsigned obj)
+{
+    if (!IS_CELL(obj))
+        return false;
+    switch (CELL_TYPE(obj)) {
+    case BT_FUNCTION:
+    case BT_CONT:
+    case BT_VMCONT:
+    case BT_VMCLOSURE:
+        return true;
+    default:
+        return false;
+    }
+}
+
 unsigned object_hash_number(unsigned obj)
 {
-    static unsigned next_object_hash = 1;
+    if (IS_BUILTIN(obj)) {
+        int64_t prim = CELL_ID(obj);
+        if (prim < 0 || prim >= PRIM_COUNT)
+            return 0;
+        if (!builtin_hash_numbers) {
+            builtin_hash_numbers =
+                checked_calloc_array(PRIM_COUNT, sizeof(unsigned));
+            if (!builtin_hash_numbers)
+                return 0;
+        }
+        if (!builtin_hash_numbers[prim])
+            builtin_hash_numbers[prim] = next_object_hash++;
+        return builtin_hash_numbers[prim];
+    }
+    if (object_hash_by_cell(obj)) {
+        uint64_t number;
+        if (weak_cell_map_get(&object_hash_cells, obj, &number))
+            return (unsigned)number;
+        unsigned fresh = next_object_hash++;
+        weak_cell_map_put(&object_hash_cells, obj, fresh);
+        return fresh;
+    }
     if (!IS_RECORD(obj) && !IS_RECORD_TYPE(obj))
         return 0;
     vector_data *vd = GET_VECTOR_PTR(obj);
@@ -3491,6 +3658,7 @@ unsigned gc(unsigned root)
 
     while (scan != ctx.hptr)
         gc_scan_cell(scan++, collect);
+    weak_cell_maps_after_gc(true);
 
     unsigned tmp = ctx.nmin;
     ctx.nmin = ctx.mmin;
@@ -3716,6 +3884,7 @@ unsigned minor_gc(unsigned root)
     // Scan newly promoted objects in old gen
     while (scan != ctx.hptr)
         gc_scan_cell(scan++, collect_to_old);
+    weak_cell_maps_after_gc(false);
 
     // Free external data for unreachable nursery cells. Promoted cells were
     // rewritten as BT_BROKENHEART, so their payloads go with the copies.

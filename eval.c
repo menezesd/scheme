@@ -37,6 +37,7 @@
 #include "eval.h"
 #include "bytecode.h"
 #include "eval_internal.h"
+#include "reader.h"
 #include "writer.h"
 #include <stdlib.h>
 
@@ -530,6 +531,239 @@ unsigned qq_transform_cps(unsigned x, unsigned env)
 // from inside the window still dispatches its own errors normally.
 static bool cps_handler_dispatch_active = false;
 
+// ----------------------------------------------------------------------------
+// Backtraces of unhandled errors
+// ----------------------------------------------------------------------------
+//
+// The CPS evaluator keeps no record of which procedure an activation belongs
+// to: applying a closure just evaluates its body in (frame . closure-env).
+// So the procedures are recovered from the continuation chain when an error
+// is about to reach the default handler, and only then. Each continuation
+// frame carries the environment its pending work runs in; an activation is
+// identified as a closure, bound somewhere in that environment's chain, whose
+// own environment is the activation's parent and whose parameters are the
+// frame's variables. When several closures fit (two top-level procedures of
+// one parameter x), the frame's data - which points into the body being
+// evaluated (see CONT_EVAL_ARGS) - picks the closure whose body contains it.
+
+// Closures whose environment is `env`, found by scanning env's chain once.
+// Each closure comes with the variable it was found bound to, which names a
+// procedure the reader could not (a named let in expanded code, say).
+typedef struct {
+    unsigned env;
+    unsigned *procs;
+    unsigned *names;
+    unsigned len, cap;
+    // The last frame the data picked a closure for: the frames of a
+    // recursion share a call site, so each is then found without a walk.
+    unsigned last_data, last_proc, last_name;
+} cps_bt_candidates;
+
+static void cps_bt_add(cps_bt_candidates *c, unsigned proc, unsigned name)
+{
+    for (unsigned i = 0; i < c->len; i++)
+        if (c->procs[i] == proc)
+            return;
+    if (c->len == c->cap) {
+        unsigned cap = c->cap ? c->cap * 2 : 8;
+        unsigned *procs = realloc(c->procs, cap * sizeof(unsigned));
+        if (!procs)
+            return;
+        c->procs = procs;
+        unsigned *names = realloc(c->names, cap * sizeof(unsigned));
+        if (!names)
+            return;
+        c->names = names;
+        c->cap = cap;
+    }
+    c->procs[c->len] = proc;
+    c->names[c->len] = name;
+    c->len++;
+}
+
+static void cps_bt_scan(cps_bt_candidates *c, unsigned env)
+{
+    c->env = env;
+    c->len = 0;
+    c->last_data = c->last_proc = c->last_name = 0;
+    unsigned steps = 0;
+    for (unsigned e = env; IS_PAIR(e) && steps < 1000000; e = cdr(e)) {
+        unsigned frame = car(e);
+        if (!IS_PAIR(frame))
+            continue;
+        unsigned vars = car(frame), vals = cdr(frame);
+        for (; IS_PAIR(vars) && IS_PAIR(vals) && steps < 1000000;
+             vars = cdr(vars), vals = cdr(vals), steps++) {
+            unsigned v = car(vals);
+            if (IS_FUNCTION(v) && IS_PAIR(CELL_CDR(v)) &&
+                CELL_CDR(CELL_CDR(v)) == env)
+                cps_bt_add(c, v, car(vars));
+        }
+    }
+}
+
+// Do a closure's parameters spell the variables of an activation frame?
+static bool cps_bt_params_match(unsigned params, unsigned vars)
+{
+    for (unsigned n = 0; n < 1000; n++) {
+        if (IS_PAIR(params)) {
+            if (!IS_PAIR(vars) || car(params) != car(vars))
+                return false;
+            params = cdr(params);
+            vars = cdr(vars);
+        } else if (params) {
+            // rest parameter: bind_params gives it the last slot
+            return IS_PAIR(vars) && car(vars) == params && !cdr(vars);
+        } else {
+            return !vars;
+        }
+    }
+    return false;
+}
+
+// Is cell one of the pairs of tree? A bounded walk: this runs per frame.
+static bool cps_bt_contains(unsigned tree, unsigned cell)
+{
+    unsigned stack[256];
+    unsigned sp = 0, visited = 0;
+    stack[sp++] = tree;
+    while (sp && visited < 20000) {
+        unsigned x = stack[--sp];
+        while (IS_PAIR(x) && visited < 20000) {
+            visited++;
+            if (x == cell)
+                return true;
+            if (IS_PAIR(car(x)) && sp < 256)
+                stack[sp++] = car(x);
+            x = cdr(x);
+        }
+    }
+    return false;
+}
+
+// The closure an activation environment belongs to, or 0. *activation is
+// set to the env node that identifies the activation (the closure's frame),
+// *binding to the variable the closure was found under.
+static unsigned cps_bt_identify(unsigned env, unsigned data,
+                                cps_bt_candidates *cache,
+                                unsigned *activation, unsigned *binding)
+{
+    *activation = env;
+    *binding = 0;
+    for (unsigned level = 0, e = env; level < 64 && IS_PAIR(e) &&
+                                      IS_PAIR(cdr(e));
+         level++, e = cdr(e)) {
+        unsigned frame = car(e);
+        if (!IS_PAIR(frame))
+            continue;
+        if (cache->env != cdr(e))
+            cps_bt_scan(cache, cdr(e));
+        if (IS_PAIR(data) && data == cache->last_data &&
+            cps_bt_params_match(CELL_CAR(cache->last_proc), car(frame))) {
+            *activation = e;
+            *binding = cache->last_name;
+            return cache->last_proc;
+        }
+        unsigned found = 0, matches = 0;
+        for (unsigned i = 0; i < cache->len; i++) {
+            unsigned proc = cache->procs[i];
+            if (!cps_bt_params_match(CELL_CAR(proc), car(frame)))
+                continue;
+            matches++;
+            if (!found) {
+                found = proc;
+                *binding = cache->names[i];
+            }
+            if (IS_PAIR(data) && cps_bt_contains(car(CELL_CDR(proc)), data)) {
+                found = proc;
+                *binding = cache->names[i];
+                matches = 1;
+                cache->last_data = data;
+                cache->last_proc = proc;
+                cache->last_name = cache->names[i];
+                break;
+            }
+        }
+        if (found && matches == 1) {
+            *activation = e;
+            return found;
+        }
+        if (found) {
+            // Several closures fit and the frame's data names none of them.
+            *activation = e;
+            return 0;
+        }
+    }
+    return 0;
+}
+
+static __attribute__((noinline, cold)) void
+cps_capture_backtrace(unsigned handler, unsigned env, unsigned cont)
+{
+    unsigned dflt = lookup_silent(intern("*default-exception-handler*"),
+                                  exception_state_env(env));
+    if (dflt == TOK_ERROR || handler != dflt)
+        return;
+    backtrace_start();
+    cps_bt_candidates cache = {0, NULL, NULL, 0, 0, 0, 0, 0};
+    unsigned last_activation = 0, last_env = 0;
+    unsigned steps = 0;
+    for (unsigned k = cont; IS_CONT(k) && steps < 10000000; steps++) {
+        unsigned type_data = CELL_CAR(k), env_next = CELL_CDR(k);
+        if (!IS_PAIR(type_data) || !IS_PAIR(env_next))
+            break;
+        unsigned type = CELL_CAR(type_data);
+        unsigned data = CELL_CDR(type_data);
+        unsigned kenv = CELL_CAR(env_next);
+        k = CELL_CDR(env_next);
+        if (type == CONT_HALT || type == CONT_ERR_RETURN || !IS_PAIR(kenv))
+            continue;
+        // Frames of an activation already reported, cheaply: most pending
+        // work runs in the activation's own environment.
+        if (kenv == last_env || kenv == last_activation)
+            continue;
+        last_env = kenv;
+        // Where the frame points into the code being evaluated.
+        unsigned source = data;
+        if (type == CONT_EVAL_ARGS && IS_PAIR(data) && IS_PAIR(cdr(data)))
+            source = cdr(cdr(data));
+        unsigned activation = kenv, binding = 0;
+        unsigned proc =
+            cps_bt_identify(kenv, source, &cache, &activation, &binding);
+        if (activation == last_activation)
+            continue;
+        last_activation = activation;
+        unsigned body = proc ? car(CELL_CDR(proc)) : 0;
+        source_info info;
+        bool located = body && reader_source_info(body, &info);
+        const char *name = located && info.name >= 0 &&
+                                   (uint64_t)info.name < ctx.atom_table_cap
+                               ? ctx.atom_table[info.name]
+                               : NULL;
+        if (!name && proc && IS_ATOM(binding) && atom_is_valid(binding))
+            name = ctx.atom_table[CELL_ID(binding)];
+        if (!proc && !IS_PAIR(cdr(kenv)))
+            continue; // top level
+        if (backtrace_hides(name, located ? info.file : NULL))
+            continue;
+        unsigned line = located ? info.line : 0;
+        const void *key = proc ? (const void *)(uintptr_t)body
+                               : (const void *)(uintptr_t)activation;
+        if (!backtrace_next(key, line))
+            continue;
+        char label[160];
+        backtrace_lambda_label(label, sizeof(label), name,
+                               proc ? CELL_CAR(proc)
+                                    : (IS_PAIR(car(activation))
+                                           ? car(car(activation))
+                                           : 0));
+        backtrace_describe(label, located ? info.file : NULL, line);
+    }
+    free(cache.procs);
+    free(cache.names);
+    backtrace_end();
+}
+
 static void cps_signal_error(const char *msg, unsigned env, unsigned cont)
 {
     if (!msg)
@@ -560,6 +794,7 @@ static void cps_signal_error(const char *msg, unsigned env, unsigned cont)
     gc_protect(&error_obj);
     unsigned args = alloc_cons(error_obj, 0);
     gc_protect(&args);
+    cps_capture_backtrace(handler, env, cont);
     unsigned err_cont = make_cont(CONT_ERR_RETURN, handler, env, cont);
     cps_handler_dispatch_active = true;
     apply_function(handler, args, env, err_cont);
@@ -846,6 +1081,7 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
             gc_protect(&obj);
             gc_protect(&env);
             gc_protect(&cont);
+            cps_capture_backtrace(handler, env, cont);
             unsigned err_cont = make_cont(CONT_ERR_RETURN, handler, env, cont);
             unsigned raise_args = alloc_cons(obj, 0);
             apply_function(handler, raise_args, env, err_cont);
@@ -1035,6 +1271,17 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
         gc_protect(&frame);
         frame = bind_params(params, args);
         if (frame == TOK_ERROR) {
+            // bind_params reports a wrong argument count without saying
+            // whose; name the procedure, as the VM does.
+            unsigned required = 0, argc = 0;
+            unsigned p = params;
+            for (; IS_PAIR(p) && required < 100000; p = cdr(p))
+                required++;
+            if (strstr(ctx.last_error, " arguments") &&
+                list_length_checked(args, &argc, "procedure") &&
+                (p ? argc < required : argc != required))
+                format_arity_error(ctx.last_error, sizeof(ctx.last_error), fn,
+                                   argc, required, p != 0);
             cps_signal_current_error(env, cont);
             return;
         }
