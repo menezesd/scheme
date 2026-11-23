@@ -64,7 +64,7 @@ unsigned prim_append(unsigned argc, unsigned *argv)
 
 unsigned prim_reverse(unsigned argc, unsigned *argv)
 {
-    REQUIRE_ARGC(argc, 1, 1, "reverse");
+    (void)argc; // apply_primitive_argv checked the count
     GC_GUARD;
     unsigned lst = argv[0];
     if (!list_length_checked(lst, NULL, "reverse"))
@@ -97,8 +97,8 @@ _Static_assert(sizeof(cxr_names) / sizeof(cxr_names[0]) ==
 // failure is reported under the procedure's own name.
 unsigned prim_cxr(unsigned prim_id, unsigned argc, unsigned *argv)
 {
+    (void)argc; // apply_primitive_argv checked the count
     const char *name = cxr_names[prim_id - PCAAR];
-    REQUIRE_ARGC(argc, 1, 1, name);
     unsigned level, path;
     if (prim_id <= PCDDR) {
         level = 2;
@@ -257,6 +257,7 @@ static unsigned list_search(unsigned key, unsigned lst, match_kind kind,
 
 unsigned prim_member_search(unsigned prim_id, unsigned argc, unsigned *argv)
 {
+    (void)argc; // apply_primitive_argv checked the count
     static const struct {
         const char *name;
         match_kind kind;
@@ -270,7 +271,6 @@ unsigned prim_member_search(unsigned prim_id, unsigned argc, unsigned *argv)
         [PASSOC - PMEMQ] = {"assoc", MATCH_EQUAL, true},
     };
     unsigned which = prim_id - PMEMQ;
-    REQUIRE_ARGC(argc, 2, 2, searches[which].name);
     return list_search(argv[0], argv[1], searches[which].kind,
                        searches[which].assoc, searches[which].name);
 }
@@ -361,7 +361,7 @@ static unsigned list_tail_cell(unsigned lst, int64_t k, const bignum *big,
 
 unsigned prim_list_tail(unsigned argc, unsigned *argv)
 {
-    REQUIRE_ARGC(argc, 2, 2, "list-tail");
+    (void)argc; // apply_primitive_argv checked the count
     int64_t k;
     const bignum *big;
     if (!list_index_arg(argv[1], &k, &big, "list-tail"))
@@ -371,7 +371,7 @@ unsigned prim_list_tail(unsigned argc, unsigned *argv)
 
 unsigned prim_list_ref(unsigned argc, unsigned *argv)
 {
-    REQUIRE_ARGC(argc, 2, 2, "list-ref");
+    (void)argc; // apply_primitive_argv checked the count
     int64_t k;
     const bignum *big;
     if (!list_index_arg(argv[1], &k, &big, "list-ref"))

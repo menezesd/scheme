@@ -5,6 +5,7 @@
 #include "env.h"
 #include "eval.h"
 #include "macros.h"
+#include "primitive_table.h"
 #include "reader.h"
 #include "types.h"
 #include "writer.h"
@@ -328,25 +329,9 @@ int main(int argc, char **argv)
     // bootstrap bindings part of the public primitive set.
     GC_GUARD;
     gc_protect(&env);
-    static const struct {
-        const char *name;
-        int prim;
-    } bootstrap_primitives[] = {
-        {"%unicode-assigned?", PUNICODEASSIGNED},
-        {"%char-combining?", PCHARCOMBINING},
-        {"%unicode-punctuation?", PUNICODEPUNCTUATION},
-        {"%unicode-symbol?", PUNICODESYMBOL},
-    };
-    for (size_t i = 0;
-         i < sizeof(bootstrap_primitives) / sizeof(bootstrap_primitives[0]);
-         i++) {
-        unsigned name = atom_from_string(bootstrap_primitives[i].name);
-        gc_protect(&name);
-        unsigned prim = mk_primop(bootstrap_primitives[i].prim);
-        gc_protect(&prim);
-        defvar(name, prim, env);
-        gc_unprotect(2);
-    }
+    for (unsigned id = 0; id < PRIM_COUNT; id++)
+        if (primitive_table[id].flags & PRIM_BOOTSTRAP)
+            define_primitive(primitive_table[id].name, id, env);
 
     // Set up automatic GC during allocation
     set_alloc_gc_root(&env);

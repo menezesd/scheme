@@ -239,7 +239,6 @@ unsigned apply_char_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
 {
     const char *pred_name = char_predicate_name(prim_id);
     if (pred_name) {
-        REQUIRE_ARGC(argc, 1, 1, pred_name);
         return char_predicate_value(prim_id, argv[0], pred_name);
     }
 
@@ -247,20 +246,17 @@ unsigned apply_char_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         const char *name = prim_id == PCHARUP      ? "char-upcase"
                            : prim_id == PCHARDOWN ? "char-downcase"
                                                   : "char-foldcase";
-        REQUIRE_ARGC(argc, 1, 1, name);
         return char_transform(prim_id, argv[0], name);
     }
 
     switch (prim_id) {
     case PUNICODEASSIGNED:
-        REQUIRE_ARGC(argc, 1, 1, "%unicode-assigned?");
         return unicode_assigned_value(argv[0], "%unicode-assigned?");
     case PUNICODEPUNCTUATION:
     case PUNICODESYMBOL: {
         const char *name = prim_id == PUNICODEPUNCTUATION
                                ? "%unicode-punctuation?"
                                : "%unicode-symbol?";
-        REQUIRE_ARGC(argc, 1, 1, name);
         int c;
         if (!expect_char_value(argv[0], &c, name))
             return TOK_ERROR;
@@ -273,17 +269,14 @@ unsigned apply_char_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         return scheme_bool(unicode_range_contains(ranges, count, (uint32_t)c));
     }
     case PCHARCOMBINING: {
-        REQUIRE_ARGC(argc, 1, 1, "%char-combining?");
         int c;
         if (!expect_char_value(argv[0], &c, "%char-combining?"))
             return TOK_ERROR;
         return scheme_bool(unicode_char_has_combining_class((uint32_t)c));
     }
     case PCHARCODE:
-        REQUIRE_ARGC(argc, 1, 1, "char->integer");
         return char_code_value(argv[0], "char->integer");
     case PCODECHAR:
-        REQUIRE_ARGC(argc, 1, 1, "integer->char");
         return integer_to_char_value(argv[0], "integer->char");
     // Character comparisons (PCHAREQ..PCHARGEI are sequential)
     case PCHAREQ:

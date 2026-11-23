@@ -719,74 +719,12 @@ static compile_result compile_quasiquote(unsigned expr, compile_ctx *cctx);
 // Constant Folding Helpers
 // ============================================================================
 
-// Check if a primitive is pure (no side effects, safe to fold)
+// Pure, and never returns a fresh mutable object (cons, list, append and the
+// string constructors are excluded: a folded constant would be shared by
+// every evaluation of the call). See PRIM_FOLDABLE in primitive_table.c.
 static bool is_foldable_primitive(int64_t prim_id)
 {
-    switch (prim_id) {
-    // Arithmetic
-    case PPLUS:
-    case PMINUS:
-    case PTIMES:
-    case PDIV:
-    case PMOD:
-    case PQUOTIENT:
-    case PREMAINDER:
-    case PABS:
-    // Comparison
-    case PLT:
-    case PGT:
-    case PLEQ:
-    case PGEQ:
-    // List operations (read-only ones)
-    case PCAR:
-    case PCDR:
-    case PLENGTH:
-    // Note: PCONS, PLIST, PREVERSE, PAPPEND are NOT foldable because
-    // they create mutable cons cells that must not be shared
-    // Type predicates
-    case PCONSP:
-    case PNULLP:
-    case PNUMP:
-    case PSTRINGP:
-    case PSYMP:
-    case PBOOLP:
-    case PCHARP:
-    case PVECTORP:
-    case PNOT:
-    case PEQ:
-    case PEQV:
-    case PEQUAL:
-    case PEQUALP:
-    // String operations that return immutable/immediate values. Operations
-    // that allocate mutable strings or lists are not foldable because a folded
-    // constant would be reused across calls to compiled lambdas.
-    case PSTRLEN:
-    case PSTRREF:
-    case PSTR2SYM:
-    // Char operations
-    case PCHARCODE:
-    case PCODECHAR:
-    case PCHARUP:
-    case PCHARDOWN:
-    // Math functions
-    case PFLOOR:
-    case PCEILING:
-    case PROUND:
-    case PTRUNCATE:
-    case PEXP:
-    case PLOG:
-    case PSIN:
-    case PCOS:
-    case PTAN:
-    case PASIN:
-    case PACOS:
-    case PATAN:
-    case PSQRT:
-    case PEXPT:
-        return true;
-    default:
-        return false;
-    }
+    return primitive_has_flag(prim_id, PRIM_FOLDABLE);
 }
 
 // ============================================================================
@@ -3328,17 +3266,7 @@ static compile_result compile_if(unsigned expr, compile_ctx *cctx)
 // they allocate fresh mutable objects, which is irrelevant to both.
 static bool trmc_safe_primitive(int64_t prim_id)
 {
-    if (is_foldable_primitive(prim_id))
-        return true;
-    switch (prim_id) {
-    case PCONS:
-    case PLIST:
-    case PAPPEND:
-    case PSTRAPP:
-        return true;
-    default:
-        return false;
-    }
+    return primitive_has_flag(prim_id, PRIM_PURE);
 }
 
 // A plain TAILCALL hands the callee's value straight back to our caller,

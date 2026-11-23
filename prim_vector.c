@@ -106,7 +106,6 @@ unsigned apply_vector_primitive(unsigned prim_id, unsigned argc,
 {
     switch (prim_id) {
     case PMAKEVEC: {
-        REQUIRE_ARGC(argc, 1, 2, "make-vector");
         unsigned fill = (argc == 2) ? argv[1] : 0;
         return make_filled_vector(argv[0], fill, "make-vector");
     }
@@ -114,7 +113,6 @@ unsigned apply_vector_primitive(unsigned prim_id, unsigned argc,
         return make_vector_from_argv(argc, argv);
     }
     case PVECREF: {
-        REQUIRE_ARGC(argc, 2, 2, "vector-ref");
         unsigned vec = argv[0];
         if (!require_vector(vec, "vector-ref"))
             return TOK_ERROR;
@@ -124,7 +122,6 @@ unsigned apply_vector_primitive(unsigned prim_id, unsigned argc,
         return vector_data_ptr(vec)[idx];
     }
     case PVECSET: {
-        REQUIRE_ARGC(argc, 3, 3, "vector-set!");
         unsigned vec = argv[0];
         if (!require_vector(vec, "vector-set!"))
             return TOK_ERROR;
@@ -136,14 +133,12 @@ unsigned apply_vector_primitive(unsigned prim_id, unsigned argc,
         return val;
     }
     case PVECLEN: {
-        REQUIRE_ARGC(argc, 1, 1, "vector-length");
         unsigned vec = argv[0];
         if (!require_vector(vec, "vector-length"))
             return TOK_ERROR;
         return store(vector_len(vec));
     }
     case PVECFILL: {
-        REQUIRE_ARGC(argc, 2, 4, "vector-fill!");
         unsigned vec = argv[0];
         if (!require_vector(vec, "vector-fill!"))
             return TOK_ERROR;
@@ -156,11 +151,9 @@ unsigned apply_vector_primitive(unsigned prim_id, unsigned argc,
         return 0;
     }
     case PLIST2VEC: {
-        REQUIRE_ARGC(argc, 1, 1, "list->vector");
         return make_vector_from_list(argv[0], "list->vector");
     }
     case PVEC2LIST: {
-        REQUIRE_ARGC(argc, 1, 3, "vector->list");
         unsigned vec = argv[0];
         if (!require_vector(vec, "vector->list"))
             return TOK_ERROR;

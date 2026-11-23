@@ -574,27 +574,22 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
 {
     switch (prim_id) {
     case PDISPLAY: {
-        REQUIRE_ARGC(argc, 1, 2, "display");
         return write_object_with_optional_port(argc, argv, "display",
                                                display_checked);
     }
     case PWRITE: {
-        REQUIRE_ARGC(argc, 1, 2, "write");
         return write_object_with_optional_port(argc, argv, "write",
                                                write_obj_port_checked);
     }
     case PWRITESHARED: {
-        REQUIRE_ARGC(argc, 1, 2, "write-shared");
         return write_object_with_optional_port(argc, argv, "write-shared",
                                                write_shared_obj_port_checked);
     }
     case PWRITESIMPLE: {
-        REQUIRE_ARGC(argc, 1, 2, "write-simple");
         return write_object_with_optional_port(argc, argv, "write-simple",
                                                write_simple_obj_port_checked);
     }
     case PNEWLINE: {
-        REQUIRE_ARGC(argc, 0, 1, "newline");
         FILE *port;
         string_port *sport;
         int ptype = extract_optional_port(argc, argv, 1, PORT_OUTPUT, &port,
@@ -611,7 +606,6 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         return 0;
     }
     case PREAD: {
-        REQUIRE_ARGC(argc, 0, 1, "read");
         FILE *fport;
         string_port *sport;
         int ptype = extract_optional_port(argc, argv, 1, PORT_INPUT, &fport,
@@ -673,7 +667,6 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         return result;
     }
     case PREADCHAR: {
-        REQUIRE_ARGC(argc, 0, 1, "read-char");
         FILE *fport;
         string_port *sport;
         int ptype = extract_optional_port(argc, argv, 1, PORT_INPUT, &fport,
@@ -682,7 +675,6 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         return read_or_peek_char(fport, sport, ptype, false, "read-char");
     }
     case PREADCHARNOHANG: {
-        REQUIRE_ARGC(argc, 0, 1, "read-char-no-hang");
         FILE *fport;
         string_port *sport;
         int ptype = extract_optional_port(argc, argv, 1, PORT_INPUT, &fport,
@@ -700,7 +692,6 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
                                  "read-char-no-hang");
     }
     case PUNREADCHAR: {
-        REQUIRE_ARGC(argc, 1, 2, "unread-char");
         CHECK_CHAR(argv[0], "unread-char");
         int c = GET_CHAR_CODE(argv[0]);
         FILE *fport;
@@ -766,7 +757,6 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         return argv[0];
     }
     case PPEEKCHAR: {
-        REQUIRE_ARGC(argc, 0, 1, "peek-char");
         FILE *fport;
         string_port *sport;
         int ptype = extract_optional_port(argc, argv, 1, PORT_INPUT, &fport,
@@ -775,7 +765,6 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         return read_or_peek_char(fport, sport, ptype, true, "peek-char");
     }
     case PWRITECHAR: {
-        REQUIRE_ARGC(argc, 1, 2, "write-char");
         CHECK_CHAR(argv[0], "write-char");
         int c = GET_CHAR_CODE(argv[0]);
         FILE *fport;
@@ -793,14 +782,11 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         return 0;
     }
     case PEOF: {
-        REQUIRE_ARGC(argc, 1, 1, "eof-object?");
         return scheme_bool(is_eof_object(argv[0]));
     }
     case PEOFOBJECT:
-        REQUIRE_ARGC(argc, 0, 0, "eof-object");
         return CELL_EOF_OBJECT;
     case PCHARREADY: {
-        REQUIRE_ARGC(argc, 0, 1, "char-ready?");
         FILE *fport;
         string_port *sport;
         int ptype = extract_optional_port(argc, argv, 1, PORT_INPUT, &fport,
@@ -816,7 +802,6 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         return file_input_ready(fport, "char-ready?");
     }
     case PU8READY: {
-        REQUIRE_ARGC(argc, 0, 1, "u8-ready?");
         FILE *fport;
         string_port *sport;
         int ptype = extract_optional_port(argc, argv, 1, PORT_INPUT, &fport,
@@ -827,7 +812,6 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         return file_input_ready(fport, "u8-ready?");
     }
     case PPEEKU8: {
-        REQUIRE_ARGC(argc, 0, 1, "peek-u8");
         FILE *fport;
         string_port *sport;
         int ptype = extract_optional_port(argc, argv, 1, PORT_INPUT, &fport,
@@ -836,15 +820,12 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         return read_or_peek_u8(fport, sport, ptype, true, "peek-u8");
     }
     case PREADSTRING: {
-        REQUIRE_ARGC(argc, 1, 2, "read-string");
         return read_string_value(argv[0], argc, argv, "read-string");
     }
     case PWRITESTRING: {
-        REQUIRE_ARGC(argc, 1, 4, "write-string");
         return write_string_value(argc, argv, "write-string");
     }
     case PREADLINE: {
-        REQUIRE_ARGC(argc, 0, 1, "read-line");
         FILE *fport;
         string_port *sport;
         int ptype = extract_optional_port(argc, argv, 1, PORT_INPUT, &fport,
@@ -925,7 +906,6 @@ unsigned apply_io_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
     }
     case PEXIT: {
         // (exit) or (exit code)
-        REQUIRE_ARGC(argc, 0, 1, "exit");
         int code = 0;
         if (argc == 1 &&
             !expect_exit_code(argv[0], &code, "exit")) {

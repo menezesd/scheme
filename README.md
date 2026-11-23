@@ -328,7 +328,7 @@ counter     ; => 1 (evaluated once at definition)
 | `eval.c/h`, `eval_forms.c`, `eval_cont.c` | CPS interpreter (`--interpreter`) |
 | `env.c/h` | Environment frames, variable binding |
 | `primitives.c/h`, `prim_*.c` | Built-in procedures (over 250 primitives) |
-| `primitive_table.c/h` | Names the primitives are bound to |
+| `primitive_table.c/h` | One entry per primitive: bound name, arity (checked before dispatch), flags |
 | `macros.c/h`, `compiled_pattern.c/h` | Hygienic macro expander, compiled `syntax-rules` patterns |
 | `utf8.c/h` | UTF-8 decoding, encoding and string indexing |
 | `bignum.c/h` | Arbitrary precision integer arithmetic |

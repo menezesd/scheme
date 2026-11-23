@@ -263,20 +263,17 @@ unsigned apply_port_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
 {
     const port_predicate_entry *predicate = find_port_predicate(prim_id);
     if (predicate) {
-        REQUIRE_ARGC(argc, 1, 1, predicate->name);
         return scheme_bool(predicate->predicate(argv[0]));
     }
 
     switch (prim_id) {
     case POPENINPUT: {
-        REQUIRE_ARGC(argc, 1, 1, "open-input-file");
         char *filename = require_string_ptr(argv[0], "open-input-file");
         if (!filename)
             return TOK_ERROR;
         return open_file_port(filename, "r", BT_INPORT, "open-input-file");
     }
     case POPENOUTPUT: {
-        REQUIRE_ARGC(argc, 1, 2, "open-output-file");
         char *filename = require_string_ptr(argv[0], "open-output-file");
         if (!filename)
             return TOK_ERROR;
@@ -287,30 +284,22 @@ unsigned apply_port_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         return open_file_port(filename, mode, BT_OUTPORT, "open-output-file");
     }
     case PCLOSEINPUT:
-    case PCLOSEOUTPUT: {
-        const char *name =
-            prim_id == PCLOSEINPUT ? "close-input-port" : "close-output-port";
-        REQUIRE_ARGC(argc, 1, 1, name);
+    case PCLOSEOUTPUT:
         return close_port_arg(argv[0], prim_id == PCLOSEINPUT);
-    }
     case PCURRENTINPUT: {
-        REQUIRE_ARGC(argc, 0, 0, "current-input-port");
         return current_port(ctx.current_input, &ctx.current_input_cell, true,
                             "current-input-port");
     }
     case PCURRENTOUTPUT: {
-        REQUIRE_ARGC(argc, 0, 0, "current-output-port");
         return current_port(ctx.current_output, &ctx.current_output_cell, false,
                             "current-output-port");
     }
     case PCURRENTERROR: {
-        REQUIRE_ARGC(argc, 0, 0, "current-error-port");
         return current_port(ctx.current_error, &ctx.current_error_cell, false,
                             "current-error-port");
     }
     // String ports
     case POPENOUTPUTSTRING: {
-        REQUIRE_ARGC(argc, 0, 0, "open-output-string");
         string_port *sp = strport_new();
         if (!sp) {
             show_error("open-output-string: out of memory");
@@ -319,11 +308,9 @@ unsigned apply_port_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
         return make_pointer_cell(BT_STROUTPORT, sp);
     }
     case PGETOUTPUTSTRING: {
-        REQUIRE_ARGC(argc, 1, 1, "get-output-string");
         return output_string_value(argv[0], "get-output-string");
     }
     case POPENINPUTSTRING: {
-        REQUIRE_ARGC(argc, 1, 3, "open-input-string");
         char *str = require_string_ptr(argv[0], "open-input-string");
         if (!str)
             return TOK_ERROR;
@@ -357,19 +344,15 @@ unsigned apply_port_primitive(unsigned prim_id, unsigned argc, unsigned *argv)
     }
     // Internal port setters (used by with-input-from-file etc.)
     case PSETCURRENTINPUT: {
-        REQUIRE_ARGC(argc, 1, 1, "set-current-input-port!");
         return set_current_port(argv[0], prim_id);
     }
     case PSETCURRENTOUTPUT: {
-        REQUIRE_ARGC(argc, 1, 1, "set-current-output-port!");
         return set_current_port(argv[0], prim_id);
     }
     case PSETCURRENTERROR: {
-        REQUIRE_ARGC(argc, 1, 1, "set-current-error-port!");
         return set_current_port(argv[0], prim_id);
     }
     case PFLUSHOUTPUT: {
-        REQUIRE_ARGC(argc, 0, 1, "flush-output-port");
         if (argc == 0) {
             if (!flush_current_output_port())
                 return TOK_ERROR;

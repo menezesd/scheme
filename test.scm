@@ -5580,6 +5580,100 @@
             (mitlib-error? (lambda () (pp)))))
 
 ;;; ============================================================================
+;;; Primitive arity (checked from primitive_table.c) and procedure-arity
+;;; ============================================================================
+
+(define (arity-test-message thunk)
+  (guard (e (#t (if (error-object? e) (error-object-message e) e)))
+    (thunk)))
+(test "arity errors from the primitive table, across modules"
+      '("car: too few arguments (expected 1, got 0)"
+        "cons: too many arguments (expected at most 2)"
+        "vector-set!: too few arguments (expected 3, got 2)"
+        "string-ref: too many arguments (expected at most 2)"
+        "char-upcase: too few arguments (expected 1, got 0)"
+        "sqrt: too many arguments (expected at most 1)"
+        "atan: too many arguments (expected at most 2)"
+        "make-rectangular: too few arguments (expected 2, got 1)"
+        "quotient: too few arguments (expected 2, got 1)"
+        "exact->inexact: too many arguments (expected at most 1)"
+        "open-input-string: too many arguments (expected at most 3)"
+        "hash-table-set!: too few arguments (expected 3, got 2)"
+        "bytevector-copy!: too many arguments (expected at most 5)"
+        "pair?: too many arguments (expected at most 1)"
+        "list-tail: too few arguments (expected 2, got 1)"
+        "cadr: too many arguments (expected at most 1)"
+        "string-upcase: too few arguments (expected 1, got 0)"
+        "char-ready?: too many arguments (expected at most 1)"
+        "eof-object: too many arguments (expected at most 0)")
+      (map arity-test-message
+           (list (lambda () (car))
+                 (lambda () (cons 1 2 3))
+                 (lambda () (vector-set! (vector 1) 0))
+                 (lambda () (string-ref "abc" 0 1))
+                 (lambda () (char-upcase))
+                 (lambda () (sqrt 4 4))
+                 (lambda () (atan 1 1 1))
+                 (lambda () (make-rectangular 1))
+                 (lambda () (quotient 7))
+                 (lambda () (exact->inexact 1 2))
+                 (lambda () (open-input-string "a" 0 1 2))
+                 (lambda () (hash-table-set! (make-equal-hash-table) 1))
+                 (lambda () (bytevector-copy! (bytevector 1) 0 (bytevector 2)
+                                              0 1 9))
+                 (lambda () (pair? 1 2))
+                 (lambda () (list-tail '(1)))
+                 (lambda () (cadr '(1 2) 3))
+                 (lambda () (string-upcase))
+                 (lambda () (char-ready? (current-input-port) 1))
+                 (lambda () (eof-object 1)))))
+(test "arity errors when the primitive is applied first-class"
+      '("car: too many arguments (expected at most 1)"
+        "vector-ref: too few arguments (expected 2, got 0)"
+        "member: too few arguments (expected 2, got 1)"
+        "string-length: too many arguments (expected at most 1)")
+      (map arity-test-message
+           (list (lambda () (apply car '((1) (2))))
+                 (lambda () (apply vector-ref '()))
+                 (lambda () (%member 1))
+                 (lambda () (let ((f string-length)) (f "a" "b"))))))
+(test "primitives that report their own count keep their messages"
+      '("-: requires at least one argument" "/: requires at least one argument"
+        "char comparison: expected at least 2 arguments, got 1"
+        "string comparison: expected at least 2 arguments, got 0")
+      (map arity-test-message
+           (list (lambda () (-)) (lambda () (/))
+                 (lambda () (char<? #\a)) (lambda () (string=?)))))
+(test "variadic primitives take any number of arguments" '(0 10 () (1 2 3 4))
+      (list (+) (apply + '(1 1 1 1 1 1 1 1 1 1)) (append) (list 1 2 3 4)))
+(test "procedure-arity of primitives"
+      '((1 . 1) (2 . 2) (0 . #f) (1 . #f) (1 . 2) (2 . 2) (1 . 3) (3 . 5)
+        (1 . 1) (2 . 2))
+      (map procedure-arity
+           (list car cons + - number->string vector-ref string-copy
+                 bytevector-copy! call/cc call-with-values)))
+(test "procedure-arity of closures"
+      '((0 . 0) (2 . 2) (1 . #f) (0 . #f) (3 . 3))
+      (list (procedure-arity (lambda () 1))
+            (procedure-arity (lambda (a b) a))
+            (procedure-arity (lambda (a . rest) a))
+            (procedure-arity (lambda args args))
+            (let ()
+              (define (three a b c) (list a b c))
+              (procedure-arity three))))
+(test "procedure-arity of stdlib procedures and continuations"
+      '((2 . #f) (0 . #f) #t)
+      (list (procedure-arity map)
+            (call/cc procedure-arity)
+            (pair? (procedure-arity procedure-arity))))
+(test "procedure-arity rejects a non-procedure"
+      '("procedure-arity: not a procedure"
+        "procedure-arity: too few arguments (expected 1, got 0)")
+      (map arity-test-message
+           (list (lambda () (procedure-arity 5))
+                 (lambda () (procedure-arity)))))
+
+;;; ============================================================================
 ;;; Summary
 ;;; ============================================================================
 

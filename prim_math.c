@@ -1028,13 +1028,11 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned argc,
     if (prim_id == PASIN || prim_id == PACOS) {
         bool is_asin = (prim_id == PASIN);
         const char *name = is_asin ? "asin" : "acos";
-        REQUIRE_ARGC(argc, 1, 1, name);
         return inverse_trig_value(argv[0], is_asin, name);
     }
 
     const rounding_func_entry *rounding_func = find_rounding_func(prim_id);
     if (rounding_func) {
-        REQUIRE_ARGC(argc, 1, 1, rounding_func->name);
         return apply_rounding(argv[0], rounding_func->mode,
                               rounding_func->name);
     }
@@ -1042,7 +1040,6 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned argc,
     const unary_number_math_entry *unary_func =
         find_unary_number_math(prim_id);
     if (unary_func) {
-        REQUIRE_ARGC(argc, 1, 1, unary_func->name);
         return apply_unary_number_math(argv[0], unary_func->real_func,
                                        unary_func->complex_func,
                                        unary_func->name);
@@ -1050,12 +1047,10 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned argc,
 
     switch (prim_id) {
     case PSQRT: {
-        REQUIRE_ARGC(argc, 1, 1, "sqrt");
         return sqrt_value(argv[0], "sqrt");
     }
     case PEXPT: {
         // z^w = exp(w * log(z)) for complex numbers
-        REQUIRE_ARGC(argc, 2, 2, "expt");
         unsigned base_arg = argv[0];
         unsigned exp_arg = argv[1];
         if (!require_number(base_arg, "expt") ||
@@ -1170,12 +1165,10 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned argc,
         return inexact_expt_value(base_arg, exp_arg);
     }
     case PATAN: {
-        REQUIRE_ARGC(argc, 1, 2, "atan");
         return atan_value(argv[0], argc == 2 ? argv[1] : 0, argc == 2,
                           "atan");
     }
     case PLOG: {
-        REQUIRE_ARGC(argc, 1, 2, "log");
         if (argc == 1)
             return log_value(argv[0], "log");
         // R7RS (log z1 z2) is the logarithm of z1 to base z2.
@@ -1193,32 +1186,25 @@ unsigned apply_math_primitive(unsigned prim_id, unsigned argc,
         return binary_div(numerator, denominator);
     }
     case PLOG1P: {
-        REQUIRE_ARGC(argc, 1, 1, "log1p");
         return log1p_value(argv[0], "log1p");
     }
     case PEXPM1: {
-        REQUIRE_ARGC(argc, 1, 1, "expm1");
         return expm1_value(argv[0], "expm1");
     }
     case PSQRT1PM1: {
-        REQUIRE_ARGC(argc, 1, 1, "sqrt1pm1");
         return sqrt1pm1_value(argv[0], "sqrt1pm1");
     }
     case PLOG1PEXP: {
-        REQUIRE_ARGC(argc, 1, 1, "log1pexp");
         return log1pexp_value(argv[0], "log1pexp");
     }
     // Random number generation (SRFI-27 style)
     case PRANDOMINTEGER: {
-        REQUIRE_ARGC(argc, 1, 1, "random-integer");
         return random_integer_value(argv[0], "random-integer");
     }
     case PRANDOMREAL: {
-        REQUIRE_ARGC(argc, 0, 0, "random-real");
         return random_real_value();
     }
     case PRANDOMSEED: {
-        REQUIRE_ARGC(argc, 1, 1, "random-seed!");
         return random_seed_value(argv[0], "random-seed!");
     }
 

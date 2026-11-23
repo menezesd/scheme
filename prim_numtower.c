@@ -448,23 +448,20 @@ static unsigned magnitude_value(unsigned x, const char *name)
 unsigned apply_numtower_primitive(unsigned prim_id, unsigned argc,
                                   unsigned *argv)
 {
+    (void)argc; // apply_primitive_argv checked the count
     const real_test_entry *real_test = find_real_test(prim_id);
     if (real_test) {
-        REQUIRE_ARGC(argc, 1, 1, real_test->name);
         return numeric_real_test(argv[0], real_test->test, real_test->name);
     }
 
     switch (prim_id) {
     case PNUMERATOR: {
-        REQUIRE_ARGC(argc, 1, 1, "numerator");
         return rational_component(argv[0], true, "numerator");
     }
     case PDENOMINATOR: {
-        REQUIRE_ARGC(argc, 1, 1, "denominator");
         return rational_component(argv[0], false, "denominator");
     }
     case PMAKERECT: {
-        REQUIRE_ARGC(argc, 2, 2, "make-rectangular");
         unsigned real = argv[0];
         unsigned imag = argv[1];
         if (!require_real(real, "make-rectangular") ||
@@ -479,26 +476,21 @@ unsigned apply_numtower_primitive(unsigned prim_id, unsigned argc,
         return store_complex(real, imag);
     }
     case PMAKEPOLAR: {
-        REQUIRE_ARGC(argc, 2, 2, "make-polar");
         if (!require_real(argv[0], "make-polar") ||
             !require_real(argv[1], "make-polar"))
             return TOK_ERROR;
         return make_polar_number(argv[0], argv[1]);
     }
     case PREALPART: {
-        REQUIRE_ARGC(argc, 1, 1, "real-part");
         return complex_part(argv[0], true, "real-part");
     }
     case PIMAGPART: {
-        REQUIRE_ARGC(argc, 1, 1, "imag-part");
         return complex_part(argv[0], false, "imag-part");
     }
     case PMAGNITUDE: {
-        REQUIRE_ARGC(argc, 1, 1, "magnitude");
         return magnitude_value(argv[0], "magnitude");
     }
     case PANGLE: {
-        REQUIRE_ARGC(argc, 1, 1, "angle");
         if (!require_number(argv[0], "angle"))
             return TOK_ERROR;
         unsigned x = argv[0];
@@ -507,7 +499,6 @@ unsigned apply_numtower_primitive(unsigned prim_id, unsigned argc,
         return store_inexact(atan2(imag, real));
     }
     case PEXACT2INEXACT: {
-        REQUIRE_ARGC(argc, 1, 1, "exact->inexact");
         unsigned x = argv[0];
         if (!require_number(x, "exact->inexact"))
             return TOK_ERROR;
@@ -520,7 +511,6 @@ unsigned apply_numtower_primitive(unsigned prim_id, unsigned argc,
         return store_inexact(to_double(x));
     }
     case PINEXACT2EXACT: {
-        REQUIRE_ARGC(argc, 1, 1, "inexact->exact");
         unsigned x = argv[0];
         if (!require_number(x, "inexact->exact"))
             return TOK_ERROR;
@@ -552,7 +542,6 @@ unsigned apply_numtower_primitive(unsigned prim_id, unsigned argc,
         return prim_inexact_to_exact(x);
     }
     case PRATIONALIZE: {
-        REQUIRE_ARGC(argc, 2, 2, "rationalize");
         return rationalize_value(argv[0], argv[1]);
     }
     default:

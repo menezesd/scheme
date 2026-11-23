@@ -13,6 +13,7 @@
 
 #include "context.h"
 #include "env.h"
+#include "primitive_table.h"
 #include "reader.h"
 #include "writer.h"
 #include "utf8.h"
@@ -720,6 +721,9 @@ static inline bool flush_file_port(FILE *fport, const char *name)
     return true;
 }
 
+// apply_primitive_argv reports a wrong argument count with this, from the
+// primitive's primitive_table.c entry, before its implementation runs; an
+// implementation needs REQUIRE_ARGC only for a count it checks beyond that.
 static inline bool check_argc(unsigned argc, unsigned min, unsigned max,
                               const char *name)
 {
@@ -1419,6 +1423,7 @@ unsigned prim_string_normalize(unsigned prim_id, unsigned argc,
 // Type predicates (prim_type.c)
 unsigned apply_type_predicate(unsigned prim_id, unsigned argc,
                               unsigned *argv);
+unsigned procedure_arity_value(unsigned proc);
 
 // Character operations (prim_char.c)
 unsigned apply_char_primitive(unsigned prim_id, unsigned argc,

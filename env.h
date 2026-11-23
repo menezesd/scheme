@@ -141,6 +141,9 @@ unsigned bind_params(unsigned params, unsigned args);
 // Create a primitive operation builtin
 unsigned mk_primop(int64_t id);
 
+// Bind name to primitive prim_id in env
+void define_primitive(const char *name, unsigned prim_id, unsigned env);
+
 // Create and initialize the default environment with primitives
 unsigned default_environment(void);
 

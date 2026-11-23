@@ -347,6 +347,12 @@ PROBES = [
     "(let ((p (make-parameter 1)) (q (make-parameter 2))) (parameterize ((p 10) (q (p))) (list (p) (q))))",
     "(letrec ((f (lambda (x) (begin (begin (define (g) x))) (g)))) (f 42))",
     "(let-syntax ((h (syntax-rules () ((_) 99)))) (letrec ((f (lambda (x) (define (g) (h)) (begin (begin (define (h) x))) (g)))) (f 42)))",
+    # procedure-arity: MIT's (min . max) pairs, max #f when unbounded. Vesper
+    # takes a primitive's arity from primitive_table.c.
+    "(map procedure-arity (list car cons + - * / = vector-ref number->string string-copy list append length call/cc call-with-values values string-append make-vector substring atan exact->inexact memq cadr vector-fill! eof-object bytevector-copy! map for-each max abs))",
+    "(map procedure-arity (list (lambda () 1) (lambda (a b) a) (lambda (a . r) a) (lambda r r)))",
+    "(let () (define (f a b c) a) (procedure-arity f))",
+    "(procedure-arity 5)",
     # Ordinary non-tail recursion should not hit an engine limit at this depth.
     "(let ((f (lambda (f n) (if (= n 0) '() (cons n (f f (- n 1))))))) (length (f f 100000)))",
 ]

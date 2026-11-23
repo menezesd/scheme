@@ -851,7 +851,7 @@ unsigned prim_divlike_inexact(unsigned (*fn)(unsigned, unsigned *),
 
 unsigned prim_modulo(unsigned argc, unsigned *argv)
 {
-    REQUIRE_ARGC(argc, 2, 2, "modulo");
+    (void)argc; // apply_primitive_argv checked the count
     unsigned xa = argv[0], xb = argv[1];
     if (!require_exact_integer_pair(xa, xb, "modulo"))
         return TOK_ERROR;
@@ -901,7 +901,7 @@ unsigned prim_modulo(unsigned argc, unsigned *argv)
 
 unsigned prim_remainder(unsigned argc, unsigned *argv)
 {
-    REQUIRE_ARGC(argc, 2, 2, "remainder");
+    (void)argc; // apply_primitive_argv checked the count
     unsigned xa = argv[0], xb = argv[1];
     if (!require_exact_integer_pair(xa, xb, "remainder"))
         return TOK_ERROR;
@@ -934,7 +934,7 @@ unsigned prim_remainder(unsigned argc, unsigned *argv)
 
 unsigned prim_quotient(unsigned argc, unsigned *argv)
 {
-    REQUIRE_ARGC(argc, 2, 2, "quotient");
+    (void)argc; // apply_primitive_argv checked the count
     unsigned xa = argv[0], xb = argv[1];
     if (!require_exact_integer_pair(xa, xb, "quotient"))
         return TOK_ERROR;
@@ -974,7 +974,7 @@ unsigned prim_quotient(unsigned argc, unsigned *argv)
 
 unsigned prim_truncate_divrem(unsigned argc, unsigned *argv)
 {
-    REQUIRE_ARGC(argc, 2, 2, "truncate/");
+    (void)argc; // apply_primitive_argv checked the count
     unsigned xa = argv[0], xb = argv[1];
     if (!require_exact_integer_pair(xa, xb, "truncate/"))
         return TOK_ERROR;
@@ -1012,7 +1012,7 @@ unsigned prim_truncate_divrem(unsigned argc, unsigned *argv)
 
 unsigned prim_floor_divrem(unsigned argc, unsigned *argv)
 {
-    REQUIRE_ARGC(argc, 2, 2, "floor/");
+    (void)argc; // apply_primitive_argv checked the count
     unsigned xa = argv[0], xb = argv[1];
     if (!require_exact_integer_pair(xa, xb, "floor/"))
         return TOK_ERROR;
@@ -1057,7 +1057,7 @@ unsigned prim_floor_divrem(unsigned argc, unsigned *argv)
 
 unsigned prim_abs(unsigned argc, unsigned *argv)
 {
-    REQUIRE_ARGC(argc, 1, 1, "abs");
+    (void)argc; // apply_primitive_argv checked the count
     unsigned x = argv[0];
     if (IS_FIXNUM(x)) {
         int32_t n = FIXNUM_VALUE(x);

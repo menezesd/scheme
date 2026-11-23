@@ -3711,25 +3711,120 @@ TEST(default_environment_has_primitives)
     PASS();
 }
 
+// Every enum primitive_id has an entry: a designated-initializer gap would
+// leave a NULL name, and apply_primitive_argv would check that primitive
+// against a 0..0 arity.
 TEST(primitive_table_is_well_formed)
 {
-    const primitive_binding *bindings = primitive_bindings();
-    size_t count = primitive_binding_count();
+    for (unsigned id = 0; id < PRIM_COUNT; id++) {
+        const primitive_info *info = primitive_info_for(id);
+        ASSERT(info == &primitive_table[id]);
+        ASSERT(info->name != NULL);
+        ASSERT(info->name[0] != '\0');
+        ASSERT(info->who == NULL || info->who[0] != '\0');
+        ASSERT(info->max_args == PRIM_ARGS_ANY ||
+               info->min_args <= info->max_args);
+        // An exact arity above 8 would be a typo: no primitive takes more
+        // than 5 fixed arguments.
+        ASSERT(info->min_args <= 8);
+        ASSERT(info->max_args == PRIM_ARGS_ANY || info->max_args <= 8);
+        // Foldable implies pure; a primitive the engines apply themselves
+        // is neither foldable nor allocation-free, and never bootstrap-only.
+        if (info->flags & PRIM_FOLDABLE)
+            ASSERT(info->flags & PRIM_PURE);
+        if (info->flags & PRIM_SPECIAL)
+            ASSERT(!(info->flags & (PRIM_PURE | PRIM_NO_ALLOC |
+                                    PRIM_BOOTSTRAP)));
+        for (unsigned j = id + 1; j < PRIM_COUNT; j++)
+            ASSERT(strcmp(info->name, primitive_table[j].name) != 0);
+        for (const primitive_alias *a = primitive_aliases; a->name; a++)
+            ASSERT(strcmp(info->name, a->name) != 0);
+    }
+    ASSERT(primitive_info_for(PRIM_COUNT) == NULL);
 
-    ASSERT(bindings != NULL);
-    ASSERT(count > 0);
-    ASSERT(bindings[count].name == NULL);
-
-    for (size_t i = 0; i < count; i++) {
-        ASSERT(bindings[i].name != NULL);
-        ASSERT(bindings[i].name[0] != '\0');
-        ASSERT(bindings[i].prim >= 0);
-        ASSERT(bindings[i].prim < PRIM_COUNT);
-        for (size_t j = i + 1; j < count; j++) {
-            ASSERT(strcmp(bindings[i].name, bindings[j].name) != 0);
-        }
+    for (const primitive_alias *a = primitive_aliases; a->name; a++) {
+        ASSERT(a->prim < PRIM_COUNT);
+        ASSERT(!(primitive_table[a->prim].flags & PRIM_BOOTSTRAP));
     }
 
+    // A sample against the arities the implementations used to check
+    // themselves.
+    ASSERT_EQ(primitive_table[PCAR].min_args, 1);
+    ASSERT_EQ(primitive_table[PCAR].max_args, 1);
+    ASSERT_EQ(primitive_table[PPLUS].min_args, 0);
+    ASSERT_EQ(primitive_table[PPLUS].max_args, PRIM_ARGS_ANY);
+    ASSERT_EQ(primitive_table[PBYTEVECCOPYTO].min_args, 3);
+    ASSERT_EQ(primitive_table[PBYTEVECCOPYTO].max_args, 5);
+    ASSERT_EQ(primitive_table[PRECORDSET].min_args, 5);
+    ASSERT_STR_EQ(primitive_error_name(&primitive_table[PMEMBER]), "member");
+    ASSERT_STR_EQ(primitive_error_name(&primitive_table[PCAR]), "car");
+    ASSERT(primitive_has_flag(PCAR, PRIM_NO_ALLOC | PRIM_FOLDABLE));
+    ASSERT(!primitive_has_flag(PCONS, PRIM_FOLDABLE));
+    ASSERT(primitive_has_flag(PCONS, PRIM_PURE));
+    ASSERT(primitive_has_flag(PCALLCC, PRIM_SPECIAL));
+    ASSERT(!primitive_has_flag(-1, PRIM_PURE));
+    ASSERT(!primitive_has_flag(PRIM_COUNT, PRIM_PURE));
+
+    PASS();
+}
+
+// Every table name is bound in a default environment to its own primitive,
+// except the bootstrap-only ones, and every alias to its target.
+TEST(primitive_table_names_are_bound)
+{
+    GC_GUARD;
+    unsigned env = default_environment();
+    gc_protect(&env);
+    for (unsigned id = 0; id < PRIM_COUNT; id++) {
+        unsigned sym = atom_from_string(primitive_table[id].name);
+        unsigned val = lookup_silent(CELL_ID(sym), env);
+        if (primitive_table[id].flags & PRIM_BOOTSTRAP) {
+            ASSERT(val == TOK_ERROR);
+            continue;
+        }
+        ASSERT(val != TOK_ERROR);
+        ASSERT(IS_BUILTIN(val));
+        ASSERT_EQ(CELL_ID(val), id);
+    }
+    for (const primitive_alias *a = primitive_aliases; a->name; a++) {
+        unsigned sym = atom_from_string(a->name);
+        unsigned val = lookup_silent(CELL_ID(sym), env);
+        ASSERT(val != TOK_ERROR && IS_BUILTIN(val));
+        ASSERT_EQ(CELL_ID(val), a->prim);
+    }
+    PASS();
+}
+
+// apply_primitive_argv rejects a wrong argument count from the table, under
+// the primitive's error name and in the format the implementations used.
+TEST(primitive_arity_checked_from_table)
+{
+    unsigned argv[8] = {0};
+    ASSERT_EQ(apply_primitive_argv(PCAR, 0, argv), TOK_ERROR);
+    ASSERT_STR_EQ(ctx.last_error,
+                  "car: too few arguments (expected 1, got 0)");
+    ASSERT_EQ(apply_primitive_argv(PCONS, 3, argv), TOK_ERROR);
+    ASSERT_STR_EQ(ctx.last_error,
+                  "cons: too many arguments (expected at most 2)");
+    ASSERT_EQ(apply_primitive_argv(PMEMBER, 1, argv), TOK_ERROR);
+    ASSERT_STR_EQ(ctx.last_error,
+                  "member: too few arguments (expected 2, got 1)");
+    ASSERT_EQ(apply_primitive_argv(PRECORDTYPEP, 2, argv), TOK_ERROR);
+    ASSERT_STR_EQ(ctx.last_error,
+                  "record-type?: too many arguments (expected at most 1)");
+    ASSERT_EQ(apply_primitive_argv(PVECSET, 2, argv), TOK_ERROR);
+    ASSERT_STR_EQ(ctx.last_error,
+                  "vector-set!: too few arguments (expected 3, got 2)");
+    // A primitive that reports its own count keeps its message.
+    ASSERT_EQ(apply_primitive_argv(PMINUS, 0, argv), TOK_ERROR);
+    ASSERT_STR_EQ(ctx.last_error, "-: requires at least one argument");
+    // Any number of arguments, including more than PRIM_ARGS_ANY.
+    unsigned many[300];
+    for (unsigned i = 0; i < 300; i++)
+        many[i] = MAKE_FIXNUM(1);
+    unsigned sum = apply_primitive_argv(PPLUS, 300, many);
+    ASSERT(CELL_TYPE(sum) == BT_NUM);
+    ASSERT_EQ(CELL_ID(sum), 300);
     PASS();
 }
 
@@ -4839,6 +4934,8 @@ int main(void)
     RUN_TEST(mk_primop_test);
     RUN_TEST(default_environment_has_primitives);
     RUN_TEST(primitive_table_is_well_formed);
+    RUN_TEST(primitive_table_names_are_bound);
+    RUN_TEST(primitive_arity_checked_from_table);
     RUN_TEST(feature_table_is_well_formed);
     RUN_TEST(cond_expand_rejects_malformed_and_requirement);
     RUN_TEST(cond_expand_rejects_malformed_or_requirement);

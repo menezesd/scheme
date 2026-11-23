@@ -810,9 +810,11 @@ enum primitive_id {
     PASSV,
     PASSOC,
     PLISTTAIL,
+    // Introspection
+    PPROCARITY,
     // MIT library support (stdlib.scm "MIT library procedures")
     PRUNTIME,          // runtime: CPU seconds as a flonum
-    PPROCEDUREARITY,   // %procedure-arity: (required . rest?) or #f
+    PCOMPOUNDPROCP,    // compound-procedure?: a closure in either engine
     PRIM_COUNT // Total number of primitives
 };
 

@@ -1159,29 +1159,22 @@ static unsigned apply_bytevector_primitive(unsigned prim_id, unsigned argc,
 {
     switch (prim_id) {
     case PMAKEBYTEVEC:
-        REQUIRE_ARGC(argc, 1, 2, "make-bytevector");
         return make_bytevector_from_args(argc, argv, "make-bytevector");
     case PBYTEVECREF:
-        REQUIRE_ARGC(argc, 2, 2, "bytevector-u8-ref");
         return bytevector_ref_value(argv[0], argv[1],
                                     "bytevector-u8-ref");
     case PBYTEVECSET:
-        REQUIRE_ARGC(argc, 3, 3, "bytevector-u8-set!");
         return bytevector_set_value(argv[0], argv[1], argv[2],
                                     "bytevector-u8-set!");
     case PBYTEVECLEN:
-        REQUIRE_ARGC(argc, 1, 1, "bytevector-length");
         return bytevector_length_value(argv[0], "bytevector-length");
     case PBYTEVECUP:
-        REQUIRE_ARGC(argc, 1, 1, "bytevector?");
         return scheme_bool(IS_BYTEVEC(argv[0]));
     case PBYTEVEC:
         return make_bytevector_from_u8_argv(argc, argv, "bytevector");
     case PBYTEVECCOPY:
-        REQUIRE_ARGC(argc, 1, 3, "bytevector-copy");
         return bytevector_copy_value(argc, argv, "bytevector-copy");
     case PBYTEVECCOPYTO:
-        REQUIRE_ARGC(argc, 3, 5, "bytevector-copy!");
         return bytevector_copy_to(argc, argv, "bytevector-copy!");
     case PBYTEVECAPPEND:
         return make_bytevector_append(argc, argv, "bytevector-append");
@@ -1482,18 +1475,15 @@ static unsigned apply_numeric_compare_primitive(unsigned prim_id,
 static unsigned apply_logic_primitive(unsigned prim_id, unsigned argc,
                                       unsigned *argv)
 {
+    (void)argc; // apply_primitive_argv checked the count
     switch (prim_id) {
     case PNOT:
-        REQUIRE_ARGC(argc, 1, 1, "not");
         return scheme_bool(IS_FALSE(argv[0]));
     case PEQ:
-        REQUIRE_ARGC(argc, 2, 2, "eq?");
         return eq_value(argv[0], argv[1]);
     case PEQV:
-        REQUIRE_ARGC(argc, 2, 2, "eqv?");
         return eqv_value(argv[0], argv[1]);
     case PEQUALP:
-        REQUIRE_ARGC(argc, 2, 2, "equal?");
         return scheme_bool(deep_equal(argv[0], argv[1]));
     default:
         show_error("logic primitive: unsupported id %u", prim_id);
@@ -1506,31 +1496,24 @@ static unsigned apply_list_primitive(unsigned prim_id, unsigned argc,
 {
     switch (prim_id) {
     case PCONS:
-        REQUIRE_ARGC(argc, 2, 2, "cons");
         return alloc_cons(argv[0], argv[1]);
     case PCAR:
-        REQUIRE_ARGC(argc, 1, 1, "car");
         return pair_car(argv[0], "car");
     case PCDR:
-        REQUIRE_ARGC(argc, 1, 1, "cdr");
         return pair_cdr(argv[0], "cdr");
     case PSETCAR:
-        REQUIRE_ARGC(argc, 2, 2, "set-car!");
         return set_pair_car(argv[0], argv[1], "set-car!");
     case PSETCDR:
-        REQUIRE_ARGC(argc, 2, 2, "set-cdr!");
         return set_pair_cdr(argv[0], argv[1], "set-cdr!");
     case PLIST:
         return make_list_from_argv(argc, argv);
     case PLENGTH:
-        REQUIRE_ARGC(argc, 1, 1, "length");
         return length_value(argv[0], "length");
     case PAPPEND:
         return prim_append(argc, argv);
     case PREVERSE:
         return prim_reverse(argc, argv);
     case PLASTPAIR:
-        REQUIRE_ARGC(argc, 1, 1, "last-pair");
         return last_pair(argv[0], "last-pair");
     case PLISTTAIL:
         return prim_list_tail(argc, argv);
@@ -1556,13 +1539,10 @@ static unsigned apply_string_primitive(unsigned prim_id, unsigned argc,
 {
     switch (prim_id) {
     case PSTRLEN:
-        REQUIRE_ARGC(argc, 1, 1, "string-length");
         return string_length_value(argv[0], "string-length");
     case PSTRREF:
-        REQUIRE_ARGC(argc, 2, 2, "string-ref");
         return string_ref_value(argv[0], argv[1], "string-ref");
     case PSTRSET:
-        REQUIRE_ARGC(argc, 3, 3, "string-set!");
         return string_set_value(argv[0], argv[1], argv[2], "string-set!");
     case PSTRAPP:
         return prim_string_append(argc, argv);
@@ -1571,40 +1551,31 @@ static unsigned apply_string_primitive(unsigned prim_id, unsigned argc,
     case PSTRSLICE:
         return prim_string_slice(argc, argv);
     case PSTR2SYM:
-        REQUIRE_ARGC(argc, 1, 1, "string->symbol");
         return make_symbol_from_string(argv[0], "string->symbol");
     case PSYM2STR:
-        REQUIRE_ARGC(argc, 1, 1, "symbol->string");
         return make_string_from_symbol(argv[0], "symbol->string");
     case PNUM2STR: {
-        REQUIRE_ARGC(argc, 1, 2, "number->string");
         int radix;
         if (!parse_optional_radix(argc, argv, "number->string", &radix))
             return TOK_ERROR;
         return number_to_string_value(argv[0], radix, "number->string");
     }
     case PSTR2NUM: {
-        REQUIRE_ARGC(argc, 1, 2, "string->number");
         int radix;
         if (!parse_optional_radix(argc, argv, "string->number", &radix))
             return TOK_ERROR;
         return string_to_number_value(argv[0], radix, "string->number");
     }
     case PMAKESTR:
-        REQUIRE_ARGC(argc, 1, 2, "make-string");
         return make_filled_string(argv[0], argc > 1 ? argv[1] : 0,
                                   argc > 1, "make-string");
     case PSTRCOPY:
-        REQUIRE_ARGC(argc, 1, 3, "string-copy");
         return string_copy_value(argc, argv, "string-copy");
     case PSTR2LIST:
-        REQUIRE_ARGC(argc, 1, 3, "string->list");
         return make_char_list_from_string_range(argc, argv, "string->list");
     case PLIST2STR:
-        REQUIRE_ARGC(argc, 1, 1, "list->string");
         return make_string_from_char_list(argv[0], "list->string");
     case PSTRFILL:
-        REQUIRE_ARGC(argc, 2, 4, "string-fill!");
         return fill_string_range(argc, argv, "string-fill!");
     case PSTRNFD:
     case PSTRNFC:
@@ -1618,10 +1589,8 @@ static unsigned apply_string_primitive(unsigned prim_id, unsigned argc,
     case PSTRING:
         return make_string_from_chars(argc, argv, "string");
     case PSTRINGTOUTF8:
-        REQUIRE_ARGC(argc, 1, 3, "string->utf8");
         return string_to_utf8_value(argc, argv, "string->utf8");
     case PUTF8TOSTRING:
-        REQUIRE_ARGC(argc, 1, 3, "utf8->string");
         return utf8_to_string_value(argc, argv, "utf8->string");
     case PSTREQ:
     case PSTRLT:
@@ -1647,19 +1616,14 @@ static unsigned apply_bitwise_primitive(unsigned prim_id, unsigned argc,
 {
     switch (prim_id) {
     case PBITWISEAND:
-        REQUIRE_ARGC(argc, 0, (unsigned)-1, "bitwise-and");
         return bitwise_fold(argc, argv, "bitwise-and", BITWISE_AND);
     case PBITWISEIOR:
-        REQUIRE_ARGC(argc, 0, (unsigned)-1, "bitwise-ior");
         return bitwise_fold(argc, argv, "bitwise-ior", BITWISE_IOR);
     case PBITWISEXOR:
-        REQUIRE_ARGC(argc, 0, (unsigned)-1, "bitwise-xor");
         return bitwise_fold(argc, argv, "bitwise-xor", BITWISE_XOR);
     case PBITWISENOT:
-        REQUIRE_ARGC(argc, 1, 1, "bitwise-not");
         return bitwise_not_value(argv[0], "bitwise-not");
     case PARITHSHIFT:
-        REQUIRE_ARGC(argc, 2, 2, "arithmetic-shift");
         return arithmetic_shift_value(argv[0], argv[1], "arithmetic-shift");
     default:
         show_error("bitwise primitive: unsupported id %u", prim_id);
@@ -2673,12 +2637,11 @@ static unsigned transcript_off(const char *name)
 static unsigned apply_transcript_primitive(unsigned prim_id, unsigned argc,
                                            unsigned *argv)
 {
+    (void)argc; // apply_primitive_argv checked the count
     switch (prim_id) {
     case PTRANSCRIPTON:
-        REQUIRE_ARGC(argc, 1, 1, "transcript-on");
         return transcript_on(argv[0], "transcript-on");
     case PTRANSCRIPTOFF:
-        REQUIRE_ARGC(argc, 0, 0, "transcript-off");
         return transcript_off("transcript-off");
     default:
         show_error("transcript primitive: unsupported id %u", prim_id);
@@ -2762,13 +2725,10 @@ static unsigned apply_environment_primitive(unsigned prim_id, unsigned argc,
 {
     switch (prim_id) {
     case PSCHEMEENV:
-        REQUIRE_ARGC(argc, 1, 1, "scheme-report-environment");
         return scheme_environment(argv[0], "scheme-report-environment");
     case PNULLENV:
-        REQUIRE_ARGC(argc, 1, 1, "null-environment");
         return null_environment(argv[0], "null-environment");
     case PR7RSENV:
-        REQUIRE_ARGC(argc, 0, 1, "%r7rs-environment");
         if (!ctx.r7rs_environment) {
             show_error("%%r7rs-environment: standard environment unavailable");
             return TOK_ERROR;
@@ -2787,16 +2747,12 @@ static unsigned apply_misc_primitive(unsigned prim_id, unsigned argc,
 {
     switch (prim_id) {
     case PCURRENTSECOND:
-        REQUIRE_ARGC(argc, 0, 0, "current-second");
         return current_second_value();
     case PCURRENTJIFFY:
-        REQUIRE_ARGC(argc, 0, 0, "current-jiffy");
         return current_jiffy_value();
     case PJIFFIESPERSECOND:
-        REQUIRE_ARGC(argc, 0, 0, "jiffies-per-second");
         return store(JIFFIES_PER_SECOND);
     case PEMERGENCYEXIT: {
-        REQUIRE_ARGC(argc, 0, 1, "emergency-exit");
         int code = 0;
         if (argc == 1 &&
             !expect_exit_code(argv[0], &code, "emergency-exit")) {
@@ -2807,138 +2763,98 @@ static unsigned apply_misc_primitive(unsigned prim_id, unsigned argc,
     case PERROR:
         return report_error_primitive(argc, argv);
     case PGENSYM:
-        REQUIRE_ARGC(argc, 0, 0, "gensym");
         return make_public_gensym();
     case PGCSTATS:
-        REQUIRE_ARGC(argc, 0, 0, "gc-stats");
         return make_gc_stats_list();
     case PVALUES:
         return values_from_argv(argc, argv);
     case PCOMMANDLINE:
-        REQUIRE_ARGC(argc, 0, 0, "command-line");
         return make_command_line_list();
     case PWRITETOSTRING:
-        REQUIRE_ARGC(argc, 1, 1, "write-to-string");
         return write_to_string_value(argv[0], "write-to-string");
     case POPENBINARYINPUT:
-        REQUIRE_ARGC(argc, 1, 1, "open-binary-input-file");
         return open_binary_input_file(argv[0], "open-binary-input-file");
     case PREADBYTEVEC:
-        REQUIRE_ARGC(argc, 2, 2, "read-bytevector");
         return read_bytevector_from_port(argv[0], argv[1],
                                          "read-bytevector");
     case PFILEEXISTS:
-        REQUIRE_ARGC(argc, 1, 1, "file-exists?");
         return file_exists_p(argv[0], "file-exists?");
     case PFILEREGULARP:
-        REQUIRE_ARGC(argc, 1, 1, "file-regular?");
         return file_type_p(argv[0], "file-regular?", PFILEREGULARP);
     case PFILEDIRECTORYP:
-        REQUIRE_ARGC(argc, 1, 1, "file-directory?");
         return file_type_p(argv[0], "file-directory?", PFILEDIRECTORYP);
     case PDELETEFILE:
-        REQUIRE_ARGC(argc, 1, 1, "delete-file");
         return delete_file_value(argv[0], "delete-file");
     case PMAKEDIRECTORY:
-        REQUIRE_ARGC(argc, 1, 1, "make-directory");
         return make_directory_value(argv[0], "make-directory");
     case PDELETEDIRECTORY:
-        REQUIRE_ARGC(argc, 1, 1, "delete-directory");
         return delete_directory_value(argv[0], "delete-directory");
     case PRENAMEFILE:
-        REQUIRE_ARGC(argc, 2, 2, "rename-file");
         return rename_file_value(argv[0], argv[1], "rename-file");
     case PCURRENTDIRECTORY:
-        REQUIRE_ARGC(argc, 0, 1, "current-directory");
         return current_directory_value(argc, argv, "current-directory");
     case PDIRECTORYFILES:
-        REQUIRE_ARGC(argc, 1, 1, "directory-files");
         return directory_files_value(argv[0], "directory-files");
     case PTEMPFILEPATH:
-        REQUIRE_ARGC(argc, 0, 0, "temporary-file-path");
         return temporary_file_path_value();
     case PGETENV:
-        REQUIRE_ARGC(argc, 1, 1, "get-environment-variable");
         return getenv_value(argv[0], "get-environment-variable");
     case PGETENVS:
-        REQUIRE_ARGC(argc, 0, 0, "get-environment-variables");
         return get_environment_variables_value();
     case POPENBINARYOUTPUT:
-        REQUIRE_ARGC(argc, 1, 1, "open-binary-output-file");
         return open_binary_output_file(argv[0], "open-binary-output-file");
     case PWRITEBYTEVEC:
-        REQUIRE_ARGC(argc, 2, 2, "write-bytevector");
         return write_bytevector_to_port(argv[0], argv[1], "write-bytevector");
     case PREADBYTEVECINTO:
-        REQUIRE_ARGC(argc, 2, 4, "read-bytevector!");
         return read_bytevector_into(argc, argv, "read-bytevector!");
     case PFEATURES:
-        REQUIRE_ARGC(argc, 0, 0, "features");
         return make_features_list();
     case PMAKEHASHTABLE:
-        REQUIRE_ARGC(argc, 0, 1, "make-hash-table");
         return make_hash_table_value(HASH_EQUAL, argc, argv,
                                      "make-hash-table");
     case PMAKESTRONGEQHASHTABLE:
-        REQUIRE_ARGC(argc, 0, 1, "make-strong-eq-hash-table");
         return make_hash_table_value(HASH_EQ, argc, argv,
                                      "make-strong-eq-hash-table");
     case PMAKEEQHASHTABLE:
-        REQUIRE_ARGC(argc, 0, 1, "make-eq-hash-table");
         return make_hash_table_value(HASH_EQ, argc, argv,
                                      "make-eq-hash-table");
     case PMAKESTRONGEQVHASHTABLE:
-        REQUIRE_ARGC(argc, 0, 1, "make-strong-eqv-hash-table");
         return make_hash_table_value(HASH_EQV, argc, argv,
                                      "make-strong-eqv-hash-table");
     case PMAKEEQVHASHTABLE:
-        REQUIRE_ARGC(argc, 0, 1, "make-eqv-hash-table");
         return make_hash_table_value(HASH_EQV, argc, argv,
                                      "make-eqv-hash-table");
     case PMAKEEQUALHASHTABLE:
-        REQUIRE_ARGC(argc, 0, 1, "make-equal-hash-table");
         return make_hash_table_value(HASH_EQUAL, argc, argv,
                                      "make-equal-hash-table");
     case PHASHTABLEP:
-        REQUIRE_ARGC(argc, 1, 1, "hash-table?");
         return scheme_bool(IS_HASHTABLE(argv[0]));
     case PHASHTABLEREF:
-        REQUIRE_ARGC(argc, 2, 3, "hash-table-ref");
         return hash_table_ref_value(argc, argv, "hash-table-ref");
     case PHASHTABLESET:
-        REQUIRE_ARGC(argc, 3, 3, "hash-table-set!");
         return hash_table_set_value(argv[0], argv[1], argv[2],
                                     "hash-table-set!");
     case PHASHTABLEDELETE:
-        REQUIRE_ARGC(argc, 2, 2, "hash-table-delete!");
         return hash_table_delete_value(argv[0], argv[1],
                                        "hash-table-delete!");
     case PHASHTABLEEXISTS:
-        REQUIRE_ARGC(argc, 2, 2, "hash-table-exists?");
         return hash_table_exists_value(argv[0], argv[1],
                                        "hash-table-exists?");
     case PHASHTABLESIZE: {
-        REQUIRE_ARGC(argc, 1, 1, "hash-table-size");
         hash_table_data *ht = require_hash_table(argv[0], "hash-table-size");
         return ht ? store(ht->size) : TOK_ERROR;
     }
     case PHASHTABLECLEAR:
-        REQUIRE_ARGC(argc, 1, 1, "hash-table-clear!");
         return hash_table_clear_value(argv[0], "hash-table-clear!");
     case PHASHTABLEKEYS:
-        REQUIRE_ARGC(argc, 1, 1, "hash-table-keys");
         return hash_table_entries_list(argv[0], "hash-table-keys", 0);
     case PHASHTABLEVALUES:
-        REQUIRE_ARGC(argc, 1, 1, "hash-table-values");
         return hash_table_entries_list(argv[0], "hash-table-values", 1);
     case PHASHTABLEALIST:
-        REQUIRE_ARGC(argc, 1, 1, "hash-table->alist");
         return hash_table_entries_list(argv[0], "hash-table->alist", 2);
     case PHASHTABLECOPY:
-        REQUIRE_ARGC(argc, 1, 1, "hash-table-copy");
         return hash_table_copy_value(argv[0], "hash-table-copy");
     case PHASHTABLEEQUIV: {
-        REQUIRE_ARGC(argc, 1, 1, "hash-table-equivalence-function");
         hash_table_data *ht =
             require_hash_table(argv[0], "hash-table-equivalence-function");
         if (!ht)
@@ -2955,13 +2871,10 @@ static unsigned apply_misc_primitive(unsigned prim_id, unsigned argc,
         return TOK_ERROR;
     }
     case PHASHTABLEHASH:
-        REQUIRE_ARGC(argc, 2, 3, "%hash-table-hash");
         return hash_table_hash_value(argc, argv, "%hash-table-hash");
     case PHASH:
-        REQUIRE_ARGC(argc, 1, 2, "hash");
         return object_hash_value(argc, argv, HASH_EQUAL, "hash");
     case PHASHBYIDENTITY:
-        REQUIRE_ARGC(argc, 1, 2, "hash-by-identity");
         return object_hash_value(argc, argv, HASH_EQ, "hash-by-identity");
     default:
         show_error("misc primitive: unsupported id %u", prim_id);
@@ -3020,100 +2933,19 @@ static unsigned runtime_value(void)
     return store_inexact((double)ts.tv_sec + (double)ts.tv_nsec / 1e9);
 }
 
-// (required-count . rest?) for a compound procedure in either engine, #f for
-// anything else. trace uses it to print a rest parameter's list as one
-// argument, as MIT's frame-based trace output does.
-static unsigned procedure_arity_value(unsigned proc)
+// MIT's compound-procedure?: a closure of either engine, not a primitive or
+// a continuation.
+static bool compound_procedure_p(unsigned proc)
 {
-    unsigned required = 0;
-    bool rest = false;
-    if (is_bytecode_closure_object(proc)) {
-        const code_object *code = GET_CLOSURE_CODE(proc);
-        required = code->arity;
-        rest = code->has_rest;
-    } else if (IS_FUNCTION(proc)) {
-        unsigned params = CELL_CAR(proc);
-        while (IS_PAIR(params)) {
-            required++;
-            params = CELL_CDR(params);
-        }
-        rest = !IS_NIL(params);
-    } else {
-        return CELL_ATOM_FALSE;
-    }
-    GC_GUARD;
-    unsigned count = store((int64_t)required);
-    gc_protect(&count);
-    return alloc_cons(count, rest ? CELL_ATOM_TRUE : CELL_ATOM_FALSE);
+    return is_bytecode_closure_object(proc) || IS_FUNCTION(proc);
 }
 
-static unsigned apply_mit_library_primitive(unsigned prim_id, unsigned argc,
-                                            unsigned *argv)
+// The primitive's own implementation. apply_primitive_argv has already
+// checked the argument count against primitive_table, and rooted argv unless
+// the primitive is PRIM_NO_ALLOC.
+static unsigned dispatch_primitive(unsigned prim_id, unsigned argc,
+                                   unsigned *argv)
 {
-    switch (prim_id) {
-    case PRUNTIME:
-        REQUIRE_ARGC(argc, 0, 0, "runtime");
-        return runtime_value();
-    case PPROCEDUREARITY:
-        REQUIRE_ARGC(argc, 1, 1, "%procedure-arity");
-        return procedure_arity_value(argv[0]);
-    default:
-        show_error("MIT library primitive: unsupported id %u", prim_id);
-        return TOK_ERROR;
-    }
-}
-
-unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
-{
-    if (argc > 0 && !argv) {
-        show_error("primitive: null argv");
-        return TOK_ERROR;
-    }
-
-    // Accessors, searches, comparisons and type predicates never allocate a
-    // cell, so nothing can collect under them and their arguments need no
-    // roots.
-    switch (prim_id) {
-    case PCAR:
-    case PCDR:
-    case PSETCAR:
-    case PSETCDR:
-    case PLASTPAIR:
-    case PLISTREF:
-        return apply_list_primitive(prim_id, argc, argv);
-    case PNOT:
-    case PEQ:
-    case PEQV:
-    case PEQUALP:
-        return apply_logic_primitive(prim_id, argc, argv);
-    case PSYMP:
-    case PNUMP:
-    case PINTEGERP:
-    case PREALP:
-    case PEXACTP:
-    case PINEXACTP:
-    case PCOMPLEXP:
-    case PRATIONALP:
-    case PPROCP:
-    case PCONSP:
-    case PNULLP:
-    case PSTRINGP:
-    case PCHARP:
-    case PVECTORP:
-    case PBOOLP:
-    case PLISTP:
-        return apply_type_predicate(prim_id, argc, argv);
-    default:
-        // c[ad]{2,4}r, memq ... assoc, list-tail
-        if (prim_id >= PCAAR && prim_id <= PLISTTAIL)
-            return apply_list_primitive(prim_id, argc, argv);
-        break;
-    }
-
-    GC_GUARD;
-    for (unsigned i = 0; i < argc; i++)
-        gc_protect(&argv[i]);
-
     switch (prim_id) {
     // Arithmetic - delegated to prim_numeric.c
     case PPLUS:
@@ -3154,6 +2986,7 @@ unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
     case PAPPEND:
     case PREVERSE:
     case PLASTPAIR:
+    case PLISTREF:
         return apply_list_primitive(prim_id, argc, argv);
 
     // Type predicates - delegated to prim_type.c
@@ -3401,7 +3234,6 @@ unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
     // through to "unknown primitive" and gc-flip was simply dead in the
     // default mode.
     case PGCFLIP:
-        REQUIRE_ARGC(argc, 0, 0, "gc-flip");
         gc(0);
         return ctx.atom_true;
 
@@ -3466,15 +3298,59 @@ unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
     case PBYTEVECUP:
         return apply_bytevector_primitive(prim_id, argc, argv);
 
+    case PPROCARITY:
+        return procedure_arity_value(argv[0]);
     // MIT library support
     case PRUNTIME:
-    case PPROCEDUREARITY:
-        return apply_mit_library_primitive(prim_id, argc, argv);
+        return runtime_value();
+    case PCOMPOUNDPROCP:
+        return scheme_bool(compound_procedure_p(argv[0]));
 
     default:
+        // c[ad]{2,4}r, memq ... assoc, list-tail
+        if (prim_id >= PCAAR && prim_id <= PLISTTAIL)
+            return apply_list_primitive(prim_id, argc, argv);
         show_error("unknown primitive: %u", prim_id);
         return TOK_ERROR;
     }
+}
+
+static bool primitive_argc_ok(const primitive_info *info, unsigned argc)
+{
+    return argc >= info->min_args &&
+           (argc <= info->max_args || info->max_args == PRIM_ARGS_ANY);
+}
+
+unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
+{
+    if (argc > 0 && !argv) {
+        show_error("primitive: null argv");
+        return TOK_ERROR;
+    }
+    if (prim_id >= PRIM_COUNT) {
+        show_error("unknown primitive: %u", prim_id);
+        return TOK_ERROR;
+    }
+
+    const primitive_info *info = &primitive_table[prim_id];
+    if (!primitive_argc_ok(info, argc) &&
+        !(info->flags & (PRIM_OWN_ARITY | PRIM_SPECIAL))) {
+        check_argc(argc, info->min_args,
+                   info->max_args == PRIM_ARGS_ANY ? (unsigned)-1
+                                                   : info->max_args,
+                   primitive_error_name(info));
+        return TOK_ERROR;
+    }
+
+    // Nothing can collect under a primitive that never allocates, so its
+    // arguments need no roots.
+    if (info->flags & PRIM_NO_ALLOC)
+        return dispatch_primitive(prim_id, argc, argv);
+
+    GC_GUARD;
+    for (unsigned i = 0; i < argc; i++)
+        gc_protect(&argv[i]);
+    return dispatch_primitive(prim_id, argc, argv);
 }
 
 unsigned apply_primitive(unsigned prim_id, unsigned args)

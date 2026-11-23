@@ -1562,23 +1562,33 @@ unsigned syntax_environment(unsigned source)
     return result;
 }
 
+void define_primitive(const char *name, unsigned prim_id, unsigned env)
+{
+    GC_GUARD;
+    gc_protect(&env);
+    unsigned sym = atom_from_string(name);
+    gc_protect(&sym);
+    unsigned prim = mk_primop(prim_id);
+    gc_protect(&prim);
+    defvar(sym, prim, env);
+}
+
 unsigned default_environment(void)
 {
     GC_GUARD;
     unsigned env = empty_environment();
     gc_protect(&env);
 
-    // Register all builtins from table
-    const primitive_binding *bindings = primitive_bindings();
-    size_t binding_count = primitive_binding_count();
-    for (size_t i = 0; i < binding_count; i++) {
-        unsigned name = atom_from_string(bindings[i].name);
-        gc_protect(&name);
-        unsigned prim = mk_primop(bindings[i].prim);
-        gc_protect(&prim);
-        defvar(name, prim, env);
-        gc_unprotect(2);
+    // Register all builtins from the table, then their extra names
+    for (unsigned id = 0; id < PRIM_COUNT; id++) {
+        const primitive_info *info = &primitive_table[id];
+        if (!info->name)
+            lisp_panic("a primitive_id has no primitive_table.c entry");
+        if (!(info->flags & PRIM_BOOTSTRAP))
+            define_primitive(info->name, id, env);
     }
+    for (const primitive_alias *a = primitive_aliases; a->name; a++)
+        define_primitive(a->name, a->prim, env);
 
     // MIT-style variables bound to the booleans. The booleans themselves are
     // not symbols, so bind the ordinary symbols true, false and t.

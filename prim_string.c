@@ -123,7 +123,6 @@ static char *string_range_copy(unsigned argc, unsigned *argv, const char *name,
 
 unsigned prim_substring(unsigned argc, unsigned *argv)
 {
-    REQUIRE_ARGC(argc, 1, 3, "substring");
     size_t start, end;
     char *result = string_range_copy(argc, argv, "substring", &start, &end);
     if (!result)
@@ -134,7 +133,6 @@ unsigned prim_substring(unsigned argc, unsigned *argv)
 unsigned prim_string_slice(unsigned argc, unsigned *argv)
 {
     GC_GUARD;
-    REQUIRE_ARGC(argc, 1, 3, "string-slice");
     size_t start, end;
     char *copy = string_range_copy(argc, argv, "string-slice", &start, &end);
     if (!copy)
@@ -621,6 +619,7 @@ static unsigned cased_string_value(unsigned arg, string_case_mode mode,
 unsigned prim_string_normalize(unsigned prim_id, unsigned argc,
                                unsigned *argv)
 {
+    (void)argc; // apply_primitive_argv checked the count
     const char *name;
     bool compatibility = false;
     bool compose = false;
@@ -643,25 +642,20 @@ unsigned prim_string_normalize(unsigned prim_id, unsigned argc,
         break;
     case PSTRFOLD:
         name = "string-foldcase";
-        REQUIRE_ARGC(argc, 1, 1, name);
         return folded_string_value(argv[0], name);
     case PSTRUP:
         name = "string-upcase";
-        REQUIRE_ARGC(argc, 1, 1, name);
         return cased_string_value(argv[0], STRING_CASE_UP, name);
     case PSTRDOWN:
         name = "string-downcase";
-        REQUIRE_ARGC(argc, 1, 1, name);
         return cased_string_value(argv[0], STRING_CASE_DOWN, name);
     case PSTRTITLE:
         name = "string-titlecase";
-        REQUIRE_ARGC(argc, 1, 1, name);
         return cased_string_value(argv[0], STRING_CASE_TITLE, name);
     default:
         show_error("string normalization primitive: unsupported id %u",
                    prim_id);
         return TOK_ERROR;
     }
-    REQUIRE_ARGC(argc, 1, 1, name);
     return normalized_string_value(argv[0], compatibility, compose, name);
 }

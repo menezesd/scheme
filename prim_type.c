@@ -125,7 +125,7 @@ static const type_predicate_entry *find_type_predicate(unsigned prim_id)
 unsigned apply_type_predicate(unsigned prim_id, unsigned argc,
                               unsigned *argv)
 {
-    REQUIRE_ARGC(argc, 1, 1, "type predicate");
+    (void)argc; // apply_primitive_argv checked the count
     const type_predicate_entry *entry = find_type_predicate(prim_id);
     if (!entry) {
         show_error("type predicate: unknown primitive %u", prim_id);
@@ -136,4 +136,44 @@ unsigned apply_type_predicate(unsigned prim_id, unsigned argc,
         return TOK_ERROR;
     }
     return scheme_bool(entry->predicate(argv[0]));
+}
+
+// (procedure-arity proc): MIT's (min . max) pair, with max #f when there is
+// no upper bound. A continuation accepts any number of values.
+unsigned procedure_arity_value(unsigned proc)
+{
+    unsigned min = 0;
+    unsigned max = 0;
+    bool bounded = true;
+    if (IS_BUILTIN(proc)) {
+        const primitive_info *info = primitive_info_for(CELL_ID(proc));
+        if (!info) {
+            show_error("procedure-arity: unknown primitive");
+            return TOK_ERROR;
+        }
+        min = info->min_args;
+        max = info->max_args;
+        bounded = info->max_args != PRIM_ARGS_ANY;
+    } else if (is_bytecode_closure_object(proc)) {
+        const code_object *code = GET_CLOSURE_CODE(proc);
+        min = max = code->arity;
+        bounded = !code->has_rest;
+    } else if (IS_FUNCTION(proc)) {
+        unsigned p = car(proc);
+        for (; IS_PAIR(p); p = cdr(p))
+            min++;
+        max = min;
+        bounded = IS_NIL(p);
+    } else if (IS_CONT(proc) || is_vm_continuation_object(proc)) {
+        bounded = false;
+    } else {
+        show_error("procedure-arity: not a procedure");
+        return TOK_ERROR;
+    }
+    GC_GUARD;
+    unsigned lo = store(min);
+    gc_protect(&lo);
+    unsigned hi = bounded ? store(max) : ctx.atom_false;
+    gc_protect(&hi);
+    return alloc_cons(lo, hi);
 }

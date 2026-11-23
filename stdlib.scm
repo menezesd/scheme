@@ -6516,8 +6516,10 @@
 
 ; As in MIT's frame-based output, a rest parameter's list is one argument.
 (define (%trace-shown-arguments procedure arguments)
-  (let ((arity (%procedure-arity procedure)))
-    (if (and arity (cdr arity) (>= (length arguments) (car arity)))
+  (let ((arity (and (compound-procedure? procedure)
+                    (procedure-arity procedure))))
+    ; (min . #f): a rest parameter follows the min required arguments.
+    (if (and arity (not (cdr arity)) (>= (length arguments) (car arity)))
         (let loop ((n (car arity)) (args arguments) (acc '()))
           (if (= n 0)
               (reverse! (cons args acc))
@@ -6537,7 +6539,7 @@
           (newline port)
           (write-string "      <== " port))
         (write-string "[Entering " port))
-    (write-string (string-append (if (%procedure-arity procedure)
+    (write-string (string-append (if (compound-procedure? procedure)
                                      "#[compound-procedure "
                                      "#[compiled-procedure ")
                                  (number->string (%trace-number procedure))
