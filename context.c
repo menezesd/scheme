@@ -2738,24 +2738,6 @@ bool identifier_valid(unsigned x)
     return IS_SYMBOL(x);
 }
 
-static bool pair_chain_acyclic(unsigned list)
-{
-    unsigned slow = list;
-    unsigned fast = list;
-    while (IS_PAIR(fast)) {
-        fast = cdr(fast);
-        if (!IS_PAIR(fast))
-            return true;
-        fast = cdr(fast);
-        if (!IS_PAIR(slow))
-            return true;
-        slow = cdr(slow);
-        if (fast == slow)
-            return false;
-    }
-    return true;
-}
-
 bool lambda_params_valid(unsigned params)
 {
     GC_GUARD;
@@ -2765,7 +2747,7 @@ bool lambda_params_valid(unsigned params)
         return true;
     if (!IS_PAIR(params))
         return false;
-    if (!pair_chain_acyclic(params))
+    if (pair_chain_is_circular(params))
         return false;
 
     unsigned seen = 0;

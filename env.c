@@ -249,24 +249,6 @@ bool env_chain_acyclic(unsigned env)
     return true;
 }
 
-static bool binding_list_acyclic_uncached(unsigned vars)
-{
-    unsigned slow = vars;
-    unsigned fast = vars;
-    while (IS_PAIR(fast)) {
-        fast = cdr(fast);
-        if (!IS_PAIR(fast))
-            return true;
-        fast = cdr(fast);
-        if (!IS_PAIR(slow))
-            return true;
-        slow = cdr(slow);
-        if (fast == slow)
-            return false;
-    }
-    return true;
-}
-
 // This runs on EVERY variable lookup, on every frame walked, before a single
 // symbol is compared - and the global frame holds ~950 bindings after the
 // stdlib loads. Uncached, the Floyd walk dominated the whole interpreter:
@@ -308,7 +290,7 @@ bool env_binding_list_acyclic(unsigned vars)
     if (slot->epoch == acyclic_epoch && slot->head == vars)
         return slot->acyclic;
 
-    bool result = binding_list_acyclic_uncached(vars);
+    bool result = !pair_chain_is_circular(vars);
     slot->head = vars;
     slot->epoch = acyclic_epoch;
     slot->acyclic = result;
