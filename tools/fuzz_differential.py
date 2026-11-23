@@ -130,12 +130,6 @@ FLOATS = ["1.5", "-0.25", "3.0", "0.1", "2.5", "-7.75", "1e10", "2.5e-3",
 # divergences instead of failing on known ones. Delete an entry once its bug
 # is fixed; --no-avoid generates the triggering shapes anyway.
 KNOWN_BUGS = {
-    "vm-quasiquote-tail":
-        "VM: a quasiquote in tail position whose template unquotes a "
-        "procedure call returns that call's value instead of the built "
-        "list/vector: (define (f g) `(,(g) 1)) (f (lambda () 5)) => 5, "
-        "interpreter (5 1). Avoided by wrapping generated quasiquotes in "
-        "(values ...), which takes them out of tail position.",
     "vm-error-wording":
         "VM: errors raised by the VM's own arithmetic and call opcodes are "
         "worded differently from the primitives the interpreter calls - "
@@ -220,10 +214,7 @@ class Gen:
         return name
 
     def qq(self, template):
-        node = ["quasiquote", template]
-        if "vm-quasiquote-tail" in self.avoid:
-            return ["values", node]
-        return node
+        return ["quasiquote", template]
 
     def chance(self, p):
         return self.r.random() < p

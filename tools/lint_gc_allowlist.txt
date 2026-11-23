@@ -8,18 +8,3 @@
 # protect-scope: the variable is declared in an inner block, protected
 # there, and still on the shadow stack when the block ends; the named call
 # after the block can collect and write through the dead stack slot.
-
-# fv is protected too, so `gc_unprotect(2); // free_vars, pattern_vars`
-# pops fv and free_vars and leaves pattern_vars behind on every rule: the
-# shadow stack grows per rule and collect_pattern_vars writes through the
-# previous iteration's slot.
-compile.c collect_syntax_free_vars protect-scope pattern_vars   # unbalanced count in the rules loop
-compile.c rebuild_syntax_rules_renamed protect-scope rules_tail  # if-block; alloc_cons after it
-compile.c compile_call protect-scope lambda_params   # lambda-inlining block falls through to the general case
-compile.c compile_call protect-scope lambda_body     # same block
-macros.c expand_procedure protect-scope local        # if-block falls through to expand_body_in
-macros.c expand_form_inner protect-scope datum_tail  # if-block; with_core_head after it
-macros.c expand_form_inner protect-scope lambda_rest # if-block; with_core_head after it
-macros.c expand_form_inner protect-scope lambda_form # same block
-macros.c unwrap_syntax_rules_form protect-scope first   # if-block; unwrap_protected in the loop after it
-macros.c rename_free_ids_inner protect-scope new_head   # IS_ATOM(head) block falls through to map_case_form

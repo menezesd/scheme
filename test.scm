@@ -4199,6 +4199,12 @@
 (test "write of a pure imaginary matches number->string" "(+i -2i)"
       (call-with-output-string
         (lambda (p) (write (list (make-rectangular 0 1) (make-rectangular 0 -2)) p))))
+(define (%reg-qq-tail g) `(,(g) 1))
+(define (%reg-qq-tail-vec g) `#(0 ,(g)))
+(define (%reg-qq-tail-apply) `(,(apply max '(1 2))))
+(test "quasiquote in tail position builds its template" '((5 1) #(0 5) (2))
+      (list (%reg-qq-tail (lambda () 5)) (%reg-qq-tail-vec (lambda () 5))
+            (%reg-qq-tail-apply)))
 (test "quasiquote transforms a vector in a dotted tail" '((a . #(5)) (a . #(1 5 5)))
       (let ((y 5)) (list `(a . #(,y)) `(a . #(1 ,@(list y y))))))
 

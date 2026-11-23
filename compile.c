@@ -6177,8 +6177,14 @@ static compile_result compile_quasiquote(unsigned expr, compile_ctx *cctx)
         return const_result(expanded);
     }
 
-    // Has unquotes - generate runtime code
+    // Has unquotes - generate runtime code. The unquoted expressions are
+    // never in tail position, even when the quasiquote is: the template's
+    // value is assembled after they return, so a tail call there would
+    // return the unquoted value alone from the enclosing procedure.
+    bool tail = cctx->tail_position;
+    cctx->tail_position = false;
     compile_qq_rec(tmpl, cctx, 1);
+    cctx->tail_position = tail;
     return dynamic_result();
 }
 
