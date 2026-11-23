@@ -2636,6 +2636,13 @@ b")
       (let ((y 10))
         (let-syntax ((m (er-macro-transformer (lambda (f r c) (r 'y)))))
           (let ((z 20)) (m)))))
+;; The compiler cannot reach a renamed local that the use site shadows, and
+;; reports it; the interpreter aliases the very binding. Never the wrong one.
+(test "er rename of a shadowed local is right or refused" #t
+      (guard (e (#t (error-object? e)))
+        (= 10 (let ((y 10))
+                (let-syntax ((m (er-macro-transformer (lambda (f r c) (r 'y)))))
+                  (let ((y 20)) (m)))))))
 (test "er letrec-syntax mutual recursion" '(#t #f)
       (letrec-syntax
           ((ev? (er-macro-transformer

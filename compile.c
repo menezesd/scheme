@@ -2113,6 +2113,32 @@ static compile_result emit_procedural_syntax_error(compile_ctx *cctx)
     return emit_syntax_error(cctx, message);
 }
 
+// A rename of a local variable that the use site shadows cannot be compiled:
+// a local is reached by name, and the name now means the shadowing binding.
+// (A syntax-rules template's free identifiers are aliased where the macro
+// is defined instead, but what a procedural transformer will rename is not
+// known until it runs.) The interpreter, whose aliases bind the very cell,
+// has no such limit. Reported rather than compiled to the wrong variable.
+static bool procedural_aliases_reachable(compile_ctx *cctx, unsigned bindings)
+{
+    for (unsigned b = bindings; IS_PAIR(b); b = cdr(b)) {
+        unsigned target = IS_PAIR(car(b)) ? cdr(car(b)) : 0;
+        if (!IS_BINDING_REF(target) || !IS_ATOM(cdr(target)))
+            continue;
+        unsigned cell = CELL_CAR(target);
+        int64_t var_id = CELL_ID(cdr(target));
+        if (IS_SYNTAX(car(cell)) || IS_MACRO(car(cell)) ||
+            env_find_binding_cell(var_id, cctx->env) == cell ||
+            binding_cell_is_stable_global(cctx, var_id, cell))
+            continue;
+        show_error("macro transformer: renamed local %s is shadowed where "
+                   "the macro is used (not supported by the compiler)",
+                   ctx.atom_table[var_id]);
+        return false;
+    }
+    return true;
+}
+
 // (define-syntax name (er-macro-transformer proc)) and the like. The
 // transformer is made now, so that the rest of the unit can use the macro,
 // and defined again when the code runs, over the run-time environment
@@ -2178,6 +2204,9 @@ static bool compile_macro_binding(unsigned mac, unsigned expr,
         // Decided before the expansion, which can collect and move mac.
         bool procedural = macros_is_procedural_transformer(mac);
         unsigned expanded = apply_syntax(mac, expr, cctx->env, &bindings);
+        if (procedural && expanded != TOK_ERROR &&
+            !procedural_aliases_reachable(cctx, bindings))
+            expanded = TOK_ERROR;
         if (expanded == TOK_ERROR && procedural) {
             // Raised, when the code runs, with the transformer's own message
             // (already reported) rather than a generic one.
