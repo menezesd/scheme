@@ -2337,11 +2337,14 @@ static unsigned pending_defines_record(compile_ctx *cctx)
 }
 
 // First pass: collect free identifiers across all rules of a single
-// transformer, building a rename map and the alias bindings needed to
-// install them. Mirrors the let-syntax collection loop but over one
-// transformer's rules instead of across multiple sibling bindings.
-static bool collect_syntax_free_vars(compile_ctx *cctx, unsigned rules,
+// transformer, adding to a rename map and the alias bindings needed to
+// install them. syntax_bindings, letrec-syntax's sibling bindings, are bound
+// in every template. With defer_pending, an identifier the current body
+// defines later is aliased once that define has run (define-syntax only).
+static void collect_syntax_free_vars(compile_ctx *cctx, unsigned rules,
                                      int64_t ellipsis_id, unsigned literals,
+                                     unsigned syntax_bindings,
+                                     bool defer_pending,
                                      unsigned *rename_map_out,
                                      unsigned *gensym_bindings_out,
                                      unsigned *gensym_const_bindings_out)
@@ -2353,10 +2356,11 @@ static bool collect_syntax_free_vars(compile_ctx *cctx, unsigned rules,
     gc_protect(&rename_map);
     gc_protect(&gensym_bindings);
     gc_protect(&gensym_const_bindings);
-    // literals is a by-value cell parameter that stays live across every
-    // iteration below, and collect_pattern_vars/collect_template_free_vars
-    // both allocate.
+    // literals and syntax_bindings are by-value cell parameters that stay
+    // live across every iteration below, and collect_pattern_vars /
+    // collect_template_free_vars both allocate.
     gc_protect(&literals);
+    gc_protect(&syntax_bindings);
 
     unsigned r = rules;
     gc_protect(&r);
@@ -2370,6 +2374,7 @@ static bool collect_syntax_free_vars(compile_ctx *cctx, unsigned rules,
         unsigned pattern_vars =
             collect_pattern_vars(pattern, 0, ellipsis_id, literals);
         gc_protect(&pattern_vars);
+        pattern_vars = add_template_syntax_bounds(pattern_vars, syntax_bindings);
         unsigned free_vars = collect_template_free_vars(
             tmpl, pattern_vars, 0, ellipsis_id, cctx->env);
         gc_protect(&free_vars);
@@ -2391,16 +2396,12 @@ static bool collect_syntax_free_vars(compile_ctx *cctx, unsigned rules,
             if (already_mapped)
                 goto next_free_var;
 
-            unsigned pending = pending_defines_record(cctx);
+            unsigned pending = defer_pending ? pending_defines_record(cctx) : 0;
             if (pending && atom_list_contains_id(car(pending), var_id)) {
                 // Defined later in this body: rename now, alias once the
                 // define has run (see pending_defines_marker_id).
                 gc_protect(&pending);
-                extern unsigned gensym_counter;
-                char name[32];
-                snprintf(name, sizeof(name), "##gensym##%u",
-                         gensym_counter++);
-                unsigned gensym_atom = make_uninterned_symbol(name);
+                unsigned gensym_atom = do_gensym();
                 gc_protect(&gensym_atom);
                 macros_note_alias(CELL_ID(gensym_atom), var_id, false);
                 unsigned entry = alloc_cons(var_atom, gensym_atom);
@@ -2417,15 +2418,10 @@ static bool collect_syntax_free_vars(compile_ctx *cctx, unsigned rules,
 
             unsigned val = lookup_silent(var_id, cctx->env);
             if (val != TOK_ERROR) {
-                extern unsigned gensym_counter;
-                // Keep the complete generated name for diagnostics. Symbol
-                // identity is independent of its printable name.
-                char name[32];
-                snprintf(name, sizeof(name), "##gensym##%u",
-                         gensym_counter++);
-                unsigned gensym_atom = make_uninterned_symbol(name);
+                unsigned gensym_atom = do_gensym();
                 gc_protect(&gensym_atom);
                 gc_protect(&val);
+                // So a renamed case is still seen as case
                 macros_note_alias(CELL_ID(gensym_atom), var_id,
                                   IS_SYNTAX(val));
 
@@ -2441,10 +2437,12 @@ static bool collect_syntax_free_vars(compile_ctx *cctx, unsigned rules,
                         alloc_cons(const_entry, gensym_const_bindings);
                     gc_unprotect(1);
                 } else {
-                    // Resolve the binding cell now, so the emission below
-                    // can embed it directly when safe (see
-                    // binding_cell_is_stable_global) instead of
-                    // re-resolving var_atom by name at runtime.
+                    // Resolve the binding cell now, against this definition-
+                    // time environment, so the emission can embed it directly
+                    // instead of re-resolving var_atom by name at runtime
+                    // (which would find whatever shadows it at the use site).
+                    // Only safe when the binding lives in the persistent
+                    // global frame - see binding_cell_is_stable_global.
                     unsigned target_cell =
                         env_find_binding_cell(var_id, cctx->env);
                     unsigned binding_ref =
@@ -2474,7 +2472,6 @@ next_free_var:
     *rename_map_out = rename_map;
     *gensym_bindings_out = gensym_bindings;
     *gensym_const_bindings_out = gensym_const_bindings;
-    return true;
 }
 
 // Second pass: rebuild a transformer_form with every rule's template
@@ -2570,6 +2567,8 @@ static void emit_syntax_gensym_aliases(compile_ctx *cctx,
         int64_t gensym_id = CELL_ID(gensym_atom);
         int64_t var_id = CELL_ID(var_atom);
 
+        // A VM stack local has no heap binding cell (its value lives in a
+        // register), so it must be captured by value.
         int local_slot = find_stack_local_slot(cctx, var_id);
         if (local_slot >= 0) {
             emit_local_get_slot(cctx, local_slot);
@@ -2583,11 +2582,9 @@ static void emit_syntax_gensym_aliases(compile_ctx *cctx,
     }
 }
 
-// Make the gensyms visible in the compile-time environment (mutating the
-// CURRENT frame in place, like an ordinary internal define - define-syntax
-// does not introduce its own scope, so no new frame/env_depth change is
-// needed or safe here).
-static void extend_env_with_syntax_gensyms(compile_ctx *cctx,
+// Make the gensyms visible in the compile-time environment env, adding them
+// to its first frame like an ordinary internal define.
+static void extend_env_with_syntax_gensyms(unsigned env,
                                            unsigned gensym_bindings,
                                            unsigned gensym_const_bindings)
 {
@@ -2596,7 +2593,7 @@ static void extend_env_with_syntax_gensyms(compile_ctx *cctx,
     // the cursor walking them has to survive each iteration's allocation -
     // otherwise the second lap reads cdr() out of a reclaimed cell.
     GC_GUARD;
-    gc_protect(&cctx->env);
+    gc_protect(&env);
     gc_protect(&gensym_bindings);
     gc_protect(&gensym_const_bindings);
 
@@ -2604,7 +2601,7 @@ static void extend_env_with_syntax_gensyms(compile_ctx *cctx,
     gc_protect(&gb);
     for (gb = gensym_const_bindings; gb; gb = cdr(gb)) {
         unsigned entry = car(gb);
-        defvar(car(entry), cdr(entry), cctx->env);
+        defvar(car(entry), cdr(entry), env);
     }
     for (gb = gensym_bindings; gb; gb = cdr(gb)) {
         unsigned entry = car(gb);
@@ -2612,8 +2609,209 @@ static void extend_env_with_syntax_gensyms(compile_ctx *cctx,
         // Placeholder value - the real value is only known at runtime;
         // this just marks the gensym as bound for shadowing/hygiene checks
         // during compilation of later forms.
-        defvar(gensym_atom, gensym_atom, cctx->env);
+        defvar(gensym_atom, gensym_atom, env);
     }
+}
+
+// (define-syntax name transformer)
+static compile_result compile_define_syntax(unsigned expr, compile_ctx *cctx)
+{
+    if (!syntax_arity_checked(expr, 2, 2, "define-syntax"))
+        return emit_syntax_error(cctx, "define-syntax: invalid syntax");
+    unsigned name = cadr(expr);
+    unsigned transformer_form = caddr(expr);
+    if (identifier_valid(name) &&
+        macros_procedural_transformer_form(transformer_form))
+        return compile_procedural_define_syntax(name, transformer_form, cctx);
+    int64_t default_ellipsis_id = syntax_default_ellipsis_id(cctx->env);
+    if (!identifier_valid(name) ||
+        !syntax_rules_valid(transformer_form, default_ellipsis_id,
+                            "define-syntax"))
+        return emit_syntax_error(cctx, "define-syntax: invalid syntax");
+
+    GC_GUARD;
+    gc_protect(&name);
+    gc_protect(&transformer_form);
+
+    // Hygiene: resolve the transformer's free identifiers NOW, at this
+    // definition point, instead of lazily at each macro use site (which may
+    // be arbitrarily far away, inside intervening shadowing scopes that would
+    // otherwise capture them). Mirrors let-syntax.
+    int64_t ellipsis_id = 0;
+    unsigned literals = 0, rules = 0;
+    syntax_rules_parts(transformer_form, default_ellipsis_id, &ellipsis_id,
+                       &literals, &rules);
+    gc_protect(&rules);
+
+    unsigned rename_map = 0, gensym_bindings = 0, gensym_const_bindings = 0;
+    gc_protect(&rename_map);
+    gc_protect(&gensym_bindings);
+    gc_protect(&gensym_const_bindings);
+    collect_syntax_free_vars(cctx, rules, ellipsis_id, literals, 0, true,
+                             &rename_map, &gensym_bindings,
+                             &gensym_const_bindings);
+
+    unsigned renamed_form = rebuild_syntax_rules_renamed(
+        transformer_form, default_ellipsis_id, rename_map);
+    if (renamed_form == TOK_ERROR)
+        return emit_syntax_error(cctx, "define-syntax: invalid syntax");
+    gc_protect(&renamed_form);
+
+    emit_syntax_gensym_aliases(cctx, gensym_bindings, gensym_const_bindings);
+    // define-syntax does not introduce a scope: the gensyms go in the
+    // current frame.
+    extend_env_with_syntax_gensyms(cctx->env, gensym_bindings,
+                                   gensym_const_bindings);
+
+    emit2(cctx, OP_CONST, code_add_const(cctx->code, renamed_form));
+    emit2(cctx, OP_DEFSYNTAX, CELL_ID(name));
+    emit2(cctx, OP_CONST, code_add_const(cctx->code, name));
+
+    unsigned transformer = make_syntax_transformer_with_default_ellipsis(
+        renamed_form, cctx->env, default_ellipsis_id);
+    if (transformer == TOK_ERROR)
+        return emit_syntax_error(cctx, "define-syntax: invalid syntax");
+    gc_protect(&transformer);
+    defvar(name, transformer, cctx->env);
+    return dynamic_result();
+}
+
+// (let-syntax ((name transformer) ...) body ...)
+// (letrec-syntax ((name transformer) ...) body ...)
+static compile_result compile_let_syntax(unsigned expr, compile_ctx *cctx,
+                                         bool letrec)
+{
+    const char *form_name = letrec ? "letrec-syntax" : "let-syntax";
+    if (!syntax_arity_checked(expr, 2, UINT_MAX, form_name))
+        return emit_syntax_error(cctx, "syntax binding: invalid syntax");
+    unsigned bindings = cadr(expr);
+    unsigned body = cddr(expr);
+    if (!binding_list_valid(bindings, form_name) ||
+        !list_length_checked(body, NULL, form_name))
+        return emit_syntax_error(cctx, "syntax binding: invalid syntax");
+
+    // If no bindings, compile body in the current env so internal
+    // defines splice into the enclosing body
+    if (!bindings)
+        return compile_begin(body, cctx);
+
+    GC_GUARD;
+    gc_protect(&bindings);
+    gc_protect(&body);
+
+    // The environment the transformers are defined in: letrec-syntax's is a
+    // frame of their own, made empty here and filled once they exist.
+    unsigned transformer_env = cctx->env;
+    gc_protect(&transformer_env);
+    if (letrec)
+        transformer_env = alloc_cons(alloc_cons(0, 0), cctx->env);
+
+    unsigned rename_map = 0, gensym_bindings = 0, gensym_const_bindings = 0;
+    gc_protect(&rename_map);
+    gc_protect(&gensym_bindings);
+    gc_protect(&gensym_const_bindings);
+
+    // First pass: collect all free variables from all templates
+    unsigned b = bindings;
+    gc_protect(&b);
+    for (; b; b = cdr(b)) {
+        unsigned transformer_form = cadr(car(b));
+        if (macros_procedural_transformer_form(transformer_form))
+            continue; // No template: made in the second pass.
+        int64_t default_ellipsis_id =
+            syntax_default_ellipsis_id(transformer_env);
+        if (!syntax_rules_valid(transformer_form, default_ellipsis_id,
+                                form_name))
+            return emit_syntax_error(cctx, "syntax binding: invalid syntax");
+
+        int64_t ellipsis_id = 0;
+        unsigned literals = 0, rules = 0;
+        syntax_rules_parts(transformer_form, default_ellipsis_id, &ellipsis_id,
+                           &literals, &rules);
+        collect_syntax_free_vars(cctx, rules, ellipsis_id, literals,
+                                 letrec ? bindings : 0, false, &rename_map,
+                                 &gensym_bindings, &gensym_const_bindings);
+    }
+
+    // Second pass: create transformers with renamed templates
+    unsigned frame_vars = 0, frame_vals = 0;
+    gc_protect(&frame_vars);
+    gc_protect(&frame_vals);
+    for (b = bindings; b; b = cdr(b)) {
+        unsigned name = car(car(b));
+        gc_protect(&name);
+        unsigned transformer;
+        if (macros_procedural_transformer_form(cadr(car(b)))) {
+            transformer = macros_make_procedural_transformer(
+                cadr(car(b)), transformer_env, form_name);
+            if (transformer == TOK_ERROR)
+                return emit_procedural_syntax_error(cctx);
+        } else {
+            int64_t default_ellipsis_id =
+                syntax_default_ellipsis_id(transformer_env);
+            unsigned renamed_form = rebuild_syntax_rules_renamed(
+                cadr(car(b)), default_ellipsis_id, rename_map);
+            if (renamed_form == TOK_ERROR)
+                return emit_syntax_error(cctx,
+                                         "syntax binding: invalid syntax");
+
+            // Free vars are pre-renamed, but the default ellipsis decision
+            // still belongs to the transformer definition environment.
+            transformer = make_syntax_transformer_with_default_ellipsis(
+                renamed_form, transformer_env, default_ellipsis_id);
+            if (transformer == TOK_ERROR)
+                return emit_syntax_error(cctx,
+                                         "syntax binding: invalid syntax");
+        }
+
+        // Add to frame
+        gc_protect(&transformer);
+        unsigned vc = alloc_cons(name, frame_vars);
+        gc_protect(&vc);
+        unsigned ac = alloc_cons(transformer, frame_vals);
+        gc_unprotect(3);
+        frame_vars = vc;
+        frame_vals = ac;
+    }
+
+    unsigned new_env = transformer_env;
+    gc_protect(&new_env);
+    if (letrec) {
+        unsigned frame = car(new_env);
+        cell_set_car(frame, frame_vars);
+        cell_set_cdr(frame, frame_vals);
+    } else {
+        new_env = alloc_cons(alloc_cons(frame_vars, frame_vals), cctx->env);
+    }
+
+    // Push a new runtime frame for the body
+    emit_pushenv(cctx);
+
+    // Bind the gensyms at let-syntax entry, BEFORE any inner scopes, and in
+    // a compile-time frame of their own so they're visible in the body
+    emit_syntax_gensym_aliases(cctx, gensym_bindings, gensym_const_bindings);
+    if (gensym_bindings || gensym_const_bindings) {
+        new_env = alloc_cons(alloc_cons(0, 0), new_env);
+        extend_env_with_syntax_gensyms(new_env, gensym_bindings,
+                                       gensym_const_bindings);
+    }
+
+    // Compile body with new compile-time environment. In this context, not a
+    // copy of it: the body records things that belong to the whole procedure
+    // (let slots and their high-water mark, assignments to stack locals,
+    // scopes to recompile) and a copy would drop them on return.
+    unsigned body_saved_env = cctx->env;
+    unsigned body_saved_known = cctx->known_lambdas;
+    gc_protect(&body_saved_env);
+    gc_protect(&body_saved_known);
+    cctx->env = new_env;
+    compile_begin(body, cctx);
+    cctx->env = body_saved_env;
+    cctx->known_lambdas = body_saved_known;
+
+    // Pop the runtime frame
+    emit_popenv(cctx);
+    return dynamic_result();
 }
 
 // ============================================================================
@@ -2738,523 +2936,12 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
                 return compile_set(expr, cctx);
             if (special_binding == TOK_ERROR && kw == ctx.kw_quasiquote)
                 return compile_quasiquote(expr, cctx);
-            if (special_binding == TOK_ERROR && kw == ctx.kw_define_syntax) {
-                // (define-syntax name transformer)
-                if (!syntax_arity_checked(expr, 2, 2, "define-syntax"))
-                    return emit_syntax_error(cctx,
-                                             "define-syntax: invalid syntax");
-                unsigned name = cadr(expr);
-                unsigned transformer_form = caddr(expr);
-                if (identifier_valid(name) &&
-                    macros_procedural_transformer_form(transformer_form))
-                    return compile_procedural_define_syntax(
-                        name, transformer_form, cctx);
-                int64_t default_ellipsis_id =
-                    syntax_default_ellipsis_id(cctx->env);
-                if (!identifier_valid(name) ||
-                    !syntax_rules_valid(transformer_form, default_ellipsis_id,
-                                        "define-syntax"))
-                    return emit_syntax_error(cctx,
-                                             "define-syntax: invalid syntax");
-
-                GC_GUARD;
-                gc_protect(&name);
-                gc_protect(&transformer_form);
-
-                // Hygiene: resolve the transformer's free identifiers NOW,
-                // at this definition point, instead of lazily at each
-                // macro use site (which may be arbitrarily far away,
-                // inside intervening shadowing scopes that would
-                // otherwise capture them). Mirrors let-syntax below.
-                int64_t ellipsis_id = 0;
-                unsigned literals = 0, rules = 0;
-                syntax_rules_parts(transformer_form, default_ellipsis_id,
-                                   &ellipsis_id, &literals, &rules);
-                gc_protect(&rules);
-
-                unsigned rename_map = 0;
-                unsigned gensym_bindings = 0;
-                unsigned gensym_const_bindings = 0;
-                gc_protect(&rename_map);
-                gc_protect(&gensym_bindings);
-                gc_protect(&gensym_const_bindings);
-                collect_syntax_free_vars(cctx, rules, ellipsis_id, literals,
-                                         &rename_map, &gensym_bindings,
-                                         &gensym_const_bindings);
-
-                unsigned renamed_form = rebuild_syntax_rules_renamed(
-                    transformer_form, default_ellipsis_id, rename_map);
-                if (renamed_form == TOK_ERROR)
-                    return emit_syntax_error(cctx,
-                                             "define-syntax: invalid syntax");
-                gc_protect(&renamed_form);
-
-                emit_syntax_gensym_aliases(cctx, gensym_bindings,
-                                          gensym_const_bindings);
-                extend_env_with_syntax_gensyms(cctx, gensym_bindings,
-                                              gensym_const_bindings);
-
-                emit2(cctx, OP_CONST,
-                      code_add_const(cctx->code, renamed_form));
-                emit2(cctx, OP_DEFSYNTAX, CELL_ID(name));
-                emit2(cctx, OP_CONST, code_add_const(cctx->code, name));
-
-                unsigned transformer = make_syntax_transformer_with_default_ellipsis(
-                    renamed_form, cctx->env, default_ellipsis_id);
-                if (transformer == TOK_ERROR)
-                    return emit_syntax_error(cctx,
-                                             "define-syntax: invalid syntax");
-                gc_protect(&transformer);
-                defvar(name, transformer, cctx->env);
-                return dynamic_result();
-            }
-
+            if (special_binding == TOK_ERROR && kw == ctx.kw_define_syntax)
+                return compile_define_syntax(expr, cctx);
             if (special_binding == TOK_ERROR &&
-                (kw == ctx.kw_let_syntax || kw == ctx.kw_letrec_syntax)) {
-                // (let-syntax ((name transformer) ...) body ...)
-                // (letrec-syntax ((name transformer) ...) body ...)
-                const char *form_name = kw == ctx.kw_let_syntax
-                                            ? "let-syntax"
-                                            : "letrec-syntax";
-                if (!syntax_arity_checked(expr, 2, UINT_MAX, form_name))
-                    return emit_syntax_error(
-                        cctx, "syntax binding: invalid syntax");
-                unsigned bindings = cadr(expr);
-                unsigned body = cddr(expr);
-                if (!binding_list_valid(bindings, form_name) ||
-                    !list_length_checked(body, NULL, form_name))
-                    return emit_syntax_error(
-                        cctx, "syntax binding: invalid syntax");
-
-                // If no bindings, compile body in the current env so internal
-                // defines splice into the enclosing body
-                if (!bindings) {
-                    return compile_begin(body, cctx);
-                }
-
-                GC_GUARD;
-                gc_protect(&bindings);
-                gc_protect(&body);
-
-                unsigned new_env = cctx->env;
-                gc_protect(&new_env);
-                unsigned frame_vars = 0, frame_vals = 0;
-                gc_protect(&frame_vars);
-                gc_protect(&frame_vals);
-
-                // Collect free variables from all templates and create rename map
-                unsigned rename_map = 0;
-                gc_protect(&rename_map);
-                unsigned gensym_bindings = 0; // List of (gensym . orig_var_id)
-                gc_protect(&gensym_bindings);
-                unsigned gensym_const_bindings = 0; // List of (gensym . value)
-                gc_protect(&gensym_const_bindings);
-
-                // First pass: create frame with placeholder values for letrec-syntax
-                if (kw == ctx.kw_letrec_syntax) {
-                    unsigned frame = alloc_cons(0, 0);
-                    gc_protect(&frame);
-                    new_env = alloc_cons(frame, cctx->env);
-                    gc_unprotect(1);
-                }
-
-                // First pass: collect all free variables from all templates
-                unsigned b = bindings;
-                gc_protect(&b);
-                while (b) {
-                    unsigned binding = car(b);
-                    unsigned transformer_form = cadr(binding);
-                    if (macros_procedural_transformer_form(transformer_form)) {
-                        // No template: made in the second pass.
-                        b = cdr(b);
-                        continue;
-                    }
-
-                    int64_t default_ellipsis_id =
-                        kw == ctx.kw_let_syntax
-                            ? syntax_default_ellipsis_id(cctx->env)
-                            : syntax_default_ellipsis_id(new_env);
-                    if (!syntax_rules_valid(transformer_form,
-                                            default_ellipsis_id, form_name))
-                        return emit_syntax_error(
-                            cctx, "syntax binding: invalid syntax");
-
-                    int64_t ellipsis_id = 0;
-                    unsigned literals = 0;
-                    unsigned rules = 0;
-                    syntax_rules_parts(transformer_form, default_ellipsis_id,
-                                       &ellipsis_id, &literals, &rules);
-
-                    unsigned r = rules;
-                    gc_protect(&r);
-                    while (r) {
-                        unsigned rule = car(r);
-                        unsigned pattern = car(rule);
-                        unsigned tmpl = cadr(rule);
-
-                        // Skip macro name in pattern
-                        if (IS_PAIR(pattern))
-                            pattern = cdr(pattern);
-
-                        // Collect pattern variables
-                        unsigned pattern_vars =
-                            collect_pattern_vars(pattern, 0, ellipsis_id, literals);
-                        gc_protect(&pattern_vars);
-                        if (kw == ctx.kw_letrec_syntax)
-                            pattern_vars =
-                                add_template_syntax_bounds(pattern_vars,
-                                                           bindings);
-
-                        // Collect free variables from template
-                        unsigned free_vars = collect_template_free_vars(
-                            tmpl, pattern_vars, 0, ellipsis_id, cctx->env);
-                        gc_protect(&free_vars);
-
-                        // For each free var, create gensym if bound in outer scope
-                        unsigned fv = free_vars;
-                        gc_protect(&fv);
-                        while (fv) {
-                            unsigned var_atom = car(fv);
-                            gc_protect(&var_atom);
-                            int64_t var_id = CELL_ID(var_atom);
-
-                            // Check if already in rename_map
-                            bool already_mapped = false;
-                            for (unsigned m = rename_map; m; m = cdr(m)) {
-                                if (CELL_ID(car(car(m))) == var_id) {
-                                    already_mapped = true;
-                                    break;
-                                }
-                            }
-                            if (already_mapped)
-                                goto next_free_var;
-
-                            // Check if bound in outer scope (compile-time env)
-                            unsigned val = lookup_silent(var_id, cctx->env);
-                            if (val != TOK_ERROR) {
-                                // Create gensym
-                                extern unsigned gensym_counter;
-                                // Leave room for the complete diagnostic name.
-                                char name[32];
-                                snprintf(name, sizeof(name), "##gensym##%u",
-                                         gensym_counter++);
-                                unsigned gensym_atom = make_uninterned_symbol(name);
-                                gc_protect(&gensym_atom);
-                                gc_protect(&val);
-                                // So a renamed case is still seen as case
-                                macros_note_alias(CELL_ID(gensym_atom), var_id,
-                                                  IS_SYNTAX(val));
-
-                                // Add to rename map: (var_atom . gensym_atom)
-                                unsigned entry = alloc_cons(var_atom, gensym_atom);
-                                gc_protect(&entry);
-                                rename_map = alloc_cons(entry, rename_map);
-                                gc_unprotect(1);
-
-                                if (IS_SYNTAX(val) || IS_MACRO(val)) {
-                                    unsigned const_entry =
-                                        alloc_cons(gensym_atom, val);
-                                    gc_protect(&const_entry);
-                                    gensym_const_bindings =
-                                        alloc_cons(const_entry,
-                                                   gensym_const_bindings);
-                                    gc_unprotect(1);
-                                } else {
-                                    // Resolve the binding cell now, against
-                                    // this definition-time environment, so
-                                    // the emission below can embed it
-                                    // directly instead of re-resolving
-                                    // var_atom by name at runtime (which
-                                    // would find whatever shadows it at the
-                                    // use site instead). Only safe when the
-                                    // binding lives in the persistent global
-                                    // frame - see binding_cell_is_stable_global.
-                                    unsigned target_cell =
-                                        env_find_binding_cell(var_id,
-                                                              cctx->env);
-                                    unsigned binding_ref =
-                                        (target_cell &&
-                                        binding_cell_is_stable_global(
-                                            cctx, var_id, target_cell))
-                                            ? make_binding_ref_cell(
-                                                  var_atom, target_cell)
-                                            : 0;
-                                    gc_protect(&binding_ref);
-                                    unsigned var_and_ref =
-                                        alloc_cons(var_atom, binding_ref);
-                                    gc_protect(&var_and_ref);
-                                    unsigned bind_entry =
-                                        alloc_cons(gensym_atom, var_and_ref);
-                                    gc_protect(&bind_entry);
-                                    gensym_bindings =
-                                        alloc_cons(bind_entry,
-                                                   gensym_bindings);
-                                    gc_unprotect(3);
-                                }
-
-                                gc_unprotect(2);
-                            }
-next_free_var:
-                            gc_unprotect(1);
-                            fv = cdr(fv);
-                        }
-                        gc_unprotect(1);
-                        gc_unprotect(2);
-                        r = cdr(r);
-                    }
-                    gc_unprotect(1);
-                    b = cdr(b);
-                }
-                gc_unprotect(1);
-
-                // Second pass: create transformers with renamed templates
-                b = bindings;
-                gc_protect(&b);
-                while (b) {
-                    unsigned binding = car(b);
-                    unsigned name = car(binding);
-                    unsigned transformer_form = cadr(binding);
-                    gc_protect(&name);
-
-                    if (macros_procedural_transformer_form(transformer_form)) {
-                        unsigned transformer =
-                            macros_make_procedural_transformer(
-                                transformer_form,
-                                kw == ctx.kw_let_syntax ? cctx->env : new_env,
-                                form_name);
-                        if (transformer == TOK_ERROR)
-                            return emit_procedural_syntax_error(cctx);
-                        gc_protect(&transformer);
-                        unsigned vc = alloc_cons(name, frame_vars);
-                        gc_protect(&vc);
-                        unsigned ac = alloc_cons(transformer, frame_vals);
-                        gc_unprotect(3);
-                        frame_vars = vc;
-                        frame_vals = ac;
-                        b = cdr(b);
-                        continue;
-                    }
-
-                    // Check it's a syntax-rules form
-                    int64_t default_ellipsis_id =
-                        kw == ctx.kw_let_syntax
-                            ? syntax_default_ellipsis_id(cctx->env)
-                            : syntax_default_ellipsis_id(new_env);
-                    if (!syntax_rules_valid(transformer_form,
-                                            default_ellipsis_id, form_name)) {
-                        return emit_syntax_error(cctx,
-                                                 "syntax binding: invalid syntax");
-                    }
-
-                    // Rename free vars in templates
-                    unsigned renamed_form = transformer_form;
-                    if (rename_map) {
-                        gc_protect(&transformer_form);
-                        gc_protect(&renamed_form);
-
-                        // Rebuild syntax-rules with renamed templates
-                        int64_t ellipsis_id = 0;
-                        unsigned literals = 0;
-                        unsigned rules = 0;
-                        syntax_rules_parts(transformer_form,
-                                           default_ellipsis_id,
-                                           &ellipsis_id, &literals, &rules);
-                        gc_protect(&literals);
-                        gc_protect(&rules);
-
-                        unsigned renamed_rules = 0;
-                        gc_protect(&renamed_rules);
-                        unsigned renamed_tail = 0;
-                        gc_protect(&renamed_tail);
-
-                        unsigned r = rules;
-                        gc_protect(&r);
-                        while (r) {
-                            unsigned rule = car(r);
-                            unsigned pattern = car(rule);
-                            unsigned tmpl = cadr(rule);
-
-                            gc_protect(&pattern);
-                            unsigned renamed_tmpl = rename_template_vars(tmpl, rename_map);
-                            if (renamed_tmpl == TOK_ERROR) {
-                                return emit_syntax_error(
-                                    cctx, "syntax binding: invalid syntax");
-                            }
-                            gc_protect(&renamed_tmpl);
-                            unsigned new_rule_tail = alloc_cons(renamed_tmpl, 0);
-                            gc_protect(&new_rule_tail);
-                            unsigned new_rule = alloc_cons(pattern, new_rule_tail);
-                            gc_protect(&new_rule);
-
-                            unsigned new_cell = alloc_cons(new_rule, 0);
-                            gc_unprotect(4);
-                            if (!renamed_rules) {
-                                renamed_rules = new_cell;
-                                renamed_tail = new_cell;
-                            } else {
-                                cell_set_cdr(renamed_tail, new_cell);
-                                renamed_tail = new_cell;
-                            }
-                            r = cdr(r);
-                        }
-                        gc_unprotect(1);
-
-                        unsigned sr_atom = car(transformer_form);
-                        unsigned second = cadr(transformer_form);
-                        gc_protect(&sr_atom);
-                        gc_protect(&second);
-                        unsigned sr_tail = 0;
-                        gc_protect(&sr_tail);
-                        if (IS_ATOM(second)) {
-                            unsigned rules_tail =
-                                alloc_cons(literals, renamed_rules);
-                            gc_protect(&rules_tail);
-                            sr_tail = alloc_cons(second, rules_tail);
-                            gc_unprotect(1);
-                        } else {
-                            sr_tail = alloc_cons(literals, renamed_rules);
-                        }
-                        renamed_form = alloc_cons(sr_atom, sr_tail);
-                        gc_unprotect(9);
-                    }
-
-                    // Free vars are pre-renamed, but the default ellipsis
-                    // decision still belongs to the transformer definition
-                    // environment.
-                    unsigned transformer_closure_env =
-                        kw == ctx.kw_let_syntax ? cctx->env : new_env;
-                    unsigned transformer =
-                        make_syntax_transformer_with_default_ellipsis(
-                            renamed_form, transformer_closure_env,
-                            default_ellipsis_id);
-                    if (transformer == TOK_ERROR) {
-                        return emit_syntax_error(
-                            cctx, "syntax binding: invalid syntax");
-                    }
-
-                    // Add to frame
-                    gc_protect(&transformer);
-                    unsigned vc = alloc_cons(name, frame_vars);
-                    gc_protect(&vc);
-                    unsigned ac = alloc_cons(transformer, frame_vals);
-                    gc_unprotect(3);
-                    frame_vars = vc;
-                    frame_vals = ac;
-                    b = cdr(b);
-                }
-                gc_unprotect(1);
-
-                // Create frame if let-syntax (letrec-syntax already has frame)
-                if (kw == ctx.kw_let_syntax) {
-                    unsigned frame = alloc_cons(frame_vars, frame_vals);
-                    gc_protect(&frame);
-                    new_env = alloc_cons(frame, cctx->env);
-                    gc_unprotect(1);
-                } else {
-                    // Update letrec-syntax frame
-                    unsigned frame = car(new_env);
-                    cell_set_car(frame, frame_vars);
-                    cell_set_cdr(frame, frame_vals);
-                }
-
-                // Push a new runtime frame for the body
-                emit_pushenv(cctx);
-
-                // Emit gensym bindings: look up original var, define gensym
-                // This happens at let-syntax entry, BEFORE any inner scopes
-                for (unsigned gb = gensym_const_bindings; gb; gb = cdr(gb)) {
-                    unsigned entry = car(gb);
-                    unsigned gensym_atom = car(entry);
-                    unsigned val = cdr(entry);
-                    int64_t gensym_id = CELL_ID(gensym_atom);
-
-                    emit2(cctx, OP_CONST, code_add_const(cctx->code, val));
-                    emit2(cctx, OP_DEFINE, gensym_id);
-                }
-
-                for (unsigned gb = gensym_bindings; gb; gb = cdr(gb)) {
-                    unsigned entry = car(gb);
-                    unsigned gensym_atom = car(entry);
-                    unsigned var_and_ref = cdr(entry);
-                    unsigned var_atom = car(var_and_ref);
-                    unsigned binding_ref = cdr(var_and_ref);
-                    int64_t gensym_id = CELL_ID(gensym_atom);
-                    int64_t var_id = CELL_ID(var_atom);
-
-                    // A VM stack local has no heap binding cell (its value
-                    // lives in a register), so it must be captured by value.
-                    int local_slot = find_stack_local_slot(cctx, var_id);
-                    if (local_slot >= 0) {
-                        emit_local_get_slot(cctx, local_slot);
-                        emit2(cctx, OP_DEFINE, gensym_id);
-                    } else if (binding_ref) {
-                        // Embed the binding cell resolved at let-syntax
-                        // definition time instead of re-resolving var_atom
-                        // by name at runtime, which would find whatever
-                        // shadows it at the use site and break hygiene.
-                        emit3(cctx, OP_DEFINE_ALIAS_REF, gensym_id,
-                              code_add_const(cctx->code, binding_ref));
-                    } else {
-                        emit3(cctx, OP_DEFINE_ALIAS, gensym_id, var_id);
-                    }
-                }
-
-                // Add gensyms to compile-time env so they're visible in body
-                if (gensym_bindings || gensym_const_bindings) {
-                    unsigned gensym_frame_vars = 0, gensym_frame_vals = 0;
-                    gc_protect(&gensym_frame_vars);
-                    gc_protect(&gensym_frame_vals);
-
-                    unsigned gcb = gensym_const_bindings;
-                    gc_protect(&gcb);
-                    while (gcb) {
-                        unsigned entry = car(gcb);
-                        unsigned gensym_atom = car(entry);
-                        unsigned val = cdr(entry);
-                        gensym_frame_vars =
-                            alloc_cons(gensym_atom, gensym_frame_vars);
-                        gensym_frame_vals = alloc_cons(val, gensym_frame_vals);
-                        gcb = cdr(gcb);
-                    }
-                    gc_unprotect(1);
-
-                    unsigned gb = gensym_bindings;
-                    gc_protect(&gb);
-                    while (gb) {
-                        unsigned entry = car(gb);
-                        unsigned gensym_atom = car(entry);
-                        // Use a placeholder value - actual value is set at runtime
-                        gensym_frame_vars = alloc_cons(gensym_atom, gensym_frame_vars);
-                        gensym_frame_vals = alloc_cons(gensym_atom, gensym_frame_vals);
-                        gb = cdr(gb);
-                    }
-                    gc_unprotect(1);
-
-                    unsigned gensym_frame = alloc_cons(gensym_frame_vars, gensym_frame_vals);
-                    gc_protect(&gensym_frame);
-                    new_env = alloc_cons(gensym_frame, new_env);
-                    gc_unprotect(3);
-                }
-
-                // Compile body with new compile-time environment. In this
-                // context, not a copy of it: the body records things that
-                // belong to the whole procedure (let slots and their
-                // high-water mark, assignments to stack locals, scopes to
-                // recompile) and a copy would drop them on return.
-                unsigned body_saved_env = cctx->env;
-                unsigned body_saved_known = cctx->known_lambdas;
-                gc_protect(&body_saved_env);
-                gc_protect(&body_saved_known);
-                cctx->env = new_env;
-                compile_begin(body, cctx);
-                cctx->env = body_saved_env;
-                cctx->known_lambdas = body_saved_known;
-                gc_unprotect(2);
-
-                // Pop the runtime frame
-                emit_popenv(cctx);
-                return dynamic_result();
-            }
+                (kw == ctx.kw_let_syntax || kw == ctx.kw_letrec_syntax))
+                return compile_let_syntax(expr, cctx,
+                                          kw == ctx.kw_letrec_syntax);
 
             // Check for macro application (silent - don't warn if not found)
             unsigned mac = lookup_silent(kw, cctx->env);

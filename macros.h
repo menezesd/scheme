@@ -63,6 +63,9 @@ void macros_note_alias(int64_t alias_id, int64_t origin_id, bool syntax);
 // id itself when it is not an alias.
 int64_t macros_identifier_origin(int64_t id);
 
+// A fresh uninterned ##gensym##N identifier.
+unsigned do_gensym(void);
+
 // Private identifier the compiler binds in a top-level begin's placeholder
 // frame: the names there are globals-to-be (see compile_begin).
 int64_t macros_toplevel_defines_marker_id(void);

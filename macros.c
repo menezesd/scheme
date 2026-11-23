@@ -92,7 +92,7 @@
 extern unsigned gensym_counter;
 
 // Generate a fresh gensym atom
-static unsigned do_gensym(void)
+unsigned do_gensym(void)
 {
     char buf[32];
     snprintf(buf, sizeof(buf), "##gensym##%u", gensym_counter++);
