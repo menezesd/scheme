@@ -5768,6 +5768,14 @@
             (#t (list 'non-error e)))
     (thunk)))
 
+(test "letrec*: an init's assignment to an earlier variable stays" 9
+      (letrec* ((x 1) (y (set! x 9))) x))
+(test "letrec*: each init sees the ones before it" '(1 2 3)
+      (letrec* ((a 1) (b (+ a 1)) (c (+ b 1))) (list a b c)))
+(test "letrec*: body definitions are local to the body" '(5 1)
+      (letrec* ((a 1)) (define b 5) (list b a)))
+(test "letrec*: forward reference" "Unassigned variable: b"
+      (ua-msg (lambda () (letrec* ((a (lambda () b)) (c (a)) (b 1)) c))))
 (test "letrec: forward reference" "Unassigned variable: y"
       (ua-msg (lambda () (letrec ((x y) (y 1)) x))))
 (test "letrec: self reference" "Unassigned variable: x"

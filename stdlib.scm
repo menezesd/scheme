@@ -5773,15 +5773,18 @@
     ((include-ci filename ...)
      (include filename ...))))
 
-; The built-in letrec already evaluates its inits left to right, assigning
-; each variable as its init returns, with every variable bound (unassigned)
-; from the start - which is letrec*. Reading one before its init has run is
-; an "Unassigned variable" error, not a placeholder value.
+;; Internal definitions, which are letrec* by definition: each init sees the
+;; ones before it assigned, and an init that assigns an earlier variable
+;; keeps that assignment - (letrec* ((x 1) (y (set! x 9))) x) is 9, as in
+;; MIT. letrec puts the earlier variables back after each init (it binds its
+;; inits as if to temporaries), so it cannot stand in for letrec*. Reading a
+;; later variable early is still "Unassigned variable: NAME".
 (define-syntax letrec*
   (syntax-rules ()
     ((letrec* ((var init) ...) body ...)
-     (letrec ((var init) ...)
-       body ...))))
+     (let ()
+       (define var init) ...
+       (let () body ...)))))
 
 (define (list-set! lst k obj)
   (set-car! (list-tail lst k) obj))
