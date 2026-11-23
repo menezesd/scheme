@@ -4147,23 +4147,10 @@ static compile_result compile_named_let(unsigned expr, compile_ctx *cctx)
     gc_protect(&bindings);
     gc_protect(&body);
 
-    unsigned params = 0, params_tail = 0;
-    unsigned args = 0, args_tail = 0;
+    unsigned params = 0, args = 0;
     gc_protect(&params);
-    gc_protect(&params_tail);
     gc_protect(&args);
-    gc_protect(&args_tail);
-
-    unsigned b = bindings;
-    gc_protect(&b);
-    for (; b; b = cdr(b)) {
-        unsigned binding = car(b);
-        gc_protect(&binding);
-        list_append(&params, &params_tail, car(binding));
-        list_append(&args, &args_tail, cadr(binding));
-        gc_unprotect(1);
-    }
-    gc_unprotect(1);
+    let_bindings_split(bindings, &params, &args);
 
     unsigned argc = list_length(args);
     bool tail = cctx->tail_position;

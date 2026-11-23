@@ -511,6 +511,9 @@ bool binding_list_valid(unsigned bindings, const char *name);
 
 // Check whether a binding has exactly the shape (name value).
 bool let_binding_has_value(unsigned binding);
+// Split a valid let binding list ((var init) ...) into fresh lists of its
+// variables and of its inits. The caller roots *vars and *inits.
+void let_bindings_split(unsigned bindings, unsigned *vars, unsigned *inits);
 
 // Check whether binding/parameter lists bind the identifier with this atom ID.
 bool binding_list_binds_id(unsigned binding_list, int64_t id);

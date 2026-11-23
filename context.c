@@ -2570,6 +2570,23 @@ bool let_binding_has_value(unsigned binding)
     return IS_PAIR(binding) && IS_PAIR(cdr(binding)) && !cddr(binding);
 }
 
+void let_bindings_split(unsigned bindings, unsigned *vars, unsigned *inits)
+{
+    GC_GUARD;
+    gc_protect(&bindings);
+    unsigned vars_tail = 0, inits_tail = 0;
+    gc_protect(&vars_tail);
+    gc_protect(&inits_tail);
+    *vars = *inits = 0;
+    for (; bindings; bindings = cdr(bindings)) {
+        unsigned binding = car(bindings);
+        gc_protect(&binding);
+        list_append(vars, &vars_tail, car(binding));
+        list_append(inits, &inits_tail, cadr(binding));
+        gc_unprotect(1);
+    }
+}
+
 bool binding_list_binds_id(unsigned binding_list, int64_t id)
 {
     if (pair_chain_is_circular(binding_list))

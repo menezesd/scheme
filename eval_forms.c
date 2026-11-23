@@ -491,6 +491,33 @@ bool handle_cond_expand(unsigned id, unsigned env, unsigned cont)
     return true;
 }
 
+// let, let* and letrec, past the arity check: (keyword bindings body ...).
+// Returns true with *bindings and *body set when there are bindings to
+// evaluate. Otherwise the form is finished: an invalid one signalled, or an
+// empty binding list's body evaluated in a fresh scope (for internal defines).
+static bool let_form_parts(unsigned id, unsigned env, unsigned cont,
+                           const char *keyword, unsigned *bindings,
+                           unsigned *body)
+{
+    *bindings = cadr(id);
+    *body = cddr(id);
+    if (!binding_list_valid(*bindings, keyword) ||
+        !list_length_checked(*body, NULL, keyword)) {
+        cps_signal_current_error(env, cont);
+        return false;
+    }
+    if (!*bindings) {
+        GC_GUARD;
+        gc_protect(body);
+        gc_protect(&env);
+        gc_protect(&cont);
+        unsigned new_env = extend_env_empty(env);
+        eval_scope_body(*body, new_env, cont);
+        return false;
+    }
+    return true;
+}
+
 static bool handle_named_let(unsigned id, unsigned env, unsigned cont)
 {
     if (!syntax_arity_checked(id, 3, UINT_MAX, "let")) {
@@ -515,23 +542,10 @@ static bool handle_named_let(unsigned id, unsigned env, unsigned cont)
     gc_protect(&env);
     gc_protect(&cont);
 
-    unsigned params = 0, params_tail = 0;
-    unsigned args = 0, args_tail = 0;
+    unsigned params = 0, args = 0;
     gc_protect(&params);
-    gc_protect(&params_tail);
     gc_protect(&args);
-    gc_protect(&args_tail);
-
-    unsigned b = bindings;
-    gc_protect(&b);
-    for (; b; b = cdr(b)) {
-        unsigned binding = car(b);
-        gc_protect(&binding);
-        list_append(&params, &params_tail, car(binding));
-        list_append(&args, &args_tail, cadr(binding));
-        gc_unprotect(1);
-    }
-    gc_unprotect(1);
+    let_bindings_split(bindings, &params, &args);
 
     unsigned name_cell = 0, val_cell = 0, new_env = 0;
     gc_protect(&name_cell);
@@ -584,25 +598,11 @@ bool handle_let(unsigned id, unsigned env, unsigned cont)
         cps_signal_current_error(env, cont);
         return true;
     }
-    unsigned bindings = cadr(id);
-    if (IS_ATOM(bindings))
+    if (IS_ATOM(cadr(id)))
         return handle_named_let(id, env, cont);
-
-    unsigned body = cddr(id);
-    if (!binding_list_valid(bindings, "let") ||
-        !list_length_checked(body, NULL, "let")) {
-        cps_signal_current_error(env, cont);
+    unsigned bindings, body;
+    if (!let_form_parts(id, env, cont, "let", &bindings, &body))
         return true;
-    }
-    if (!bindings) {
-        GC_GUARD;
-        gc_protect(&body);
-        gc_protect(&env);
-        gc_protect(&cont);
-        unsigned new_env = extend_env_empty(env);
-        eval_scope_body(body, new_env, cont);
-        return true;
-    }
     GC_GUARD;
     gc_protect(&bindings);
     gc_protect(&body);
@@ -646,23 +646,9 @@ bool handle_letstar(unsigned id, unsigned env, unsigned cont)
         cps_signal_current_error(env, cont);
         return true;
     }
-    unsigned bindings = cadr(id);
-    unsigned body = cddr(id);
-    if (!binding_list_valid(bindings, "let*") ||
-        !list_length_checked(body, NULL, "let*")) {
-        cps_signal_current_error(env, cont);
+    unsigned bindings, body;
+    if (!let_form_parts(id, env, cont, "let*", &bindings, &body))
         return true;
-    }
-    if (!bindings) {
-        // Create empty scope for internal defines
-        GC_GUARD;
-        gc_protect(&body);
-        gc_protect(&env);
-        gc_protect(&cont);
-        unsigned new_env = extend_env_empty(env);
-        eval_scope_body(body, new_env, cont);
-        return true;
-    }
     GC_GUARD;
     unsigned first = car(bindings);
     unsigned first_val_expr = cadr(first);
@@ -689,23 +675,9 @@ bool handle_letrec(unsigned id, unsigned env, unsigned cont)
         cps_signal_current_error(env, cont);
         return true;
     }
-    unsigned bindings = cadr(id);
-    unsigned body = cddr(id);
-    if (!binding_list_valid(bindings, "letrec") ||
-        !list_length_checked(body, NULL, "letrec")) {
-        cps_signal_current_error(env, cont);
+    unsigned bindings, body;
+    if (!let_form_parts(id, env, cont, "letrec", &bindings, &body))
         return true;
-    }
-
-    if (!bindings) {
-        GC_GUARD;
-        gc_protect(&body);
-        gc_protect(&env);
-        gc_protect(&cont);
-        unsigned new_env = extend_env_empty(env);
-        eval_scope_body(body, new_env, cont);
-        return true;
-    }
 
     GC_GUARD;
     // Protect bindings, body, env and cont across all allocations
