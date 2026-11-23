@@ -1229,8 +1229,174 @@ static unsigned collect_template_free_vars(unsigned tmpl, unsigned pattern_vars,
     return collected;
 }
 
-// Rename free variables in template according to rename_map
-// rename_map: list of (orig_atom . gensym_atom)
+// Renaming a template replaces its free identifiers by the gensyms in a
+// rename map, a list of (orig_atom . gensym_atom). How a subtemplate is
+// renamed depends on where it sits: in code, inside quasiquoted data at some
+// depth, or in code under a let that rebinds quote or quasiquote.
+typedef enum {
+    RENAME_CODE,
+    RENAME_QUASIQUOTED,
+    RENAME_SHADOWED_HEADS
+} rename_kind;
+
+typedef struct {
+    rename_kind kind;
+    unsigned depth;           // RENAME_QUASIQUOTED: quasiquote nesting depth
+    bool quote_shadowed;      // RENAME_SHADOWED_HEADS
+    bool quasiquote_shadowed; // RENAME_SHADOWED_HEADS
+} rename_mode;
+
+static const rename_mode rename_as_code = {RENAME_CODE, 0, false, false};
+static const rename_mode rename_as_quasiquoted = {RENAME_QUASIQUOTED, 1, false,
+                                                  false};
+
+static unsigned rename_template_vars_quasiquote(unsigned tmpl,
+                                                unsigned rename_map,
+                                                unsigned depth);
+static unsigned rename_template_vars_shadowed_heads(unsigned tmpl,
+                                                    unsigned rename_map,
+                                                    bool quote_shadowed,
+                                                    bool quasiquote_shadowed);
+
+static unsigned rename_template_in_mode(unsigned tmpl, unsigned rename_map,
+                                        const rename_mode *mode)
+{
+    switch (mode->kind) {
+    case RENAME_QUASIQUOTED:
+        return rename_template_vars_quasiquote(tmpl, rename_map, mode->depth);
+    case RENAME_SHADOWED_HEADS:
+        return rename_template_vars_shadowed_heads(tmpl, rename_map,
+                                                   mode->quote_shadowed,
+                                                   mode->quasiquote_shadowed);
+    default:
+        return rename_template_vars(tmpl, rename_map);
+    }
+}
+
+static unsigned rename_template_atom(unsigned tmpl, unsigned rename_map)
+{
+    int64_t id = CELL_ID(tmpl);
+    for (unsigned m = rename_map; m; m = cdr(m)) {
+        unsigned entry = car(m);
+        if (IS_ATOM(car(entry)) && CELL_ID(car(entry)) == id)
+            return cdr(entry);
+    }
+    return tmpl;
+}
+
+// (head x . rest), rebuilt with x renamed in mode.
+static unsigned rename_template_cadr(unsigned tmpl, unsigned rename_map,
+                                     const rename_mode *mode)
+{
+    // The renaming allocates, and tmpl is read after it.
+    GC_GUARD;
+    gc_protect(&tmpl);
+    gc_protect(&rename_map);
+    unsigned new_body = rename_template_in_mode(cadr(tmpl), rename_map, mode);
+    if (new_body == TOK_ERROR)
+        return TOK_ERROR;
+    gc_protect(&new_body);
+    unsigned result_tail = alloc_cons(new_body, cddr(tmpl));
+    gc_protect(&result_tail);
+    return alloc_cons(car(tmpl), result_tail);
+}
+
+// True when next, a tail of a list being renamed in mode, has to be renamed
+// as a form of its own: its head is a keyword the mode treats specially.
+static bool rename_tail_is_form(unsigned next, const rename_mode *mode)
+{
+    if (!IS_ATOM(car(next)))
+        return false;
+    int64_t id = CELL_ID(car(next));
+    switch (mode->kind) {
+    case RENAME_QUASIQUOTED:
+        return id == ctx.kw_unquote || id == ctx.kw_unquote_splicing ||
+               id == ctx.kw_quasiquote;
+    case RENAME_SHADOWED_HEADS:
+        return id == ctx.kw_quote || id == ctx.kw_quasiquote ||
+               syntax_rules_form_like(next);
+    default:
+        return is_special_form(id);
+    }
+}
+
+// Rename each element of the list tmpl in mode, returning tmpl itself when
+// nothing changed. Templates may contain very wide flat forms; their cdr
+// spine is data, not structural nesting, so iterate over it rather than
+// consume a C stack frame per element.
+static unsigned rename_template_list(unsigned tmpl, unsigned rename_map,
+                                     const rename_mode *mode)
+{
+    GC_GUARD;
+    unsigned original = tmpl;
+    unsigned result = 0, result_tail = 0;
+    bool changed = false;
+    gc_protect(&tmpl);
+    gc_protect(&rename_map);
+    gc_protect(&original);
+    gc_protect(&result);
+    gc_protect(&result_tail);
+    for (;;) {
+        unsigned new_car =
+            rename_template_in_mode(car(tmpl), rename_map, mode);
+        if (new_car == TOK_ERROR)
+            return TOK_ERROR;
+        // Compare with the cell as it is now, not the car passed in: a
+        // collection in the call moves the original and can hand its old
+        // index to the renamed copy, which then looked unchanged and was
+        // dropped.
+        if (new_car != car(tmpl))
+            changed = true;
+        gc_protect(&new_car);
+        list_append(&result, &result_tail, new_car);
+        gc_unprotect(1);
+
+        unsigned next = cdr(tmpl);
+        if (!IS_PAIR(next) || rename_tail_is_form(next, mode)) {
+            unsigned new_tail = rename_template_in_mode(next, rename_map, mode);
+            if (new_tail == TOK_ERROR)
+                return TOK_ERROR;
+            if (new_tail != cdr(tmpl))
+                changed = true;
+            if (!changed)
+                return original;
+            if (new_tail)
+                cell_set_cdr(result_tail, new_tail);
+            return result;
+        }
+        tmpl = next;
+    }
+}
+
+// A vector with each element renamed in mode, or tmpl itself when nothing
+// changed.
+static unsigned rename_template_vector(unsigned tmpl, unsigned rename_map,
+                                       const rename_mode *mode)
+{
+    GC_GUARD;
+    unsigned len = vector_len(tmpl);
+    gc_protect(&tmpl);
+    gc_protect(&rename_map);
+    unsigned new_vec = make_vector(len, 0);
+    if (new_vec == TOK_ERROR)
+        return TOK_ERROR;
+    gc_protect(&new_vec);
+    bool changed = false;
+    for (unsigned i = 0; i < len; i++) {
+        unsigned old_elem = vector_data_ptr(tmpl)[i];
+        gc_protect(&old_elem);
+        unsigned new_elem = rename_template_in_mode(old_elem, rename_map, mode);
+        if (new_elem == TOK_ERROR)
+            return TOK_ERROR;
+        vector_set_elem(new_vec, i, new_elem);
+        if (new_elem != old_elem)
+            changed = true;
+        gc_unprotect(1);
+    }
+    return changed ? new_vec : tmpl;
+}
+
+// Rename quasiquoted data at the given depth: only unquoted parts are code.
 static unsigned rename_template_vars_quasiquote(unsigned tmpl,
                                                 unsigned rename_map,
                                                 unsigned depth)
@@ -1238,142 +1404,29 @@ static unsigned rename_template_vars_quasiquote(unsigned tmpl,
     if (!tmpl || !rename_map)
         return tmpl;
 
+    rename_mode mode = {RENAME_QUASIQUOTED, depth, false, false};
     if (IS_PAIR(tmpl)) {
         unsigned head = car(tmpl);
-        if (IS_ATOM(head)) {
+        if (IS_ATOM(head) && IS_PAIR(cdr(tmpl))) {
             int64_t head_id = CELL_ID(head);
-            if ((head_id == ctx.kw_unquote ||
-                 head_id == ctx.kw_unquote_splicing) &&
-                IS_PAIR(cdr(tmpl))) {
-                // The renaming allocates, and tmpl is read after it.
-                GC_GUARD;
-                gc_protect(&tmpl);
-                unsigned body = cadr(tmpl);
-                unsigned new_body;
-                if (depth == 1)
-                    new_body = rename_template_vars(body, rename_map);
-                else
-                    new_body = rename_template_vars_quasiquote(
-                        body, rename_map, depth - 1);
-                if (new_body == TOK_ERROR)
-                    return TOK_ERROR;
-                gc_protect(&new_body);
-                unsigned result_tail = alloc_cons(new_body, cddr(tmpl));
-                gc_protect(&result_tail);
-                return alloc_cons(car(tmpl), result_tail);
+            if (head_id == ctx.kw_unquote ||
+                head_id == ctx.kw_unquote_splicing) {
+                rename_mode inner = {RENAME_QUASIQUOTED, depth - 1, false,
+                                     false};
+                return rename_template_cadr(
+                    tmpl, rename_map, depth == 1 ? &rename_as_code : &inner);
             }
-            if (head_id == ctx.kw_quasiquote && IS_PAIR(cdr(tmpl))) {
-                GC_GUARD;
-                gc_protect(&tmpl);
-                unsigned new_body = rename_template_vars_quasiquote(
-                    cadr(tmpl), rename_map, depth + 1);
-                if (new_body == TOK_ERROR)
-                    return TOK_ERROR;
-                gc_protect(&new_body);
-                unsigned result_tail = alloc_cons(new_body, cddr(tmpl));
-                gc_protect(&result_tail);
-                return alloc_cons(car(tmpl), result_tail);
+            if (head_id == ctx.kw_quasiquote) {
+                rename_mode inner = {RENAME_QUASIQUOTED, depth + 1, false,
+                                     false};
+                return rename_template_cadr(tmpl, rename_map, &inner);
             }
         }
-
-        unsigned original = tmpl;
-        unsigned result = 0, result_tail = 0;
-        bool changed = false;
-        gc_protect(&tmpl);
-        gc_protect(&rename_map);
-        gc_protect(&original);
-        gc_protect(&result);
-        gc_protect(&result_tail);
-        for (;;) {
-            unsigned old_car = car(tmpl);
-            unsigned new_car =
-                rename_template_vars_quasiquote(old_car, rename_map, depth);
-            if (new_car == TOK_ERROR) {
-                gc_unprotect(5);
-                return TOK_ERROR;
-            }
-            // Compare with the cell as it is now, not old_car: a collection
-            // in the call moves the original and can hand its old index to
-            // the renamed copy, which then looked unchanged and was dropped.
-            if (new_car != car(tmpl))
-                changed = true;
-            gc_protect(&new_car);
-            list_append(&result, &result_tail, new_car);
-            gc_unprotect(1);
-
-            unsigned next = cdr(tmpl);
-            if (!IS_PAIR(next)) {
-                unsigned new_tail =
-                    rename_template_vars_quasiquote(next, rename_map, depth);
-                if (new_tail == TOK_ERROR) {
-                    gc_unprotect(5);
-                    return TOK_ERROR;
-                }
-                if (new_tail != cdr(tmpl))
-                    changed = true;
-                if (!changed) {
-                    gc_unprotect(5);
-                    return original;
-                }
-                if (new_tail)
-                    cell_set_cdr(result_tail, new_tail);
-                gc_unprotect(5);
-                return result;
-            }
-            if (IS_ATOM(car(next))) {
-                int64_t next_id = CELL_ID(car(next));
-                if (next_id == ctx.kw_unquote ||
-                    next_id == ctx.kw_unquote_splicing ||
-                    next_id == ctx.kw_quasiquote) {
-                    unsigned new_tail = rename_template_vars_quasiquote(
-                        next, rename_map, depth);
-                    if (new_tail == TOK_ERROR) {
-                        gc_unprotect(5);
-                        return TOK_ERROR;
-                    }
-                    if (new_tail != cdr(tmpl))
-                        changed = true;
-                    if (!changed) {
-                        gc_unprotect(5);
-                        return original;
-                    }
-                    cell_set_cdr(result_tail, new_tail);
-                    gc_unprotect(5);
-                    return result;
-                }
-            }
-            tmpl = next;
-        }
+        return rename_template_list(tmpl, rename_map, &mode);
     }
 
-    if (IS_VECTOR(tmpl)) {
-        unsigned len = vector_len(tmpl);
-        gc_protect(&tmpl);
-        gc_protect(&rename_map);
-        unsigned new_vec = make_vector(len, 0);
-        if (new_vec == TOK_ERROR) {
-            gc_unprotect(2);
-            return TOK_ERROR;
-        }
-        gc_protect(&new_vec);
-        bool changed = false;
-        for (unsigned i = 0; i < len; i++) {
-            unsigned old_elem = vector_data_ptr(tmpl)[i];
-            gc_protect(&old_elem);
-            unsigned new_elem =
-                rename_template_vars_quasiquote(old_elem, rename_map, depth);
-            if (new_elem == TOK_ERROR) {
-                gc_unprotect(4);
-                return TOK_ERROR;
-            }
-            vector_set_elem(new_vec, i, new_elem);
-            if (new_elem != old_elem)
-                changed = true;
-            gc_unprotect(1);
-        }
-        gc_unprotect(3);
-        return changed ? new_vec : tmpl;
-    }
+    if (IS_VECTOR(tmpl))
+        return rename_template_vector(tmpl, rename_map, &mode);
 
     return tmpl;
 }
@@ -1453,11 +1506,6 @@ static unsigned rename_map_without_let_bounds(unsigned rename_map,
     return rename_map;
 }
 
-static unsigned rename_template_vars_shadowed_heads(unsigned tmpl,
-                                                    unsigned rename_map,
-                                                    bool quote_shadowed,
-                                                    bool quasiquote_shadowed);
-
 static unsigned rename_template_vars_lambda(unsigned tmpl, unsigned rename_map)
 {
     unsigned keyword = car(tmpl);
@@ -1489,6 +1537,52 @@ static unsigned rename_template_vars_lambda(unsigned tmpl, unsigned rename_map)
     return alloc_cons(keyword, result_tail);
 }
 
+// Rename the inits of a let-style binding list under *map, setting *changed
+// if any init changed. With sequential (let*), each variable is removed from
+// *map, for the inits after it, once its own init is renamed. map must point
+// at a rooted variable.
+static unsigned rename_let_bindings(unsigned binding_list, unsigned *map,
+                                    bool sequential, bool *changed)
+{
+    GC_GUARD;
+    gc_protect(&binding_list);
+    unsigned new_bindings = 0;
+    unsigned new_tail = 0;
+    gc_protect(&new_bindings);
+    gc_protect(&new_tail);
+
+    unsigned bl = binding_list;
+    gc_protect(&bl);
+    for (; IS_PAIR(bl); bl = cdr(bl)) {
+        unsigned binding = car(bl);
+        if (!let_binding_has_value(binding)) {
+            list_append(&new_bindings, &new_tail, binding);
+            continue;
+        }
+
+        unsigned var = car(binding);
+        unsigned val = cadr(binding);
+        gc_protect(&var);
+        gc_protect(&val);
+        unsigned new_val = rename_template_vars(val, *map);
+        if (new_val == TOK_ERROR)
+            return TOK_ERROR;
+        gc_protect(&new_val);
+        unsigned bind_tail = alloc_cons(new_val, 0);
+        gc_protect(&bind_tail);
+        unsigned new_binding = alloc_cons(var, bind_tail);
+        gc_protect(&new_binding);
+        list_append(&new_bindings, &new_tail, new_binding);
+        if (new_val != val)
+            *changed = true;
+        gc_unprotect(5);
+
+        if (sequential)
+            *map = rename_map_without_atom(*map, var);
+    }
+    return new_bindings;
+}
+
 static unsigned rename_template_vars_let(unsigned tmpl, unsigned rename_map,
                                          bool is_letstar, bool is_letrec)
 {
@@ -1508,50 +1602,20 @@ static unsigned rename_template_vars_let(unsigned tmpl, unsigned rename_map,
     if (!proper_list_silent(binding_list))
         return tmpl;
 
+    // let*'s and letrec's inits see (some of) the bindings: they use, and
+    // let* updates, body_map.
     unsigned body_map = rename_map;
     gc_protect(&body_map);
     if (is_letrec)
         body_map = rename_map_without_let_bounds(body_map, binding_list);
 
-    unsigned new_bindings = 0;
-    unsigned new_tail = 0;
-    gc_protect(&new_bindings);
-    gc_protect(&new_tail);
     bool changed = false;
-
-    unsigned bl = binding_list;
-    gc_protect(&bl);
-    for (; IS_PAIR(bl); bl = cdr(bl)) {
-        unsigned binding = car(bl);
-        if (!let_binding_has_value(binding)) {
-            list_append(&new_bindings, &new_tail, binding);
-            continue;
-        }
-
-        unsigned var = car(binding);
-        unsigned val = cadr(binding);
-        unsigned val_map = (is_letstar || is_letrec) ? body_map : rename_map;
-        gc_protect(&var);
-        gc_protect(&val);
-        gc_protect(&val_map);
-
-        unsigned new_val = rename_template_vars(val, val_map);
-        if (new_val == TOK_ERROR)
-            return TOK_ERROR;
-        gc_protect(&new_val);
-        unsigned bind_tail = alloc_cons(new_val, 0);
-        gc_protect(&bind_tail);
-        unsigned new_binding = alloc_cons(var, bind_tail);
-        gc_protect(&new_binding);
-        list_append(&new_bindings, &new_tail, new_binding);
-        if (new_val != val)
-            changed = true;
-        gc_unprotect(6);
-
-        if (is_letstar && !is_letrec)
-            body_map = rename_map_without_atom(body_map, var);
-    }
-    gc_unprotect(1);
+    unsigned new_bindings = rename_let_bindings(
+        binding_list, (is_letstar || is_letrec) ? &body_map : &rename_map,
+        is_letstar && !is_letrec, &changed);
+    if (new_bindings == TOK_ERROR)
+        return TOK_ERROR;
+    gc_protect(&new_bindings);
 
     if (!is_letstar && !is_letrec)
         body_map = rename_map_without_let_bounds(body_map, binding_list);
@@ -1600,39 +1664,12 @@ static unsigned rename_template_vars_named_let(unsigned tmpl,
     if (!proper_list_silent(binding_list))
         return tmpl;
 
-    unsigned new_bindings = 0;
-    unsigned new_tail = 0;
-    gc_protect(&new_bindings);
-    gc_protect(&new_tail);
     bool changed = false;
-
-    unsigned bl = binding_list;
-    gc_protect(&bl);
-    for (; IS_PAIR(bl); bl = cdr(bl)) {
-        unsigned binding = car(bl);
-        if (!let_binding_has_value(binding)) {
-            list_append(&new_bindings, &new_tail, binding);
-            continue;
-        }
-
-        unsigned var = car(binding);
-        unsigned val = cadr(binding);
-        gc_protect(&var);
-        gc_protect(&val);
-        unsigned new_val = rename_template_vars(val, rename_map);
-        if (new_val == TOK_ERROR)
-            return TOK_ERROR;
-        gc_protect(&new_val);
-        unsigned bind_tail = alloc_cons(new_val, 0);
-        gc_protect(&bind_tail);
-        unsigned new_binding = alloc_cons(var, bind_tail);
-        gc_protect(&new_binding);
-        list_append(&new_bindings, &new_tail, new_binding);
-        if (new_val != val)
-            changed = true;
-        gc_unprotect(5);
-    }
-    gc_unprotect(1);
+    unsigned new_bindings =
+        rename_let_bindings(binding_list, &rename_map, false, &changed);
+    if (new_bindings == TOK_ERROR)
+        return TOK_ERROR;
+    gc_protect(&new_bindings);
 
     unsigned body_map = rename_map_without_atom(rename_map, name);
     gc_protect(&body_map);
@@ -1659,15 +1696,8 @@ static unsigned rename_template_vars(unsigned tmpl, unsigned rename_map)
     if (!tmpl || !rename_map)
         return tmpl;
 
-    if (IS_ATOM(tmpl)) {
-        int64_t id = CELL_ID(tmpl);
-        for (unsigned m = rename_map; m; m = cdr(m)) {
-            unsigned entry = car(m);
-            if (IS_ATOM(car(entry)) && CELL_ID(car(entry)) == id)
-                return cdr(entry);
-        }
-        return tmpl;
-    }
+    if (IS_ATOM(tmpl))
+        return rename_template_atom(tmpl, rename_map);
 
     if (IS_PAIR(tmpl)) {
         bool head_is_alias = false;
@@ -1681,23 +1711,9 @@ static unsigned rename_template_vars(unsigned tmpl, unsigned rename_map)
         if (syntax_rules_form_like(tmpl) && !head_is_alias)
             return tmpl;
         if (IS_ATOM(car(tmpl)) && CELL_ID(car(tmpl)) == ctx.kw_quasiquote &&
-            IS_PAIR(cdr(tmpl)) && !head_is_alias) {
-            // rename_template_vars_quasiquote allocates, and car(tmpl) /
-            // cddr(tmpl) are read after it returns, so tmpl has to survive
-            // the call. GC_GUARD releases these on every exit, replacing the
-            // manual unprotect below.
-            GC_GUARD;
-            gc_protect(&tmpl);
-            gc_protect(&rename_map);
-            unsigned new_body =
-                rename_template_vars_quasiquote(cadr(tmpl), rename_map, 1);
-            if (new_body == TOK_ERROR)
-                return TOK_ERROR;
-            gc_protect(&new_body);
-            unsigned result_tail = alloc_cons(new_body, cddr(tmpl));
-            gc_protect(&result_tail);
-            return alloc_cons(car(tmpl), result_tail);
-        }
+            IS_PAIR(cdr(tmpl)) && !head_is_alias)
+            return rename_template_cadr(tmpl, rename_map,
+                                        &rename_as_quasiquoted);
         if (IS_ATOM(car(tmpl)) && CELL_ID(car(tmpl)) == ctx.kw_lambda &&
             IS_PAIR(cdr(tmpl)) && IS_PAIR(cddr(tmpl)) && !head_is_alias) {
             return rename_template_vars_lambda(tmpl, rename_map);
@@ -1746,66 +1762,7 @@ static unsigned rename_template_vars(unsigned tmpl, unsigned rename_map)
             }
             return out;
         }
-        unsigned original = tmpl;
-        unsigned result = 0, result_tail = 0;
-        bool changed = false;
-        gc_protect(&tmpl);
-        gc_protect(&rename_map);
-        gc_protect(&original);
-        gc_protect(&result);
-        gc_protect(&result_tail);
-        for (;;) {
-            unsigned old_car = car(tmpl);
-            unsigned new_car = rename_template_vars(old_car, rename_map);
-            if (new_car == TOK_ERROR) {
-                gc_unprotect(5);
-                return TOK_ERROR;
-            }
-            // Compare with the cell as it is now, not old_car: a collection
-            // in the call moves the original and can hand its old index to
-            // the renamed copy, which then looked unchanged and was dropped.
-            if (new_car != car(tmpl))
-                changed = true;
-            gc_protect(&new_car);
-            list_append(&result, &result_tail, new_car);
-            gc_unprotect(1);
-
-            unsigned next = cdr(tmpl);
-            if (!IS_PAIR(next)) {
-                unsigned new_tail = rename_template_vars(next, rename_map);
-                if (new_tail == TOK_ERROR) {
-                    gc_unprotect(5);
-                    return TOK_ERROR;
-                }
-                if (new_tail != cdr(tmpl))
-                    changed = true;
-                if (!changed) {
-                    gc_unprotect(5);
-                    return original;
-                }
-                if (new_tail)
-                    cell_set_cdr(result_tail, new_tail);
-                gc_unprotect(5);
-                return result;
-            }
-            if (IS_ATOM(car(next)) && is_special_form(CELL_ID(car(next)))) {
-                unsigned new_tail = rename_template_vars(next, rename_map);
-                if (new_tail == TOK_ERROR) {
-                    gc_unprotect(5);
-                    return TOK_ERROR;
-                }
-                if (new_tail != cdr(tmpl))
-                    changed = true;
-                if (!changed) {
-                    gc_unprotect(5);
-                    return original;
-                }
-                cell_set_cdr(result_tail, new_tail);
-                gc_unprotect(5);
-                return result;
-            }
-            tmpl = next;
-        }
+        return rename_template_list(tmpl, rename_map, &rename_as_code);
     }
 
     // A vector is self-evaluating data: an alias inside one would be read
@@ -1821,16 +1778,11 @@ static unsigned rename_template_vars_shadowed_heads(unsigned tmpl,
     if (!tmpl || !rename_map)
         return tmpl;
 
-    if (IS_ATOM(tmpl)) {
-        int64_t id = CELL_ID(tmpl);
-        for (unsigned m = rename_map; m; m = cdr(m)) {
-            unsigned entry = car(m);
-            if (IS_ATOM(car(entry)) && CELL_ID(car(entry)) == id)
-                return cdr(entry);
-        }
-        return tmpl;
-    }
+    if (IS_ATOM(tmpl))
+        return rename_template_atom(tmpl, rename_map);
 
+    rename_mode mode = {RENAME_SHADOWED_HEADS, 0, quote_shadowed,
+                        quasiquote_shadowed};
     if (IS_PAIR(tmpl)) {
         bool head_is_alias = false;
         if (IS_ATOM(car(tmpl)))
@@ -1842,122 +1794,14 @@ static unsigned rename_template_vars_shadowed_heads(unsigned tmpl,
             !quote_shadowed && !head_is_alias)
             return tmpl;
         if (IS_ATOM(car(tmpl)) && CELL_ID(car(tmpl)) == ctx.kw_quasiquote &&
-            IS_PAIR(cdr(tmpl)) && !quasiquote_shadowed && !head_is_alias) {
-            // rename_template_vars_quasiquote allocates, and car(tmpl) /
-            // cddr(tmpl) are read after it returns, so tmpl has to survive
-            // the call. GC_GUARD releases these on every exit, replacing the
-            // manual unprotect below.
-            GC_GUARD;
-            gc_protect(&tmpl);
-            gc_protect(&rename_map);
-            unsigned new_body =
-                rename_template_vars_quasiquote(cadr(tmpl), rename_map, 1);
-            if (new_body == TOK_ERROR)
-                return TOK_ERROR;
-            gc_protect(&new_body);
-            unsigned result_tail = alloc_cons(new_body, cddr(tmpl));
-            gc_protect(&result_tail);
-            return alloc_cons(car(tmpl), result_tail);
-        }
-
-        unsigned original = tmpl;
-        unsigned result = 0, result_tail = 0;
-        bool changed = false;
-        gc_protect(&tmpl);
-        gc_protect(&rename_map);
-        gc_protect(&original);
-        gc_protect(&result);
-        gc_protect(&result_tail);
-        for (;;) {
-            unsigned old_car = car(tmpl);
-            unsigned new_car = rename_template_vars_shadowed_heads(
-                old_car, rename_map, quote_shadowed, quasiquote_shadowed);
-            if (new_car == TOK_ERROR) {
-                gc_unprotect(5);
-                return TOK_ERROR;
-            }
-            // Compare with the cell as it is now, not old_car: a collection
-            // in the call moves the original and can hand its old index to
-            // the renamed copy, which then looked unchanged and was dropped.
-            if (new_car != car(tmpl))
-                changed = true;
-            gc_protect(&new_car);
-            list_append(&result, &result_tail, new_car);
-            gc_unprotect(1);
-
-            unsigned next = cdr(tmpl);
-            if (!IS_PAIR(next)) {
-                unsigned new_tail = rename_template_vars_shadowed_heads(
-                    next, rename_map, quote_shadowed, quasiquote_shadowed);
-                if (new_tail == TOK_ERROR) {
-                    gc_unprotect(5);
-                    return TOK_ERROR;
-                }
-                if (new_tail != cdr(tmpl))
-                    changed = true;
-                if (!changed) {
-                    gc_unprotect(5);
-                    return original;
-                }
-                if (new_tail)
-                    cell_set_cdr(result_tail, new_tail);
-                gc_unprotect(5);
-                return result;
-            }
-            if (IS_ATOM(car(next))) {
-                int64_t next_id = CELL_ID(car(next));
-                if (next_id == ctx.kw_quote || next_id == ctx.kw_quasiquote ||
-                    syntax_rules_form_like(next)) {
-                    unsigned new_tail = rename_template_vars_shadowed_heads(
-                        next, rename_map, quote_shadowed,
-                        quasiquote_shadowed);
-                    if (new_tail == TOK_ERROR) {
-                        gc_unprotect(5);
-                        return TOK_ERROR;
-                    }
-                    if (new_tail != cdr(tmpl))
-                        changed = true;
-                    if (!changed) {
-                        gc_unprotect(5);
-                        return original;
-                    }
-                    cell_set_cdr(result_tail, new_tail);
-                    gc_unprotect(5);
-                    return result;
-                }
-            }
-            tmpl = next;
-        }
+            IS_PAIR(cdr(tmpl)) && !quasiquote_shadowed && !head_is_alias)
+            return rename_template_cadr(tmpl, rename_map,
+                                        &rename_as_quasiquoted);
+        return rename_template_list(tmpl, rename_map, &mode);
     }
 
-    if (IS_VECTOR(tmpl)) {
-        unsigned len = vector_len(tmpl);
-        gc_protect(&tmpl);
-        gc_protect(&rename_map);
-        unsigned new_vec = make_vector(len, 0);
-        if (new_vec == TOK_ERROR) {
-            gc_unprotect(2);
-            return TOK_ERROR;
-        }
-        gc_protect(&new_vec);
-        bool changed = false;
-        for (unsigned i = 0; i < len; i++) {
-            unsigned old_elem = vector_data_ptr(tmpl)[i];
-            gc_protect(&old_elem);
-            unsigned new_elem = rename_template_vars_shadowed_heads(
-                old_elem, rename_map, quote_shadowed, quasiquote_shadowed);
-            if (new_elem == TOK_ERROR) {
-                gc_unprotect(4);
-                return TOK_ERROR;
-            }
-            vector_set_elem(new_vec, i, new_elem);
-            if (new_elem != old_elem)
-                changed = true;
-            gc_unprotect(1);
-        }
-        gc_unprotect(3);
-        return changed ? new_vec : tmpl;
-    }
+    if (IS_VECTOR(tmpl))
+        return rename_template_vector(tmpl, rename_map, &mode);
 
     return tmpl;
 }
