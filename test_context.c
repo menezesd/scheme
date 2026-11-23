@@ -1676,6 +1676,25 @@ TEST(code_sweep_ignores_unregistered_closure_pointer)
     PASS();
 }
 
+// The sweep frees a dead code object without code_unregister. Its address
+// must leave every membership cache, the recently-confirmed table included:
+// malloc reuses addresses, and a new code object allocated there that still
+// looked registered would never be added to the registry, so the collector
+// would never trace its constants. (The pointer is only compared below.)
+TEST(code_sweep_forgets_a_swept_object_it_had_confirmed)
+{
+    code_object *dead = code_new();
+    ASSERT(dead != NULL);
+    ASSERT(code_object_is_registered(dead)); // now a recent confirmation
+    ASSERT(code_object_is_registered(dead));
+    uintptr_t dead_addr = (uintptr_t)dead;
+
+    gc_sweep_code_objects();
+
+    ASSERT(!code_object_is_registered((const code_object *)dead_addr));
+    PASS();
+}
+
 TEST(code_sweep_ignores_unregistered_vm_continuation_pointer)
 {
     code_object *unreferenced = code_new();
@@ -4898,6 +4917,7 @@ int main(void)
     RUN_TEST(code_free_preserves_shared_child);
     RUN_TEST(code_sweep_marks_vm_continuation_code);
     RUN_TEST(code_sweep_ignores_unregistered_closure_pointer);
+    RUN_TEST(code_sweep_forgets_a_swept_object_it_had_confirmed);
     RUN_TEST(code_sweep_ignores_unregistered_vm_continuation_pointer);
     RUN_TEST(gc_ignores_unregistered_vm_continuation_payload);
     RUN_TEST(pattern_sweep_ignores_unregistered_pattern_pointer);

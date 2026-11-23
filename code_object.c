@@ -133,8 +133,22 @@ static void code_set_add(code_object *code)
     code_set_used++;
 }
 
+// Every call into a closure confirms its code object is registered. Most
+// calls go to a few code objects at a time, so a small direct-mapped table of
+// recently confirmed members answers them without probing the full set, which
+// is large enough to live outside the first-level cache. An object leaves it
+// with the set, here - on code_unregister and on the sweep, which frees
+// without unregistering. A swept address left in it would make the next
+// code object malloc puts there look registered, so code_register would
+// never add it and the collector would never trace its constants.
+#define CODE_RECENT_SLOTS 64
+static const code_object *code_recent[CODE_RECENT_SLOTS];
+
 static void code_set_remove(const code_object *code)
 {
+    size_t recent = code_set_start(CODE_RECENT_SLOTS, code);
+    if (code_recent[recent] == code)
+        code_recent[recent] = NULL;
     if (!code_set_cap)
         return;
     size_t i = code_set_slot_find(code_set, code_set_cap, code);
@@ -162,19 +176,8 @@ void code_register(code_object *code)
     code_objects_since_sweep++;
 }
 
-// Every call into a closure confirms its code object is registered. Most
-// calls go to a few code objects at a time, so a small direct-mapped table of
-// recently confirmed members answers them without probing the full set, which
-// is large enough to live outside the first-level cache. An object leaves it
-// when it leaves the registry.
-#define CODE_RECENT_SLOTS 64
-static const code_object *code_recent[CODE_RECENT_SLOTS];
-
 static void code_unregister(code_object *code)
 {
-    size_t recent = code_set_start(CODE_RECENT_SLOTS, code);
-    if (code_recent[recent] == code)
-        code_recent[recent] = NULL;
     code_object **prev = &code_object_registry;
     while (*prev) {
         if (*prev == code) {
