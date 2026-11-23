@@ -37,6 +37,7 @@ make test-prop # Run the property tests (property_tests.scm)
 make test-r5rs # Run the R5RS conformance tests in both engines
 make test-stress # Run the stress tests (stress_tests.scm)
 make test-repl-exit # Check REPL exit codes and input handling in both engines
+make test-backtrace # Check the backtraces of unhandled errors in both engines
 make test-lineedit # Drive the REPL's line editor through a pseudo-terminal
 make test-fuzz # Differential fuzzing: random programs must print the same in both engines
 make lint     # GC-safety lint of the C sources (tools/lint_gc.py)
@@ -142,6 +143,35 @@ interpreter (useful for debugging), use:
 ```bash
 ./vesper --interpreter script.scm
 ```
+
+### Errors and Debugging
+
+An error that no handler takes is reported as `Unhandled exception: ...`,
+followed by a backtrace, innermost call first, with each procedure named by
+its definition and source line; repeated frames of one procedure are folded
+into one line:
+
+```
+Unhandled exception: car: not a pair
+  in (fact n) at fact.scm:1
+  ... 3 more frames in (fact n)
+  in <top-level> at fact.scm:2
+```
+
+Proper tail calls leave no frame behind, and the interpreter reconstructs
+its frames from the continuation, so its backtraces can be shorter. An error
+that a `guard` or `with-exception-handler` catches prints nothing. Reading a
+`letrec`, `letrec*`, named-`let` or internal-definition variable before its
+initializer has run is the error `Unassigned variable: NAME`, as in MIT
+Scheme.
+
+Procedures print as MIT's do: `#[compound-procedure 12 fact]`,
+`#[compound-procedure 13]` for an anonymous one, `#[compiled-procedure 17
+("car") car]` for a built-in, `#[continuation 14]`. MIT's debugging aids are
+available: `pp` pretty-prints data, `(trace fact)` and
+`untrace` (also `trace-entry`, `trace-exit`) report each call and return,
+`procedure-arity` returns `(min . max)` with `#f` for no maximum, and
+`runtime`, `real-time` and `with-timings` time a computation.
 
 ## Language Features
 
