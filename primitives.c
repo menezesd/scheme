@@ -3356,13 +3356,13 @@ unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
     }
 
     // Nothing can collect under a primitive that never allocates, so its
-    // arguments need no roots.
-    if (info->flags & PRIM_NO_ALLOC)
-        return dispatch_primitive(prim_id, argc, argv);
-
+    // arguments need no roots. The dispatch switch has this one call, so
+    // that it is inlined here.
     GC_GUARD;
-    for (unsigned i = 0; i < argc; i++)
-        gc_protect(&argv[i]);
+    if (!(info->flags & PRIM_NO_ALLOC)) {
+        for (unsigned i = 0; i < argc; i++)
+            gc_protect(&argv[i]);
+    }
     return dispatch_primitive(prim_id, argc, argv);
 }
 
