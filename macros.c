@@ -5622,6 +5622,9 @@ static unsigned macro_identifier_replacement(proc_expansion *st,
     gc_protect(&replacement);
     unsigned closure_val = lookup_silent(id, st->closure_env);
     gc_protect(&closure_val);
+    unsigned target = 0, entry = 0;
+    gc_protect(&target);
+    gc_protect(&entry);
     int core = closure_val == TOK_ERROR && !atom_is_core_alias(id)
                    ? atom_core_form(id)
                    : CF_NONE;
@@ -5641,13 +5644,11 @@ static unsigned macro_identifier_replacement(proc_expansion *st,
     } else if (closure_val != TOK_ERROR) {
         replacement = do_gensym();
         macros_note_alias(CELL_ID(replacement), id, IS_SYNTAX(closure_val));
-        unsigned target = closure_val;
-        gc_protect(&target);
+        target = closure_val;
         unsigned cell = env_find_binding_cell(id, st->closure_env);
         if (cell)
             target = make_binding_ref_cell(atom, cell);
-        unsigned entry = alloc_cons(replacement, target);
-        gc_protect(&entry);
+        entry = alloc_cons(replacement, target);
         st->produced = alloc_cons(entry, st->produced);
     } else if (collides || bound_for_hygiene(id, st->use_env)) {
         // Free where the macro was defined but bound, or spelled like one
