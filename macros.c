@@ -3506,10 +3506,8 @@ static unsigned hygienize_template(unsigned tmpl, unsigned bindings)
     gc_protect(&bindings);
 
     // Atoms don't need hygienization (they're handled by syntax_expand)
-    if (IS_ATOM(tmpl)) {
-        gc_unprotect(2);
+    if (IS_ATOM(tmpl))
         return tmpl;
-    }
 
     if (IS_PAIR(tmpl)) {
         unsigned head = car(tmpl);
@@ -3517,10 +3515,8 @@ static unsigned hygienize_template(unsigned tmpl, unsigned bindings)
         // Check for protected wrapper: (##protected## . identifier)
         // These come from pattern variable substitution and should not be
         // renamed
-        if (IS_ATOM(head) && CELL_ID(head) == ctx.kw_protected) {
-            gc_unprotect(2);
+        if (IS_ATOM(head) && CELL_ID(head) == ctx.kw_protected)
             return tmpl; // Return protected wrapper unchanged
-        }
 
         // Check for binding forms, whose head the free-identifier rename
         // may have replaced by a core alias or a syntax alias.
@@ -3536,21 +3532,17 @@ static unsigned hygienize_template(unsigned tmpl, unsigned bindings)
                 if (head_id == ctx.kw_let && IS_ATOM(second)) {
                     if (!IS_PAIR(cddr(tmpl)))
                         return tmpl;
-                    gc_unprotect(2);
                     return hygienize_named_let(tmpl, bindings);
                 }
                 if (IS_PAIR(cddr(tmpl)) &&
-                    (!second || (IS_PAIR(second) && IS_PAIR(car(second))))) {
-                    gc_unprotect(2);
+                    (!second || (IS_PAIR(second) && IS_PAIR(car(second)))))
                     return head_id == ctx.kw_letstar
                                ? hygienize_letstar(tmpl, bindings)
                                : hygienize_let(tmpl, bindings, false);
-                }
             }
             if (head_id == ctx.kw_letrec) {
                 if (!IS_PAIR(cdr(tmpl)) || !IS_PAIR(cddr(tmpl)))
                     return tmpl;
-                gc_unprotect(2);
                 return hygienize_let(tmpl, bindings, true);
             }
 
@@ -3558,42 +3550,32 @@ static unsigned hygienize_template(unsigned tmpl, unsigned bindings)
             if (head_id == ctx.kw_lambda) {
                 if (!IS_PAIR(cdr(tmpl)) || !IS_PAIR(cddr(tmpl)))
                     return tmpl;
-                gc_unprotect(2);
                 return hygienize_lambda(tmpl, bindings);
             }
 
             if (head_id == ctx.kw_define) {
                 if (!IS_PAIR(cdr(tmpl)))
                     return tmpl;
-                gc_unprotect(2);
                 return hygienize_define(tmpl, bindings);
             }
 
-            if (head_id == ctx.kw_begin) {
-                gc_unprotect(2);
+            if (head_id == ctx.kw_begin)
                 return hygienize_begin(tmpl, bindings);
-            }
 
             // Skip syntax-rules - they have their own patterns/templates
             // that will be hygienized when expanded
-            if (syntax_rules_form_like(tmpl)) {
-                gc_unprotect(2);
+            if (syntax_rules_form_like(tmpl))
                 return tmpl;
-            }
 
             if (head_id == ctx.kw_quasiquote && IS_PAIR(cdr(tmpl))) {
                 unsigned new_body = hygienize_quasiquote(cadr(tmpl), bindings,
                                                          1);
-                if (new_body == TOK_ERROR) {
-                    gc_unprotect(2);
+                if (new_body == TOK_ERROR)
                     return TOK_ERROR;
-                }
                 gc_protect(&new_body);
                 unsigned result_tail = alloc_cons(new_body, cddr(tmpl));
                 gc_protect(&result_tail);
-                unsigned result = alloc_cons(head, result_tail);
-                gc_unprotect(4);
-                return result;
+                return alloc_cons(car(tmpl), result_tail);
             }
 
             // For let-syntax/letrec-syntax, hygienize the body but not the
@@ -3609,17 +3591,12 @@ static unsigned hygienize_template(unsigned tmpl, unsigned bindings)
                 gc_protect(&syn_body);
                 // Only hygienize the body, not the transformer bindings
                 unsigned new_body = hygienize_template(syn_body, bindings);
-                if (new_body == TOK_ERROR) {
-                    gc_unprotect(4);
+                if (new_body == TOK_ERROR)
                     return TOK_ERROR;
-                }
                 gc_protect(&new_body);
                 unsigned result_tail = alloc_cons(syn_bindings, new_body);
                 gc_protect(&result_tail);
-                unsigned result = alloc_cons(head, result_tail);
-                gc_unprotect(
-                    6); // result_tail, new_body, syn_body, syn_bindings, tmpl, bindings
-                return result;
+                return alloc_cons(car(tmpl), result_tail);
             }
         }
 
@@ -3631,10 +3608,8 @@ static unsigned hygienize_template(unsigned tmpl, unsigned bindings)
         gc_protect(&result_tail);
         for (;;) {
             unsigned new_car = hygienize_template(car(tmpl), bindings);
-            if (new_car == TOK_ERROR) {
-                gc_unprotect(4);
+            if (new_car == TOK_ERROR)
                 return TOK_ERROR;
-            }
             gc_protect(&new_car);
             list_append(&result, &result_tail, new_car);
             gc_unprotect(1);
@@ -3643,13 +3618,10 @@ static unsigned hygienize_template(unsigned tmpl, unsigned bindings)
             if (!IS_PAIR(next)) {
                 if (next) {
                     unsigned new_tail = hygienize_template(next, bindings);
-                    if (new_tail == TOK_ERROR) {
-                        gc_unprotect(4);
+                    if (new_tail == TOK_ERROR)
                         return TOK_ERROR;
-                    }
                     cell_set_cdr(result_tail, new_tail);
                 }
-                gc_unprotect(4);
                 return result;
             }
 
@@ -3657,12 +3629,9 @@ static unsigned hygienize_template(unsigned tmpl, unsigned bindings)
             // to begin a new syntactic form rather than being list data.
             if (IS_ATOM(car(next)) && is_special_form(CELL_ID(car(next)))) {
                 unsigned new_tail = hygienize_template(next, bindings);
-                if (new_tail == TOK_ERROR) {
-                    gc_unprotect(4);
+                if (new_tail == TOK_ERROR)
                     return TOK_ERROR;
-                }
                 cell_set_cdr(result_tail, new_tail);
-                gc_unprotect(4);
                 return result;
             }
             tmpl = next;
@@ -3679,45 +3648,35 @@ static unsigned hygienize_template(unsigned tmpl, unsigned bindings)
             unsigned orig = data[i];
             gc_protect(&orig);
             unsigned h = hygienize_template(orig, bindings);
-            if (h == TOK_ERROR) {
-                gc_unprotect(3);
+            if (h == TOK_ERROR)
                 return TOK_ERROR;
-            }
             if (h != orig)
                 changed = true;
             gc_unprotect(1);
         }
 
-        if (!changed) {
-            gc_unprotect(2);
+        if (!changed)
             return tmpl;
-        }
 
         unsigned new_vec = make_vector(len, 0);
-        if (new_vec == TOK_ERROR) {
-            gc_unprotect(2);
+        if (new_vec == TOK_ERROR)
             return TOK_ERROR;
-        }
         gc_protect(&new_vec);
         for (unsigned i = 0; i < len; i++) {
             // Refresh data pointers - GC may have moved vectors
             unsigned *data = vector_data_ptr(tmpl);
             unsigned elem = data[i];
             unsigned hygienized = hygienize_template(elem, bindings);
-            if (hygienized == TOK_ERROR) {
-                gc_unprotect(3);
+            if (hygienized == TOK_ERROR)
                 return TOK_ERROR;
-            }
             // Through the write barrier: new_vec may have been promoted by a
             // collection during the recursive call, and a raw store would hide
             // this nursery element from the next minor GC.
             vector_set_elem(new_vec, i, hygienized);
         }
-        gc_unprotect(3);
         return new_vec;
     }
 
-    gc_unprotect(2);
     return tmpl;
 }
 
