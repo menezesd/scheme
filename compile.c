@@ -59,7 +59,7 @@ static bool compile_frame_binds(unsigned frame, int64_t var_id)
     return false;
 }
 
-// A let binding held in a stack slot (see compile_call's lambda inliner).
+// A let binding held in a stack slot (see compile_lambda_application).
 // frame_pos identifies the compile-env frame that binds it by its position,
 // the frame count of the environment with that frame on top: while the scope
 // is open the chain under it is fixed, so the position names exactly one
@@ -68,8 +68,7 @@ struct let_slot_binding {
     unsigned frame_pos;
     int64_t var_id;
     unsigned slot;
-    unsigned scope; // the scope's ordinal, for banning it after a problem
-    bool assigned;  // a set! reached it (the source scan predicted none)
+    bool assigned; // a set! reached it (the source scan predicted none)
 };
 
 // Resolve var_id to the stack slot holding it in this body, or -1 if it
@@ -156,7 +155,7 @@ static void let_scope_ban(compile_ctx *cctx, unsigned scope)
 }
 
 static bool let_binding_push(compile_ctx *cctx, unsigned frame_pos,
-                             int64_t var_id, unsigned slot, unsigned scope)
+                             int64_t var_id, unsigned slot)
 {
     if (cctx->let_binding_count == cctx->let_binding_cap) {
         unsigned cap = cctx->let_binding_cap ? cctx->let_binding_cap * 2 : 8;
@@ -168,7 +167,7 @@ static bool let_binding_push(compile_ctx *cctx, unsigned frame_pos,
         cctx->let_binding_cap = cap;
     }
     cctx->let_bindings[cctx->let_binding_count++] =
-        (struct let_slot_binding){frame_pos, var_id, slot, scope, false};
+        (struct let_slot_binding){frame_pos, var_id, slot, false};
     return true;
 }
 
@@ -354,9 +353,9 @@ static bool body_defines_internally(unsigned body, unsigned env)
 // is compiled, from the unexpanded source, so the walks below are
 // predictions. What makes them safe is the check of what was actually
 // emitted: locals_body_needs_environment and compile_set for parameters, and
-// the per-scope checks in compile_call for let slots. A prediction that
-// misses a capture or an assignment costs a recompile, never a wrong
-// answer; one that sees a capture where there is none costs the slot.
+// the per-scope checks in compile_lambda_application for let slots. A
+// prediction that misses a capture or an assignment costs a recompile, never
+// a wrong answer; one that sees a capture where there is none costs the slot.
 //
 // So the walks aim to be exact for the forms loops are made of - lambda,
 // define, the let family including named let, do, and immediately applied
@@ -3393,7 +3392,8 @@ static bool children_reach_symbol(const code_object *code,
 //   one - e.g. from a macro that expands into define or define-values;
 // - a closure created in the body that reaches a parameter by name would
 //   find an outer binding, since the parameter lives only in a stack slot.
-// compile_call checks each let scope that uses slots the same way.
+// compile_lambda_application checks each let scope that uses slots the same
+// way.
 static bool locals_body_needs_environment(const code_object *code,
                                           unsigned body_start,
                                           unsigned children_start,
@@ -5436,7 +5436,7 @@ static bool compile_lambda_application(unsigned fn_expr, unsigned args,
                                       cctx->env) &&
             !assigned_in_body(lambda_body, param_ids[k], cctx->env) &&
             let_binding_push(cctx, frame_pos, param_ids[k],
-                             cctx->let_slot_next, scope)) {
+                             cctx->let_slot_next)) {
             param_slots[k] = (int)cctx->let_slot_next++;
         } else {
             needs_frame = true;
