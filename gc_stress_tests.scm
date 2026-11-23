@@ -449,6 +449,31 @@
          (let ((r2 (gcs-sum '(1 2 3))))
            (set! + saved)
            (list r1 r2))))
+;; Let bindings in stack slots live on the VM stack between the parameters
+;; and the operands. A collection in the middle of a let body has to find and
+;; forward them like parameters, and a re-entered continuation restores them.
+(define (gc-ls-loop n)
+  (let loop ((i 0) (acc '()))
+    (if (= i n)
+        (reverse acc)
+        (let ((pair (cons i (* i i))) (tag (list 'x i)))
+          (gc-flip)
+          (let* ((sum (+ (car pair) (cdr pair))) (cell (list sum tag)))
+            (loop (+ i 1) (cons cell acc)))))))
+(check "let slots survive collections" '((0 (x 0)) (2 (x 1)) (6 (x 2)))
+       (gc-ls-loop 3))
+(define gc-ls-k #f)
+(define (gc-ls-reenter)
+  (let ((a (list 1 2)) (b (call/cc (lambda (k) (set! gc-ls-k k) 0))))
+    (gc-flip)
+    (cons b a)))
+(check "re-entered let body after collections" '((0 1 2) (1 1 2) (2 1 2))
+       (let ((n 0) (out '()))
+         (let ((v (gc-ls-reenter)))
+           (set! out (cons v out))
+           (set! n (+ n 1))
+           (if (< n 3) (gc-ls-k n))
+           (reverse out))))
 
 ;; (command-line) is the script's own view of its invocation - its name and
 ;; arguments - without vesper's options. make test-gcstress runs this file as

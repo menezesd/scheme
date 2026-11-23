@@ -7482,6 +7482,202 @@ TEST(trmc_unwinds_let_frames_before_the_loop_jump)
     PASS();
 }
 
+// The code object of the first lambda in a compiled top-level form, i.e.
+// the procedure a (define name (lambda ...)) makes.
+static const code_object *first_lambda(const code_object *code)
+{
+    return code && code->children_len > 0 ? code->children[0] : NULL;
+}
+
+TEST(let_slots_hold_inlined_lambda_bindings)
+{
+    unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
+    // An immediately applied lambda is what the stdlib's let and let* expand
+    // to (test_eval has no stdlib, so it is spelled out here). In a
+    // stack-local body its bindings take stack slots: the loop pushes no
+    // frame per iteration, and its self call stays a guarded jump.
+    const char *src =
+        "(define ls-sum (lambda (n)"
+        "  (letrec ((loop (lambda (i acc)"
+        "    (if (= i 0) acc"
+        "        ((lambda (sq d)"
+        "           ((lambda (a) (loop (- i 1) (+ acc a))) (+ sq d)))"
+        "         (* i i) (- i 1))))))"
+        "    (loop n 0))))";
+    code_object *code = trmc_compile(src, env);
+    const code_object *outer = first_lambda(code);
+    const code_object *loop = first_lambda(outer);
+    ASSERT(loop != NULL && loop->use_locals);
+    ASSERT(code_tree_has_opcode(loop, OP_RESERVE_LOCALS));
+    ASSERT(code_tree_has_opcode(loop, OP_LOCAL_SET_VOID));
+    ASSERT(code_tree_has_opcode(loop, OP_RECURSE));
+    ASSERT(!code_tree_has_opcode(loop, OP_PUSHENV));
+    ASSERT(!code_tree_has_opcode(loop, OP_DEFINE));
+    ASSERT(compiled_eval_string(src, env) != TOK_ERROR);
+    ASSERT(is_int(compiled_eval_string("(ls-sum 10)", env), 430));
+    // A body that needs no slot keeps no (empty) reservation.
+    code = trmc_compile("(define ls-plain (lambda (a b) (+ a b)))", env);
+    ASSERT(first_lambda(code) != NULL && first_lambda(code)->use_locals);
+    ASSERT(!code_tree_has_opcode(code, OP_RESERVE_LOCALS));
+    PASS();
+}
+
+TEST(let_slots_keep_captured_and_assigned_bindings_in_frames)
+{
+    unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
+    // A binding a closure captures needs a fresh frame per iteration, so
+    // each closure keeps its own; one that is assigned needs a frame so a
+    // re-entered continuation sees the assignment.
+    const char *thunks =
+        "(define ls-thunks (lambda (n)"
+        "  (letrec ((loop (lambda (i acc)"
+        "    (if (= i n) acc"
+        "        ((lambda (j) (loop (+ i 1) (cons (lambda () j) acc)))"
+        "         (* i 10))))))"
+        "    (loop 0 '()))))";
+    code_object *code = trmc_compile(thunks, env);
+    ASSERT(code_tree_has_opcode(first_lambda(first_lambda(code)), OP_PUSHENV));
+    ASSERT(compiled_eval_string(thunks, env) != TOK_ERROR);
+    ASSERT(is_int(compiled_eval_string("((car (ls-thunks 3)))", env), 20));
+    ASSERT(is_int(compiled_eval_string("((car (cdr (ls-thunks 3))))", env),
+                  10));
+
+    const char *assigned =
+        "(define ls-set (lambda (n) ((lambda (x) (set! x (+ x n)) x) n)))";
+    code = trmc_compile(assigned, env);
+    ASSERT(code_tree_has_opcode(first_lambda(code), OP_PUSHENV));
+    ASSERT(compiled_eval_string(assigned, env) != TOK_ERROR);
+    ASSERT(is_int(compiled_eval_string("(ls-set 4)", env), 8));
+    PASS();
+}
+
+TEST(assigned_bindings_see_assignments_after_reentry)
+{
+    unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
+    // A continuation copies the VM stack. Re-entering one would put an
+    // assigned stack slot back to its value at capture time, so an assigned
+    // parameter or let binding is kept in an environment frame, where the
+    // assignment persists: each re-entry increments the same location.
+    ASSERT(compiled_eval_string("(define ls-k #f)", env) != TOK_ERROR);
+    const char *param =
+        "(define ls-param (lambda (x)"
+        "  (call/cc (lambda (k) (set! ls-k k)))"
+        "  (set! x (+ x 1))"
+        "  x))";
+    code_object *code = trmc_compile(param, env);
+    ASSERT(first_lambda(code) != NULL && !first_lambda(code)->use_locals);
+    ASSERT(compiled_eval_string(param, env) != TOK_ERROR);
+    ASSERT(compiled_eval_string(
+               "(define ls-let (lambda (n)"
+               "  ((lambda (x)"
+               "     (call/cc (lambda (k) (set! ls-k k)))"
+               "     (set! x (+ x n))"
+               "     x)"
+               "   0)))",
+               env) != TOK_ERROR);
+    const char *drivers[] = {
+        "(let ((n 0) (out '()))"
+        "  (let ((v (ls-param 0)))"
+        "    (set! out (cons v out)) (set! n (+ n 1))"
+        "    (if (< n 3) (ls-k #f))"
+        "    out))",
+        "(let ((n 0) (out '()))"
+        "  (let ((v (ls-let 1)))"
+        "    (set! out (cons v out)) (set! n (+ n 1))"
+        "    (if (< n 3) (ls-k #f))"
+        "    out))",
+    };
+    for (unsigned i = 0; i < sizeof drivers / sizeof drivers[0]; i++) {
+        unsigned out = compiled_eval_string(drivers[i], env);
+        ASSERT(IS_PAIR(out) && is_int(car(out), 3));
+        ASSERT(IS_PAIR(cdr(out)) && is_int(car(cdr(out)), 2));
+        ASSERT(IS_PAIR(cddr(out)) && is_int(car(cddr(out)), 1));
+    }
+    PASS();
+}
+
+TEST(stack_locals_survive_macros_that_make_no_closure)
+{
+    unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
+    // A syntax-rules macro mentioning a parameter used to count as capturing
+    // it, which kept nearly every loop (the stdlib's do, when and let are
+    // macros) out of stack locals. Its templates decide now: one that makes
+    // no closure leaves the parameters in slots, one that does keeps them in
+    // a frame.
+    ASSERT(compiled_eval_string(
+               "(define-syntax ls-when"
+               "  (syntax-rules () ((_ c e ...) (if c (begin e ...) #f))))",
+               env) != TOK_ERROR);
+    ASSERT(compiled_eval_string(
+               "(define-syntax ls-thunk"
+               "  (syntax-rules () ((_ e) (lambda () e))))",
+               env) != TOK_ERROR);
+    const char *loop_src =
+        "(define ls-w (lambda (n)"
+        "  (letrec ((loop (lambda (i s)"
+        "    (if (= i n) s"
+        "        (begin (ls-when (< i 0) (car '()))"
+        "               (loop (+ i 1) (+ s i)))))))"
+        "    (loop 0 0))))";
+    code_object *code = trmc_compile(loop_src, env);
+    const code_object *loop = first_lambda(first_lambda(code));
+    ASSERT(loop != NULL && loop->use_locals);
+    ASSERT(code_tree_has_opcode(loop, OP_RECURSE));
+    ASSERT(compiled_eval_string(loop_src, env) != TOK_ERROR);
+    ASSERT(is_int(compiled_eval_string("(ls-w 10)", env), 45));
+
+    const char *thunk_src = "(define ls-th (lambda (x) (ls-thunk x)))";
+    code = trmc_compile(thunk_src, env);
+    ASSERT(first_lambda(code) != NULL && !first_lambda(code)->use_locals);
+    ASSERT(compiled_eval_string(thunk_src, env) != TOK_ERROR);
+    ASSERT(is_int(compiled_eval_string("((ls-th 3))", env), 3));
+    PASS();
+}
+
+TEST(let_slots_recompile_when_the_expansion_needs_a_frame)
+{
+    unsigned env = default_environment();
+    GC_GUARD;
+    gc_protect(&env);
+    // The slot decision is made from the unexpanded body. A macro the scan
+    // cannot see into - here one bound by let-syntax inside the body - can
+    // still close over the binding, and a global macro can expand into a
+    // definition, which needs a frame to land in. Either way the scope is
+    // compiled again with its frame.
+    const char *capture =
+        "(define ls-cap (lambda (n)"
+        "  ((lambda (x)"
+        "     (let-syntax ((th (syntax-rules () ((_ v) (lambda () v)))))"
+        "       (th x)))"
+        "   (* n 2))))";
+    ASSERT(compiled_eval_string(capture, env) != TOK_ERROR);
+    ASSERT(is_int(compiled_eval_string("((ls-cap 5))", env), 10));
+
+    ASSERT(compiled_eval_string(
+               "(define-syntax ls-def"
+               "  (syntax-rules () ((_ v e) (define v e))))",
+               env) != TOK_ERROR);
+    ASSERT(compiled_eval_string("(define ls-y 'global)", env) != TOK_ERROR);
+    const char *defines =
+        "(define ls-mdef (lambda (n)"
+        "  ((lambda () (ls-def ls-y (* n 3)) ls-y))))";
+    code_object *code = trmc_compile(defines, env);
+    ASSERT(code_tree_has_opcode(first_lambda(code), OP_PUSHENV));
+    ASSERT(compiled_eval_string(defines, env) != TOK_ERROR);
+    ASSERT(is_int(compiled_eval_string("(ls-mdef 2)", env), 6));
+    unsigned y = compiled_eval_string("ls-y", env);
+    ASSERT(IS_ATOM(y) && CELL_ID(y) == intern("global"));
+    PASS();
+}
+
 TEST(trmc_folds_string_append)
 {
     unsigned env = default_environment();
@@ -8487,6 +8683,11 @@ int main(void)
     RUN_TEST(trmc_declines_for_a_top_level_define);
     RUN_TEST(trmc_follows_cond_clauses);
     RUN_TEST(trmc_unwinds_let_frames_before_the_loop_jump);
+    RUN_TEST(let_slots_hold_inlined_lambda_bindings);
+    RUN_TEST(let_slots_keep_captured_and_assigned_bindings_in_frames);
+    RUN_TEST(assigned_bindings_see_assignments_after_reentry);
+    RUN_TEST(stack_locals_survive_macros_that_make_no_closure);
+    RUN_TEST(let_slots_recompile_when_the_expansion_needs_a_frame);
     RUN_TEST(trmc_folds_string_append);
     RUN_TEST(trmc_fold_mode_leaves_an_earlier_result_alone);
     RUN_TEST(trmc_transforms_append_over_a_self_tail_call);

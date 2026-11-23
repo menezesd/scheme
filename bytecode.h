@@ -190,6 +190,10 @@ enum opcode {
     OP_LOCAL_GET1,   // Push stack[bp + 1]
     OP_LOCAL_GET2,   // Push stack[bp + 2]
     OP_LOCAL_GET3,   // Push stack[bp + 3]
+    // RESERVE_LOCALS n: push n empty slots for let-bound stack locals. Sits
+    // at a stack-local body's loop entry point, after the parameters and any
+    // TRMC accumulator, so each iteration starts from cleared slots.
+    OP_RESERVE_LOCALS,
 
     // Quickened (type-specialized) opcodes — assume fixnum operands
     OP_ADD_INT,   // Fixnum add: skip type checks, deopt on non-fixnum
@@ -508,6 +512,27 @@ typedef struct compile_ctx {
     // (the frame count of the lambda's own environment). A name bound in any
     // frame pushed above it shadows the parameter, so it is not a stack local.
     unsigned locals_env_len;
+    // A set! reached a parameter slot that the source scan did not predict
+    // (a macro's expansion, say). compile_lambda then recompiles with the
+    // parameters in an environment frame: see compile_set.
+    bool locals_assigned;
+
+    // Let-bound stack locals: an inlined ((lambda ...) ...) - what let, let*
+    // and named let expand to - inside a stack-local body keeps its
+    // uncaptured, unassigned bindings in slots above the parameters instead
+    // of a fresh environment frame. See compile_call.
+    bool let_slots;              // this compile attempt may use them
+    unsigned let_slot_base;      // first let slot (after params and TRMC)
+    unsigned let_slot_next;      // next free slot
+    unsigned let_slot_max;       // high-water mark; RESERVE_LOCALS pushes it
+    struct let_slot_binding *let_bindings; // open slot bindings, innermost last
+    unsigned let_binding_count;
+    unsigned let_binding_cap;
+    unsigned let_scope_counter;  // inlined scopes seen in this attempt
+    unsigned *let_scope_bans;    // scopes a previous attempt found unsafe
+    unsigned let_scope_ban_count;
+    unsigned let_scope_ban_cap;
+    bool let_slot_retry;         // this attempt banned a scope: recompile
 } compile_ctx;
 
 // ============================================================================

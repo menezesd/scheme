@@ -58,36 +58,117 @@ static bool compile_frame_binds(unsigned frame, int64_t var_id)
     return false;
 }
 
-static int find_stack_local_slot(compile_ctx *cctx, int64_t var_id)
-{
-    if (cctx->num_locals <= 0)
-        return -1;
+// A let binding held in a stack slot (see compile_call's lambda inliner).
+// frame_pos identifies the compile-env frame that binds it by its position,
+// the frame count of the environment with that frame on top: while the scope
+// is open the chain under it is fixed, so the position names exactly one
+// frame, and nothing needs rooting.
+struct let_slot_binding {
+    unsigned frame_pos;
+    int64_t var_id;
+    unsigned slot;
+    unsigned scope; // the scope's ordinal, for banning it after a problem
+    bool assigned;  // a set! reached it (the source scan predicted none)
+};
 
-    int slot = -1;
-    for (int i = 0; i < cctx->num_locals; i++) {
-        if (cctx->local_ids[i] == var_id) {
-            slot = i;
-            break;
-        }
-    }
-    if (slot < 0)
-        return -1;
+// Resolve var_id to the stack slot holding it in this body, or -1 if it
+// lives in an environment. *binding_out (if given) receives the index of the
+// let-slot binding, or -1 for a parameter.
+static int resolve_stack_local(compile_ctx *cctx, int64_t var_id,
+                               int *binding_out)
+{
+    if (binding_out)
+        *binding_out = -1;
+    if (cctx->num_locals < 0)
+        return -1; // not a stack-local body
 
     // Every scope opened inside the body (letrec, internal defines, an
     // inlined lambda, ...) pushes a compile-env frame above the parameter
-    // frame. A binding of the same name in one of them shadows the
-    // parameter, and its value lives in that runtime frame, not the slot.
+    // frame. The innermost one binding the name decides: a let scope's frame
+    // may hold it in a slot, any other holds it in that runtime frame.
     unsigned len = 0;
     for (unsigned e = cctx->env; IS_PAIR(e); e = cdr(e))
         len++;
     unsigned e = cctx->env;
-    for (unsigned i = 0; len > cctx->locals_env_len &&
-                         i < len - cctx->locals_env_len && IS_PAIR(e);
-         i++, e = cdr(e)) {
-        if (compile_frame_binds(car(e), var_id))
-            return -1;
+    for (unsigned pos = len; pos > cctx->locals_env_len && IS_PAIR(e);
+         pos--, e = cdr(e)) {
+        if (!compile_frame_binds(car(e), var_id))
+            continue;
+        for (unsigned i = cctx->let_binding_count; i-- > 0;) {
+            struct let_slot_binding *b = &cctx->let_bindings[i];
+            if (b->frame_pos < pos)
+                break; // bindings are kept in nesting order
+            if (b->frame_pos == pos && b->var_id == var_id) {
+                if (binding_out)
+                    *binding_out = (int)i;
+                return (int)b->slot;
+            }
+        }
+        return -1;
     }
-    return slot;
+
+    for (int i = 0; i < cctx->num_locals; i++)
+        if (cctx->local_ids[i] == var_id)
+            return i;
+    return -1;
+}
+
+static int find_stack_local_slot(compile_ctx *cctx, int64_t var_id)
+{
+    return resolve_stack_local(cctx, var_id, NULL);
+}
+
+// Most let slots one body may use. A binding past it goes to an
+// environment frame, as all of them did before let slots.
+#define LET_SLOT_LIMIT 64
+
+static bool let_scope_banned(const compile_ctx *cctx, unsigned scope)
+{
+    for (unsigned i = 0; i < cctx->let_scope_ban_count; i++)
+        if (cctx->let_scope_bans[i] == scope)
+            return true;
+    return false;
+}
+
+// What was emitted for a let scope shows its bindings cannot all stay in
+// slots after all. Have compile_lambda compile the body again, with this
+// scope in an environment frame as before let slots.
+static void let_scope_ban(compile_ctx *cctx, unsigned scope)
+{
+    cctx->let_slot_retry = true;
+    if (let_scope_banned(cctx, scope))
+        return;
+    if (cctx->let_scope_ban_count == cctx->let_scope_ban_cap) {
+        unsigned cap = cctx->let_scope_ban_cap ? cctx->let_scope_ban_cap * 2
+                                               : 8;
+        unsigned *bans =
+            checked_realloc_array(cctx->let_scope_bans, cap, sizeof *bans);
+        if (!bans) {
+            // Cannot record it: no let slots at all on the next attempt.
+            cctx->let_slots = false;
+            return;
+        }
+        cctx->let_scope_bans = bans;
+        cctx->let_scope_ban_cap = cap;
+    }
+    cctx->let_scope_bans[cctx->let_scope_ban_count++] = scope;
+}
+
+static bool let_binding_push(compile_ctx *cctx, unsigned frame_pos,
+                             int64_t var_id, unsigned slot, unsigned scope)
+{
+    if (cctx->let_binding_count == cctx->let_binding_cap) {
+        unsigned cap = cctx->let_binding_cap ? cctx->let_binding_cap * 2 : 8;
+        struct let_slot_binding *bindings = checked_realloc_array(
+            cctx->let_bindings, cap, sizeof *bindings);
+        if (!bindings)
+            return false; // the binding stays in an environment frame
+        cctx->let_bindings = bindings;
+        cctx->let_binding_cap = cap;
+    }
+    cctx->let_bindings[cctx->let_binding_count++] =
+        (struct let_slot_binding){frame_pos, var_id, slot, scope, false};
+    return true;
 }
 
 static void emit_local_get_slot(compile_ctx *cctx, int slot)
@@ -257,77 +338,321 @@ static bool body_defines_internally(unsigned body, unsigned env)
     return false;
 }
 
-// Check if var_id is captured by an inner closure. Since this runs on
-// unexpanded source, we must check let/let*/letrec too (they expand
-// to lambdas via macros). This is conservative: a let that doesn't
-// actually escape will still disable locals. But it's safe and correct.
-static bool captured_by_inner_lambda(unsigned expr, int64_t var_id, unsigned env)
-{
-    // The spine is walked with this loop rather than by recursing on the cdr,
-    // which cost one C frame per list element: a lambda with a long flat body,
-    // or a macro that expands to one, overflowed the C stack here. Only the
-    // cars still recurse, so depth follows nesting rather than length.
-    for (;;) {
-        if (!expr || !IS_PAIR(expr))
-            return false;
-        if (!IS_ATOM(car(expr))) {
-            if (captured_by_inner_lambda(car(expr), var_id, env))
-                return true;
-            expr = cdr(expr);
-            continue;
-        }
+// ============================================================================
+// Capture and assignment prediction for stack locals
+// ============================================================================
+//
+// A binding can live in a VM stack slot only if no closure refers to it (a
+// closure reaches variables through its environment, and a slot is not in
+// one) and nothing assigns it (a continuation copies the stack, so a value
+// written after a capture would be lost when the capture is re-entered,
+// where an environment binding keeps it). Both are decided before the body
+// is compiled, from the unexpanded source, so the walks below are
+// predictions. What makes them safe is the check of what was actually
+// emitted: locals_body_needs_environment and compile_set for parameters, and
+// the per-scope checks in compile_call for let slots. A prediction that
+// misses a capture or an assignment costs a recompile, never a wrong
+// answer; one that sees a capture where there is none costs the slot.
+//
+// So the walks aim to be exact for the forms loops are made of - lambda,
+// define, the let family including named let, do, and immediately applied
+// lambdas, which compile_call inlines instead of closing over - whether
+// those are built in or the standard library's macros, and for any other
+// syntax-rules macro consult its templates instead of assuming the worst.
+// None of them allocates.
 
-        // Heads are compared as keywords with core aliases read as the
-        // keyword they stand for, but looked up as written: a core alias is
-        // the core form even where its name is rebound. Missing one here
-        // would leave a captured variable in a stack slot.
-        int64_t head_id = CELL_ID(car(expr));
-        int64_t kw = kw_canon(head_id);
-        unsigned binding = lookup_silent(head_id, env);
-        bool unbound = binding == TOK_ERROR;
-        if (kw == ctx.kw_quote && unbound)
+static bool body_captures(unsigned body, int64_t var_id, unsigned env);
+static bool formals_bind(unsigned formals, int64_t sym);
+
+// The standard library's do: not a core form, so it has no cached keyword.
+static int64_t do_keyword_id(void)
+{
+    static int64_t id = 0;
+    if (!id)
+        id = intern("do"); // the atom table only; no cell is allocated
+    return id;
+}
+
+// ((lambda formals body ...) arg ...) in a shape compile_call inlines: the
+// lambda never becomes a closure. Keep the arity test in step with the
+// inliner's can_inline; a disagreement is caught by the post-compile checks.
+static bool inlined_lambda_application(unsigned expr, unsigned env,
+                                       unsigned *formals_out,
+                                       unsigned *body_out)
+{
+    if (!IS_PAIR(expr) || !form_is_core(car(expr), ctx.kw_lambda, env))
+        return false;
+    unsigned fn = car(expr);
+    if (!IS_PAIR(cdr(fn)) || !IS_PAIR(cddr(fn)))
+        return false;
+    unsigned formals = cadr(fn);
+    unsigned param_count = 0;
+    bool has_rest = false;
+    for (unsigned p = formals; p; p = cdr(p)) {
+        if (!IS_PAIR(p)) {
+            if (!IS_ATOM(p))
+                return false;
+            has_rest = true;
+            break;
+        }
+        if (!IS_ATOM(car(p)))
             return false;
-        // A nested lambda captures this variable if its body refers to the
-        // outer binding. Check the full lambda form so shadowing parameters
-        // are handled by contains_reference.
-        if (kw == ctx.kw_lambda && unbound)
-            return contains_reference(expr, var_id);
-        // (define (name . formals) body ...) builds a closure without a
-        // literal lambda; treat it as (lambda formals body ...).
-        if (kw == ctx.kw_define && unbound &&
-            IS_PAIR(cdr(expr)) && IS_PAIR(cadr(expr))) {
-            for (unsigned p = cdr(cadr(expr)); p; p = IS_PAIR(p) ? cdr(p) : 0) {
-                if (IS_ATOM(p))
-                    return CELL_ID(p) == var_id ? false
-                                                : contains_reference(cddr(expr), var_id);
-                if (!IS_PAIR(p))
-                    break;
-                if (IS_ATOM(car(p)) && CELL_ID(car(p)) == var_id)
-                    return false; // shadowed by a formal
-            }
-            return contains_reference(cddr(expr), var_id);
-        }
-        // A named let built in (when let is not a macro) compiles its body
-        // as a closure, so any reference in the form counts.
-        if (kw == ctx.kw_let && unbound &&
-            IS_PAIR(cdr(expr)) && IS_ATOM(cadr(expr)) && cadr(expr))
-            return contains_reference(expr, var_id);
-        // let/let*/letrec binding initializers may create closures over this
-        // variable, so scan the whole form for nested lambdas. Direct
-        // references do not count as captures because atoms return false
-        // above.
-        if ((kw == ctx.kw_let || kw == ctx.kw_letstar ||
-             kw == ctx.kw_letrec) &&
-            unbound) {
-            expr = cdr(expr);
-            continue;
-        }
-        if (binding != TOK_ERROR && IS_SYNTAX(binding))
-            return contains_reference(expr, var_id);
-        if (captured_by_inner_lambda(car(expr), var_id, env))
-            return true;
-        expr = cdr(expr);
+        param_count++;
     }
+    unsigned arg_count = 0;
+    unsigned a = cdr(expr);
+    for (; IS_PAIR(a); a = cdr(a))
+        arg_count++;
+    if (a)
+        return false; // improper argument list
+    if (has_rest ? arg_count < param_count : arg_count != param_count)
+        return false;
+    *formals_out = formals;
+    *body_out = cddr(fn);
+    return true;
+}
+
+// Whether a syntax-rules template could expand to a closure (it uses lambda
+// or define, a named let, do, or another syntax-rules macro whose templates
+// could) or to an assignment (set!, directly or through another macro). A
+// macro already being scanned - a recursive one - adds nothing new and is
+// skipped; nesting deeper than the bound is assumed to. let, let* and letrec
+// are judged by their shape rather than by their own templates, which use
+// lambda for what compile_call inlines.
+#define TEMPLATE_SCAN_DEPTH 4
+
+enum template_scan_mode { SCAN_CLOSURE, SCAN_ASSIGN };
+
+static bool syntax_template_scan(unsigned transformer,
+                                 enum template_scan_mode mode,
+                                 const unsigned *visiting, int depth);
+
+static bool template_scan(unsigned tmpl, unsigned env,
+                          enum template_scan_mode mode,
+                          const unsigned *visiting, int depth)
+{
+    for (;;) {
+        if (IS_ATOM(tmpl)) {
+            int64_t id = CELL_ID(tmpl);
+            int64_t kw = kw_canon(id);
+            if (mode == SCAN_CLOSURE &&
+                (kw == ctx.kw_lambda || kw == ctx.kw_define ||
+                 id == do_keyword_id()))
+                return true;
+            if (mode == SCAN_ASSIGN && kw == ctx.kw_set)
+                return true;
+            if (kw == ctx.kw_let || kw == ctx.kw_letstar ||
+                kw == ctx.kw_letrec || kw == ctx.kw_quote)
+                return false;
+            unsigned binding = lookup_silent(id, env);
+            return binding != TOK_ERROR && IS_SYNTAX(binding) &&
+                   syntax_template_scan(binding, mode, visiting, depth);
+        }
+        if (!IS_PAIR(tmpl))
+            return false;
+        unsigned head = car(tmpl);
+        if (IS_ATOM(head)) {
+            int64_t kw = kw_canon(CELL_ID(head));
+            if (kw == ctx.kw_quote)
+                return false; // a datum, not code
+            if (mode == SCAN_CLOSURE && kw == ctx.kw_let &&
+                IS_PAIR(cdr(tmpl)) && IS_ATOM(cadr(tmpl)))
+                return true; // named let
+        }
+        if (template_scan(head, env, mode, visiting, depth))
+            return true;
+        tmpl = cdr(tmpl);
+    }
+}
+
+static bool syntax_template_scan(unsigned transformer,
+                                 enum template_scan_mode mode,
+                                 const unsigned *visiting, int depth)
+{
+    for (int i = 0; i < depth; i++)
+        if (visiting[i] == transformer)
+            return false;
+    if (depth >= TEMPLATE_SCAN_DEPTH)
+        return true;
+    unsigned syn_data = car(transformer);
+    if (!IS_PAIR(syn_data) || !IS_PAIR(cdr(syn_data)))
+        return true;
+    unsigned stack[TEMPLATE_SCAN_DEPTH];
+    for (int i = 0; i < depth; i++)
+        stack[i] = visiting[i];
+    stack[depth] = transformer;
+    unsigned env = cdr(transformer);
+    for (unsigned r = cddr(syn_data); IS_PAIR(r); r = cdr(r)) {
+        unsigned rule = car(r);
+        if (!IS_PAIR(rule) ||
+            template_scan(cdr(rule), env, mode, stack, depth + 1))
+            return true;
+    }
+    return false;
+}
+
+static bool binding_names_include(unsigned bindings, int64_t var_id)
+{
+    for (unsigned b = bindings; IS_PAIR(b); b = cdr(b)) {
+        unsigned binding = car(b);
+        if (IS_PAIR(binding) && IS_ATOM(car(binding)) &&
+            CELL_ID(car(binding)) == var_id)
+            return true;
+    }
+    return false;
+}
+
+static bool binding_inits_capture(unsigned bindings, int64_t var_id,
+                                  unsigned env);
+
+// True if evaluating the form expr might create a closure that refers to
+// var_id. A reference by itself is not a capture.
+static bool form_captures(unsigned expr, int64_t var_id, unsigned env)
+{
+    if (!IS_PAIR(expr))
+        return false;
+    unsigned head = car(expr);
+    if (!IS_ATOM(head)) {
+        unsigned formals = 0, fn_body = 0;
+        if (inlined_lambda_application(expr, env, &formals, &fn_body))
+            return body_captures(cdr(expr), var_id, env) ||
+                   (!formals_bind(formals, var_id) &&
+                    body_captures(fn_body, var_id, env));
+        return form_captures(head, var_id, env) ||
+               body_captures(cdr(expr), var_id, env);
+    }
+
+    // Heads are compared as keywords with core aliases read as the
+    // keyword they stand for, but looked up as written: a core alias is
+    // the core form even where its name is rebound.
+    int64_t head_id = CELL_ID(head);
+    int64_t kw = kw_canon(head_id);
+    unsigned binding = lookup_silent(head_id, env);
+    bool unbound = binding == TOK_ERROR;
+    bool syntax = !unbound && IS_SYNTAX(binding);
+    if (kw == ctx.kw_quote && unbound)
+        return false;
+    // A nested lambda captures this variable if its body refers to the
+    // outer binding. Check the full lambda form so shadowing parameters
+    // are handled by contains_reference.
+    if (kw == ctx.kw_lambda && unbound)
+        return contains_reference(expr, var_id);
+    // (define (name . formals) body ...) builds a closure without a
+    // literal lambda; treat it as (lambda formals body ...).
+    if (kw == ctx.kw_define && unbound && IS_PAIR(cdr(expr)) &&
+        IS_PAIR(cadr(expr)))
+        return !formals_bind(cdr(cadr(expr)), var_id) &&
+               contains_reference(cddr(expr), var_id);
+
+    // The let family, built in or the standard library's macros. A plain
+    // let or let* is an inlined lambda application, letrec builds no
+    // closure of its own, and a named let closes over its body only.
+    if ((unbound || syntax) && IS_PAIR(cdr(expr)) &&
+        (kw == ctx.kw_let || kw == ctx.kw_letstar || kw == ctx.kw_letrec)) {
+        unsigned second = cadr(expr);
+        if (kw == ctx.kw_let && IS_ATOM(second)) {
+            if (!IS_PAIR(cddr(expr)))
+                return false;
+            unsigned bindings = caddr(expr);
+            if (binding_inits_capture(bindings, var_id, env))
+                return true;
+            if (CELL_ID(second) == var_id ||
+                binding_names_include(bindings, var_id))
+                return false; // the loop rebinds it
+            return contains_reference(cdddr(expr), var_id);
+        }
+        return binding_inits_capture(second, var_id, env) ||
+               body_captures(cddr(expr), var_id, env);
+    }
+    // (do ((var init step ...) ...) (test expr ...) command ...): the inits
+    // run outside the loop's closure, everything else inside it.
+    if ((unbound || syntax) && head_id == do_keyword_id() &&
+        IS_PAIR(cdr(expr))) {
+        unsigned bindings = cadr(expr);
+        if (binding_inits_capture(bindings, var_id, env))
+            return true;
+        if (binding_names_include(bindings, var_id))
+            return false;
+        for (unsigned b = bindings; IS_PAIR(b); b = cdr(b))
+            if (IS_PAIR(car(b)) && IS_PAIR(cdr(car(b))) &&
+                contains_reference(cddr(car(b)), var_id))
+                return true;
+        return contains_reference(cddr(expr), var_id);
+    }
+    // Any other syntax-rules macro: a use that does not mention the variable
+    // cannot capture it, and one whose templates make no closure is walked
+    // like a call.
+    if (syntax) {
+        if (!contains_reference(cdr(expr), var_id))
+            return false;
+        if (syntax_template_scan(binding, SCAN_CLOSURE, NULL, 0))
+            return true;
+    }
+    return body_captures(cdr(expr), var_id, env);
+}
+
+// The initializers of a let-style binding list ((var init ...) ...).
+static bool binding_inits_capture(unsigned bindings, int64_t var_id,
+                                  unsigned env)
+{
+    for (unsigned b = bindings; IS_PAIR(b); b = cdr(b)) {
+        unsigned binding = car(b);
+        if (IS_PAIR(binding) && IS_PAIR(cdr(binding)) &&
+            form_captures(cadr(binding), var_id, env))
+            return true;
+    }
+    return false;
+}
+
+// The same over a list of forms - a body, or an application's operands. The
+// spine is walked with a loop rather than by recursing on the cdr, which
+// cost one C frame per element: a lambda with a long flat body, or a macro
+// that expands to one, overflowed the C stack. Only the forms recurse, so
+// depth follows nesting rather than length.
+static bool body_captures(unsigned body, int64_t var_id, unsigned env)
+{
+    for (unsigned e = body; IS_PAIR(e); e = cdr(e))
+        if (form_captures(car(e), var_id, env))
+            return true;
+    return false;
+}
+
+// True if var_id may be captured by a closure made in body (a list of
+// forms); see above for why this is a prediction.
+static bool captured_by_inner_lambda(unsigned body, int64_t var_id,
+                                     unsigned env)
+{
+    return body_captures(body, var_id, env);
+}
+
+// True if body (a list of forms) might assign var_id: a (set! var_id ...)
+// anywhere in it, shadowed or not, or a use of a syntax-rules macro that
+// mentions the variable and whose templates contain set!.
+static bool assigned_in_body(unsigned body, int64_t var_id, unsigned env)
+{
+    for (unsigned e = body; IS_PAIR(e); e = cdr(e)) {
+        unsigned expr = car(e);
+        if (!IS_PAIR(expr))
+            continue;
+        unsigned head = car(expr);
+        if (IS_ATOM(head)) {
+            int64_t kw = kw_canon(CELL_ID(head));
+            unsigned binding = lookup_silent(CELL_ID(head), env);
+            if (kw == ctx.kw_quote && binding == TOK_ERROR)
+                continue;
+            if (kw == ctx.kw_set && binding == TOK_ERROR &&
+                IS_PAIR(cdr(expr)) && IS_ATOM(cadr(expr)) &&
+                CELL_ID(cadr(expr)) == var_id)
+                return true;
+            if (binding != TOK_ERROR && IS_SYNTAX(binding) &&
+                contains_reference(cdr(expr), var_id) &&
+                syntax_template_scan(binding, SCAN_ASSIGN, NULL, 0))
+                return true;
+        }
+        if (assigned_in_body(expr, var_id, env))
+            return true;
+    }
+    return false;
 }
 
 // Check if expr contains a reference to var_id (for detecting self-reference)
@@ -521,6 +846,8 @@ static void cctx_free(compile_ctx *cctx)
     // Unprotect env, known_lambdas and loop_params from cctx_new
     gc_unprotect(3);
     // Note: code is transferred out, not freed here
+    free(cctx->let_bindings);
+    free(cctx->let_scope_bans);
     free(cctx);
 }
 
@@ -2847,12 +3174,19 @@ next_free_var:
                     gc_unprotect(3);
                 }
 
-                // Compile body with new compile-time environment
-                compile_ctx new_cctx = *cctx;
-                new_cctx.env = new_env;
-                gc_protect(&new_cctx.env);
-                gc_protect(&new_cctx.known_lambdas);
-                compile_begin(body, &new_cctx);
+                // Compile body with new compile-time environment. In this
+                // context, not a copy of it: the body records things that
+                // belong to the whole procedure (let slots and their
+                // high-water mark, assignments to stack locals, scopes to
+                // recompile) and a copy would drop them on return.
+                unsigned body_saved_env = cctx->env;
+                unsigned body_saved_known = cctx->known_lambdas;
+                gc_protect(&body_saved_env);
+                gc_protect(&body_saved_known);
+                cctx->env = new_env;
+                compile_begin(body, cctx);
+                cctx->env = body_saved_env;
+                cctx->known_lambdas = body_saved_known;
                 gc_unprotect(2);
 
                 // Pop the runtime frame
@@ -3277,14 +3611,10 @@ static bool trmc_scan_tail(unsigned expr, compile_ctx *cctx,
     // let macro expands to, and the shape compile_call inlines rather than
     // building a closure for.
     //
-    // Mostly latent as things stand: captured_by_inner_lambda counts a
-    // reference from inside this lambda as a capture, even though the lambda
-    // is about to be inlined and never becomes a closure, so any body that
-    // mentions a loop parameter under a let loses stack locals - and TRMC
-    // needs them for the accumulator's address. Teaching that walk about
-    // immediately-applied lambdas would make this live, and would want to
-    // match the inliner's acceptance conditions exactly, since disagreeing
-    // means a closure looking up a parameter that is not in the environment.
+    // captured_by_inner_lambda knows this lambda is inlined rather than made
+    // into a closure (inlined_lambda_application), so a loop parameter
+    // mentioned under a let keeps its stack slot - which TRMC needs for the
+    // accumulator's address.
     //
     // Same caveat as a let besides: the scan reads the body without these
     // bindings in scope, so it cannot tell that one shadows a name it
@@ -3428,21 +3758,14 @@ static bool code_reaches_symbol(const code_object *code, int64_t sym,
     return false;
 }
 
-// A stack-local body must not need an environment frame of its own. The
-// decision to use locals is made from the unexpanded source, so check what
-// was actually emitted:
-// - a definition at the body's own scope (no PUSHENV around it) would land
-//   in the closure's environment - for a top-level procedure, the global
-//   one - e.g. from a macro that expands into define or define-values;
-// - a closure created in the body that reaches a parameter by name would
-//   find an outer binding, since the parameter lives only in a stack slot.
-static bool locals_body_needs_environment(const code_object *code,
-                                          unsigned body_start,
-                                          unsigned children_start,
-                                          unsigned params)
+// True if code emitted from 'from' on defines into whatever frame is current
+// when it starts: a DEFINE (or alias, or syntax definition) not inside a
+// PUSHENV ... POPENV of its own.
+static bool code_defines_outside_own_frames(const code_object *code,
+                                            unsigned from)
 {
     unsigned depth = 0;
-    for (unsigned ip = body_start; ip < code->code_len;) {
+    for (unsigned ip = from; ip < code->code_len;) {
         unsigned op = code->code[ip];
         unsigned size = instruction_size(op);
         if (size == 0 || size > code->code_len - ip)
@@ -3467,13 +3790,39 @@ static bool locals_body_needs_environment(const code_object *code,
         }
         ip += size;
     }
+    return false;
+}
+
+// True if a closure made since children_start reaches sym by name.
+static bool children_reach_symbol(const code_object *code,
+                                  unsigned children_start, int64_t sym)
+{
+    for (unsigned i = children_start; i < code->children_len; i++)
+        if (code_reaches_symbol(code->children[i], sym, 0))
+            return true;
+    return false;
+}
+
+// A stack-local body must not need an environment frame of its own. The
+// decision to use locals is made from the unexpanded source, so check what
+// was actually emitted:
+// - a definition at the body's own scope (no PUSHENV around it) would land
+//   in the closure's environment - for a top-level procedure, the global
+//   one - e.g. from a macro that expands into define or define-values;
+// - a closure created in the body that reaches a parameter by name would
+//   find an outer binding, since the parameter lives only in a stack slot.
+// compile_call checks each let scope that uses slots the same way.
+static bool locals_body_needs_environment(const code_object *code,
+                                          unsigned body_start,
+                                          unsigned children_start,
+                                          unsigned params)
+{
+    if (code_defines_outside_own_frames(code, body_start))
+        return true;
     for (unsigned p = params; IS_PAIR(p); p = cdr(p)) {
-        if (!IS_ATOM(car(p)))
-            continue;
-        int64_t sym = CELL_ID(car(p));
-        for (unsigned i = children_start; i < code->children_len; i++)
-            if (code_reaches_symbol(code->children[i], sym, 0))
-                return true;
+        if (IS_ATOM(car(p)) &&
+            children_reach_symbol(code, children_start, CELL_ID(car(p))))
+            return true;
     }
     return false;
 }
@@ -3584,16 +3933,18 @@ static compile_result compile_lambda(unsigned expr, compile_ctx *cctx)
 
     // Stack locals: keep params on VM stack for direct access (LOCAL_GET)
     // instead of in environment frames. Only for fixed-arity functions where
-    // no parameter is captured by an inner closure.
-    // A body with internal defines needs an environment frame for them; see
-    // body_defines_internally.
-    if (!has_rest && arity > 0 && arity <= 8 &&
+    // no parameter is captured by an inner closure or assigned (see the
+    // prediction walks above). A body with internal defines needs an
+    // environment frame for them; see body_defines_internally. A procedure
+    // without parameters qualifies too: its let bindings can use slots.
+    if (!has_rest && arity <= 8 &&
         !body_defines_internally(body, lambda_env)) {
         bool can_use_locals = true;
         unsigned slot = 0;
         for (unsigned p = params; p && IS_PAIR(p); p = cdr(p), slot++) {
             int64_t pid = CELL_ID(car(p));
-            if (captured_by_inner_lambda(body, pid, lambda_env)) {
+            if (captured_by_inner_lambda(body, pid, lambda_env) ||
+                assigned_in_body(body, pid, lambda_env)) {
                 can_use_locals = false;
                 break;
             }
@@ -3603,66 +3954,111 @@ static compile_result compile_lambda(unsigned expr, compile_ctx *cctx)
             lambda_cctx->num_locals = (int)arity;
             lambda_cctx->code->use_locals = true;
             lambda_cctx->locals_env_len = compile_env_length(lambda_env);
+            lambda_cctx->let_slots = true;
         }
     }
 
-    // Tail recursion modulo cons. Decided before the body is compiled, since
-    // TRMC_INIT has to sit ahead of the loop entry point.
-    unsigned body_start = lambda_cctx->code->code_len;
-    unsigned char trmc_mode = trmc_body_qualifies(body, lambda_cctx);
-    if (trmc_mode != TRMC_MODE_NONE) {
-        lambda_cctx->trmc_mode = trmc_mode;
-        lambda_cctx->trmc_slot = (unsigned)lambda_cctx->num_locals;
-        lambda_cctx->code->trmc_mode = trmc_mode;
-        lambda_cctx->code->trmc_slot = lambda_cctx->trmc_slot;
-        emit(lambda_cctx, OP_TRMC_INIT);
-    }
-    // Self tail calls jump here, not to ip 0: re-running TRMC_INIT would
-    // discard the accumulator. Set unconditionally so the loop optimization
-    // stops assuming nothing is ever emitted before the body.
-    lambda_cctx->loop_start = lambda_cctx->code->code_len;
-
     // compile_begin leaves its scope frames on the context's environment, so
     // a recompile below must start again from the lambda's own environment.
+    unsigned body_start = lambda_cctx->code->code_len;
     unsigned body_env = lambda_cctx->env;
     gc_protect(&body_env);
+    unsigned body_known = lambda_cctx->known_lambdas;
+    gc_protect(&body_known);
     unsigned children_start = lambda_cctx->code->children_len;
+    bool allow_trmc = true;
+    unsigned let_attempts = 0;
 
-    // Compile body
-    compile_begin(body, lambda_cctx);
-
-    if (lambda_cctx->code->use_locals &&
-        locals_body_needs_environment(lambda_cctx->code, body_start,
-                                      children_start, params)) {
-        // See locals_body_needs_environment: the pre-pass over the source
-        // chose stack locals, but the expanded body needs the parameters in
-        // an environment frame. Compile it again that way.
+    // Compile the body, and again whenever what was emitted shows that a
+    // decision made beforehand from the source was wrong. Each retry gives
+    // up something, so this ends: banned let scopes (bounded attempts, then
+    // no let slots at all), then stack locals, then TRMC.
+    for (;;) {
         code_truncate(lambda_cctx->code, body_start, children_start);
-        lambda_cctx->code->use_locals = false;
-        lambda_cctx->num_locals = -1;
-        lambda_cctx->trmc_mode = TRMC_MODE_NONE;
-        lambda_cctx->code->trmc_mode = TRMC_MODE_NONE;
-        lambda_cctx->loop_start = body_start;
         lambda_cctx->env = body_env;
+        lambda_cctx->known_lambdas = body_known;
         lambda_cctx->env_depth = 0;
         lambda_cctx->tail_position = true;
-        compile_begin(body, lambda_cctx);
-    }
+        lambda_cctx->locals_assigned = false;
+        lambda_cctx->let_slot_retry = false;
+        lambda_cctx->let_scope_counter = 0;
+        lambda_cctx->let_binding_count = 0;
 
-    if (lambda_cctx->trmc_mode != TRMC_MODE_NONE &&
-        trmc_code_has_tailcall(lambda_cctx->code, body_start)) {
-        // See trmc_code_has_tailcall. trmc_call_opcode should have kept every
-        // tail call in this body out of TAILCALL form, so reaching here means
-        // some path emitted one anyway. Throw the body away and compile it
-        // again plainly rather than return a truncated result.
-        code_truncate(lambda_cctx->code, body_start, children_start);
-        lambda_cctx->trmc_mode = TRMC_MODE_NONE;
-        lambda_cctx->code->trmc_mode = TRMC_MODE_NONE;
-        lambda_cctx->loop_start = body_start;
-        lambda_cctx->env = body_env;
-        lambda_cctx->env_depth = 0;
-        lambda_cctx->tail_position = true;
+        // Tail recursion modulo cons. Decided before the body is compiled,
+        // since TRMC_INIT has to sit ahead of the loop entry point.
+        unsigned char trmc_mode = allow_trmc
+                                      ? trmc_body_qualifies(body, lambda_cctx)
+                                      : TRMC_MODE_NONE;
+        lambda_cctx->trmc_mode = trmc_mode;
+        lambda_cctx->code->trmc_mode = trmc_mode;
+        if (trmc_mode != TRMC_MODE_NONE) {
+            lambda_cctx->trmc_slot = (unsigned)lambda_cctx->num_locals;
+            lambda_cctx->code->trmc_slot = lambda_cctx->trmc_slot;
+            emit(lambda_cctx, OP_TRMC_INIT);
+        }
+        // Self tail calls jump here, not to ip 0: re-running TRMC_INIT would
+        // discard the accumulator. Set unconditionally so the loop
+        // optimization stops assuming nothing is ever emitted before the
+        // body.
+        lambda_cctx->loop_start = lambda_cctx->code->code_len;
+
+        // Let slots follow the parameters and the TRMC accumulator. Their
+        // count is known only once the body is compiled, so the reservation
+        // is patched afterwards (and dropped by the peephole pass if zero).
+        // It sits at the loop entry, so a self call clears them too.
+        unsigned reserve_operand = 0;
+        if (lambda_cctx->let_slots) {
+            unsigned base = (unsigned)lambda_cctx->num_locals +
+                            (trmc_mode == TRMC_MODE_HOLE   ? 2
+                             : trmc_mode == TRMC_MODE_FOLD ? 1
+                                                           : 0);
+            lambda_cctx->let_slot_base = base;
+            lambda_cctx->let_slot_next = base;
+            lambda_cctx->let_slot_max = base;
+            emit2(lambda_cctx, OP_RESERVE_LOCALS, 0);
+            reserve_operand = lambda_cctx->code->code_len - 1;
+        }
+
         compile_begin(body, lambda_cctx);
+
+        if (lambda_cctx->let_slot_retry) {
+            // A let scope needs an environment frame after all; its ordinal
+            // is now banned. Ordinals are stable between attempts (the same
+            // source compiles in the same order), but give up on let slots
+            // for this body rather than loop if they somehow are not.
+            if (++let_attempts >= 4 || !lambda_cctx->let_slots) {
+                lambda_cctx->let_slots = false;
+                lambda_cctx->let_scope_ban_count = 0;
+            }
+            continue;
+        }
+        if (lambda_cctx->code->use_locals &&
+            (lambda_cctx->locals_assigned ||
+             locals_body_needs_environment(lambda_cctx->code, body_start,
+                                           children_start, params))) {
+            // See locals_body_needs_environment and compile_set: the
+            // pre-pass over the source chose stack locals, but the expanded
+            // body needs the parameters in an environment frame. Compile it
+            // again that way.
+            lambda_cctx->code->use_locals = false;
+            lambda_cctx->num_locals = -1;
+            lambda_cctx->let_slots = false;
+            continue;
+        }
+        if (trmc_mode != TRMC_MODE_NONE &&
+            trmc_code_has_tailcall(lambda_cctx->code, body_start)) {
+            // See trmc_code_has_tailcall. trmc_call_opcode should have kept
+            // every tail call in this body out of TAILCALL form, so reaching
+            // here means some path emitted one anyway. Throw the body away
+            // and compile it again plainly rather than return a truncated
+            // result.
+            allow_trmc = false;
+            continue;
+        }
+        if (reserve_operand)
+            code_patch(lambda_cctx->code, reserve_operand,
+                       lambda_cctx->let_slot_max - lambda_cctx->let_slot_base);
+        break;
     }
 
     if (lambda_cctx->code->use_locals) {
@@ -4819,8 +5215,19 @@ static compile_result compile_set(unsigned expr, compile_ctx *cctx)
 
     // Use LOCAL_SET if variable is a stack local (and not shadowed)
     int64_t var_id = CELL_ID(var);
-    int local_slot = find_stack_local_slot(cctx, var_id);
+    int binding = -1;
+    int local_slot = resolve_stack_local(cctx, var_id, &binding);
     if (local_slot >= 0) {
+        // The source scan (assigned_in_body) keeps assigned variables out
+        // of slots, since a re-entered continuation would restore the slot
+        // to its value at capture time instead of seeing the assignment.
+        // Reaching one here means a macro's expansion assigned it: the code
+        // emitted is a placeholder, and the body is compiled again with the
+        // variable in an environment frame.
+        if (binding >= 0)
+            cctx->let_bindings[binding].assigned = true;
+        else
+            cctx->locals_assigned = true;
         emit2(cctx, OP_LOCAL_SET, (unsigned)local_slot);
         return dynamic_result();
     }
@@ -5240,14 +5647,18 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
             }
             gc_unprotect(1);
 
-            // Push new environment frame
-            emit_pushenv(cctx);
-
-            // Dynamically allocate parameter ID array
-            unsigned *param_ids = NULL;
-            if (param_count > 0) {
-                param_ids = checked_malloc_array(param_count, sizeof(unsigned));
-                if (!param_ids) {
+            // The bindings, fixed parameters first and the rest parameter
+            // last, and for each the stack slot holding it (-1: the frame).
+            unsigned var_count = param_count + (has_rest ? 1 : 0);
+            int64_t *param_ids = NULL;
+            int *param_slots = NULL;
+            if (var_count > 0) {
+                param_ids = checked_malloc_array(var_count, sizeof *param_ids);
+                param_slots =
+                    checked_malloc_array(var_count, sizeof *param_slots);
+                if (!param_ids || !param_slots) {
+                    free(param_ids);
+                    free(param_slots);
                     show_error("lambda: out of memory for parameters");
                     emit(cctx, OP_HALT);
                     return dynamic_result();
@@ -5266,23 +5677,11 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
             }
             if (i != param_count) {
                 free(param_ids);
+                free(param_slots);
                 return emit_syntax_error(cctx, "lambda: invalid syntax");
             }
-
-            // Define rest param first (it's on top of stack)
-            if (has_rest) {
-                emit2(cctx, OP_DEFINE, CELL_ID(rest_param));
-            }
-
-            // Define fixed params in reverse order (pop from stack)
-            if (param_ids) {
-                for (int j = (int)param_count - 1; j >= 0; j--) {
-                    emit2(cctx, OP_DEFINE, param_ids[j]);
-                }
-            }
-
-            // Free the parameter ID array
-            free(param_ids);
+            if (has_rest)
+                param_ids[param_count] = CELL_ID(rest_param);
 
             GC_GUARD;
             // Extend compile-time environment with params for body compilation
@@ -5326,6 +5725,53 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
                 unsigned frame = alloc_cons(frame_vars, frame_vals);
                 gc_protect(&frame);
                 cctx->env = alloc_cons(frame, cctx->env);
+            }
+
+            // Let slots. In a stack-local body a binding that no closure
+            // captures and nothing assigns can live in a stack slot (see the
+            // prediction walks near the top of this file), so a let - the
+            // stdlib's let, let* and named let all arrive here - costs no
+            // environment frame, no defvar and no lookups. The scope still
+            // needs a frame if its body defines anything, or if any binding
+            // must stay in one; a scope with none pushes nothing, which also
+            // keeps the loop optimization's self calls at env_depth 0.
+            unsigned scope = 0;
+            bool frameless = false;
+            unsigned saved_slot_next = cctx->let_slot_next;
+            unsigned saved_binding_count = cctx->let_binding_count;
+            if (cctx->let_slots) {
+                scope = cctx->let_scope_counter++;
+                frameless = !let_scope_banned(cctx, scope) &&
+                            !body_defines_internally(lambda_body, cctx->env) &&
+                            !body_has_define_syntax(lambda_body, cctx->env);
+            }
+            unsigned frame_pos = frameless ? compile_env_length(cctx->env) : 0;
+            bool needs_frame = !frameless;
+            for (unsigned k = 0; k < var_count; k++) {
+                param_slots[k] = -1;
+                if (frameless && cctx->let_slot_next < LET_SLOT_LIMIT &&
+                    !captured_by_inner_lambda(lambda_body, param_ids[k],
+                                              cctx->env) &&
+                    !assigned_in_body(lambda_body, param_ids[k], cctx->env) &&
+                    let_binding_push(cctx, frame_pos, param_ids[k],
+                                     cctx->let_slot_next, scope)) {
+                    param_slots[k] = (int)cctx->let_slot_next++;
+                } else {
+                    needs_frame = true;
+                }
+            }
+            if (cctx->let_slot_next > cctx->let_slot_max)
+                cctx->let_slot_max = cctx->let_slot_next;
+
+            // Bind in reverse, popping the values just computed: the rest
+            // parameter's list is on top.
+            if (needs_frame)
+                emit_pushenv(cctx);
+            for (unsigned k = var_count; k-- > 0;) {
+                if (param_slots[k] >= 0)
+                    emit2(cctx, OP_LOCAL_SET_VOID, (unsigned)param_slots[k]);
+                else
+                    emit2(cctx, OP_DEFINE, (unsigned)param_ids[k]);
             }
 
             // Track lambda arguments for escape analysis inlining
@@ -5382,18 +5828,46 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
                 }
             }
             cctx->tail_position = tail;
+            unsigned body_code_start = cctx->code->code_len;
+            unsigned body_children_start = cctx->code->children_len;
             compile_begin(lambda_body, cctx);
             cctx->num_locals = saved_num_locals;
             if (saved_num_locals > 0)
                 memcpy(cctx->local_ids, saved_local_ids,
                        sizeof(int64_t) * saved_num_locals);
 
+            // The decisions above were made from the unexpanded body. Check
+            // what it compiled to, as compile_lambda does for parameters: a
+            // definition with no frame of this scope's to land in, a closure
+            // reaching a slot binding by name, or an assignment to one (a
+            // macro's doing, all three) means this scope needs its frame.
+            if (frameless) {
+                bool unsafe = !needs_frame &&
+                              code_defines_outside_own_frames(cctx->code,
+                                                              body_code_start);
+                for (unsigned k = saved_binding_count;
+                     !unsafe && k < cctx->let_binding_count; k++) {
+                    struct let_slot_binding *b = &cctx->let_bindings[k];
+                    unsafe = b->assigned ||
+                             children_reach_symbol(cctx->code,
+                                                   body_children_start,
+                                                   b->var_id);
+                }
+                if (unsafe)
+                    let_scope_ban(cctx, scope);
+            }
+            cctx->let_binding_count = saved_binding_count;
+            cctx->let_slot_next = saved_slot_next;
+            free(param_ids);
+            free(param_slots);
+
             // Restore compile-time environment and known_lambdas
             cctx->env = saved_env;
             cctx->known_lambdas = saved_known;
 
             // Pop environment frame
-            emit_popenv(cctx);
+            if (needs_frame)
+                emit_popenv(cctx);
 
             return dynamic_result();
         }

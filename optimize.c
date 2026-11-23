@@ -78,6 +78,7 @@ unsigned instruction_size(unsigned op)
     case OP_LOCAL_GET:
     case OP_LOCAL_SET:
     case OP_LOCAL_SET_VOID:
+    case OP_RESERVE_LOCALS:
     case OP_CONST:
     case OP_DEFINE:
     case OP_SET:
@@ -384,6 +385,16 @@ void peephole_optimize(code_object *code)
         // ================================================================
         // Existing peephole patterns
         // ================================================================
+
+        // Pattern: RESERVE_LOCALS 0 -> nothing. compile_lambda emits the
+        // reservation before it knows whether any let binding will use a
+        // slot. Removing it is safe even at a jump target (the loop entry):
+        // the target is remapped to the instruction that follows.
+        if (op == OP_RESERVE_LOCALS && i + 1 < len && c[i + 1] == 0) {
+            remove[i] = remove[i + 1] = true;
+            i += 2;
+            continue;
+        }
 
         // Pattern: CONST x, POP -> nothing (dead code)
         if (op == OP_CONST && i + 2 < len && c[i + 2] == OP_POP &&
@@ -701,6 +712,7 @@ static const char *opcode_names[] = {
     [OP_LOCAL_GET1] = "LOCAL_GET1",
     [OP_LOCAL_GET2] = "LOCAL_GET2",
     [OP_LOCAL_GET3] = "LOCAL_GET3",
+    [OP_RESERVE_LOCALS] = "RESERVE_LOCALS",
     [OP_ADD_INT] = "ADD_INT",
     [OP_SUB_INT] = "SUB_INT",
     [OP_MUL_INT] = "MUL_INT",
@@ -829,6 +841,7 @@ void disassemble(code_object *code, const char *name)
         case OP_LOCAL_GET:
         case OP_LOCAL_SET:
         case OP_LOCAL_SET_VOID:
+        case OP_RESERVE_LOCALS:
             printf(" %u", code->code[start + 1]);
             break;
         case OP_JUMP:

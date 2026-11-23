@@ -2262,6 +2262,18 @@ static unsigned vm_dispatch(vm_state *vm)
             break;
         }
 
+        case OP_RESERVE_LOCALS: {
+            // Slots for let-bound stack locals, above the parameters and any
+            // TRMC accumulator. Like those, they are ordinary stack words: the
+            // collectors trace them and a continuation copies them. A self
+            // call (RECURSE) cuts the stack back to the parameters and jumps
+            // here, so each iteration starts with cleared slots.
+            unsigned n = vm->code->code[vm->ip++];
+            for (unsigned i = 0; i < n && !vm->error; i++)
+                vm_push(vm, 0);
+            break;
+        }
+
         case OP_TRMC_PUSH: {
             unsigned symbol_index = vm->code->code[vm->ip++];
             unsigned symbol = 0;
