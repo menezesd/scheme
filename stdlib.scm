@@ -5845,3 +5845,1146 @@
        (if var
            (and-let* (more ...) body ...)
            #f)))))
+
+;;; ============================================================================
+;;; MIT library procedures
+;;; ============================================================================
+;;; List, vector, stream, debugging and timing procedures from MIT/GNU Scheme
+;;; 12.1, with its argument orders, empty-input results and error cases.
+
+;;; --- Lists ------------------------------------------------------------------
+
+; fold-left - fold from the left with the accumulator first: (proc acc elt ...)
+; over one or more lists, stopping at the shortest (MIT).
+(define (fold-left proc initial lst . more-lists)
+  (%require-circular-lists "fold-left" (cons lst more-lists))
+  (if (null? more-lists)
+      (let loop ((lst lst) (acc initial))
+        (if (null-list? lst)
+            acc
+            (loop (cdr lst) (proc acc (car lst)))))
+      (let loop ((lists (cons lst more-lists)) (acc initial))
+        (if (%fold-list-end? lists)
+            acc
+            (loop (map cdr lists) (apply proc acc (map car lists)))))))
+
+; reduce-left - left-associative reduce: (((a b) c) d); initial only for ().
+(define (reduce-left proc initial lst)
+  (%require-proper-list "reduce-left" lst)
+  (if (null? lst)
+      initial
+      (fold-left proc (car lst) (cdr lst))))
+
+; MIT's argument order is (list predicate); the results are any's and
+; every's (the predicate's own true value).
+(define (there-exists? items predicate)
+  (any predicate items))
+
+(define (for-all? items predicate)
+  (every predicate items))
+
+(define (%list-head who lst k)
+  (let loop ((lst lst) (k k) (acc '()))
+    (cond ((= k 0) (reverse! acc))
+          ((pair? lst) (loop (cdr lst) (- k 1) (cons (car lst) acc)))
+          (else
+           (error (string-append who
+                                 ": list is shorter than requested count"))))))
+
+; list-head - a fresh list of the first k elements (only those are visited)
+(define (list-head lst k)
+  (%require-nonnegative-integer "list-head" k)
+  (%list-head "list-head" lst k))
+
+; sublist - the elements of list from index start up to (not including) end
+(define (sublist lst start end)
+  (%require-nonnegative-integer "sublist" start)
+  (%require-nonnegative-integer "sublist" end)
+  (if (> start end)
+      (error "sublist: start index is greater than end index"))
+  (let loop ((lst lst) (i start))
+    (cond ((= i 0) (%list-head "sublist" lst (- end start)))
+          ((pair? lst) (loop (cdr lst) (- i 1)))
+          (else (error "sublist: list is shorter than requested count")))))
+
+; except-last-pair - a fresh copy of a non-empty list without its last pair
+(define (except-last-pair lst)
+  (if (not (pair? lst))
+      (error "except-last-pair: expected non-empty list"))
+  (%require-finite-list "except-last-pair" lst)
+  (let loop ((lst lst) (acc '()))
+    (if (pair? (cdr lst))
+        (loop (cdr lst) (cons (car lst) acc))
+        (reverse! acc))))
+
+; except-last-pair! - the same, by cutting the list before its last pair
+(define (except-last-pair! lst)
+  (if (not (pair? lst))
+      (error "except-last-pair!: expected non-empty list"))
+  (%require-finite-list "except-last-pair!" lst)
+  (if (pair? (cdr lst))
+      (let loop ((prev lst))
+        (if (pair? (cddr prev))
+            (loop (cdr prev))
+            (begin
+              (set-cdr! prev '())
+              lst)))
+      '()))
+
+(define (make-initialized-list n init-proc)
+  (%require-nonnegative-integer "make-initialized-list" n)
+  (list-tabulate n init-proc))
+
+; list-of-type? / vector-of-type? - is object a list (vector) whose every
+; element satisfies predicate?
+(define (list-of-type? object predicate)
+  (and (list? object)
+       (let loop ((lst object))
+         (or (null? lst)
+             (and (predicate (car lst))
+                  (loop (cdr lst)))))))
+
+(define (vector-of-type? object predicate)
+  (and (vector? object)
+       (let ((n (vector-length object)))
+         (let loop ((i 0))
+           (or (= i n)
+               (and (predicate (vector-ref object i))
+                    (loop (+ i 1))))))))
+
+; Association-list deletion. Like MIT, the whole alist is validated, and the
+; non-destructive forms always return a fresh list.
+(define (%require-alist who alist)
+  (if (not (list-of-type? alist pair?))
+      (error (string-append who ": expected association list"))))
+
+(define (%del-ass who same? key alist)
+  (%require-alist who alist)
+  (let loop ((alist alist) (acc '()))
+    (cond ((null? alist) (reverse! acc))
+          ((same? key (caar alist)) (loop (cdr alist) acc))
+          (else (loop (cdr alist) (cons (car alist) acc))))))
+
+(define (%del-ass! who same? key alist)
+  (%require-alist who alist)
+  (let skip ((alist alist))
+    (cond ((null? alist) '())
+          ((same? key (caar alist)) (skip (cdr alist)))
+          (else
+           (let loop ((prev alist))
+             (let ((next (cdr prev)))
+               (cond ((null? next) alist)
+                     ((same? key (caar next))
+                      (set-cdr! prev (cdr next))
+                      (loop prev))
+                     (else (loop next)))))))))
+
+(define (del-assq key alist) (%del-ass "del-assq" eq? key alist))
+(define (del-assv key alist) (%del-ass "del-assv" eqv? key alist))
+(define (del-assoc key alist) (%del-ass "del-assoc" equal? key alist))
+(define (del-assq! key alist) (%del-ass! "del-assq!" eq? key alist))
+(define (del-assv! key alist) (%del-ass! "del-assv!" eqv? key alist))
+(define (del-assoc! key alist) (%del-ass! "del-assoc!" equal? key alist))
+
+;;; --- Vectors ----------------------------------------------------------------
+
+(define (make-initialized-vector n initialization)
+  (%require-nonnegative-integer "make-initialized-vector" n)
+  (let ((vec (make-vector n)))
+    (let loop ((i 0))
+      (if (= i n)
+          vec
+          (begin
+            (vector-set! vec i (initialization i))
+            (loop (+ i 1)))))))
+
+; vector-binary-search - MIT 12.1's (vector key<? unwrap-key key): search a
+; vector sorted by key<? on (unwrap-key element) for key, returning the
+; element found (not its index) or #f.
+(define (vector-binary-search vector key<? unwrap-key key)
+  (if (not (vector? vector))
+      (error "vector-binary-search: expected vector"))
+  (let loop ((start 0) (end (vector-length vector)))
+    (and (< start end)
+         (let* ((midpoint (quotient (+ start end) 2))
+                (item (vector-ref vector midpoint))
+                (item-key (unwrap-key item)))
+           (cond ((key<? key item-key) (loop start midpoint))
+                 ((key<? item-key key) (loop (+ midpoint 1) end))
+                 (else item))))))
+
+(define (subvector vector start end)
+  (%require-vector-range "subvector" vector start end)
+  (vector-copy vector start end))
+
+(define (vector-head vector end)
+  (subvector vector 0 end))
+
+(define (vector-tail vector start)
+  (if (not (vector? vector))
+      (error "vector-tail: expected vector"))
+  (subvector vector start (vector-length vector)))
+
+; vector-grow - a new vector of length n holding vector's elements first
+(define (vector-grow vector n)
+  (if (not (vector? vector))
+      (error "vector-grow: expected vector"))
+  (%require-nonnegative-integer "vector-grow" n)
+  (let ((len (vector-length vector)))
+    (if (< n len)
+        (error "vector-grow: new length is less than the vector's length"))
+    (let ((new (make-vector n #f)))
+      (%subvector-move-left! vector 0 len new 0)
+      new)))
+
+(define (vector-first vector)
+  (if (not (vector? vector))
+      (error "vector-first: expected vector"))
+  (if (= (vector-length vector) 0)
+      (error "vector-first: empty vector"))
+  (vector-ref vector 0))
+
+(define (vector-last vector)
+  (if (not (vector? vector))
+      (error "vector-last: expected vector"))
+  (if (= (vector-length vector) 0)
+      (error "vector-last: empty vector"))
+  (vector-ref vector (- (vector-length vector) 1)))
+
+(define (subvector->list vector start end)
+  (%require-vector-range "subvector->list" vector start end)
+  (vector->list vector start end))
+
+(define (subvector-fill! vector start end value)
+  (%require-vector-range "subvector-fill!" vector start end)
+  (vector-fill! vector value start end))
+
+(define (%subvector-move-left! from start end to at)
+  (let loop ((i start) (j at))
+    (if (< i end)
+        (begin
+          (vector-set! to j (vector-ref from i))
+          (loop (+ i 1) (+ j 1))))))
+
+(define (%subvector-move-right! from start end to at)
+  (let loop ((i (- end 1)) (j (+ at (- end start 1))))
+    (if (>= i start)
+        (begin
+          (vector-set! to j (vector-ref from i))
+          (loop (- i 1) (- j 1))))))
+
+(define (%require-subvector-move who from start end to at)
+  (%require-vector-range who from start end)
+  (if (not (vector? to))
+      (error (string-append who ": expected destination vector")))
+  (%require-nonnegative-integer who at)
+  (if (> (+ at (- end start)) (vector-length to))
+      (error (string-append who ": destination range out of bounds"))))
+
+; subvector-move-left! copies in ascending index order, subvector-move-right!
+; in descending order; within one vector they differ when the ranges overlap.
+(define (subvector-move-left! from start end to at)
+  (%require-subvector-move "subvector-move-left!" from start end to at)
+  (%subvector-move-left! from start end to at))
+
+(define (subvector-move-right! from start end to at)
+  (%require-subvector-move "subvector-move-right!" from start end to at)
+  (%subvector-move-right! from start end to at))
+
+;;; --- Streams ----------------------------------------------------------------
+;;; A stream is () or a pair whose cdr is a promise of the rest (SICP, MIT).
+
+(define-syntax cons-stream
+  (syntax-rules ()
+    ((_ a b) (cons a (delay b)))))
+
+; (cons-stream* a b ... rest) is (cons-stream a (cons-stream b ... rest))
+(define-syntax cons-stream*
+  (syntax-rules ()
+    ((_ a) a)
+    ((_ a b c ...) (cons-stream a (cons-stream* b c ...)))))
+
+(define the-empty-stream '())
+
+(define (stream-pair? object)
+  (and (pair? object) (promise? (cdr object))))
+
+(define (stream-null? object) (null? object))
+(define (empty-stream? object) (null? object))
+
+(define (stream-car stream)
+  (if (not (stream-pair? stream))
+      (error "stream-car: expected stream pair"))
+  (car stream))
+
+(define (stream-cdr stream)
+  (if (not (stream-pair? stream))
+      (error "stream-cdr: expected stream pair"))
+  (force (cdr stream)))
+
+(define (stream-first stream) (stream-car stream))
+(define (stream-rest stream) (stream-cdr stream))
+
+(define (stream . objects) (list->stream objects))
+
+; list->stream - lazy, like MIT: a dotted tail is reported when reached
+(define (list->stream lst)
+  (if (pair? lst)
+      (cons-stream (car lst) (list->stream (cdr lst)))
+      (begin
+        (if (not (null? lst))
+            (error "list->stream: expected list"))
+        '())))
+
+; stream->list - the elements as a list; the optional limit (MIT 9.2) stops
+; after that many without forcing the rest.
+(define (stream->list stream . limit)
+  (if (> (length limit) 1)
+      (error "stream->list: too many arguments"))
+  (let loop ((stream stream)
+             (n (and (pair? limit)
+                     (%require-nonnegative-integer "stream->list" (car limit))))
+             (acc '()))
+    (cond ((and n (= n 0)) (reverse! acc))
+          ((stream-pair? stream)
+           (if (and n (= n 1))
+               (reverse! (cons (car stream) acc))
+               (loop (force (cdr stream)) (and n (- n 1))
+                     (cons (car stream) acc))))
+          ((null? stream) (reverse! acc))
+          (else (error "stream->list: expected stream")))))
+
+; stream-head - a list of the first index elements. As in MIT, the tail
+; after the last one taken is forced too.
+(define (stream-head stream index)
+  (%require-nonnegative-integer "stream-head" index)
+  (let loop ((stream stream) (index index) (acc '()))
+    (if (> index 0)
+        (begin
+          (if (not (stream-pair? stream))
+              (error "stream-head: stream is shorter than requested count"))
+          (loop (force (cdr stream)) (- index 1) (cons (car stream) acc)))
+        (reverse! acc))))
+
+(define (stream-tail stream index)
+  (%require-nonnegative-integer "stream-tail" index)
+  (let loop ((stream stream) (index index))
+    (if (> index 0)
+        (begin
+          (if (not (stream-pair? stream))
+              (error "stream-tail: stream is shorter than requested count"))
+          (loop (force (cdr stream)) (- index 1)))
+        stream)))
+
+(define (stream-ref stream index)
+  (let ((tail (stream-tail stream index)))
+    (if (not (stream-pair? tail))
+        (error "stream-ref: index out of range"))
+    (car tail)))
+
+(define (stream-length stream)
+  (let loop ((stream stream) (n 0))
+    (cond ((stream-pair? stream) (loop (force (cdr stream)) (+ n 1)))
+          ((null? stream) n)
+          (else (error "stream-length: expected stream")))))
+
+(define (stream-last-pair stream)
+  (if (not (stream-pair? stream))
+      (error "stream-last-pair: expected non-empty stream"))
+  (let loop ((stream stream))
+    (let ((next (force (cdr stream))))
+      (cond ((stream-pair? next) (loop next))
+            ((null? next) stream)
+            (else (error "stream-last-pair: expected stream"))))))
+
+(define (stream-last stream)
+  (car (stream-last-pair stream)))
+
+; Are we at the end of any of these streams? Each must be a stream.
+(define (%streams-end? who streams)
+  (let loop ((streams streams))
+    (cond ((null? streams) #f)
+          ((stream-pair? (car streams)) (loop (cdr streams)))
+          ((null? (car streams)) #t)
+          (else (error (string-append who ": expected stream"))))))
+
+(define (%streams-rest streams)
+  (map (lambda (stream) (force (cdr stream))) streams))
+
+; stream-map - lazy; with several streams, stops at the shortest
+(define (stream-map procedure stream . streams)
+  (if (null? streams)
+      (let loop ((stream stream))
+        (cond ((stream-pair? stream)
+               (cons-stream (procedure (car stream))
+                            (loop (force (cdr stream)))))
+              ((null? stream) '())
+              (else (error "stream-map: expected stream"))))
+      (let loop ((streams (cons stream streams)))
+        (if (%streams-end? "stream-map" streams)
+            '()
+            (cons-stream (apply procedure (map car streams))
+                         (loop (%streams-rest streams)))))))
+
+(define (stream-for-each procedure stream . streams)
+  (if (null? streams)
+      (let loop ((stream stream))
+        (cond ((stream-pair? stream)
+               (procedure (car stream))
+               (loop (force (cdr stream))))
+              ((not (null? stream))
+               (error "stream-for-each: expected stream"))))
+      (let loop ((streams (cons stream streams)))
+        (if (not (%streams-end? "stream-for-each" streams))
+            (begin
+              (apply procedure (map car streams))
+              (loop (%streams-rest streams)))))))
+
+; stream-append - lazy; the last stream becomes the tail as it is
+(define (stream-append . streams)
+  (if (null? streams)
+      '()
+      (let outer ((streams streams))
+        (if (null? (cdr streams))
+            (car streams)
+            (let inner ((stream (car streams)))
+              (cond ((stream-pair? stream)
+                     (cons-stream (car stream) (inner (force (cdr stream)))))
+                    ((null? stream) (outer (cdr streams)))
+                    (else (error "stream-append: expected stream"))))))))
+
+; stream-append-map - lazily append the streams procedure returns
+(define (stream-append-map procedure stream . streams)
+  (let outer ((results (apply stream-map procedure stream streams)))
+    (if (stream-pair? results)
+        (let inner ((stream (car results)))
+          (cond ((stream-pair? stream)
+                 (cons-stream (car stream) (inner (force (cdr stream)))))
+                ((null? stream) (outer (force (cdr results))))
+                (else (error "stream-append-map: expected stream"))))
+        '())))
+
+; stream-filter - lazy; finds each next match only when it is asked for
+(define (stream-filter predicate stream)
+  (let loop ((stream stream))
+    (cond ((stream-pair? stream)
+           (if (predicate (car stream))
+               (cons-stream (car stream) (loop (force (cdr stream))))
+               (loop (force (cdr stream)))))
+          ((null? stream) '())
+          (else (error "stream-filter: expected stream")))))
+
+; stream-accumulate - right fold, (procedure elt acc), in constant stack
+(define (stream-accumulate procedure initial stream)
+  (let loop ((stream stream) (rev '()))
+    (cond ((stream-pair? stream)
+           (loop (force (cdr stream)) (cons (car stream) rev)))
+          ((null? stream) (fold procedure initial rev))
+          (else (error "stream-accumulate: expected stream")))))
+
+; stream-truncate - lazy prefix of the elements before the first satisfying
+; predicate
+(define (stream-truncate stream predicate)
+  (let loop ((stream stream))
+    (if (and (stream-pair? stream)
+             (not (predicate (car stream))))
+        (cons-stream (car stream) (loop (force (cdr stream))))
+        '())))
+
+; stream-write - MIT's {a b c} notation
+(define (stream-write stream . port)
+  (let ((port (if (pair? port) (car port) (current-output-port))))
+    (if (not (output-port? port))
+        (error "stream-write: expected output port"))
+    (cond ((stream-pair? stream)
+           (write-char #\{ port)
+           (write (car stream) port)
+           (stream-for-each (lambda (object)
+                              (write-char #\space port)
+                              (write object port))
+                            (force (cdr stream)))
+           (write-char #\} port))
+          ((null? stream) (write-string "{}" port))
+          (else (error "stream-write: expected stream")))))
+
+; The primes, as a stream extended on demand by trial division.
+(define prime-numbers-stream
+  (letrec ((primes (cons-stream 2 (primes-from 3)))
+           (primes-from
+            (lambda (n)
+              (if (prime? n)
+                  (cons-stream n (primes-from (+ n 2)))
+                  (primes-from (+ n 2)))))
+           (prime?
+            (lambda (n)
+              (let loop ((ps primes))
+                (let ((p (car ps)))
+                  (cond ((> (* p p) n) #t)
+                        ((= (remainder n p) 0) #f)
+                        (else (loop (force (cdr ps))))))))))
+    primes))
+
+;;; --- Special forms ----------------------------------------------------------
+
+; named-lambda - a lambda with a name for debugging; as in MIT, the name is
+; not bound in the body.
+(define-syntax named-lambda
+  (syntax-rules ()
+    ((_ (name . formals) body ...) (lambda formals body ...))))
+
+; fluid-let - dynamically rebind existing variables for the extent of the
+; body, swapping values on every entry and exit (continuations included).
+; The values not currently bound are kept in a list, one per variable.
+(define-syntax fluid-let
+  (syntax-rules ()
+    ((_ () body ...) (let () body ...))
+    ((_ ((var value) ...) body ...)
+     (let ((saved (list value ...)))
+       (let ((swap! (lambda ()
+                      (let ((rest saved))
+                        (let ((old var))
+                          (set! var (car rest))
+                          (set-car! rest old)
+                          (set! rest (cdr rest)))
+                        ...))))
+         (dynamic-wind swap! (lambda () body ...) swap!))))))
+
+; define-integrable - MIT's inlining hint; here an ordinary define
+(define-syntax define-integrable
+  (syntax-rules ()
+    ((_ form body ...) (define form body ...))))
+
+; assert - MIT signals ";Assertion failed: <expression> <extra> ..."
+(define-syntax assert
+  (syntax-rules ()
+    ((_ condition extra ...)
+     (if (not condition)
+         (error "Assertion failed:" 'condition extra ...)))))
+
+;;; --- Miscellaneous ----------------------------------------------------------
+
+(define (write-line object . port)
+  (let ((port (if (pair? port) (car port) (current-output-port))))
+    (write object port)
+    (newline port)))
+
+(define (symbol-append . objects)
+  (string->symbol
+   (call-with-output-string
+    (lambda (port)
+      (for-each (lambda (object) (display object port)) objects)))))
+
+(define (symbol<? x y)
+  (if (not (and (symbol? x) (symbol? y)))
+      (error "symbol<?: expected symbols"))
+  (string<? (symbol->string x) (symbol->string y)))
+
+(define (char-ascii? char)
+  (< (char->integer char) 128))
+
+(define (cube z) (* z z z))
+
+(define with-values call-with-values)
+
+(define (constant-procedure k)
+  (lambda arguments k))
+
+; MIT's older hash-table names, still in 12.1
+(define (hash-table/get table key default)
+  (hash-table-ref/default table key default))
+(define (hash-table/put! table key value) (hash-table-set! table key value))
+(define (hash-table/remove! table key) (hash-table-delete! table key))
+(define (hash-table/count table) (hash-table-size table))
+(define (hash-table/key-list table) (hash-table-keys table))
+(define (hash-table/datum-list table) (hash-table-values table))
+(define (hash-table/clear! table) (hash-table-clear! table))
+
+; guarantee - return object if it satisfies predicate, else signal MIT's
+; wrong-type error
+(define (guarantee predicate object . caller)
+  (if (predicate object)
+      object
+      (error (string-append "The object " (write-to-string object)
+                            (if (pair? caller)
+                                (string-append ", passed as an argument to "
+                                               (write-to-string (car caller))
+                                               ",")
+                                "")
+                            " is not the correct type."))))
+
+;;; --- Timing -----------------------------------------------------------------
+;;; runtime (CPU seconds as a flonum) is a primitive. MIT's internal time
+;;; ticks are milliseconds.
+
+(define %real-time-origin (current-jiffy))
+
+; real-time - wall-clock milliseconds since the epoch, as a flonum (MIT 9.2)
+(define (real-time)
+  (/ (* 1000. (current-jiffy)) (jiffies-per-second)))
+
+; real-time-clock - wall-clock ticks since startup, as an exact integer
+(define (real-time-clock)
+  (quotient (* 1000 (- (current-jiffy) %real-time-origin))
+            (jiffies-per-second)))
+
+; process-time-clock - CPU ticks, as an exact integer
+(define (process-time-clock)
+  (exact (round (* 1000 (runtime)))))
+
+(define (internal-time/ticks->seconds ticks)
+  (/ ticks 1000.))
+
+(define (internal-time/seconds->ticks seconds)
+  (exact (round (* seconds 1000))))
+
+; with-timings - call thunk, then receiver with the run time, GC time and real
+; time it took in ticks; return thunk's values. Vesper does not time its
+; collector, so the GC time is always 0.
+(define (with-timings thunk receiver)
+  (let ((process-start (process-time-clock))
+        (real-start (real-time-clock)))
+    (call-with-values thunk
+      (lambda results
+        (let ((process-end (process-time-clock))
+              (real-end (real-time-clock)))
+          (receiver (- process-end process-start)
+                    0
+                    (- real-end real-start))
+          (apply values results))))))
+
+;;; --- Tracing ----------------------------------------------------------------
+;;; (trace name) rebinds the variable name to a wrapper that reports each call
+;;; and return to (trace-output-port) in MIT's format:
+;;;
+;;;   [Entering #[compound-procedure 12 fact]
+;;;       Args: 3]
+;;;   [6
+;;;         <== #[compound-procedure 12 fact]
+;;;       Args: 3]
+;;;
+;;; MIT advises the procedure object itself; here the binding is wrapped, so
+;;; the trace forms are macros that take a variable name.
+
+(define trace-output-port (make-parameter (current-output-port)))
+
+; The wrapper calls only these private aliases, so tracing the public ones
+; cannot recurse into the tracer.
+(define %trace-apply apply)
+(define %trace-call-with-values call-with-values)
+(define %trace-values values)
+
+; True while the tracer itself is running: calls it makes, even to a traced
+; procedure such as car, are not traced. It is cleared before control
+; returns to user code.
+(define %trace-busy? #f)
+
+; Each traced binding: #(name original wrapper getter setter entry? exit?)
+(define %traced '())
+
+; MIT prints procedures with their object-hash number; numbers are assigned
+; on first trace and kept for the procedure.
+(define %trace-numbers '())
+
+(define (%trace-number procedure)
+  (let ((known (assq procedure %trace-numbers)))
+    (if known
+        (cdr known)
+        (let ((n (+ 1 (length %trace-numbers))))
+          (set! %trace-numbers (cons (cons procedure n) %trace-numbers))
+          n))))
+
+(define (%trace-write-truncated text limit port)
+  (if (> (string-length text) limit)
+      (begin
+        (write-string (substring text 0 limit) port)
+        (write-string "..." port))
+      (write-string text port)))
+
+; One value is written as itself; zero or several (MIT's #[multi-values 12])
+; as #[multi-values v ...].
+(define (%trace-results-text results)
+  (if (and (pair? results) (null? (cdr results)))
+      (write-to-string (car results))
+      (call-with-output-string
+       (lambda (port)
+         (write-string "#[multi-values" port)
+         (for-each (lambda (value)
+                     (write-char #\space port)
+                     (write value port))
+                   results)
+         (write-string "]" port)))))
+
+; As in MIT's frame-based output, a rest parameter's list is one argument.
+(define (%trace-shown-arguments procedure arguments)
+  (let ((arity (%procedure-arity procedure)))
+    (if (and arity (cdr arity) (>= (length arguments) (car arity)))
+        (let loop ((n (car arity)) (args arguments) (acc '()))
+          (if (= n 0)
+              (reverse! (cons args acc))
+              (loop (- n 1) (cdr args) (cons (car args) acc))))
+        arguments)))
+
+; Lines are truncated to MIT's widths for an 80-column port.
+(define (%trace-display record arguments results)
+  (let ((port (trace-output-port))
+        (procedure (vector-ref record 1))
+        (width 79))
+    (if results
+        (begin
+          (write-string "[" port)
+          (%trace-write-truncated (%trace-results-text results) (- width 2)
+                                  port)
+          (newline port)
+          (write-string "      <== " port))
+        (write-string "[Entering " port))
+    (write-string (string-append (if (%procedure-arity procedure)
+                                     "#[compound-procedure "
+                                     "#[compiled-procedure ")
+                                 (number->string (%trace-number procedure))
+                                 " "
+                                 (symbol->string (vector-ref record 0))
+                                 "]")
+                  port)
+    (let loop ((args (%trace-shown-arguments procedure arguments))
+               (prefix "    Args: "))
+      (if (pair? args)
+          (begin
+            (newline port)
+            (write-string prefix port)
+            (%trace-write-truncated (write-to-string (car args)) (- width 11)
+                                    port)
+            (loop (cdr args) "          "))))
+    (write-string "]" port)
+    (newline port)))
+
+; The wrapper sets %trace-busy? before touching anything a user could trace.
+; A call without exit tracing stays a tail call.
+(define (%make-trace-wrapper record)
+  (let ((original (vector-ref record 1)))
+    (lambda arguments
+      (if %trace-busy?
+          (%trace-apply original arguments)
+          (begin
+            (set! %trace-busy? #t)
+            (if (vector-ref record 5)
+                (%trace-display record arguments #f))
+            (if (vector-ref record 6)
+                (begin
+                  (set! %trace-busy? #f)
+                  (%trace-call-with-values
+                   (lambda () (%trace-apply original arguments))
+                   (lambda results
+                     (set! %trace-busy? #t)
+                     (%trace-display record arguments results)
+                     (set! %trace-busy? #f)
+                     (%trace-apply %trace-values results))))
+                (begin
+                  (set! %trace-busy? #f)
+                  (%trace-apply original arguments))))))))
+
+; The record of the trace wrapping this binding's current value, if any.
+; Records whose binding has since been given another value are dropped.
+(define (%trace-record value)
+  (set! %traced
+        (filter (lambda (record)
+                  (eq? ((vector-ref record 3)) (vector-ref record 2)))
+                %traced))
+  (let loop ((records %traced))
+    (cond ((null? records) #f)
+          ((eq? (vector-ref (car records) 2) value) (car records))
+          (else (loop (cdr records))))))
+
+(define (%trace! who name value getter setter entry? exit?)
+  (set! %trace-busy? #t)
+  (let ((record (%trace-record value)))
+    (cond (record
+           (if entry? (vector-set! record 5 #t))
+           (if exit? (vector-set! record 6 #t)))
+          ((procedure? value)
+           (let ((record (vector name value #f getter setter entry? exit?)))
+             (vector-set! record 2 (%make-trace-wrapper record))
+             (set! %traced (cons record %traced))
+             (setter (vector-ref record 2))))
+          (else
+           (set! %trace-busy? #f)
+           (error (string-append who ": expected procedure") value))))
+  (set! %trace-busy? #f)
+  (if #f #f))
+
+(define (%untrace-record! record entry? exit?)
+  (if entry? (vector-set! record 5 #f))
+  (if exit? (vector-set! record 6 #f))
+  (if (not (or (vector-ref record 5) (vector-ref record 6)))
+      (begin
+        ((vector-ref record 4) (vector-ref record 1))
+        (set! %traced
+              (filter (lambda (other) (not (eq? other record))) %traced)))))
+
+(define (%untrace! who name value entry? exit?)
+  (set! %trace-busy? #t)
+  (let ((record (%trace-record value)))
+    (if (not record)
+        (begin
+          (set! %trace-busy? #f)
+          (error (string-append who ": not traced:") name)))
+    (%untrace-record! record entry? exit?))
+  (set! %trace-busy? #f)
+  (if #f #f))
+
+(define (%untrace-all! entry? exit?)
+  (set! %trace-busy? #t)
+  (%trace-record #f)
+  (for-each (lambda (record) (%untrace-record! record entry? exit?))
+            %traced)
+  (set! %trace-busy? #f)
+  (if #f #f))
+
+;; The trace forms take the variable whose procedure is traced.
+(define-syntax trace-entry
+  (syntax-rules ()
+    ((_ name) (%trace! "trace-entry" 'name name (lambda () name)
+                       (lambda (value) (set! name value)) #t #f))))
+
+(define-syntax trace-exit
+  (syntax-rules ()
+    ((_ name) (%trace! "trace-exit" 'name name (lambda () name)
+                       (lambda (value) (set! name value)) #f #t))))
+
+(define-syntax trace-both
+  (syntax-rules ()
+    ((_ name) (%trace! "trace-both" 'name name (lambda () name)
+                       (lambda (value) (set! name value)) #t #t))))
+
+(define-syntax trace
+  (syntax-rules ()
+    ((_ name) (%trace! "trace" 'name name (lambda () name)
+                       (lambda (value) (set! name value)) #t #t))))
+
+;; Without a name, the untrace forms apply to every traced procedure.
+(define-syntax untrace-entry
+  (syntax-rules ()
+    ((_) (%untrace-all! #t #f))
+    ((_ name) (%untrace! "untrace-entry" 'name name #t #f))))
+
+(define-syntax untrace-exit
+  (syntax-rules ()
+    ((_) (%untrace-all! #f #t))
+    ((_ name) (%untrace! "untrace-exit" 'name name #f #t))))
+
+(define-syntax untrace
+  (syntax-rules ()
+    ((_) (%untrace-all! #t #t))
+    ((_ name) (%untrace! "untrace" 'name name #t #t))))
+
+;;; --- Pretty printer ---------------------------------------------------------
+;;; pp follows MIT's layout: an expression that fits on the line is printed
+;;; flat; otherwise a combination keeps its first argument on the operator's
+;;; line and aligns the rest under it, falling back to one element per line.
+;;; As code, if/cond/and/or always break, define/lambda/let-style forms put
+;;; their bodies on new lines indented two columns, and quoted data and vector
+;;; contents are laid out as tables. Compound procedures print as objects:
+;;; Vesper does not retain their source.
+
+(define %pp-x-size 79)
+
+; Nodes: an atom is its written text (a string), or (symbol . text) for a
+; symbol; a list is #(list size subnodes head-symbol); a prefix node, for
+; quote forms and vectors, is #(prefix size prefix-text subnode).
+(define (%pp-size node)
+  (cond ((string? node) (string-length node))
+        ((pair? node) (string-length (cdr node)))
+        (else (vector-ref node 1))))
+
+(define (%pp-quote-prefix object)
+  (and (pair? (cdr object))
+       (null? (cddr object))
+       (case (car object)
+         ((quote) "'")
+         ((quasiquote) "`")
+         ((unquote) ",")
+         ((unquote-splicing) ",@")
+         (else #f))))
+
+; Build the node tree, escaping through cycle with #f on circular structure.
+(define (%pp-walk object abbreviate? cycle)
+  (let ((active (make-strong-eqv-hash-table)))
+    (define (enter! container)
+      (if (hash-table-ref/default active container #f)
+          (cycle #f))
+      (hash-table-set! active container #t))
+    (define (walk object)
+      (cond ((pair? object)
+             (let ((prefix (and abbreviate? (%pp-quote-prefix object))))
+               (if prefix
+                   (begin
+                     (enter! object)
+                     (let ((sub (walk (cadr object))))
+                       (hash-table-delete! active object)
+                       (vector 'prefix (+ (string-length prefix) (%pp-size sub))
+                               prefix sub)))
+                   (walk-list object
+                              (and (symbol? (car object)) (car object))))))
+            ((and (vector? object) (> (vector-length object) 0))
+             (enter! object)
+             (let ((sub (walk-list (vector->list object) #f)))
+               (hash-table-delete! active object)
+               (vector 'prefix (+ 1 (%pp-size sub)) "#" sub)))
+            ((symbol? object) (cons object (write-to-string object)))
+            (else (write-to-string object))))
+    (define (walk-list lst head)
+      (let loop ((rest lst) (spine '()) (nodes '()))
+        (cond ((pair? rest)
+               (enter! rest)
+               (let ((node (walk (car rest))))
+                 (loop (cdr rest) (cons rest spine) (cons node nodes))))
+              (else
+               (let ((nodes (if (null? rest)
+                                nodes
+                                (cons (walk rest) (cons "." nodes)))))
+                 (for-each (lambda (pair) (hash-table-delete! active pair))
+                           spine)
+                 (vector 'list
+                         (fold (lambda (node size) (+ size (%pp-size node) 1))
+                               1 nodes)
+                         (reverse! nodes)
+                         head))))))
+    (walk object)))
+
+(define (%pp-special-kind head)
+  (case head
+    ((cond if and or) 'forced)
+    ((let) 'let)
+    ((define lambda named-lambda let* letrec letrec* let-values let*-values
+      fluid-let parameterize)
+     'procedure)
+    ((case) 'case)
+    (else
+     (and (symbol? head)
+          (string-prefix? "define-" (symbol->string head))
+          'procedure))))
+
+(define (%pp-print node column depth code? port)
+  (define (size node) (%pp-size node))
+  (define (emit text) (write-string text port))
+  (define (tab-to column)
+    (newline port)
+    (emit (make-string column #\space)))
+  (define (fits-within? node column depth)
+    (> (- %pp-x-size depth) (+ column (size node))))
+  (define (fits-as-column? column nodes depth)
+    (let loop ((nodes nodes))
+      (if (null? (cdr nodes))
+          (fits-within? (car nodes) column depth)
+          (and (> %pp-x-size (+ column (size (car nodes))))
+               (loop (cdr nodes))))))
+  (define (print-flat node)
+    (cond ((string? node) (emit node))
+          ((pair? node) (emit (cdr node)))
+          ((eq? (vector-ref node 0) 'prefix)
+           (emit (vector-ref node 2))
+           (print-flat (vector-ref node 3)))
+          (else
+           (emit "(")
+           (print-flat (car (vector-ref node 2)))
+           (for-each (lambda (node) (emit " ") (print-flat node))
+                     (cdr (vector-ref node 2)))
+           (emit ")"))))
+  (define (print-flat-column nodes column)
+    (print-flat (car nodes))
+    (for-each (lambda (node) (tab-to column) (print-flat node)) (cdr nodes)))
+  (define (print-column nodes column depth code?)
+    (let loop ((nodes nodes))
+      (if (null? (cdr nodes))
+          (print-node (car nodes) column depth code?)
+          (begin
+            (print-node (car nodes) column 0 code?)
+            (tab-to column)
+            (loop (cdr nodes))))))
+  (define (print-node node column depth code?)
+    (cond ((or (string? node) (pair? node)) (print-flat node))
+          ((eq? (vector-ref node 0) 'prefix)
+           (let ((prefix (vector-ref node 2)))
+             (emit prefix)
+             ; What follows a quote or a vector's # is data.
+             (print-node (vector-ref node 3) (+ column (string-length prefix))
+                         depth #f)))
+          (else
+           (let* ((nodes (vector-ref node 2))
+                  (kind (and code? (pair? (cdr nodes))
+                             (%pp-special-kind (vector-ref node 3)))))
+             (cond (kind (print-special kind nodes column depth))
+                   ((fits-within? node column depth) (print-flat node))
+                   (code? (print-combination nodes column depth))
+                   (else (print-table nodes column depth)))))))
+  (define (print-combination nodes column depth)
+    (emit "(")
+    (let ((column (+ column 1)) (depth (+ depth 1)))
+      (cond ((null? (cdr nodes)) (print-node (car nodes) column depth #t))
+            ((two-on-first-line? nodes column depth)
+             (print-flat (car nodes))
+             (emit " ")
+             (print-flat-column (cdr nodes) (+ column 1 (size (car nodes)))))
+            (else (print-column nodes column depth #t))))
+    (emit ")"))
+  (define (two-on-first-line? nodes column depth)
+    (let ((column (+ column 1 (size (car nodes)))))
+      (and (>= %pp-x-size column)
+           (fits-as-column? column (cdr nodes) depth))))
+  ; A special form: the keyword, then its own layout of the rest. Optimistic
+  ; is the column after the keyword, pessimistic the body indentation.
+  (define (print-special kind nodes column depth)
+    (emit "(")
+    (print-flat (car nodes))
+    (emit " ")
+    (let ((nodes (cdr nodes))
+          (optimistic (+ column 2 (size (car nodes))))
+          (pessimistic (+ column 2))
+          (depth (+ depth 1)))
+      (define (print-body nodes)
+        (if (pair? nodes)
+            (begin
+              (tab-to pessimistic)
+              (print-column nodes pessimistic depth #t))))
+      (case kind
+        ((forced) (print-column nodes optimistic depth #t))
+        ((procedure)
+         (print-node (car nodes) optimistic (if (pair? (cdr nodes)) 0 depth) #t)
+         (print-body (cdr nodes)))
+        ((let)
+         (cond ((null? (cdr nodes))
+                (print-node (car nodes) optimistic depth #t))
+               ((pair? (car nodes))     ; named let
+                (emit (cdr (car nodes)))
+                (let ((bindings (cadr nodes))
+                      (after-name (+ optimistic 1 (size (car nodes)))))
+                  (cond ((fits-within? bindings after-name 0)
+                         (emit " ")
+                         (print-flat bindings))
+                        ((and (vector? bindings)
+                              (eq? (vector-ref bindings 0) 'list)
+                              (fits-as-column? (+ after-name 2)
+                                               (vector-ref bindings 2) 0))
+                         (emit " (")
+                         (print-flat-column (vector-ref bindings 2)
+                                            (+ after-name 1))
+                         (emit ")"))
+                        (else
+                         (tab-to optimistic)
+                         (print-node bindings optimistic 0 #t))))
+                (print-body (cddr nodes)))
+               ((fits-within? (car nodes) optimistic 0)
+                (print-flat (car nodes))
+                (print-body (cdr nodes)))
+               (else
+                (print-node (car nodes) optimistic 0 #t)
+                (print-body (cdr nodes)))))
+        ((case)
+         (cond ((null? (cdr nodes))
+                (print-node (car nodes) optimistic depth #t))
+               ((fits-within? (car nodes) optimistic 0)
+                (print-flat (car nodes))
+                (print-body (cdr nodes)))
+               (else
+                (tab-to (+ pessimistic 2))
+                (print-node (car nodes) optimistic 0 #t)
+                (print-body (cdr nodes)))))))
+    (emit ")"))
+  ; Data that does not fit: as many columns as fit, MIT's table layout.
+  (define (print-table nodes column depth)
+    (emit "(")
+    (maybe-print-table nodes (+ column 1) (+ depth 1))
+    (emit ")"))
+  (define (maybe-print-table nodes column depth)
+    (let* ((available (- %pp-x-size column))
+           (n-nodes (length nodes))
+           (max-cols (quotient (+ n-nodes 1) 2))
+           (nodev (list->vector nodes))
+           (last-size (size (vector-ref nodev (- n-nodes 1)))))
+      (define (default) (print-column nodes column depth #f))
+      (define (fit? n widths)
+        (and (>= available (+ (- n 1) (apply + widths)))
+             (let ((last-n-1 (remainder (- n-nodes 1) n)))
+               (>= available
+                   (+ last-n-1 (apply + (list-head widths last-n-1))
+                      last-size depth)))))
+      (define (find-widths n)
+        (let recur ((start 0))
+          (if (= start n)
+              '()
+              (cons (let loop ((posn start) (width 0))
+                      (if (< posn n-nodes)
+                          (loop (+ posn n)
+                                (max width (size (vector-ref nodev posn))))
+                          width))
+                    (recur (+ start 1))))))
+      (define (try n)
+        (if (< n 2)
+            (default)
+            (let ((widths (find-widths n)))
+              (if (fit? n widths)
+                  (print-table-rows
+                   nodes column
+                   ; Prefer one column fewer when it needs no more rows.
+                   (let ((next-n (- n 1)))
+                     (if (or (= n 2)
+                             (not (= (quotient (+ n-nodes next-n) n)
+                                     (quotient (+ n-nodes (- next-n 1))
+                                               next-n)))
+                             (not (fit? next-n (find-widths next-n))))
+                         widths
+                         (find-widths next-n))))
+                  (try (- n 1))))))
+      (if (< n-nodes 4)
+          (default)
+          (let loop ((n 1) (rest (cdr nodes))
+                     (space (- available (size (car nodes)))))
+            (cond ((> n max-cols) (try max-cols))
+                  ((>= space 0)
+                   (loop (+ n 1) (cdr rest) (- space (+ 1 (size (car rest))))))
+                  (else (try (max 2 (- n 1)))))))))
+  (define (print-table-rows nodes column all-widths)
+    (let loop ((row nodes) (widths all-widths) (spaces 0))
+      (cond ((null? row))
+            ((null? widths)
+             (tab-to column)
+             (loop row all-widths 0))
+            (else
+             (emit (make-string spaces #\space))
+             (print-flat (car row))
+             (loop (cdr row) (cdr widths)
+                   (+ 1 (- (car widths) (size (car row)))))))))
+  (print-node node column depth code?))
+
+(define (%pp-object object port as-code? indentation)
+  (let ((node (call-with-current-continuation
+               (lambda (cycle) (%pp-walk object as-code? cycle)))))
+    (if (> indentation 0)
+        (write-string (make-string indentation #\space) port))
+    (if node
+        (%pp-print node indentation 0 as-code? port)
+        (write object port))
+    (newline port)))
+
+; pp - (pp object [port [as-code? [indentation]]]). A user-defined record is
+; followed by its fields, one (name value) per line, as in MIT.
+(define (pp object . options)
+  (let ((port (if (pair? options) (car options) (current-output-port)))
+        (as-code? (if (and (pair? options) (pair? (cdr options)))
+                      (cadr options)
+                      #t))
+        (indentation (if (and (pair? options) (pair? (cdr options))
+                              (pair? (cddr options)))
+                         (caddr options)
+                         0)))
+    (if (not (output-port? port))
+        (error "pp: expected output port"))
+    (%require-nonnegative-integer "pp" indentation)
+    (%pp-object object port as-code? indentation)
+    (if (and (record? object)
+             (not (%record-type-sealed? (record-type-descriptor object))))
+        (let ((type (record-type-descriptor object)))
+          (for-each (lambda (field)
+                      (%pp-object
+                       (list field ((record-accessor type field) object))
+                       port as-code? 0))
+                    (record-type-field-names type))))))

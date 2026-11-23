@@ -386,6 +386,10 @@ static const primitive_binding builtins[] = {
     {"textual-port?", PTEXTUALPORTP},
     {"binary-port?", PBINARYPORTP},
 
+    // MIT library support (stdlib.scm "MIT library procedures")
+    {"runtime", PRUNTIME},
+    {"%procedure-arity", PPROCEDUREARITY},
+
     {NULL, 0}};
 
 const primitive_binding *primitive_bindings(void)

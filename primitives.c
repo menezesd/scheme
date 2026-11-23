@@ -20,6 +20,7 @@
  */
 
 #include "primitives.h"
+#include "bytecode.h"
 #include "feature_table.h"
 #include "prim_internal.h"
 #include "utf8.h"
@@ -3004,6 +3005,64 @@ static unsigned unsupported_special_primitive(unsigned prim_id)
     return TOK_ERROR;
 }
 
+// ============================================================================
+// MIT library support (stdlib.scm "MIT library procedures")
+// ============================================================================
+
+// MIT's runtime: the process's CPU time in seconds, as a flonum.
+static unsigned runtime_value(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts) != 0) {
+        show_error("runtime: clock_gettime failed");
+        return TOK_ERROR;
+    }
+    return store_inexact((double)ts.tv_sec + (double)ts.tv_nsec / 1e9);
+}
+
+// (required-count . rest?) for a compound procedure in either engine, #f for
+// anything else. trace uses it to print a rest parameter's list as one
+// argument, as MIT's frame-based trace output does.
+static unsigned procedure_arity_value(unsigned proc)
+{
+    unsigned required = 0;
+    bool rest = false;
+    if (is_bytecode_closure_object(proc)) {
+        const code_object *code = GET_CLOSURE_CODE(proc);
+        required = code->arity;
+        rest = code->has_rest;
+    } else if (IS_FUNCTION(proc)) {
+        unsigned params = CELL_CAR(proc);
+        while (IS_PAIR(params)) {
+            required++;
+            params = CELL_CDR(params);
+        }
+        rest = !IS_NIL(params);
+    } else {
+        return CELL_ATOM_FALSE;
+    }
+    GC_GUARD;
+    unsigned count = store((int64_t)required);
+    gc_protect(&count);
+    return alloc_cons(count, rest ? CELL_ATOM_TRUE : CELL_ATOM_FALSE);
+}
+
+static unsigned apply_mit_library_primitive(unsigned prim_id, unsigned argc,
+                                            unsigned *argv)
+{
+    switch (prim_id) {
+    case PRUNTIME:
+        REQUIRE_ARGC(argc, 0, 0, "runtime");
+        return runtime_value();
+    case PPROCEDUREARITY:
+        REQUIRE_ARGC(argc, 1, 1, "%procedure-arity");
+        return procedure_arity_value(argv[0]);
+    default:
+        show_error("MIT library primitive: unsupported id %u", prim_id);
+        return TOK_ERROR;
+    }
+}
+
 unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
 {
     if (argc > 0 && !argv) {
@@ -3406,6 +3465,11 @@ unsigned apply_primitive_argv(unsigned prim_id, unsigned argc, unsigned *argv)
     case PBYTEVEC:
     case PBYTEVECUP:
         return apply_bytevector_primitive(prim_id, argc, argv);
+
+    // MIT library support
+    case PRUNTIME:
+    case PPROCEDUREARITY:
+        return apply_mit_library_primitive(prim_id, argc, argv);
 
     default:
         show_error("unknown primitive: %u", prim_id);
