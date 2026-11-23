@@ -2103,6 +2103,39 @@ static void emit_gensym_definitions(compile_ctx *cctx, unsigned bindings)
     }
 }
 
+// A procedural transformer failed - to be made, or on a use: the code
+// raises its message, already reported, where it runs.
+static compile_result emit_procedural_syntax_error(compile_ctx *cctx)
+{
+    char message[sizeof(ctx.last_error)];
+    snprintf(message, sizeof(message), "%s",
+             ctx.last_error[0] ? ctx.last_error : "macro expansion failed");
+    return emit_syntax_error(cctx, message);
+}
+
+// (define-syntax name (er-macro-transformer proc)) and the like. The
+// transformer is made now, so that the rest of the unit can use the macro,
+// and defined again when the code runs, over the run-time environment
+// (OP_DEFSYNTAX), as a syntax-rules one is.
+static compile_result compile_procedural_define_syntax(unsigned name,
+                                                       unsigned form,
+                                                       compile_ctx *cctx)
+{
+    GC_GUARD;
+    gc_protect(&name);
+    gc_protect(&form);
+    unsigned transformer =
+        macros_make_procedural_transformer(form, cctx->env, "define-syntax");
+    if (transformer == TOK_ERROR)
+        return emit_procedural_syntax_error(cctx);
+    gc_protect(&transformer);
+    emit2(cctx, OP_CONST, code_add_const(cctx->code, transformer));
+    emit2(cctx, OP_DEFSYNTAX, CELL_ID(name));
+    emit2(cctx, OP_CONST, code_add_const(cctx->code, name));
+    defvar(name, transformer, cctx->env);
+    return dynamic_result();
+}
+
 static bool compile_macro_binding(unsigned mac, unsigned expr,
                                   compile_ctx *cctx, compile_result *result)
 {
@@ -2142,7 +2175,17 @@ static bool compile_macro_binding(unsigned mac, unsigned expr,
     if (IS_SYNTAX(mac)) {
         unsigned bindings = 0;
         gc_protect(&bindings);
+        // Decided before the expansion, which can collect and move mac.
+        bool procedural = macros_is_procedural_transformer(mac);
         unsigned expanded = apply_syntax(mac, expr, cctx->env, &bindings);
+        if (expanded == TOK_ERROR && procedural) {
+            // Raised, when the code runs, with the transformer's own message
+            // (already reported) rather than a generic one.
+            *result = emit_procedural_syntax_error(cctx);
+            cctx->macro_expansion_depth--;
+            gc_unprotect(1);
+            return true;
+        }
         if (expanded == TOK_ERROR) {
             show_error("macro expansion failed");
             *result = emit_syntax_error(cctx, "macro expansion failed");
@@ -2177,7 +2220,11 @@ static bool compile_macro_binding(unsigned mac, unsigned expr,
         gc_protect(&frame);
         unsigned new_env = alloc_cons(frame, menv);
         gc_protect(&new_env);
+        // Scheme code running while this unit is compiled: no code-object
+        // sweep may free the unit meanwhile (see code_sweep_inhibit).
+        code_sweep_inhibit();
         unsigned expanded = eval_cps(mbody, new_env);
+        code_sweep_allow();
         gc_protect(&expanded);
         if (expanded == TOK_ERROR) {
             show_error("macro expansion failed");
@@ -2652,6 +2699,10 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
                                              "define-syntax: invalid syntax");
                 unsigned name = cadr(expr);
                 unsigned transformer_form = caddr(expr);
+                if (identifier_valid(name) &&
+                    macros_procedural_transformer_form(transformer_form))
+                    return compile_procedural_define_syntax(
+                        name, transformer_form, cctx);
                 int64_t default_ellipsis_id =
                     syntax_default_ellipsis_id(cctx->env);
                 if (!identifier_valid(name) ||
@@ -2767,6 +2818,11 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
                 while (b) {
                     unsigned binding = car(b);
                     unsigned transformer_form = cadr(binding);
+                    if (macros_procedural_transformer_form(transformer_form)) {
+                        // No template: made in the second pass.
+                        b = cdr(b);
+                        continue;
+                    }
 
                     int64_t default_ellipsis_id =
                         kw == ctx.kw_let_syntax
@@ -2913,6 +2969,25 @@ next_free_var:
                     unsigned name = car(binding);
                     unsigned transformer_form = cadr(binding);
                     gc_protect(&name);
+
+                    if (macros_procedural_transformer_form(transformer_form)) {
+                        unsigned transformer =
+                            macros_make_procedural_transformer(
+                                transformer_form,
+                                kw == ctx.kw_let_syntax ? cctx->env : new_env,
+                                form_name);
+                        if (transformer == TOK_ERROR)
+                            return emit_procedural_syntax_error(cctx);
+                        gc_protect(&transformer);
+                        unsigned vc = alloc_cons(name, frame_vars);
+                        gc_protect(&vc);
+                        unsigned ac = alloc_cons(transformer, frame_vals);
+                        gc_unprotect(3);
+                        frame_vars = vc;
+                        frame_vals = ac;
+                        b = cdr(b);
+                        continue;
+                    }
 
                     // Check it's a syntax-rules form
                     int64_t default_ellipsis_id =

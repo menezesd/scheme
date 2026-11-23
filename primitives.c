@@ -22,6 +22,7 @@
 #include "primitives.h"
 #include "bytecode.h"
 #include "feature_table.h"
+#include "macros.h"
 #include "prim_internal.h"
 #include "utf8.h"
 #include <dirent.h>
@@ -3236,6 +3237,17 @@ static unsigned dispatch_primitive(unsigned prim_id, unsigned argc,
     case PGCFLIP:
         gc(0);
         return ctx.atom_true;
+
+    // Procedural macro transformers - macros.c
+    case PMACRORENAME:
+    case PMACROCOMPARE:
+    case PMACROERRORHANDLER:
+    case PMACRORETURN:
+    case PCLOSESYNTAX:
+    case PMAKESYNCLOSURE:
+    case PIDENTIFIERP:
+    case PIDENTIFIEREQ:
+        return macros_apply_syntactic_primitive(prim_id, argc, argv);
 
     // Numeric tower operations - delegated to prim_numtower.c
     case PNUMERATOR:

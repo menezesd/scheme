@@ -86,4 +86,28 @@ unsigned macros_freeze_core_keywords(unsigned transformer_form,
                                      unsigned closure_env,
                                      int64_t default_ellipsis_id);
 
+// Procedural (MIT) transformers: (er-macro-transformer proc),
+// (rsc-macro-transformer proc) and (sc-macro-transformer proc) as the
+// transformer of define-syntax, let-syntax or letrec-syntax. proc is
+// evaluated at syntax time in the top level of closure_env's chain, and the
+// result is a BT_SYNTAX object that apply_syntax applies like any macro.
+bool macros_procedural_transformer_form(unsigned transformer_form);
+// TOK_ERROR, with the error shown, when proc does not evaluate to a
+// procedure or its evaluation fails.
+unsigned macros_make_procedural_transformer(unsigned transformer_form,
+                                            unsigned closure_env,
+                                            const char *context);
+bool macros_is_procedural_transformer(unsigned transformer);
+// The same transformer closed over env instead (a define-syntax compiled
+// against the compile-time environment, installed at run time).
+unsigned macros_rebind_procedural_transformer(unsigned transformer,
+                                              unsigned env);
+// Whether form names a procedural macro bound in env (a top-level loader
+// compiles such a form only after the forms before it have run).
+bool macros_form_uses_procedural_macro(unsigned form, unsigned env);
+// rename, compare, close-syntax, make-syntactic-closure, identifier?,
+// identifier=? and the syntax-time exception handler.
+unsigned macros_apply_syntactic_primitive(unsigned prim_id, unsigned argc,
+                                          unsigned *argv);
+
 #endif // MACROS_H

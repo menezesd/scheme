@@ -379,6 +379,24 @@ PROBES = [
     "(call-with-current-continuation (lambda (k) (with-exception-handler (lambda (e) (k (condition/report-string e))) (lambda () ((lambda (x) (define (g) x) (define x 10) (g)) 1)))))",
     "(call-with-current-continuation (lambda (k) (with-exception-handler (lambda (e) (k (condition/report-string e))) (lambda () (let () (define a 1) (define b (lambda () c)) (define c (b)) c)))))",
     "(call-with-current-continuation (lambda (k) (with-exception-handler (lambda (e) (k (condition/report-string e))) (lambda () (let loop ((i 0)) (if (< i 3) (loop (+ i 1)) i))))))",
+    # Procedural transformers (MIT's er-, rsc- and sc-macro-transformer).
+    "(let-syntax ((swap! (er-macro-transformer (lambda (f r c) `(,(r 'let) ((,(r 'tmp) ,(cadr f))) (,(r 'set!) ,(cadr f) ,(caddr f)) (,(r 'set!) ,(caddr f) ,(r 'tmp))))))) (let ((tmp 1) (y 2) (let 0) (set! list)) (swap! tmp y) (list tmp y)))",
+    "(let-syntax ((my-or (er-macro-transformer (lambda (f r c) `(,(r 'let) ((,(r 't) ,(cadr f))) (,(r 'if) ,(r 't) ,(r 't) ,(caddr f))))))) (let ((t 5) (if list)) (my-or #f t)))",
+    "(let-syntax ((loop (er-macro-transformer (lambda (f r c) `(,(r 'call-with-current-continuation) (,(r 'lambda) (break) (,(r 'let) ,(r 'f) () ,@(cdr f) (,(r 'f))))))))) (let ((i 0)) (loop (set! i (+ i 1)) (if (= i 5) (break i)))))",
+    "(let-syntax ((m (er-macro-transformer (lambda (f r c) (list (c (cadr f) (r 'else)) (c (r 'if) 'if)))))) (list (m else) (let ((else 1)) (m else)) (let ((if 2)) (m x))))",
+    "(let-syntax ((m (er-macro-transformer (lambda (f r c) (eq? (r 'x) (r 'x)))))) (m))",
+    "(let ((y 10)) (let-syntax ((m (er-macro-transformer (lambda (f r c) (r 'y))))) (list (m) (let ((z 1)) (m)))))",
+    "(letrec-syntax ((ev? (er-macro-transformer (lambda (f r c) (if (null? (cdr f)) #t `(,(r 'od?) ,@(cddr f)))))) (od? (er-macro-transformer (lambda (f r c) (if (null? (cdr f)) #f `(,(r 'ev?) ,@(cddr f))))))) (list (ev? 1 2 3 4) (ev? 1 2 3)))",
+    # A transformer sees no locals (they do not exist at syntax time), and its
+    # errors are raised as errors (through eval, which defers them to run time
+    # in MIT too).
+    "(eval '(let ((z 3)) (let-syntax ((m (er-macro-transformer (lambda (f r c) z)))) (m))) (interaction-environment))",
+    "(eval '(let-syntax ((m (er-macro-transformer (lambda (f r c) (car '()))))) (m)) (interaction-environment))",
+    "(let-syntax ((m (er-macro-transformer (lambda (f r c) `(,(r 'quote) (,(r 'if) ,@(cdr f))))))) (let ((if 1)) (m a b)))",
+    "(let ((x 'local)) (let-syntax ((r1 (rsc-macro-transformer (lambda (f e) 'x))) (r2 (rsc-macro-transformer (lambda (f e) (close-syntax 'x e))))) (list (r1) (r2))))",
+    "(let-syntax ((push (rsc-macro-transformer (lambda (f e) `(,(make-syntactic-closure e '() 'set!) ,(caddr f) (,(make-syntactic-closure e '() 'cons) ,(cadr f) ,(caddr f))))))) (let ((cons list) (l '())) (push 1 l) l))",
+    "(let-syntax ((push (sc-macro-transformer (lambda (f e) (let ((item (make-syntactic-closure e '() (cadr f))) (lst (make-syntactic-closure e '() (caddr f)))) `(set! ,lst (cons ,item ,lst))))))) (let ((cons list) (l '())) (push 3 l) l))",
+    "(let-syntax ((m (sc-macro-transformer (lambda (f e) `(quote ,(list (identifier? 'a) (identifier? (close-syntax 'a e)) (identifier? 1) (identifier=? e 'a e 'a) (identifier=? e 'a e 'b))))))) (m))",
 ]
 
 def list_boundary_probes():
@@ -848,6 +866,31 @@ PROGRAMS = [
 (%emit (lambda () (case 3 ((1) 'a) (else 'b))))
 (define => #f)
 (%emit (lambda () (case 2 ((2) => (lambda (x) (* x 3))) (else 0))))
+""",
+    # Top-level procedural macros: a transformer calling a helper defined
+    # after the macro, hygiene against a global of the renamed name, and an
+    # sc macro whose output is closed in the macro environment.
+    """(define-syntax pm-m (er-macro-transformer (lambda (f r c) (pm-helper (cadr f)))))
+(define (pm-helper x) (list 'quote (list 'helped x)))
+(%emit (lambda () (pm-m 1)))
+(define-syntax pm-swap! (er-macro-transformer (lambda (f r c) `(,(r 'let) ((,(r 'tmp) ,(cadr f))) (,(r 'set!) ,(cadr f) ,(caddr f)) (,(r 'set!) ,(caddr f) ,(r 'tmp))))))
+(define tmp 1)
+(define pm-y 2)
+(pm-swap! tmp pm-y)
+(%emit (lambda () (list tmp pm-y)))
+(define pm-x 'global)
+(define-syntax pm-sc (sc-macro-transformer (lambda (f e) 'pm-x)))
+(define-syntax pm-rsc (rsc-macro-transformer (lambda (f e) 'pm-x)))
+(%emit (lambda () (let ((pm-x 'local)) (list (pm-sc) (pm-rsc)))))
+(define-syntax pm-loop-until
+  (sc-macro-transformer
+   (lambda (exp env)
+     (let ((id (cadr exp)) (init (caddr exp)) (test (cadddr exp))
+           (return (cadddr (cdr exp))) (step (cadddr (cddr exp)))
+           (close (lambda (exp free) (make-syntactic-closure env free exp))))
+       `(letrec ((loop (lambda (,id) (if ,(close test (list id)) ,(close return (list id)) (loop ,(close step (list id)))))))
+          (loop ,(close init '())))))))
+(%emit (lambda () (let ((loop 5)) (pm-loop-until i 0 (> i 10) (* i loop) (+ i 1)))))
 """,
 ]
 

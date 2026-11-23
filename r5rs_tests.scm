@@ -2553,6 +2553,221 @@ b")
 (test "do and named let are unaffected" '(10 10)
     (list (do ((i 0 (+ i 1))) ((= i 10) i))
           (let loop ((i 0)) (if (= i 10) i (loop (+ i 1))))))
+;;; Procedural macros (MIT er-, rsc- and sc-macro-transformer)
+;;; ============================================================================
+
+(test-section "procedural macros")
+
+(define-syntax pm-swap!
+  (er-macro-transformer
+   (lambda (form rename compare)
+     (let ((a (cadr form)) (b (caddr form)))
+       `(,(rename 'let) ((,(rename 'tmp) ,a))
+          (,(rename 'set!) ,a ,b)
+          (,(rename 'set!) ,b ,(rename 'tmp)))))))
+(define pm-tmp-a 1)
+(define pm-tmp-b 2)
+(pm-swap! pm-tmp-a pm-tmp-b)
+(test "er swap! of globals" '(2 1) (list pm-tmp-a pm-tmp-b))
+(test "er swap! of a variable named like its temporary" '(4 3 5)
+      (let ((tmp 3) (let 4) (set! 5)) (pm-swap! tmp let) (list tmp let set!)))
+(test "er swap! inside a procedure called repeatedly" '(2 2 2)
+      (let loop ((i 0) (acc '()))
+        (if (= i 3)
+            acc
+            (loop (+ i 1)
+                  (cons (let ((p 1) (q 2)) (pm-swap! p q) p) acc)))))
+
+(define-syntax pm-or
+  (er-macro-transformer
+   (lambda (form rename compare)
+     (cond ((null? (cdr form)) #f)
+           ((null? (cddr form)) (cadr form))
+           (else `(,(rename 'let) ((,(rename 't) ,(cadr form)))
+                    (,(rename 'if) ,(rename 't) ,(rename 't)
+                     (,(rename 'pm-or) ,@(cddr form)))))))))
+(test "er or with renamed let and if, recursive" '(5 #f 7)
+      (list (let ((t 5) (if list)) (pm-or #f t)) (pm-or) (pm-or #f #f 7)))
+
+(define-syntax pm-loop
+  (er-macro-transformer
+   (lambda (form rename compare)
+     `(,(rename 'call-with-current-continuation)
+       (,(rename 'lambda) (break)
+        (,(rename 'let) ,(rename 'f) () ,@(cdr form) (,(rename 'f))))))))
+(test "er loop captures an unrenamed break" 5
+      (let ((i 0)) (pm-loop (set! i (+ i 1)) (if (= i 5) (break i)))))
+
+(define-syntax pm-cond
+  (er-macro-transformer
+   (lambda (form rename compare)
+     (let ((clauses (cdr form)))
+       (if (null? clauses)
+           #f
+           (let ((c (car clauses)))
+             (if (and (identifier? (car c)) (compare (car c) (rename 'else)))
+                 `(,(rename 'begin) ,@(cdr c))
+                 `(,(rename 'if) ,(car c)
+                   (,(rename 'begin) ,@(cdr c))
+                   (,(rename 'pm-cond) ,@(cdr clauses))))))))))
+(test "er compare matches else" 2 (pm-cond (#f 1) (else 2)))
+(test "er compare rejects a rebound else" #f
+      (let ((else #f)) (pm-cond (#f 1) (else 2))))
+
+(define-syntax pm-rename-facts
+  (er-macro-transformer
+   (lambda (form rename compare)
+     `(,(rename 'quote)
+       ,(list (eq? (rename 'x) (rename 'x))
+              (compare (rename 'if) 'if)
+              (compare 'a 'b))))))
+(test "er rename memoizes; compare by binding" '(#t #t #f) (pm-rename-facts))
+(test "er compare sees a use-site rebinding" '(#t #f #f)
+      (let ((if 1)) (pm-rename-facts)))
+
+(define (pm-helper x) (list 'helped x))
+(define-syntax pm-uses-helper
+  (er-macro-transformer
+   (lambda (f r c) `(,(r 'quote) ,(pm-helper (cadr f))))))
+(test "er transformer calls a top-level procedure" '(helped 5)
+      (pm-uses-helper 5))
+
+(test "er let-syntax rename of a local" 10
+      (let ((y 10))
+        (let-syntax ((m (er-macro-transformer (lambda (f r c) (r 'y)))))
+          (let ((z 20)) (m)))))
+(test "er letrec-syntax mutual recursion" '(#t #f)
+      (letrec-syntax
+          ((ev? (er-macro-transformer
+                 (lambda (f r c)
+                   (if (null? (cdr f)) #t `(,(r 'od?) ,@(cddr f))))))
+           (od? (er-macro-transformer
+                 (lambda (f r c)
+                   (if (null? (cdr f)) #f `(,(r 'ev?) ,@(cddr f)))))))
+        (list (ev? 1 2 3 4) (ev? 1 2 3))))
+
+(define (pm-internal-use)
+  (define-syntax twice
+    (er-macro-transformer
+     (lambda (f r c) `(,(r 'begin) ,(cadr f) ,(cadr f)))))
+  (define n 0)
+  (twice (set! n (+ n 1)))
+  n)
+(test "er internal define-syntax" '(2 2) (list (pm-internal-use) (pm-internal-use)))
+
+(define-syntax pm-def-getter
+  (er-macro-transformer
+   (lambda (f r c)
+     `(,(r 'define-syntax) ,(cadr f)
+       (,(r 'syntax-rules) () ((_) ,(caddr f)))))))
+(pm-def-getter pm-get-five 5)
+(test "er macro defining a syntax-rules macro" 5 (pm-get-five))
+
+(define-syntax pm-sr-swap (syntax-rules () ((_ a b) (pm-swap! a b))))
+(test "syntax-rules expanding into an er macro" '(2 1)
+      (let ((p 1) (q 2)) (pm-sr-swap p q) (list p q)))
+
+(define-syntax pm-def-const
+  (syntax-rules ()
+    ((_ name val)
+     (define-syntax name (er-macro-transformer (lambda (f r c) val))))))
+(pm-def-const pm-seven 7)
+(test "syntax-rules macro defining an er macro" 7 (pm-seven))
+
+(define-syntax pm-quoted
+  (er-macro-transformer
+   (lambda (f r c) `(,(r 'quote) (,(r 'if) ,(r 'x) ,@(cdr f))))))
+(test "renamed identifiers in quoted data are plain symbols" '(if x a b)
+      (let ((if 1) (x 2)) (pm-quoted a b)))
+
+(test "er transformer error is a catchable error" "macro transformer: car: not a pair"
+      (guard (e (#t (condition/report-string e)))
+        (eval '(let-syntax ((bad (er-macro-transformer (lambda (f r c) (car '())))))
+                 (bad))
+              (interaction-environment))))
+(define-syntax pm-bad
+  (er-macro-transformer (lambda (f r c) (error "bad form:" f))))
+(define (pm-call-bad) (pm-bad 1 2))
+(test "er error raised where the use runs" '(#t "macro transformer: bad form: (pm-bad 1 2)")
+      (guard (e (#t (list (error-object? e) (condition/report-string e))))
+        (pm-call-bad)))
+(test "transformer cannot see locals" "macro transformer: undefined variable: z"
+      (guard (e (#t (condition/report-string e)))
+        (eval '(let ((z 3))
+                 (let-syntax ((m (er-macro-transformer (lambda (f r c) z))))
+                   (m)))
+              (interaction-environment))))
+
+(define-syntax pm-runaway
+  (er-macro-transformer (lambda (f r c) `(,(r 'pm-runaway)))))
+(test "runaway er expansion is bounded" 'bounded
+      (guard (e (#t 'bounded)) (eval '(pm-runaway) (interaction-environment))))
+
+;; rsc: output closed where the macro is used, env the macro environment.
+(define-syntax pm-push
+  (rsc-macro-transformer
+   (lambda (exp env)
+     `(,(make-syntactic-closure env '() 'set!)
+       ,(caddr exp)
+       (,(make-syntactic-closure env '() 'cons)
+        ,(cadr exp)
+        ,(caddr exp))))))
+(define pm-stack '())
+(pm-push 1 pm-stack)
+(test "rsc push closes cons in the macro environment" '(2 1)
+      (let ((cons list)) (pm-push 2 pm-stack) pm-stack))
+(define pm-where 'global)
+(define-syntax pm-rsc-open (rsc-macro-transformer (lambda (f env) 'pm-where)))
+(define-syntax pm-rsc-closed
+  (rsc-macro-transformer (lambda (f env) (close-syntax 'pm-where env))))
+(test "rsc output is the use environment's unless closed" '(local global)
+      (let ((pm-where 'local)) (list (pm-rsc-open) (pm-rsc-closed))))
+
+;; sc: output closed in the macro environment, env the use environment.
+(define-syntax pm-sc-open (sc-macro-transformer (lambda (f env) 'pm-where)))
+(define-syntax pm-sc-closed
+  (sc-macro-transformer (lambda (f env) (close-syntax 'pm-where env))))
+(test "sc output is the macro environment's unless closed" '(global local)
+      (let ((pm-where 'local)) (list (pm-sc-open) (pm-sc-closed))))
+(define-syntax pm-push2
+  (sc-macro-transformer
+   (lambda (exp env)
+     (let ((item (make-syntactic-closure env '() (cadr exp)))
+           (lst (make-syntactic-closure env '() (caddr exp))))
+       `(set! ,lst (cons ,item ,lst))))))
+(test "sc push" '(3) (let ((cons list) (l '())) (pm-push2 3 l) l))
+(define-syntax pm-loop-until
+  (sc-macro-transformer
+   (lambda (exp env)
+     (let ((id (cadr exp))
+           (init (caddr exp))
+           (test (cadddr exp))
+           (return (cadddr (cdr exp)))
+           (step (cadddr (cddr exp)))
+           (close (lambda (exp free) (make-syntactic-closure env free exp))))
+       `(letrec ((loop (lambda (,id)
+                         (if ,(close test (list id))
+                             ,(close return (list id))
+                             (loop ,(close step (list id)))))))
+          (loop ,(close init '())))))))
+(test "sc loop-until with free names" 55
+      (let ((loop 5)) (pm-loop-until i 0 (> i 10) (* i loop) (+ i 1))))
+(define-syntax pm-ids
+  (sc-macro-transformer
+   (lambda (f env)
+     `(quote ,(list (identifier? 'a) (identifier? (close-syntax 'a env))
+                    (identifier? 1) (identifier=? env 'a env 'a)
+                    (identifier=? env 'a env 'b))))))
+(test "identifier? and identifier=?" '(#t #t #f #t #f) (pm-ids))
+(test "nested procedural macros" '(1 2)
+      (let-syntax ((outer (er-macro-transformer
+                           (lambda (f r c)
+                             `(,(r 'let-syntax)
+                               ((inner (,(r 'er-macro-transformer)
+                                        (,(r 'lambda) (f2 r2 c2)
+                                         (,(r 'cadr) f2)))))
+                               (,(r 'list) (inner ,(cadr f)) (inner 2)))))))
+        (outer 1)))
 
 ;;; ============================================================================
 ;;; Summary

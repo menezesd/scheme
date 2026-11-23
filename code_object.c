@@ -552,8 +552,35 @@ void gc_sweep_code_objects(void)
 // since the last sweep (the sweep's heap scan is no more work than that
 // collection was; minor collections are too frequent to pay for it) or the
 // registry has grown enough to amortise the scan on its own.
+// Nonzero while Scheme code runs on behalf of the compiler - a procedural
+// macro transformer, or a define-macro body, applied while a unit is being
+// compiled. That unit's code objects are registered but held only by the
+// compiler's C locals, so the reachability scan below would free them under
+// it; a nested VM run reaching one of the safe points (eval, load) must not
+// sweep until the compiler is done.
+static int code_sweep_inhibit_depth = 0;
+
+void code_sweep_inhibit(void)
+{
+    code_sweep_inhibit_depth++;
+}
+
+void code_sweep_allow(void)
+{
+    if (code_sweep_inhibit_depth > 0)
+        code_sweep_inhibit_depth--;
+}
+
+// After a lisp_panic longjmp, which skips the matching code_sweep_allow.
+void code_sweep_inhibit_reset(void)
+{
+    code_sweep_inhibit_depth = 0;
+}
+
 void gc_sweep_code_objects_if_due(void)
 {
+    if (code_sweep_inhibit_depth > 0)
+        return;
     if (code_objects_since_sweep == 0)
         return;
     size_t threshold = code_objects_live_after_sweep;

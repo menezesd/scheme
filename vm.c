@@ -2831,7 +2831,12 @@ static unsigned vm_dispatch(vm_state *vm)
             int64_t sym_id = vm->code->code[vm->ip++];
             unsigned transformer_form = vm_pop(vm);
 
-            if (!syntax_rules_valid(transformer_form,
+            // A procedural transformer was made when its define-syntax was
+            // compiled; only its environment is the run-time one.
+            bool procedural =
+                macros_is_procedural_transformer(transformer_form);
+            if (!procedural &&
+                !syntax_rules_valid(transformer_form,
                                     syntax_default_ellipsis_id(vm->env),
                                     "define-syntax")) {
                 VM_ERROR(vm, "define-syntax: invalid syntax-rules");
@@ -2840,8 +2845,11 @@ static unsigned vm_dispatch(vm_state *vm)
 
             // CRITICAL: Protect transformer_form before any allocations
             gc_protect(&transformer_form);
-            unsigned transformer = make_syntax_transformer(transformer_form,
-                                                           vm->env);
+            unsigned transformer =
+                procedural ? macros_rebind_procedural_transformer(
+                                 transformer_form, vm->env)
+                           : make_syntax_transformer(transformer_form,
+                                                     vm->env);
             if (transformer == TOK_ERROR) {
                 VM_ERROR(vm, "define-syntax: transformer creation failed");
                 gc_unprotect(1);

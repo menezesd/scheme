@@ -711,14 +711,19 @@ static inline bool bind_syntax_rules(unsigned bindings, unsigned def_env,
         unsigned binding = car(b);
         unsigned name = car(binding);
         unsigned transformer_form = cadr(binding);
-        if (!syntax_rules_valid(transformer_form,
+        bool procedural = macros_procedural_transformer_form(transformer_form);
+        if (!procedural &&
+            !syntax_rules_valid(transformer_form,
                                 syntax_default_ellipsis_id(closure_env),
                                 context)) {
             tramp_error();
             return false;
         }
         gc_protect(&name);
-        unsigned p = make_syntax_transformer(transformer_form, closure_env);
+        unsigned p = procedural ? macros_make_procedural_transformer(
+                                      transformer_form, closure_env, context)
+                                : make_syntax_transformer(transformer_form,
+                                                          closure_env);
         if (p == TOK_ERROR) {
             tramp_error();
             return false;
@@ -765,6 +770,10 @@ bool dispatch_special_form(int64_t kw, unsigned id, unsigned env,
                            unsigned cont, unsigned *head_value);
 bool eval_note_macro_expansion(void);
 void eval_reset_macro_expansion_depth(void);
+// Saved and restored around syntax-time evaluation (a procedural macro
+// transformer), which runs a nested eval_cps that resets the count.
+unsigned eval_macro_expansion_depth_get(void);
+void eval_macro_expansion_depth_set(unsigned depth);
 
 // ============================================================================
 // Continuation Handlers (defined in eval_cont.c)

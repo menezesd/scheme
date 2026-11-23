@@ -528,6 +528,33 @@
               (lambda () (letrec* ((a (lambda () b)) (c (a)) (b 1)) c)))
              (letrec ((x (begin (set! x (make-list 5 0)) (length x)))) x)
              (letrec ((a 1) (b (+ a 1)) (c (list a b 3))) c)))
+;; Procedural transformers run Scheme code while a unit is being expanded or
+;; compiled: the transformer allocates freely, and everything the expander
+;; and compiler hold across the call must be rooted.
+(define-syntax gc-er-swap!
+  (er-macro-transformer
+   (lambda (form rename compare)
+     (let ((a (cadr form)) (b (caddr form)))
+       `(,(rename 'let) ((,(rename 'tmp) ,a))
+          (,(rename 'set!) ,a ,b)
+          (,(rename 'set!) ,b ,(rename 'tmp)))))))
+(define-syntax gc-sc-push
+  (sc-macro-transformer
+   (lambda (exp env)
+     (let ((item (make-syntactic-closure env '() (cadr exp)))
+           (lst (make-syntactic-closure env '() (caddr exp))))
+       `(set! ,lst (cons ,item ,lst))))))
+(define (gc-procedural-macros n)
+  (let ((tmp n) (other 0) (l '()) (cons list))
+    (gc-er-swap! tmp other)
+    (gc-sc-push tmp l)
+    (list tmp other l)))
+(check "procedural macros" '((0 7 (0)) (0 8 (0)))
+       (list (gc-procedural-macros 7)
+             (let-syntax ((m (er-macro-transformer
+                              (lambda (f r c)
+                                `(,(r 'gc-procedural-macros) ,(cadr f))))))
+               (m 8))))
 
 ;; (command-line) is the script's own view of its invocation - its name and
 ;; arguments - without vesper's options. make test-gcstress runs this file as

@@ -68,6 +68,16 @@ void eval_reset_macro_expansion_depth(void)
     eval_macro_expansion_depth = 0;
 }
 
+unsigned eval_macro_expansion_depth_get(void)
+{
+    return eval_macro_expansion_depth;
+}
+
+void eval_macro_expansion_depth_set(unsigned depth)
+{
+    eval_macro_expansion_depth = depth;
+}
+
 // ============================================================================
 // Quasiquote Expansion
 // ============================================================================

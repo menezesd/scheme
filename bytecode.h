@@ -579,6 +579,10 @@ void minor_gc_update_all_code_objects(void);
 void code_register(code_object *code); // Add code object to GC registry
 void gc_sweep_code_objects(void);      // Free unreachable code objects after GC
 void gc_sweep_code_objects_if_due(void); // Rate-limited sweep at a safe point
+// Bracket Scheme code run while compiling (see code_object.c).
+void code_sweep_inhibit(void);
+void code_sweep_allow(void);
+void code_sweep_inhibit_reset(void);
 vm_state *get_active_vm(void);         // Get currently running VM (for GC)
 
 // Disassembler

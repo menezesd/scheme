@@ -191,6 +191,16 @@ static bool load_from_port(FILE *f, unsigned *env, bool warn_on_error,
                 return false;
             }
         } else {
+            // A procedural macro's transformer runs when the batch holding
+            // its use is compiled, and may call what the forms before the
+            // use define: those must have run by then.
+            if (batch && macros_form_uses_procedural_macro(expr, *env) &&
+                !eval_pending_batch(&batch, &batch_tail, *env,
+                                    warn_on_error)) {
+                gc_unprotect(1);
+                restore_reader_context(old_filename);
+                return false;
+            }
             list_append(&batch, &batch_tail, expr);
         }
         gc_unprotect(1); // expr - per-iteration cleanup

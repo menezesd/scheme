@@ -428,6 +428,17 @@ const primitive_info primitive_table[PRIM_COUNT] = {
     // MIT library support (stdlib.scm "MIT library procedures")
     [PRUNTIME] = PRIM("runtime", 0, 0, 0),
     [PCOMPOUNDPROCP] = PRIM("compound-procedure?", 1, 1, NO_ALLOC),
+    // Procedural macro transformers (macros.c)
+    [PMACRORENAME] = PRIM_AS("%macro-rename", 1, 1, 0, "rename"),
+    [PMACROCOMPARE] = PRIM_AS("%macro-compare", 2, 2, 0, "compare"),
+    [PMACROERRORHANDLER] = PRIM_AS("%macro-transformer-error-handler", 1, 2, 0,
+                                   "macro transformer error handler"),
+    [PMACRORETURN] = PRIM_AS("%macro-transformer-return", 1, 1, 0,
+                             "macro transformer return"),
+    [PCLOSESYNTAX] = PRIM("close-syntax", 2, 2, 0),
+    [PMAKESYNCLOSURE] = PRIM("make-syntactic-closure", 3, 3, 0),
+    [PIDENTIFIERP] = PRIM("identifier?", 1, 1, 0),
+    [PIDENTIFIEREQ] = PRIM("identifier=?", 4, 4, 0),
 
     // Introspection
     [PPROCARITY] = PRIM("procedure-arity", 1, 1, 0),

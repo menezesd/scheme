@@ -19,6 +19,24 @@
 (define (shadowed-stdlib-macro n)
   (let ((if list) (begin list))
     ((lambda () (when #t n)))))
+;; The same through procedural transformers: rename (er) and the sc
+;; output's own identifiers resolve to core aliases, not fresh symbols.
+(define-syntax er-when
+  (er-macro-transformer
+   (lambda (form rename compare)
+     `(,(rename 'if) ,(cadr form) (,(rename 'begin) ,@(cddr form)) #f))))
+
+(define-syntax sc-when
+  (sc-macro-transformer
+   (lambda (form env)
+     `(if ,(make-syntactic-closure env '() (cadr form))
+          (begin ,@(map (lambda (e) (make-syntactic-closure env '() e))
+                        (cddr form)))
+          #f))))
+
+(define (shadowed-procedural-macros n)
+  (let ((if list) (begin list))
+    ((lambda () (+ (er-when #t n) (sc-when #t n))))))
 
 (define (gensym-counter)
   (let ((s (symbol->string (gensym))))
@@ -27,14 +45,15 @@
 (define (run i acc)
   (if (= i 500000)
       acc
-      (run (+ i 1) (+ acc (shadowed-user-macro 1) (shadowed-stdlib-macro 1)))))
+      (run (+ i 1) (+ acc (shadowed-user-macro 1) (shadowed-stdlib-macro 1)
+                      (shadowed-procedural-macros 1)))))
 
 (define before (gensym-counter))
 (define result (run 0 0))
 (define minted (- (gensym-counter) before 1))
 
 (display "atom growth: ")
-(display (if (and (= result 1000000) (< minted 100))
+(display (if (and (= result 2000000) (< minted 100))
              "all passed"
              (list 'failed result minted)))
 (newline)

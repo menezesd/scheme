@@ -823,6 +823,15 @@ enum primitive_id {
     // MIT library support (stdlib.scm "MIT library procedures")
     PRUNTIME,          // runtime: CPU seconds as a flonum
     PCOMPOUNDPROCP,    // compound-procedure?: a closure in either engine
+    // Procedural macro transformers (macros.c)
+    PMACRORENAME,
+    PMACROCOMPARE,
+    PMACROERRORHANDLER,
+    PMACRORETURN,
+    PCLOSESYNTAX,
+    PMAKESYNCLOSURE,
+    PIDENTIFIERP,
+    PIDENTIFIEREQ,
     PRIM_COUNT // Total number of primitives
 };
 

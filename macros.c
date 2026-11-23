@@ -76,11 +76,14 @@
  */
 
 #include "macros.h"
+#include "bytecode.h"
 #include "compiled_pattern.h"
 #include "context.h"
 #include "eval_internal.h"
 #include "env.h"
+#include "eval.h"
 #include "prim_internal.h" // make_string_copy
+#include "writer.h"
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
@@ -266,7 +269,9 @@ static unsigned expand_let_syntax(unsigned form, unsigned syn_env,
     while (b) {
         unsigned binding = car(b);
         if (!IS_PAIR(binding) || !identifier_valid(car(binding)) ||
-            !is_syntax_rules(cadr(binding))) {
+            !IS_PAIR(cdr(binding)) ||
+            (!is_syntax_rules(cadr(binding)) &&
+             !macros_procedural_transformer_form(cadr(binding)))) {
             return TOK_ERROR;
         }
 
@@ -274,11 +279,18 @@ static unsigned expand_let_syntax(unsigned form, unsigned syn_env,
         unsigned name = car(binding);
         gc_protect(&name);
         unsigned transformer_form = cadr(binding);
-        if (!syntax_rules_valid(transformer_form, ellipsis_id, syn_arity))
+        bool procedural = macros_procedural_transformer_form(transformer_form);
+        if (!procedural &&
+            !syntax_rules_valid(transformer_form, ellipsis_id, syn_arity))
             return TOK_ERROR;
 
-        unsigned p = make_syntax_transformer(
-            transformer_form, is_let_syntax ? syn_env : expanded_env);
+        unsigned p =
+            procedural
+                ? macros_make_procedural_transformer(
+                      transformer_form,
+                      is_let_syntax ? syn_env : expanded_env, syn_arity)
+                : make_syntax_transformer(
+                      transformer_form, is_let_syntax ? syn_env : expanded_env);
         if (p == TOK_ERROR)
             return TOK_ERROR;
         gc_protect(&p);
@@ -313,10 +325,13 @@ static int expansion_depth = 0;
 
 static bool core_heads_only;
 
+static void procedural_expansion_reset(void);
+
 void macros_reset_expansion_depth(void)
 {
     // Also called after a lisp_panic longjmp, which skips the save/restore
     // pairs around the state below.
+    procedural_expansion_reset();
     expansion_depth = 0;
     unwrap_template_ellipsis_id = 0;
     expansion_real_env = 0;
@@ -998,13 +1013,19 @@ static unsigned expand_form_inner(unsigned expr, unsigned syn_env,
             show_error("define-syntax: expected name");
             return TOK_ERROR;
         }
-        if (!syntax_rules_valid(transformer_form,
+        bool procedural = macros_procedural_transformer_form(transformer_form);
+        if (!procedural &&
+            !syntax_rules_valid(transformer_form,
                                syntax_default_ellipsis_id(syn_env),
                                "define-syntax")) {
             return TOK_ERROR;
         }
 
-        unsigned p = make_syntax_transformer(transformer_form, syn_env);
+        unsigned p = procedural ? macros_make_procedural_transformer(
+                                      transformer_form, syn_env,
+                                      "define-syntax")
+                                : make_syntax_transformer(transformer_form,
+                                                          syn_env);
         if (p == TOK_ERROR)
             return TOK_ERROR;
         gc_protect(&p);
@@ -4468,9 +4489,20 @@ static void annotate_ellipsis_depths(compiled_pattern *cpat, unsigned bindings)
     }
 }
 
+static unsigned apply_procedural_syntax(unsigned transformer, unsigned input,
+                                        unsigned use_env,
+                                        unsigned *bindings_out);
+
 unsigned apply_syntax(unsigned transformer, unsigned input, unsigned use_env,
                       unsigned *bindings_out)
 {
+    if (macros_is_procedural_transformer(transformer)) {
+        if (bindings_out)
+            *bindings_out = 0;
+        return apply_procedural_syntax(transformer, input, use_env,
+                                       bindings_out);
+    }
+
     // Protect parameters that may be in nursery - GC can run during
     // expansion. GC_GUARD releases every protection below on any return
     // path, so no manual unprotect accounting is needed at the exits.
@@ -4985,4 +5017,816 @@ unsigned macros_strip_core_aliases(unsigned datum)
     if (datum_core_alias_scan(datum, &budget, 0) != 1)
         return datum;
     return datum_without_core_aliases(datum);
+}
+
+// ============================================================================
+// Procedural transformers: er-, rsc- and sc-macro-transformer (MIT)
+// ============================================================================
+//
+// A procedural transformer is a BT_SYNTAX cell like a syntax-rules one, so
+// every keyword-versus-variable decision treats it the same way. Its car is
+// (marker kind . procedure) instead of (ellipsis literals . rules), the
+// marker an atom of a private uninterned id; its cdr is the definition
+// environment, as for syntax-rules.
+//
+// The transformer procedure is evaluated, and later called, at syntax time
+// by the CPS evaluator in both engines (the compiler already does the same
+// for define-macro), in the top level of the definition environment's chain:
+// locals do not exist yet when a macro use is expanded, so MIT, too, reports
+// a transformer that refers to one as an unbound variable.
+//
+// Hygiene. The output of a transformer is made of identifiers of two kinds:
+// those meant in the macro's definition environment - what rename returned
+// (er), what an sc transformer wrote itself, what was closed in the
+// transformer environment (rsc) - and those meant where the macro is used:
+// everything else in an er or rsc output, and whatever was closed in the
+// usage environment (sc). The two are told apart by cell identity: rename
+// returns a fresh atom cell, and a collection forwards every reference to a
+// cell alike. An identifier of the first kind is then treated exactly as a
+// free identifier of a syntax-rules template: left alone where it denotes
+// the same binding at the use site, a core keyword's permanent core alias
+// where the use site rebinds it, else an alias of its definition-site
+// binding (or an unbound gensym). On top of that, one that is spelled like
+// an identifier of the second kind in the same output is always renamed, so
+// that neither can bind the other - the swap! of (swap! tmp x). Nothing else
+// mints a symbol, so an expansion in a loop costs no atom-table slot.
+
+enum { PROC_ER = 0, PROC_RSC = 1, PROC_SC = 2 };
+enum { SC_USE = 0, SC_MACRO = 1 };
+
+// Nested syntax-time evaluations: a transformer that expands a macro use of
+// its own (by eval, say) re-enters through C.
+#define MAX_SYNTAX_TIME_NESTING 64
+// Nesting of a transformer's output walked; deeper output is an error.
+#define MAX_PROCEDURAL_OUTPUT_DEPTH 10000
+
+static int64_t private_marker_id(int64_t *slot, const char *name)
+{
+    if (!*slot)
+        *slot = CELL_ID(make_uninterned_symbol(name));
+    return *slot;
+}
+
+static int64_t procedural_marker_id(void)
+{
+    static int64_t id = 0;
+    return private_marker_id(&id, "##procedural-transformer##");
+}
+
+static int64_t syntactic_closure_marker_id(void)
+{
+    static int64_t id = 0;
+    return private_marker_id(&id, "##syntactic-closure##");
+}
+
+static int64_t syntactic_env_marker_id(void)
+{
+    static int64_t id = 0;
+    return private_marker_id(&id, "##syntactic-environment##");
+}
+
+static unsigned atom_with_id(int64_t id)
+{
+    unsigned atom = alloc();
+    CELL_TYPE(atom) = BT_ATOM;
+    CELL_ID(atom) = id;
+    return atom;
+}
+
+static bool atom_is_marker(unsigned x, int64_t id)
+{
+    return IS_ATOM(x) && CELL_ID(x) == id;
+}
+
+// The kind a (name expr) transformer form names, or -1.
+static int procedural_form_kind(unsigned form)
+{
+    static int64_t er_id = 0, rsc_id = 0, sc_id = 0;
+    if (!IS_PAIR(form) || !IS_ATOM(car(form)))
+        return -1;
+    if (!er_id) {
+        er_id = intern("er-macro-transformer");
+        rsc_id = intern("rsc-macro-transformer");
+        sc_id = intern("sc-macro-transformer");
+    }
+    int64_t id = CELL_ID(car(form));
+    if (id == er_id)
+        return PROC_ER;
+    if (id == rsc_id)
+        return PROC_RSC;
+    if (id == sc_id)
+        return PROC_SC;
+    return -1;
+}
+
+bool macros_procedural_transformer_form(unsigned transformer_form)
+{
+    return procedural_form_kind(transformer_form) >= 0;
+}
+
+bool macros_is_procedural_transformer(unsigned transformer)
+{
+    return IS_SYNTAX(transformer) && IS_PAIR(car(transformer)) &&
+           atom_is_marker(car(car(transformer)), procedural_marker_id()) &&
+           IS_PAIR(cdr(car(transformer)));
+}
+
+unsigned macros_rebind_procedural_transformer(unsigned transformer,
+                                              unsigned env)
+{
+    if (!macros_is_procedural_transformer(transformer))
+        return TOK_ERROR;
+    return make_typed_cell(BT_SYNTAX, car(transformer), env);
+}
+
+static bool procedure_value(unsigned x)
+{
+    return IS_FUNCTION(x) || IS_BUILTIN(x) || is_bytecode_closure_object(x);
+}
+
+// The outermost frame of env's chain: the environment top-level code there
+// runs in.
+static unsigned toplevel_env_of(unsigned env)
+{
+    unsigned e = env;
+    for (unsigned hops = 0; IS_PAIR(e) && IS_PAIR(cdr(e)) && hops < 1000000;
+         hops++)
+        e = cdr(e);
+    return IS_PAIR(e) ? e : env;
+}
+
+// ---------------------------------------------------------------------------
+// Syntax-time evaluation
+// ---------------------------------------------------------------------------
+
+static int syntax_time_nesting = 0;
+// The object the first exception raised inside the innermost syntax-time
+// evaluation carried; rooted while one runs.
+static unsigned syntax_time_raised = 0;
+static bool syntax_time_raised_set = false;
+// Set when the transformer call of the innermost syntax-time evaluation
+// returns (see apply_procedural_syntax).
+static bool syntax_time_returned = false;
+
+// The message an exception object reports, as condition/report-string has
+// it for an error object, or the object written for anything else.
+static void describe_raised(unsigned obj, char *out, size_t out_size)
+{
+    char *buf = NULL;
+    size_t len = 0;
+    FILE *mem = open_memstream(&buf, &len);
+    if (!mem) {
+        snprintf(out, out_size, "macro transformer raised an exception");
+        return;
+    }
+    if (IS_RECORD(obj) && ctx.builtin_record_types[BRT_CONDITION] &&
+        record_rtd(obj) == ctx.builtin_record_types[BRT_CONDITION]) {
+        unsigned *fields = vector_data_ptr(obj);
+        unsigned message = fields[RECORD_FIELDS_START + 1];
+        unsigned irritants = fields[RECORD_FIELDS_START + 2];
+        display_obj_port_checked(message, mem);
+        for (unsigned i = irritants; IS_PAIR(i); i = cdr(i)) {
+            fputc(' ', mem);
+            write_obj_port_checked(car(i), mem);
+        }
+    } else {
+        fputs("non-condition object signalled: ", mem);
+        write_obj_port_checked(obj, mem);
+    }
+    fclose(mem);
+    snprintf(out, out_size, "%s", buf ? buf : "");
+    free(buf);
+}
+
+// Evaluate expr in env for the expander or the compiler: the trampoline's
+// state and the run-time expansion count are those of the code being
+// expanded, so both are put back afterwards, and errors are not dispatched
+// to whatever handler that code installed (a guard around an eval, say,
+// would jump to a continuation of the program from inside the nested
+// trampoline) but end the evaluation, their message left in ctx.last_error
+// prefixed by context. Code objects are not swept meanwhile (see
+// code_sweep_inhibit). A continuation captured outside the transformer and
+// invoked inside it cannot be supported: the rest of the computation it
+// stands for runs to its end inside this evaluation. When expr is a
+// transformer call wrapped in %macro-transformer-return (check_return), an
+// evaluation that ends without that return is then an error rather than an
+// expansion.
+static unsigned syntax_time_eval(unsigned expr, unsigned env,
+                                 const char *context, bool check_return)
+{
+    if (syntax_time_nesting >= MAX_SYNTAX_TIME_NESTING) {
+        show_error("%s: syntax-time evaluation nested too deeply", context);
+        return TOK_ERROR;
+    }
+    GC_GUARD;
+    gc_protect(&expr);
+    gc_protect(&env);
+    tramp_state saved_tramp = tramp;
+    gc_protect(&saved_tramp.expr);
+    gc_protect(&saved_tramp.env);
+    gc_protect(&saved_tramp.cont);
+    gc_protect(&saved_tramp.value);
+    unsigned saved_raised = syntax_time_raised;
+    bool saved_raised_set = syntax_time_raised_set;
+    gc_protect(&saved_raised);
+    // The static slot is a root once, for the outermost evaluation: a
+    // collection must not forward it twice.
+    if (syntax_time_nesting == 0)
+        gc_protect(&syntax_time_raised);
+    syntax_time_raised = 0;
+    syntax_time_raised_set = false;
+    bool saved_returned = syntax_time_returned;
+    syntax_time_returned = false;
+    unsigned saved_depth = eval_macro_expansion_depth_get();
+
+    int64_t handler_id = intern("*current-exception-handler*");
+    unsigned handler_env = exception_state_env(toplevel_env_of(env));
+    gc_protect(&handler_env);
+    unsigned old_handler = lookup_silent(handler_id, handler_env);
+    gc_protect(&old_handler);
+    bool swap_handler = old_handler != TOK_ERROR;
+    if (swap_handler) {
+        unsigned handler = mk_primop(PMACROERRORHANDLER);
+        if (handler == TOK_ERROR)
+            return TOK_ERROR;
+        setvar(handler_id, handler, handler_env);
+    }
+    bool saved_suppress = ctx.suppress_error_output;
+    ctx.suppress_error_output = true;
+    syntax_time_nesting++;
+    code_sweep_inhibit();
+
+    unsigned result = eval_cps(expr, env);
+    gc_protect(&result);
+
+    code_sweep_allow();
+    syntax_time_nesting--;
+    ctx.suppress_error_output = saved_suppress;
+    if (swap_handler)
+        setvar(handler_id, old_handler, handler_env);
+    eval_macro_expansion_depth_set(saved_depth);
+    tramp = saved_tramp;
+
+    if (result != TOK_ERROR && check_return && !syntax_time_returned) {
+        show_error("%s: a continuation escaped from the transformer",
+                   context);
+        result = TOK_ERROR;
+    } else if (result == TOK_ERROR) {
+        char reason[sizeof(ctx.last_error)];
+        if (syntax_time_raised_set)
+            describe_raised(syntax_time_raised, reason, sizeof(reason));
+        else
+            snprintf(reason, sizeof(reason), "%s",
+                     ctx.last_error[0] ? ctx.last_error : "evaluation failed");
+        // A nested transformer's failure already carries the prefix.
+        size_t prefix_len = strlen(context);
+        if (strncmp(reason, context, prefix_len) == 0 &&
+            strncmp(reason + prefix_len, ": ", 2) == 0)
+            show_error("%s", reason);
+        else
+            show_error("%s: %s", context, reason);
+    }
+    syntax_time_raised = saved_raised;
+    syntax_time_raised_set = saved_raised_set;
+    syntax_time_returned = saved_returned;
+    return result;
+}
+
+unsigned macros_make_procedural_transformer(unsigned transformer_form,
+                                            unsigned closure_env,
+                                            const char *context)
+{
+    GC_GUARD;
+    gc_protect(&transformer_form);
+    gc_protect(&closure_env);
+    int kind = procedural_form_kind(transformer_form);
+    unsigned len = 0;
+    if (kind < 0 || !proper_list_silent(transformer_form) ||
+        !list_length_checked(transformer_form, &len, context) || len != 2) {
+        show_error("%s: invalid procedural transformer", context);
+        return TOK_ERROR;
+    }
+    unsigned proc = syntax_time_eval(cadr(transformer_form),
+                                     toplevel_env_of(closure_env), context,
+                                     false);
+    if (proc == TOK_ERROR)
+        return TOK_ERROR;
+    gc_protect(&proc);
+    if (!procedure_value(proc)) {
+        show_error("%s: transformer is not a procedure", context);
+        return TOK_ERROR;
+    }
+    unsigned kind_cell = store(kind);
+    gc_protect(&kind_cell);
+    unsigned rest = alloc_cons(kind_cell, proc);
+    gc_protect(&rest);
+    unsigned marker = atom_with_id(procedural_marker_id());
+    gc_protect(&marker);
+    unsigned data = alloc_cons(marker, rest);
+    gc_protect(&data);
+    return make_typed_cell(BT_SYNTAX, data, closure_env);
+}
+
+// ---------------------------------------------------------------------------
+// Expansion state, rename and compare
+// ---------------------------------------------------------------------------
+
+typedef struct proc_expansion {
+    unsigned closure_env; // the macro's definition environment
+    unsigned use_env;     // where the macro is used
+    unsigned renamed;     // the cells rename returned, one per name
+    unsigned senv_macro;  // syntactic environment objects of rsc and sc
+    unsigned senv_use;
+    unsigned use_ids;     // names of use-site identifiers in the output
+    unsigned decisions;   // (atom . replacement) per definition-site name
+    unsigned produced;    // alias bindings for the use site
+    int kind;
+    struct proc_expansion *outer;
+} proc_expansion;
+
+static proc_expansion *current_expansion = NULL;
+
+static bool identifier_atom(unsigned x)
+{
+    return IS_ATOM(x) && !IS_BOOLEAN(x) &&
+           CELL_ID(x) != CELL_ID(CELL_ATOM_TRUE) &&
+           CELL_ID(x) != CELL_ID(CELL_ATOM_FALSE);
+}
+
+static bool syntactic_closure_p(unsigned x)
+{
+    return IS_PAIR(x) &&
+           atom_is_marker(car(x), syntactic_closure_marker_id()) &&
+           IS_PAIR(cdr(x)) && IS_PAIR(cddr(x));
+}
+
+static bool syntactic_env_p(unsigned x)
+{
+    return IS_PAIR(x) && atom_is_marker(car(x), syntactic_env_marker_id());
+}
+
+static int senv_context(const proc_expansion *st, unsigned senv)
+{
+    if (st && senv == st->senv_macro)
+        return SC_MACRO;
+    return SC_USE;
+}
+
+static unsigned context_env(const proc_expansion *st, int context)
+{
+    return context == SC_MACRO ? st->closure_env : st->use_env;
+}
+
+static unsigned procedural_rename(unsigned x)
+{
+    proc_expansion *st = current_expansion;
+    if (!st) {
+        show_error("rename: no macro expansion in progress");
+        return TOK_ERROR;
+    }
+    if (!identifier_atom(x)) {
+        show_error("rename: not an identifier");
+        return TOK_ERROR;
+    }
+    for (unsigned r = st->renamed; IS_PAIR(r); r = cdr(r)) {
+        if (CELL_ID(car(r)) == CELL_ID(x))
+            return car(r);
+    }
+    GC_GUARD;
+    unsigned renamed = atom_with_id(CELL_ID(x));
+    gc_protect(&renamed);
+    st->renamed = alloc_cons(renamed, st->renamed);
+    return renamed;
+}
+
+// The name an identifier occurrence spells and the environment it is to be
+// looked up in. False for anything that is not an identifier.
+static bool identifier_denotation(const proc_expansion *st, unsigned x,
+                                  unsigned senv, int64_t *id, unsigned *env)
+{
+    int context = senv_context(st, senv);
+    for (int hops = 0; syntactic_closure_p(x) && hops < 1000; hops++) {
+        context = senv_context(st, cadr(x));
+        x = cdr(cddr(x));
+    }
+    if (!identifier_atom(x))
+        return false;
+    if (atom_cell_listed(x, st->renamed))
+        context = SC_MACRO;
+    *id = CELL_ID(x);
+    *env = context_env(st, context);
+    return true;
+}
+
+// Whether id_a looked up in env_a and id_b in env_b are the same binding:
+// the same cell, or both free and spelled alike (core keywords included).
+// Allocates nothing.
+static bool same_identifier_binding(int64_t id_a, unsigned env_a,
+                                    int64_t id_b, unsigned env_b)
+{
+    unsigned cell_a = hygiene_binding_cell(id_a, env_a);
+    unsigned cell_b = hygiene_binding_cell(id_b, env_b);
+    if (cell_a || cell_b)
+        return cell_a == cell_b;
+    return kw_canon(identifier_origin(id_a)) ==
+           kw_canon(identifier_origin(id_b));
+}
+
+static unsigned procedural_compare(unsigned a, unsigned senv_a, unsigned b,
+                                   unsigned senv_b)
+{
+    proc_expansion *st = current_expansion;
+    if (!st) {
+        show_error("compare: no macro expansion in progress");
+        return TOK_ERROR;
+    }
+    int64_t id_a = 0, id_b = 0;
+    unsigned env_a = 0, env_b = 0;
+    if (!identifier_denotation(st, a, senv_a, &id_a, &env_a) ||
+        !identifier_denotation(st, b, senv_b, &id_b, &env_b))
+        return a == b ? ctx.atom_true : ctx.atom_false;
+    return same_identifier_binding(id_a, env_a, id_b, env_b) ? ctx.atom_true
+                                                             : ctx.atom_false;
+}
+
+static unsigned make_syntactic_closure(unsigned senv, unsigned free,
+                                       unsigned form)
+{
+    if (!syntactic_env_p(senv)) {
+        show_error("make-syntactic-closure: not a syntactic environment");
+        return TOK_ERROR;
+    }
+    if (!proper_list_silent(free)) {
+        show_error("make-syntactic-closure: free names must be a list");
+        return TOK_ERROR;
+    }
+    GC_GUARD;
+    gc_protect(&senv);
+    gc_protect(&free);
+    gc_protect(&form);
+    unsigned tail = alloc_cons(free, form);
+    gc_protect(&tail);
+    tail = alloc_cons(senv, tail);
+    gc_protect(&tail);
+    unsigned marker = atom_with_id(syntactic_closure_marker_id());
+    gc_protect(&marker);
+    return alloc_cons(marker, tail);
+}
+
+static bool syntactic_identifier_p(unsigned x)
+{
+    for (int hops = 0; syntactic_closure_p(x) && hops < 1000; hops++)
+        x = cdr(cddr(x));
+    return identifier_atom(x);
+}
+
+unsigned macros_apply_syntactic_primitive(unsigned prim_id, unsigned argc,
+                                          unsigned *argv)
+{
+    switch (prim_id) {
+    case PMACRORENAME:
+        REQUIRE_ARGC(argc, 1, 1, "rename");
+        return procedural_rename(argv[0]);
+    case PMACROCOMPARE: {
+        REQUIRE_ARGC(argc, 2, 2, "compare");
+        unsigned senv = current_expansion ? current_expansion->senv_use : 0;
+        return procedural_compare(argv[0], senv, argv[1], senv);
+    }
+    case PMACROERRORHANDLER:
+        // Installed as *current-exception-handler* by syntax_time_eval.
+        // Returning ends the evaluation in both engines ("handler returned
+        // from non-continuable exception"); the first object raised is the
+        // one reported.
+        REQUIRE_ARGC(argc, 1, 2, "macro transformer error handler");
+        if (!syntax_time_raised_set) {
+            syntax_time_raised = argv[0];
+            syntax_time_raised_set = true;
+        }
+        return ctx.atom_false;
+    case PMACRORETURN:
+        // Wraps the transformer call: marks its normal return.
+        REQUIRE_ARGC(argc, 1, 1, "macro transformer return");
+        syntax_time_returned = true;
+        return argv[0];
+    case PCLOSESYNTAX:
+        REQUIRE_ARGC(argc, 2, 2, "close-syntax");
+        return make_syntactic_closure(argv[1], 0, argv[0]);
+    case PMAKESYNCLOSURE:
+        REQUIRE_ARGC(argc, 3, 3, "make-syntactic-closure");
+        return make_syntactic_closure(argv[0], argv[1], argv[2]);
+    case PIDENTIFIERP:
+        REQUIRE_ARGC(argc, 1, 1, "identifier?");
+        return syntactic_identifier_p(argv[0]) ? ctx.atom_true
+                                               : ctx.atom_false;
+    case PIDENTIFIEREQ:
+        REQUIRE_ARGC(argc, 4, 4, "identifier=?");
+        if (!syntactic_env_p(argv[0]) || !syntactic_env_p(argv[2])) {
+            show_error("identifier=?: not a syntactic environment");
+            return TOK_ERROR;
+        }
+        return procedural_compare(argv[1], argv[0], argv[3], argv[2]);
+    default:
+        show_error("syntactic primitive: unsupported id %u", prim_id);
+        return TOK_ERROR;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// From a transformer's output to the expansion
+// ---------------------------------------------------------------------------
+
+// The syntactic closures an output is nested in, innermost first: the
+// context their identifiers are in, and the free names that are instead in
+// the enclosing one. The outermost scope is the transformer's own.
+typedef struct sc_scope {
+    int context;
+    unsigned free;
+    const struct sc_scope *outer;
+} sc_scope;
+
+static int occurrence_context(const proc_expansion *st, unsigned atom,
+                              const sc_scope *scope)
+{
+    if (atom_cell_listed(atom, st->renamed))
+        return SC_MACRO;
+    while (scope->outer && atom_list_contains_id(scope->free, CELL_ID(atom)))
+        scope = scope->outer;
+    return scope->context;
+}
+
+// Whether atom, heading a form of the output, is the core keyword kw where
+// it is to be looked up.
+static bool head_means_core(const proc_expansion *st, unsigned atom,
+                            const sc_scope *scope, int64_t kw)
+{
+    if (!identifier_atom(atom) || kw_canon(CELL_ID(atom)) != kw)
+        return false;
+    unsigned env = context_env(st, occurrence_context(st, atom, scope));
+    return lookup_silent(CELL_ID(atom), env) == TOK_ERROR;
+}
+
+static bool procedural_output_error(const char *what)
+{
+    show_error("macro transformer: %s", what);
+    return false;
+}
+
+// Pass 1: note the names of the use-site identifiers in x (outside quoted
+// data) in st->use_ids.
+static bool collect_use_ids(proc_expansion *st, unsigned x,
+                            const sc_scope *scope, unsigned depth)
+{
+    if (depth > MAX_PROCEDURAL_OUTPUT_DEPTH)
+        return procedural_output_error("output nested too deeply");
+    GC_GUARD;
+    gc_protect(&x);
+    if (identifier_atom(x)) {
+        if (occurrence_context(st, x, scope) == SC_USE &&
+            !atom_list_contains_id(st->use_ids, CELL_ID(x)))
+            st->use_ids = alloc_cons(x, st->use_ids);
+        return true;
+    }
+    if (!IS_PAIR(x))
+        return true;
+    if (pair_chain_is_circular(x))
+        return procedural_output_error("circular output");
+    if (syntactic_closure_p(x)) {
+        sc_scope inner = {senv_context(st, cadr(x)), caddr(x), scope};
+        gc_protect(&inner.free);
+        return collect_use_ids(st, cdr(cddr(x)), &inner, depth + 1);
+    }
+    if (head_means_core(st, car(x), scope, ctx.kw_quote))
+        return true;
+    for (; IS_PAIR(x) && !syntactic_closure_p(x); x = cdr(x)) {
+        if (!collect_use_ids(st, car(x), scope, depth + 1))
+            return false;
+    }
+    return collect_use_ids(st, x, scope, depth + 1);
+}
+
+// What a definition-site identifier becomes in the expansion (see the
+// comment at the top of this section); the alias binding it needs, if any,
+// is added to st->produced.
+static unsigned macro_identifier_replacement(proc_expansion *st,
+                                             unsigned atom)
+{
+    int64_t id = CELL_ID(atom);
+    for (unsigned d = st->decisions; IS_PAIR(d); d = cdr(d)) {
+        if (CELL_ID(car(car(d))) == id)
+            return cdr(car(d));
+    }
+    GC_GUARD;
+    gc_protect(&atom);
+    bool collides = atom_list_contains_id(st->use_ids, id);
+    unsigned replacement = atom;
+    gc_protect(&replacement);
+    unsigned closure_val = lookup_silent(id, st->closure_env);
+    gc_protect(&closure_val);
+    int core = closure_val == TOK_ERROR && !atom_is_core_alias(id)
+                   ? atom_core_form(id)
+                   : CF_NONE;
+    bool same_binding_at_use_site =
+        closure_val != TOK_ERROR &&
+        env_find_binding_cell(id, st->closure_env) != 0 &&
+        hygiene_binding_cell(id, st->closure_env) ==
+            hygiene_binding_cell(id, st->use_env);
+    if (generated_gensym_atom(atom) || atom_is_core_alias(id)) {
+        // Already an alias made by an earlier expansion: kept, as a
+        // syntax-rules template keeps one.
+    } else if (core != CF_NONE) {
+        if (collides || bound_for_hygiene(id, st->use_env))
+            replacement = core_alias_cell(core);
+    } else if (same_binding_at_use_site && !collides) {
+        // Means the same thing where it lands: nothing to do.
+    } else if (closure_val != TOK_ERROR) {
+        replacement = do_gensym();
+        macros_note_alias(CELL_ID(replacement), id, IS_SYNTAX(closure_val));
+        unsigned target = closure_val;
+        gc_protect(&target);
+        unsigned cell = env_find_binding_cell(id, st->closure_env);
+        if (cell)
+            target = make_binding_ref_cell(atom, cell);
+        unsigned entry = alloc_cons(replacement, target);
+        gc_protect(&entry);
+        st->produced = alloc_cons(entry, st->produced);
+    } else if (collides || bound_for_hygiene(id, st->use_env)) {
+        // Free where the macro was defined but bound, or spelled like one
+        // that is, where it is used: a fresh name no use can capture.
+        replacement = do_gensym();
+    }
+    unsigned decision = alloc_cons(atom, replacement);
+    gc_protect(&decision);
+    st->decisions = alloc_cons(decision, st->decisions);
+    return replacement;
+}
+
+// Pass 2: x with every definition-site identifier replaced and syntactic
+// closures dissolved. Lists are copied; quoted data is shared as it is.
+static unsigned convert_procedural_output(proc_expansion *st, unsigned x,
+                                          const sc_scope *scope,
+                                          unsigned depth)
+{
+    if (depth > MAX_PROCEDURAL_OUTPUT_DEPTH) {
+        procedural_output_error("output nested too deeply");
+        return TOK_ERROR;
+    }
+    if (identifier_atom(x)) {
+        if (occurrence_context(st, x, scope) == SC_USE)
+            return x;
+        return macro_identifier_replacement(st, x);
+    }
+    if (!IS_PAIR(x))
+        return x;
+    GC_GUARD;
+    gc_protect(&x);
+    if (syntactic_closure_p(x)) {
+        sc_scope inner = {senv_context(st, cadr(x)), caddr(x), scope};
+        gc_protect(&inner.free);
+        return convert_procedural_output(st, cdr(cddr(x)), &inner, depth + 1);
+    }
+    bool quoted = head_means_core(st, car(x), scope, ctx.kw_quote);
+    unsigned out = 0, out_tail = 0;
+    gc_protect(&out);
+    gc_protect(&out_tail);
+    bool first = true;
+    for (; IS_PAIR(x) && !syntactic_closure_p(x); x = cdr(x)) {
+        unsigned elem = car(x);
+        if (!quoted || first)
+            elem = convert_procedural_output(st, elem, scope, depth + 1);
+        if (elem == TOK_ERROR)
+            return TOK_ERROR;
+        list_append(&out, &out_tail, elem);
+        first = false;
+    }
+    unsigned tail =
+        quoted ? x : convert_procedural_output(st, x, scope, depth + 1);
+    if (tail == TOK_ERROR)
+        return TOK_ERROR;
+    if (tail)
+        cell_set_cdr(out_tail, tail);
+    return out;
+}
+
+static unsigned apply_procedural_syntax(unsigned transformer, unsigned input,
+                                        unsigned use_env,
+                                        unsigned *bindings_out)
+{
+    GC_GUARD;
+    gc_protect(&transformer);
+    gc_protect(&input);
+    gc_protect(&use_env);
+    if (!IS_PAIR(input) || pair_chain_is_circular(input)) {
+        show_error("macro use: invalid syntax");
+        return TOK_ERROR;
+    }
+    unsigned data = car(transformer);
+    unsigned kind_cell = cadr(data);
+    int kind = IS_FIXNUM(kind_cell) ? (int)FIXNUM_VALUE(kind_cell)
+                                    : (int)CELL_ID(kind_cell);
+    unsigned proc = cddr(data);
+    gc_protect(&proc);
+
+    proc_expansion st = {cdr(transformer), use_env, 0, 0, 0, 0, 0, 0, kind,
+                         current_expansion};
+    gc_protect(&st.closure_env);
+    gc_protect(&st.use_env);
+    gc_protect(&st.renamed);
+    gc_protect(&st.senv_macro);
+    gc_protect(&st.senv_use);
+    gc_protect(&st.use_ids);
+    gc_protect(&st.decisions);
+    gc_protect(&st.produced);
+    unsigned marker = atom_with_id(syntactic_env_marker_id());
+    gc_protect(&marker);
+    unsigned tag = store(SC_MACRO);
+    st.senv_macro = alloc_cons(marker, tag);
+    tag = store(SC_USE);
+    st.senv_use = alloc_cons(marker, tag);
+
+    // The call (%macro-transformer-return ((quote proc) (quote input)
+    // (quote arg) ...)), quoted with the core alias of quote, which no
+    // binding of quote can shadow. Built from the end, re-reading the rooted
+    // values: each allocation can move them.
+    unsigned extra[2] = {0, 0};
+    gc_protect(&extra[0]);
+    gc_protect(&extra[1]);
+    unsigned nextra = 0;
+    if (kind == PROC_ER) {
+        extra[0] = mk_primop(PMACRORENAME);
+        extra[1] = mk_primop(PMACROCOMPARE);
+        nextra = 2;
+    } else {
+        extra[0] = kind == PROC_RSC ? st.senv_macro : st.senv_use;
+        nextra = 1;
+    }
+    unsigned call = 0;
+    gc_protect(&call);
+    for (int i = (int)nextra + 1; i >= 0; i--) {
+        unsigned quoted = alloc_cons(i == 0 ? proc
+                                     : i == 1 ? input
+                                              : extra[i - 2],
+                                     0);
+        gc_protect(&quoted);
+        quoted = alloc_cons(core_alias_cell(CF_QUOTE), quoted);
+        gc_protect(&quoted);
+        call = alloc_cons(quoted, call);
+        gc_unprotect(2);
+    }
+
+    unsigned ret = mk_primop(PMACRORETURN);
+    gc_protect(&ret);
+    call = alloc_cons(call, 0);
+    call = alloc_cons(ret, call);
+
+    current_expansion = &st;
+    unsigned output = syntax_time_eval(call, toplevel_env_of(st.closure_env),
+                                       "macro transformer", true);
+    current_expansion = st.outer;
+    if (output == TOK_ERROR)
+        return TOK_ERROR;
+    gc_protect(&output);
+
+    sc_scope top = {kind == PROC_SC ? SC_MACRO : SC_USE, 0, NULL};
+    if (!collect_use_ids(&st, output, &top, 0))
+        return TOK_ERROR;
+    unsigned result = convert_procedural_output(&st, output, &top, 0);
+    if (result == TOK_ERROR)
+        return TOK_ERROR;
+    gc_protect(&result);
+    if (bindings_out && st.produced)
+        append_bindings_chain(bindings_out, st.produced);
+    return result;
+}
+
+static void procedural_expansion_reset(void)
+{
+    current_expansion = NULL;
+    syntax_time_nesting = 0;
+    syntax_time_raised = 0;
+    syntax_time_raised_set = false;
+    syntax_time_returned = false;
+    code_sweep_inhibit_reset();
+}
+
+// Whether form mentions a name bound to a procedural transformer in env -
+// conservatively, quoted data included. Allocates nothing.
+static bool mentions_procedural_macro(unsigned form, unsigned env,
+                                      unsigned *budget, unsigned depth)
+{
+    for (; IS_PAIR(form); form = cdr(form)) {
+        if (*budget == 0 || depth > 256)
+            return false;
+        (*budget)--;
+        if (mentions_procedural_macro(car(form), env, budget, depth + 1))
+            return true;
+    }
+    return identifier_atom(form) &&
+           macros_is_procedural_transformer(
+               lookup_silent(CELL_ID(form), env));
+}
+
+bool macros_form_uses_procedural_macro(unsigned form, unsigned env)
+{
+    unsigned budget = 100000;
+    return mentions_procedural_macro(form, env, &budget, 0);
 }

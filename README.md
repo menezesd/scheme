@@ -12,7 +12,10 @@ which `make test-diff` checks it against.
 - **Tail Call Optimization**: Proper tail calls in both interpreter and VM
 - **R5RS Compliance**: Passes standard compliance tests including tricky edge cases
 - **Numeric Tower**: Integers, bignums, rationals, floats, and complex numbers
-- **Hygienic Macros**: Full `syntax-rules` with referential transparency
+- **Hygienic Macros**: Full `syntax-rules` with referential transparency, and
+  MIT's procedural `er-macro-transformer`, `rsc-macro-transformer` and
+  `sc-macro-transformer` (with `close-syntax`, `make-syntactic-closure`,
+  `identifier?` and `identifier=?`)
 - **First-Class Continuations**: Full `call/cc` with multi-shot continuation support
 - **SRFI Support**: SRFI-1 (lists), SRFI-2 (`and-let*`), SRFI-8 (`receive`),
   SRFI-9 (records), SRFI-26 (cut/cute), SRFI-27 (random bits), SRFI-28 (`format`)

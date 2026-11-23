@@ -840,12 +840,19 @@ bool handle_define_syntax(unsigned id, unsigned env, unsigned cont)
     gc_protect(&transformer_form);
     gc_protect(&env);
     gc_protect(&cont);
-    if (!syntax_rules_valid(transformer_form, syntax_default_ellipsis_id(env),
-                            "define-syntax")) {
-        cps_signal_current_error(env, cont);
-        return true;
+    unsigned p;
+    if (macros_procedural_transformer_form(transformer_form)) {
+        p = macros_make_procedural_transformer(transformer_form, env,
+                                               "define-syntax");
+    } else {
+        if (!syntax_rules_valid(transformer_form,
+                                syntax_default_ellipsis_id(env),
+                                "define-syntax")) {
+            cps_signal_current_error(env, cont);
+            return true;
+        }
+        p = make_syntax_transformer(transformer_form, env);
     }
-    unsigned p = make_syntax_transformer(transformer_form, env);
     if (p == TOK_ERROR) {
         cps_signal_current_error(env, cont);
         return true;
