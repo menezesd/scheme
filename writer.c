@@ -476,14 +476,13 @@ static void mark_shared_inner(unsigned s)
 // Forward declaration
 static void write_obj_fp(unsigned s, bool with_quotes, FILE *fp);
 
-static void write_escaped_string(FILE *fp, const char *s)
+// Write s between delim characters (" for strings, | for symbols), escaping
+// the delimiter, backslash and control characters.
+static void write_escaped(FILE *fp, const char *s, char delim)
 {
-    fputc('"', fp);
+    fputc(delim, fp);
     for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
         switch (*p) {
-        case '"':
-            fputs("\\\"", fp);
-            break;
         case '\\':
             fputs("\\\\", fp);
             break;
@@ -503,14 +502,18 @@ static void write_escaped_string(FILE *fp, const char *s)
             fputs("\\b", fp);
             break;
         default:
-            if (*p < 0x20 || *p == 0x7f)
+            if (*p == (unsigned char)delim) {
+                fputc('\\', fp);
+                fputc(delim, fp);
+            } else if (*p < 0x20 || *p == 0x7f) {
                 fprintf(fp, "\\x%02X;", *p);
-            else
+            } else {
                 fputc(*p, fp);
+            }
             break;
         }
     }
-    fputc('"', fp);
+    fputc(delim, fp);
 }
 
 // Unicode case folding (defined in prim_char.c, declared in prim_internal.h;
@@ -572,9 +575,7 @@ static bool symbol_needs_escape(const char *s)
     // Leading '.' lexes as the dotted-pair marker (only "..." reads back)
     if (s[0] == '.' && strcmp(s, "...") != 0)
         return true;
-    unsigned char first = (unsigned char)s[0];
-    if (first == '#' || first == '"' || first == '\'' || first == '`' ||
-        first == ',' || first == '(' || first == ')' || first == ';')
+    if (s[0] == '#')
         return true;
     for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
         if (*p <= 0x20 || *p == 0x7f || *p == '"' || *p == '\'' ||
@@ -583,43 +584,6 @@ static bool symbol_needs_escape(const char *s)
             return true;
     }
     return symbol_folds_differently(s);
-}
-
-static void write_escaped_symbol(FILE *fp, const char *s)
-{
-    fputc('|', fp);
-    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
-        switch (*p) {
-        case '|':
-            fputs("\\|", fp);
-            break;
-        case '\\':
-            fputs("\\\\", fp);
-            break;
-        case '\n':
-            fputs("\\n", fp);
-            break;
-        case '\t':
-            fputs("\\t", fp);
-            break;
-        case '\r':
-            fputs("\\r", fp);
-            break;
-        case '\a':
-            fputs("\\a", fp);
-            break;
-        case '\b':
-            fputs("\\b", fp);
-            break;
-        default:
-            if (*p < 0x20 || *p == 0x7f)
-                fprintf(fp, "\\x%02X;", *p);
-            else
-                fputc(*p, fp);
-            break;
-        }
-    }
-    fputc('|', fp);
 }
 
 static void write_utf8_scalar(FILE *fp, int code)
@@ -937,7 +901,7 @@ static void write_obj_fp_inner(unsigned s, bool with_quotes, FILE *fp)
             const char *name = ctx.atom_table[CELL_ID(s)];
             // R7RS display: "Symbols are not escaped."
             if (with_quotes && symbol_needs_escape(name))
-                write_escaped_symbol(fp, name);
+                write_escaped(fp, name, '|');
             else
                 fprintf(fp, "%s", name);
         }
@@ -1019,7 +983,7 @@ static void write_obj_fp_inner(unsigned s, bool with_quotes, FILE *fp)
             break;
         }
         if (with_quotes) {
-            write_escaped_string(fp, str);
+            write_escaped(fp, str, '"');
         } else {
             fprintf(fp, "%s", str);
         }
