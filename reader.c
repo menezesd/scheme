@@ -2253,6 +2253,11 @@ unsigned read_obj_stdin(void)
     return read_obj_from_port(stdin, true, NULL);
 }
 
+unsigned read_obj_repl(FILE *port)
+{
+    return read_obj_from_port(port, true, NULL);
+}
+
 size_t reader_port_pending_bytes(FILE *port)
 {
     if (reader_port == port)

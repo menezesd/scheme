@@ -4,6 +4,7 @@
 #include "context.h"
 #include "env.h"
 #include "eval.h"
+#include "lineedit.h"
 #include "macros.h"
 #include "primitive_table.h"
 #include "reader.h"
@@ -383,6 +384,16 @@ int main(int argc, char **argv)
     reader_set_filename("<stdin>");
     bool interactive = isatty(fileno(stdin));
 
+    // On a terminal (both ends) the REPL reads through the line editor:
+    // a stream that delivers whole edited entries, so the reader sees the
+    // same bytes it would read from a cooked terminal. Otherwise - piped
+    // input, or output redirected - stdin is read directly, as always.
+    // Static, like env, because it is read again after a panic longjmp.
+    static FILE *edited_input = NULL;
+    if (interactive && lineedit_available())
+        edited_input = lineedit_open("]=> ", "... ",
+                                     lineedit_default_history_path());
+
     // Piped/non-interactive input behaves like running a script: report
     // failure via the exit code if any top-level form errored, matching
     // the file-argument path below. An interactive session keeps exiting
@@ -402,6 +413,9 @@ int main(int argc, char **argv)
         }
         recovering = true;
         had_error = true;
+        // A panic never comes from inside the line editor, but the terminal
+        // must not be left raw whatever happened.
+        lineedit_restore_terminal();
         // Recovered from a fatal error - reset and continue. The longjmp
         // skipped every GC_GUARD cleanup and every vm_run exit, so drop the
         // dangling shadow-stack roots and VM chain before running a
@@ -430,17 +444,23 @@ int main(int argc, char **argv)
     }
 
     for (;;) {
-        if (interactive) {
-            printf("]=> ");
-            fflush(stdout);
+        unsigned expr;
+        if (edited_input) {
+            // The editor draws the prompt when it needs another entry.
+            lineedit_new_datum();
+            expr = read_obj_repl(edited_input);
+        } else {
+            if (interactive) {
+                printf("]=> ");
+                fflush(stdout);
+            }
+            expr = read_obj_stdin();
         }
-
-        unsigned expr = read_obj_stdin();
         if (is_eof_object(expr))
             break;
         if (expr == TOK_ERROR) {
             had_error = true;
-            if (ferror(stdin))
+            if (ferror(edited_input ? edited_input : stdin))
                 break;
             continue;
         }

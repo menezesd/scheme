@@ -6,7 +6,7 @@ LDFLAGS = -lm
 UNICODE_VERSION = 15.1.0
 
 # Source files
-SRCS = main.c context.c reader.c writer.c env.c primitive_table.c feature_table.c utf8.c primitives.c macros.c eval.c bignum.c \
+SRCS = main.c lineedit.c context.c reader.c writer.c env.c primitive_table.c feature_table.c utf8.c primitives.c macros.c eval.c bignum.c \
        prim_numeric.c prim_compare.c prim_list.c prim_string.c prim_type.c \
        prim_char.c prim_vector.c prim_record.c prim_math.c prim_io.c prim_port.c prim_numtower.c \
        eval_forms.c eval_cont.c compile.c code_object.c optimize.c vm.c compiled_pattern.c
@@ -14,7 +14,8 @@ OBJS = $(SRCS:.c=.o)
 DEBUG_OBJS = $(SRCS:.c=.debug.o)
 SAN_OBJS = $(SRCS:.c=.san.o)
 HEADERS = types.h context.h reader.h writer.h env.h primitive_table.h feature_table.h utf8.h primitives.h macros.h eval.h bignum.h \
-          prim_internal.h eval_internal.h bytecode.h compile_internal.h compiled_pattern.h
+          prim_internal.h eval_internal.h bytecode.h compile_internal.h compiled_pattern.h \
+          lineedit.h
 GENERATED = stdlib_data.h
 
 # Target executable
@@ -31,7 +32,8 @@ UBSAN_OBJS = $(SRCS:.c=.ubsan.o)
 UBSAN_CFLAGS = $(DEBUG_CFLAGS) -fsanitize=undefined
 UBSAN_LDFLAGS = $(LDFLAGS) -fsanitize=undefined
 
-.PHONY: all clean distclean debug sanitize ubsan test test-interpreter test-c test-prop test-r5rs test-stress test-sanitize test-ubsan test-repl-exit test-diff test-gcstress test-atom-growth test-all unicode-tables
+.PHONY: all clean distclean debug sanitize ubsan test test-interpreter test-c test-prop test-r5rs test-stress test-sanitize test-ubsan test-repl-exit test-diff test-gcstress test-atom-growth test-all unicode-tables \
+        lint test-fuzz test-lineedit
 
 all: $(TARGET)
 
@@ -67,6 +69,7 @@ $(TARGET): $(OBJS)
 # Object file dependencies
 $(OBJS): $(HEADERS)
 main.o: main.c $(HEADERS) stdlib_data.h
+lineedit.o: lineedit.c lineedit.h
 context.o: context.c context.h feature_table.h types.h
 reader.o: reader.c reader.h context.h types.h
 writer.o: writer.c writer.h context.h types.h
@@ -296,9 +299,29 @@ test-atom-growth: $(TARGET)
 		fi; \
 	done
 
+# Static GC-safety checks over the C sources (see tools/lint_gc.py): roots
+# that outlive their variable's scope, stores that bypass the write barrier,
+# and overlapping writes into ctx.last_error. The self-test first proves the
+# checks still fire on each bug class. Known findings awaiting fixes in files
+# being changed elsewhere are listed in tools/lint_gc_allowlist.txt.
+lint:
+	@python3 tools/lint_gc.py --self-test
+	@python3 tools/lint_gc.py
+
+# Random terminating programs, run by the VM and the CPS interpreter, must
+# print the same. A fixed seed keeps it reproducible; run the script with
+# other seeds and a larger --count to search further (tools/fuzz_differential.py
+# --help), or with --mit to compare against MIT Scheme as well.
+test-fuzz: $(TARGET)
+	@python3 tools/fuzz_differential.py --seed 1 --count 300
+
+# The interactive REPL's line editor, driven through a pseudo-terminal.
+test-lineedit: $(TARGET)
+	@python3 tools/test_repl_lineedit.py
+
 # Run all tests, including the UBSan-only smoke path that works on macOS
 # systems where ASan can hang before main.
-test-all: test test-interpreter test-c test-prop test-r5rs test-stress test-ubsan test-repl-exit test-diff test-gcstress test-atom-growth
+test-all: lint test test-interpreter test-c test-prop test-r5rs test-stress test-ubsan test-repl-exit test-lineedit test-fuzz test-diff test-gcstress test-atom-growth
 
 clean:
 	rm -f $(OBJS) $(DEBUG_OBJS) $(SAN_OBJS) $(UBSAN_OBJS) $(TARGET) \

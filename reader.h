@@ -26,6 +26,10 @@ unsigned read_obj_string_port(FILE *port, bool *no_fold_case);
 // Read a REPL form using stdin's shared port state and retain its location.
 unsigned read_obj_stdin(void);
 
+// The same for a REPL reading from another stream (the line editor's): its
+// own port state, location retained across forms.
+unsigned read_obj_repl(FILE *port);
+
 // Get the number of internally pushed-back bytes saved for a port
 size_t reader_port_pending_bytes(FILE *port);
 
