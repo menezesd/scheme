@@ -857,7 +857,11 @@ class Gen:
 
     def callcc_values(self, env, b):
         k = self.fresh("k")
-        vals = [self.g_int(env, b) for _ in range(self.r.randint(0, 3))]
+        # MIT 12.1's call/cc continuations take exactly one argument, even
+        # inside a call-with-values producer, where R7RS (and Vesper) pass
+        # them on as multiple values.
+        count = 1 if self.mit else self.r.randint(0, 3)
+        vals = [self.g_int(env, b) for _ in range(count)]
         return ["call-with-values",
                 ["lambda", [], ["call-with-current-continuation",
                                 ["lambda", [k], [k] + vals]]],
@@ -1600,10 +1604,18 @@ except Exception:  # pragma: no cover - the module is part of this tree
 FLOATISH = re.compile(r"^[+-]?(\d+\.\d*|\.\d+|\d+)(e[+-]?\d+)?$")
 
 
+# A built-in prints as #[compiled-procedure N ("car") car] in Vesper and with
+# MIT's compiled block and addresses, #[compiled-procedure N ("list" #x10)
+# #xbc #x10a1e2644], in MIT: compared by hash number alone.
+COMPILED_PROCEDURE = re.compile(r"#\[compiled-procedure (\d+) [^\]]*\]")
+
+
 def mit_equivalent(a, b):
     """Token-wise comparison that accepts MIT's flonum spelling and last-digit
     differences in inexact results."""
     a = a.replace("#[eof]", "#!eof")
+    a = COMPILED_PROCEDURE.sub(r"#[compiled-procedure \1]", a)
+    b = COMPILED_PROCEDURE.sub(r"#[compiled-procedure \1]", b)
     if a == b:
         return True
     from run_mit_differential import DATUM_TOKEN
