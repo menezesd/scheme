@@ -965,6 +965,147 @@ static void apply_cont_step(void)
 // Function Application
 // ============================================================================
 
+// (apply proc arg1 arg2 ... arglist) - prepend args to arglist
+static void apply_apply(unsigned args, unsigned env, unsigned cont)
+{
+    if (!args || !cdr(args)) {
+        show_error("apply expects at least two arguments");
+        cps_signal_current_error(env, cont);
+        return;
+    }
+    GC_GUARD;
+    unsigned proc = car(args);
+    args = cdr(args);
+
+    // Find the last argument (must be a list) and collect preceding
+    // args
+    unsigned proc_args = 0;
+    gc_protect(&proc);
+    gc_protect(&proc_args);
+    gc_protect(&args);
+    gc_protect(&env);
+    gc_protect(&cont);
+
+    // Build list of all args except last, then append last
+    unsigned prefix = 0;
+    gc_protect(&prefix);
+    while (cdr(args)) {
+        prefix = alloc_cons(car(args), prefix);
+        args = cdr(args);
+    }
+    // args is now the last element, car(args) is the final list
+    proc_args = car(args);
+    // Every apply target, including a continuation, must receive a
+    // proper argument list.  Builtins and closures validate this
+    // later, but continuations otherwise turn a cyclic list into an
+    // invalid multiple-values object.
+    if (!list_length_checked(proc_args, NULL, "apply")) {
+        cps_signal_current_error(env, cont);
+        return;
+    }
+
+    // Prepend the reversed prefix to proc_args
+    while (prefix) {
+        proc_args = alloc_cons(car(prefix), proc_args);
+        prefix = cdr(prefix);
+    }
+
+    apply_function(proc, proc_args, env, cont);
+}
+
+// (load filename): read the whole file, then evaluate its forms in env.
+static void apply_load(unsigned args, unsigned env, unsigned cont)
+{
+    if (!args || cdr(args)) {
+        show_error("load expects exactly one argument");
+        cps_signal_current_error(env, cont);
+        return;
+    }
+    unsigned filename_arg = car(args);
+    if (!IS_STRING(filename_arg)) {
+        show_error("load: expected string argument");
+        cps_signal_current_error(env, cont);
+        return;
+    }
+    const char *filename = GET_STRING_PTR(filename_arg);
+    if (!string_is_registered(filename)) {
+        show_error("load: invalid string");
+        cps_signal_current_error(env, cont);
+        return;
+    }
+    const char *old_filename = reader_get_filename();
+    char *filename_copy = checked_string_copy(filename);
+    if (!filename_copy) {
+        show_error("load: out of memory");
+        cps_signal_current_error(env, cont);
+        return;
+    }
+    FILE *f = fopen(filename, "r");
+    if (!f) {
+        show_error("load: cannot open file: %s", filename);
+        free(filename_copy);
+        cps_signal_current_error(env, cont);
+        return;
+    }
+    reader_set_filename(filename_copy);
+    reader_reset_position();
+
+    unsigned exprs = 0, exprs_tail = 0;
+    bool load_failed = false;
+    GC_GUARD;
+    gc_protect(&exprs);
+    gc_protect(&exprs_tail);
+    gc_protect(&env);
+    gc_protect(&cont);
+    for (;;) {
+        unsigned expr = read_obj_port(f);
+        if (expr == TOK_ERROR) {
+            load_failed = true;
+            break;
+        }
+        if (is_eof_object(expr))
+            break;
+        if (expr == TOK_CLOSE || expr == TOK_DOT) {
+            show_error("load: unexpected reader token");
+            load_failed = true;
+            break;
+        }
+        list_append(&exprs, &exprs_tail, expr);
+    }
+    reader_forget_port(f);
+    if (fclose(f) != 0) {
+        show_error("load: close failed");
+        load_failed = true;
+    }
+    reader_set_filename(old_filename);
+    reader_reset_position();
+    free(filename_copy);
+
+    if (load_failed) {
+        cps_signal_current_error(env, cont);
+        return;
+    }
+
+    if (!exprs) {
+        tramp_apply(0, cont);
+        return;
+    }
+
+    if (!cdr(exprs)) {
+        tramp_eval(car(exprs), env, cont);
+    } else {
+        GC_GUARD;
+        unsigned first_expr = car(exprs);
+        unsigned rest = cdr(exprs);
+        gc_protect(&first_expr);
+        gc_protect(&rest);
+        gc_protect(&env);
+        gc_protect(&cont);
+        unsigned k = make_cont(CONT_BEGIN, rest, env, cont);
+        tramp_eval(first_expr, env, k);
+    }
+}
+
 void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
 {
     if (IS_BUILTIN(fn)) {
@@ -987,52 +1128,8 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
             return;
         }
 
-        // Special handling for apply
-        // (apply proc arg1 arg2 ... arglist) - prepend args to arglist
         if (prim_id == PAPPLY) {
-            if (!args || !cdr(args)) {
-                show_error("apply expects at least two arguments");
-                cps_signal_current_error(env, cont);
-                return;
-            }
-            GC_GUARD;
-            unsigned proc = car(args);
-            args = cdr(args);
-
-            // Find the last argument (must be a list) and collect preceding
-            // args
-            unsigned proc_args = 0;
-            gc_protect(&proc);
-            gc_protect(&proc_args);
-            gc_protect(&args);
-            gc_protect(&env);
-            gc_protect(&cont);
-
-            // Build list of all args except last, then append last
-            unsigned prefix = 0;
-            gc_protect(&prefix);
-            while (cdr(args)) {
-                prefix = alloc_cons(car(args), prefix);
-                args = cdr(args);
-            }
-            // args is now the last element, car(args) is the final list
-            proc_args = car(args);
-            // Every apply target, including a continuation, must receive a
-            // proper argument list.  Builtins and closures validate this
-            // later, but continuations otherwise turn a cyclic list into an
-            // invalid multiple-values object.
-            if (!list_length_checked(proc_args, NULL, "apply")) {
-                cps_signal_current_error(env, cont);
-                return;
-            }
-
-            // Prepend the reversed prefix to proc_args
-            while (prefix) {
-                proc_args = alloc_cons(car(prefix), proc_args);
-                prefix = cdr(prefix);
-            }
-
-            apply_function(proc, proc_args, env, cont);
+            apply_apply(args, env, cont);
             return;
         }
 
@@ -1141,96 +1238,8 @@ void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
             return;
         }
 
-        // Special handling for load
         if (prim_id == PLOAD) {
-            if (!args || cdr(args)) {
-                show_error("load expects exactly one argument");
-                cps_signal_current_error(env, cont);
-                return;
-            }
-            unsigned filename_arg = car(args);
-            if (!IS_STRING(filename_arg)) {
-                show_error("load: expected string argument");
-                cps_signal_current_error(env, cont);
-                return;
-            }
-            const char *filename = GET_STRING_PTR(filename_arg);
-            if (!string_is_registered(filename)) {
-                show_error("load: invalid string");
-                cps_signal_current_error(env, cont);
-                return;
-            }
-            const char *old_filename = reader_get_filename();
-            char *filename_copy = checked_string_copy(filename);
-            if (!filename_copy) {
-                show_error("load: out of memory");
-                cps_signal_current_error(env, cont);
-                return;
-            }
-            FILE *f = fopen(filename, "r");
-            if (!f) {
-                show_error("load: cannot open file: %s", filename);
-                free(filename_copy);
-                cps_signal_current_error(env, cont);
-                return;
-            }
-            reader_set_filename(filename_copy);
-            reader_reset_position();
-
-            unsigned exprs = 0, exprs_tail = 0;
-            bool load_failed = false;
-            GC_GUARD;
-            gc_protect(&exprs);
-            gc_protect(&exprs_tail);
-            gc_protect(&env);
-            gc_protect(&cont);
-            for (;;) {
-                unsigned expr = read_obj_port(f);
-                if (expr == TOK_ERROR) {
-                    load_failed = true;
-                    break;
-                }
-                if (is_eof_object(expr))
-                    break;
-                if (expr == TOK_CLOSE || expr == TOK_DOT) {
-                    show_error("load: unexpected reader token");
-                    load_failed = true;
-                    break;
-                }
-                list_append(&exprs, &exprs_tail, expr);
-            }
-            reader_forget_port(f);
-            if (fclose(f) != 0) {
-                show_error("load: close failed");
-                load_failed = true;
-            }
-            reader_set_filename(old_filename);
-            reader_reset_position();
-            free(filename_copy);
-
-            if (load_failed) {
-                cps_signal_current_error(env, cont);
-                return;
-            }
-
-            if (!exprs) {
-                tramp_apply(0, cont);
-                return;
-            }
-
-            if (!cdr(exprs)) {
-                tramp_eval(car(exprs), env, cont);
-            } else {
-                GC_GUARD;
-                unsigned first_expr = car(exprs);
-                unsigned rest = cdr(exprs);
-                gc_protect(&first_expr);
-                gc_protect(&rest);
-                gc_protect(&env);
-                gc_protect(&cont);
-                unsigned k = make_cont(CONT_BEGIN, rest, env, cont);
-                tramp_eval(first_expr, env, k);
-            }
+            apply_load(args, env, cont);
             return;
         }
 
