@@ -5680,6 +5680,52 @@
                  (lambda () (procedure-arity)))))
 
 ;;; ============================================================================
+;;; Error messages of the VM's arithmetic and comparison opcodes
+;;; ============================================================================
+
+;; The VM compiles calls of +, <, =, zero?, vector-ref ... to opcodes. Their
+;; errors are worded as the primitives word them, which is what a first-class
+;; call (and the interpreter) reports, so both engines say the same thing.
+
+(section "Opcode error messages")
+
+(define (op-msg thunk)
+  (guard (e ((error-object? e) (condition/report-string e))
+            (#t (list 'non-error e)))
+    (thunk)))
+(define %op-bad 'a)
+(define %op-big (expt 10 30))
+
+(test "+ with a symbol" "+: not a number" (op-msg (lambda () (+ 1.5 %op-bad))))
+(test "- with a symbol" "-: not a number" (op-msg (lambda () (- 1 %op-bad))))
+(test "* with a symbol" "*: not a number" (op-msg (lambda () (* 2 %op-bad))))
+(test "/ with a symbol" "/: not a number" (op-msg (lambda () (/ 1 %op-bad))))
+(test "/ of a ratio by zero" "/: division by zero" (op-msg (lambda () (/ 1/2 0))))
+(test "/ of a bignum by zero" "/: division by zero" (op-msg (lambda () (/ %op-big 0))))
+(test "modulo with a symbol" "modulo: expected exact integer"
+      (op-msg (lambda () (modulo 5 %op-bad))))
+(test "modulo of a flonum" "modulo: expected integer"
+      (op-msg (lambda () (modulo 5.5 2))))
+(test "< with a symbol" "<: not a number" (op-msg (lambda () (< 1 %op-bad))))
+(test ">= with a symbol" ">=: not a number" (op-msg (lambda () (>= 1 %op-bad))))
+(test "= with a symbol" "=: not a number" (op-msg (lambda () (= 1 %op-bad))))
+(test "zero? of a symbol" "=: not a number" (op-msg (lambda () (zero? %op-bad))))
+(test "abs of a symbol" "abs: not a real number" (op-msg (lambda () (abs %op-bad))))
+(test "< in a test position" "<: not a number"
+      (op-msg (lambda () (if (< %op-bad 1) 1 2))))
+(test "= in a test position" "=: not a number"
+      (op-msg (lambda () (if (= %op-bad 1) 1 2))))
+(test "zero? in a test position" "=: not a number"
+      (op-msg (lambda () (if (zero? %op-bad) 1 2))))
+(test "vector-ref with a symbol index" "vector-ref: expected exact integer"
+      (op-msg (lambda () (vector-ref (vector 1) 'x))))
+(test "vector-set! with a flonum index" "vector-set!: expected exact integer"
+      (op-msg (lambda () (vector-set! (vector 1) 0.0 'v))))
+(test "duplicate do variables" "lambda: invalid formals"
+      (op-msg (lambda () (eval '(do ((k 1) (k 2)) (#t 0))
+                               (interaction-environment)))))
+
+;;; ============================================================================
 ;;; Unassigned variables
 ;;; ============================================================================
 

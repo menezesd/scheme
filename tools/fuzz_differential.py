@@ -127,45 +127,7 @@ FLOATS = ["1.5", "-0.25", "3.0", "0.1", "2.5", "-7.75", "1e10", "2.5e-3",
 # generator away from one bug, so that `make test-fuzz` guards against new
 # divergences instead of failing on known ones. Delete an entry once its bug
 # is fixed; --no-avoid generates the triggering shapes anyway.
-KNOWN_BUGS = {
-    "vm-error-wording":
-        "VM: errors raised by the VM's own arithmetic and call opcodes are "
-        "worded differently from the primitives the interpreter calls - "
-        "(* 2 'a) \"*: invalid operands\" vs \"*: not a number\"; also +, <, "
-        "=, zero?, modulo (\"expected exact integer\" / \"expected "
-        "integer\"), abs (\"not a number\" vs \"not a real number\"), "
-        "vector-ref with a non-integer index, (/ 1/2 0) (\"invalid operands "
-        "or division by zero\" vs \"division by zero\"; the VM uses the same "
-        "words for (/ #f 1), \"/: not a number\" in the interpreter), every "
-        "arity error (\"wrong number of arguments\" vs \"procedure: too "
-        "few/many arguments\"), and duplicate formals, (do ((k 1) (k 2)) "
-        "(#t 0)) (\"lambda: invalid syntax\" vs \"lambda: invalid "
-        "formals\"). Compared modulo these wordings (MESSAGE_ALIASES).",
-}
-
-# For vm-error-wording: each engine's spelling of the same error, rewritten
-# to one form before outputs are compared.
-MESSAGE_ALIASES = [
-    # Applied to both engines' output, so a wording either engine uses for
-    # one of these errors compares equal to the other engine's.
-    # The VM says "invalid operands or division by zero" for both.
-    (re.compile(r"/: (?:invalid operands or division by zero|division by zero|"
-                r"not a number)"), "/: <bad operand or zero>"),
-    (re.compile(r"lambda: invalid (?:syntax|formals)"), "lambda: <bad formals>"),
-    (re.compile(r"([^\s\"]+): (?:invalid operands|not a number|not a real number|"
-                r"expected exact integer|expected integer)"), r"\1: <bad operand>"),
-    (re.compile(r"vector-ref: (?:index not an integer|<bad operand>)"),
-     "vector-ref: <bad index>"),
-    (re.compile(r"wrong number of arguments|procedure: too (?:few|many) arguments"),
-     "<arity>"),
-]
-
-
-def canonical_messages(engine, out):
-    """Fold the known differently-worded error messages in OUT together."""
-    for rx, repl in MESSAGE_ALIASES:
-        out = rx.sub(repl, out)
-    return out
+KNOWN_BUGS = {}
 
 
 class Budget:
@@ -1207,14 +1169,6 @@ class Gen:
             ["length", ["quote", ["#dot", "1", "2"]]],
             ["let", [["x", "1"]], ["x"]],
         ])
-        if "vm-error-wording" in self.avoid:
-            # The message may be taken apart (string->list, substring...),
-            # out of reach of MESSAGE_ALIASES, so keep to errors both
-            # engines word alike.
-            if bad[0] == "/":
-                bad = ["/", str(self.r.randint(-50, 50)), "0"]
-            elif isinstance(bad[0], list):
-                bad = [bad[0], "1"]
         return ["guard", [e, [["error-object?", e], ["condition/report-string", e]],
                           ["else", ["list", ["quote", "raised"], e]]],
                 bad]
@@ -1691,17 +1645,6 @@ PANIC = re.compile(r"Returning to REPL|Fatal error|panic|Assertion failed|"
                    r"AddressSanitizer|runtime error:")
 
 
-# The KNOWN_BUGS being worked around in this run (set from the command line).
-ACTIVE_AVOID = set(KNOWN_BUGS)
-
-
-def comparable(engine, out):
-    """OUT as compared: known wording differences folded together."""
-    if "vm-error-wording" in ACTIVE_AVOID and engine in ("vm", "cps"):
-        return canonical_messages(engine, out)
-    return out
-
-
 def compare(results, mit, use_stderr, expect_clean=False):
     """Return None when the engines agree, else (category, description).
 
@@ -1731,7 +1674,7 @@ def compare(results, mit, use_stderr, expect_clean=False):
         last = (vm.err.strip().splitlines() or ["?"])[-1]
         return ("abort", "both engines stopped the program early (exit %s): %s"
                 % (vm.code, last[:200]))
-    if comparable("vm", vm.out) != comparable("cps", cps.out):
+    if vm.out != cps.out:
         return ("stdout", "stdout differs between vm and cps")
     if use_stderr and strip_paths(vm.err) != strip_paths(cps.err):
         return ("stderr", "stderr differs between vm and cps")
@@ -1764,8 +1707,8 @@ def signature(results):
     """What shrinking keeps fixed for a stdout divergence: the kind of the
     first line where the engines' outputs part (two different values, a value
     against an error, two wordings of an error...)."""
-    a = comparable("vm", results["vm"].out).split("\n")
-    b = comparable("cps", results["cps"].out).split("\n")
+    a = results["vm"].out.split("\n")
+    b = results["cps"].out.split("\n")
     for i in range(max(len(a), len(b))):
         x = a[i] if i < len(a) else None
         y = b[i] if i < len(b) else None
@@ -1909,7 +1852,7 @@ def run_batch(seed, indices, args, workdir):
     # Narrow down to the programs whose sections differ, or - when an engine
     # stopped early - everything from the first missing section on.
     suspects = []
-    secs = {n: split_sections(comparable(n, r.out)) for n, r in results.items()}
+    secs = {n: split_sections(r.out) for n, r in results.items()}
     for i in indices:
         outs = [secs[n].get(i) for n in secs]
         if any(o is None for o in outs) or len(set(outs)) > 1 or args.stderr \
@@ -1987,8 +1930,6 @@ def main(argv=None):
                     help="describe the known divergences being avoided and exit")
     args = ap.parse_args(argv)
     args.avoid = frozenset() if args.no_avoid else frozenset(KNOWN_BUGS)
-    ACTIVE_AVOID.clear()
-    ACTIVE_AVOID.update(args.avoid)
     if args.known_bugs:
         for name, text in KNOWN_BUGS.items():
             print("%s: %s" % (name, text))

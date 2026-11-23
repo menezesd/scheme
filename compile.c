@@ -3958,9 +3958,10 @@ static compile_result compile_lambda(unsigned expr, compile_ctx *cctx)
     gc_protect(&lambda_env);
 
     // lambda_params_valid allocates, so locals must be protected first
-    if (!body || !list_length_checked(body, NULL, "lambda") ||
-        !lambda_params_valid(params))
+    if (!body || !list_length_checked(body, NULL, "lambda"))
         return emit_syntax_error(cctx, "lambda: invalid syntax");
+    if (!lambda_params_valid(params))
+        return emit_syntax_error(cctx, "lambda: invalid formals");
 
     // Build a dummy frame with parameters as vars, all bound to 0
     {
@@ -5781,9 +5782,10 @@ static compile_result compile_call(unsigned expr, compile_ctx *cctx)
         gc_protect(&lambda_params);
         gc_protect(&lambda_body);
         // lambda_params_valid allocates, so locals must be protected first
-        if (!lambda_params_valid(lambda_params) ||
-            !list_length_checked(lambda_body, NULL, "lambda"))
+        if (!list_length_checked(lambda_body, NULL, "lambda"))
             return emit_syntax_error(cctx, "lambda: invalid syntax");
+        if (!lambda_params_valid(lambda_params))
+            return emit_syntax_error(cctx, "lambda: invalid formals");
 
         // Count params and check for rest parameter
         // Handle two cases:

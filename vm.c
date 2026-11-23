@@ -72,6 +72,23 @@ static void protect_and_box3(unsigned *a, unsigned *b, unsigned *c)
         goto vm_dispatch_error;                                                \
     } while (0)
 
+// The message for operands an arithmetic or comparison opcode's slow path
+// rejected: the operation is redone as its primitive, so the error is worded
+// as a first-class call of the primitive - and the interpreter - word it.
+// Only reached on the error path.
+static const char *vm_primitive_error(unsigned prim_id, unsigned a, unsigned b)
+{
+    unsigned argv[2] = {a, b};
+    // The rerun reports this same error again; what the opcode's own
+    // operation already reported for it goes.
+    discard_error_diagnostic();
+    ctx.last_error[0] = '\0';
+    if (apply_primitive_argv(prim_id, 2, argv) == TOK_ERROR &&
+        ctx.last_error[0])
+        return ctx.last_error;
+    return "invalid operands";
+}
+
 static vector_data *vm_expect_vector_data(vm_state *vm, unsigned vec,
                                           const char *msg)
 {
@@ -3203,7 +3220,7 @@ static unsigned vm_dispatch(vm_state *vm)
             }
             unsigned result = vm_numeq_zero(n);
             if (result == TOK_ERROR)
-                VM_ERROR_BREAK(vm, "=: invalid operands");
+                VM_ERROR_BREAK(vm, vm_primitive_error(PEQUAL, n, MAKE_FIXNUM(0)));
             vm_push(vm, result);
             break;
         }
@@ -3262,7 +3279,7 @@ static unsigned vm_dispatch(vm_state *vm)
             unsigned result = binary_add(a, b);
             gc_unprotect(2);
             if (result == TOK_ERROR)
-                VM_ERROR_BREAK(vm, "+: invalid operands");
+                VM_ERROR_BREAK(vm, vm_primitive_error(PPLUS, a, b));
             vm_push(vm, result);
             break;
         }
@@ -3280,7 +3297,7 @@ static unsigned vm_dispatch(vm_state *vm)
             unsigned result = binary_sub(a, b);
             gc_unprotect(2);
             if (result == TOK_ERROR)
-                VM_ERROR_BREAK(vm, "-: invalid operands");
+                VM_ERROR_BREAK(vm, vm_primitive_error(PMINUS, a, b));
             vm_push(vm, result);
             break;
         }
@@ -3298,7 +3315,7 @@ static unsigned vm_dispatch(vm_state *vm)
             unsigned result = binary_mul(a, b);
             gc_unprotect(2);
             if (result == TOK_ERROR)
-                VM_ERROR_BREAK(vm, "*: invalid operands");
+                VM_ERROR_BREAK(vm, vm_primitive_error(PTIMES, a, b));
             vm_push(vm, result);
             break;
         }
@@ -3326,7 +3343,7 @@ static unsigned vm_dispatch(vm_state *vm)
             unsigned result = binary_div(a, b);
             gc_unprotect(2);
             if (result == TOK_ERROR)
-                VM_ERROR_BREAK(vm, "/: invalid operands or division by zero");
+                VM_ERROR_BREAK(vm, vm_primitive_error(PDIV, a, b));
             vm_push(vm, result);
             break;
         }
@@ -3348,7 +3365,7 @@ static unsigned vm_dispatch(vm_state *vm)
             unsigned result = binary_mod(a, b);
             gc_unprotect(2);
             if (result == TOK_ERROR)
-                VM_ERROR_BREAK(vm, "modulo: invalid operands");
+                VM_ERROR_BREAK(vm, vm_primitive_error(PMOD, a, b));
             vm_push(vm, result);
             break;
         }
@@ -3366,7 +3383,7 @@ static unsigned vm_dispatch(vm_state *vm)
             unsigned result = binary_lt(a, b);
             gc_unprotect(2);
             if (result == TOK_ERROR)
-                VM_ERROR_BREAK(vm, "<: invalid operands");
+                VM_ERROR_BREAK(vm, vm_primitive_error(PLT, a, b));
             vm_push(vm, result);
             break;
         }
@@ -3383,7 +3400,7 @@ static unsigned vm_dispatch(vm_state *vm)
             unsigned result = binary_gt(a, b);
             gc_unprotect(2);
             if (result == TOK_ERROR)
-                VM_ERROR_BREAK(vm, ">: invalid operands");
+                VM_ERROR_BREAK(vm, vm_primitive_error(PGT, a, b));
             vm_push(vm, result);
             break;
         }
@@ -3400,7 +3417,7 @@ static unsigned vm_dispatch(vm_state *vm)
             unsigned result = binary_le(a, b);
             gc_unprotect(2);
             if (result == TOK_ERROR)
-                VM_ERROR_BREAK(vm, "<=: invalid operands");
+                VM_ERROR_BREAK(vm, vm_primitive_error(PLEQ, a, b));
             vm_push(vm, result);
             break;
         }
@@ -3417,7 +3434,7 @@ static unsigned vm_dispatch(vm_state *vm)
             unsigned result = binary_ge(a, b);
             gc_unprotect(2);
             if (result == TOK_ERROR)
-                VM_ERROR_BREAK(vm, ">=: invalid operands");
+                VM_ERROR_BREAK(vm, vm_primitive_error(PGEQ, a, b));
             vm_push(vm, result);
             break;
         }
@@ -3433,7 +3450,7 @@ static unsigned vm_dispatch(vm_state *vm)
             unsigned result = binary_numeq(a, b);
             gc_unprotect(2);
             if (result == TOK_ERROR)
-                VM_ERROR_BREAK(vm, "=: invalid operands");
+                VM_ERROR_BREAK(vm, vm_primitive_error(PEQUAL, a, b));
             vm_push(vm, result);
             break;
         }
@@ -3548,7 +3565,7 @@ static unsigned vm_dispatch(vm_state *vm)
             } else {
                 unsigned result = vm_numeq_zero(n);
                 if (result == TOK_ERROR)
-                    VM_ERROR_BREAK(vm, "=: invalid operands");
+                    VM_ERROR_BREAK(vm, vm_primitive_error(PEQUAL, n, MAKE_FIXNUM(0)));
                 is_zero = result == ctx.atom_true;
             }
             if (is_zero == (op == OP_JUMPIFZERO))
@@ -3684,7 +3701,7 @@ static unsigned vm_dispatch(vm_state *vm)
             unsigned i;
             if (!vm_expect_vector_index(
                     vm, vec, idx, "vector-ref: not a vector",
-                    "vector-ref: index not an integer",
+                    "vector-ref: expected exact integer",
                     "vector-ref: index out of bounds", &vd, &i))
                 goto vm_dispatch_error;
             vm_push(vm, vd->data[i]);
@@ -3698,7 +3715,7 @@ static unsigned vm_dispatch(vm_state *vm)
             unsigned i;
             if (!vm_expect_vector_index(
                     vm, vec, idx, "vector-set!: not a vector",
-                    "vector-set!: index not an integer",
+                    "vector-set!: expected exact integer",
                     "vector-set!: index out of bounds", NULL, &i))
                 goto vm_dispatch_error;
             gc_protect(&vec);
@@ -3805,7 +3822,12 @@ static unsigned vm_dispatch(vm_state *vm)
                     vm_push(vm, n);
                 }
             } else {
-                VM_ERROR(vm, "abs: not a number");
+                unsigned argv[1] = {n};
+                discard_error_diagnostic();
+                ctx.last_error[0] = '\0';
+                apply_primitive_argv(PABS, 1, argv);
+                VM_ERROR(vm, ctx.last_error[0] ? ctx.last_error
+                                               : "abs: not a number");
             }
             break;
         }
@@ -3896,7 +3918,7 @@ static unsigned vm_dispatch(vm_state *vm)
                 unsigned result = binary_numeq(a, b);
                 gc_unprotect(2);
                 if (result == TOK_ERROR)
-                    VM_ERROR_BREAK(vm, "=: invalid operands");
+                    VM_ERROR_BREAK(vm, vm_primitive_error(PEQUAL, a, b));
                 eq = (result == ctx.atom_true);
             }
             if (!eq)
@@ -3936,7 +3958,12 @@ static unsigned vm_dispatch(vm_state *vm)
                 }
                 gc_unprotect(2);
                 if (result == TOK_ERROR)
-                    VM_ERROR_BREAK(vm, "comparison: invalid operands");
+                    VM_ERROR_BREAK(vm, vm_primitive_error(
+                        fused_op == OP_LT_JUMPIFNOT   ? PLT
+                        : fused_op == OP_GT_JUMPIFNOT ? PGT
+                        : fused_op == OP_LE_JUMPIFNOT ? PLEQ
+                                                      : PGEQ,
+                        a, b));
                 cond = (result == ctx.atom_true);
             }
             if (!cond)

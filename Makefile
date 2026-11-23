@@ -351,7 +351,7 @@ lint:
 # other seeds and a larger --count to search further (tools/fuzz_differential.py
 # --help), or with --mit to compare against MIT Scheme as well.
 test-fuzz: $(TARGET)
-	@python3 tools/fuzz_differential.py --seed 1 --count 300
+	@python3 tools/fuzz_differential.py --seed 1 --count 300 --stderr
 
 # The interactive REPL's line editor, driven through a pseudo-terminal.
 test-lineedit: $(TARGET)
