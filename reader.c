@@ -1001,19 +1001,63 @@ static unsigned parse_radix_real(const char *s, int radix)
     return normalize_rational_cells(numerator, denominator);
 }
 
+// +inf.0, -inf.0, +nan.0 or -nan.0 (any case), spelled the same in every
+// radix.
+static bool parse_infinity_or_nan(const char *s, double *value)
+{
+    if (*s != '+' && *s != '-')
+        return false;
+    if (strcasecmp(s + 1, "inf.0") == 0)
+        *value = *s == '-' ? -HUGE_VAL : HUGE_VAL;
+    else if (strcasecmp(s + 1, "nan.0") == 0)
+        *value = (double)NAN;
+    else
+        return false;
+    return true;
+}
+
+// A decimal integer or inexact decimal (no '/' or imaginary suffix), or #f.
+static unsigned parse_decimal_real(const char *s)
+{
+    double special;
+    if (parse_infinity_or_nan(s, &special))
+        return store_inexact(special);
+    const char *digits = s + (*s == '+' || *s == '-');
+    if (*digits && digits[strspn(digits, "0123456789")] == '\0') {
+        errno = 0;
+        long long ival = strtoll(s, NULL, 10);
+        if (errno == ERANGE || ival == LLONG_MAX || ival == LLONG_MIN) {
+            bignum *bn = bn_from_string(s, 10);
+            if (bn)
+                return store_integer(bn);
+        }
+        return store(ival);
+    }
+    // strtod also takes C spellings that are not Scheme syntax: leading
+    // space, inf/nan words and hex floats ("0x1p3").
+    if (!isdigit((unsigned char)digits[0]) &&
+        !(digits[0] == '.' && isdigit((unsigned char)digits[1])))
+        return ctx.atom_false;
+    if (strpbrk(s, "xXpP"))
+        return ctx.atom_false;
+    char *end;
+    double value = strtod(s, &end);
+    return *end == '\0' ? store_inexact(value) : ctx.atom_false;
+}
+
 static unsigned parse_real_component(const char *s, int radix,
                                       reader_exactness exactness)
 {
     size_t len = strlen(s);
-    // A component must be real. Reject nested imaginary suffixes before
-    // calling atom_from_string, which also accepts complete complex values.
-    // (Radices of 19 and up only reach here whole, and 'i' is a digit there.)
+    // A component must be real: reject a nested imaginary suffix. (Radices
+    // of 19 and up only reach here whole, and 'i' is a digit there.)
     if (!len ||
         ((radix == 2 || radix == 8 || radix == 10 || radix == 16) &&
          (s[len - 1] == 'i' || s[len - 1] == 'I')))
         return ctx.atom_false;
 
     unsigned value;
+    double special;
     if (radix == 10 && !strchr(s, '/')) {
         bool handled = false;
         if (exactness == READER_EXACTNESS_EXACT) {
@@ -1022,15 +1066,11 @@ static unsigned parse_real_component(const char *s, int radix,
                 return TOK_ERROR;
         }
         if (!handled)
-            value = atom_from_string(s);
+            value = parse_decimal_real(s);
+    } else if (parse_infinity_or_nan(s, &special)) {
+        value = store_inexact(special);
     } else {
-        // Infinities and NaNs use the same spelling in every radix.
-        if ((*s == '+' || *s == '-') &&
-            (strcasecmp(s + 1, "inf.0") == 0 ||
-             strcasecmp(s + 1, "nan.0") == 0))
-            value = atom_from_string(s);
-        else
-            value = parse_radix_real(s, radix);
+        value = parse_radix_real(s, radix);
     }
     if (value == TOK_ERROR)
         return TOK_ERROR;
@@ -1564,16 +1604,6 @@ static unsigned read_string_literal(void)
     return x;
 }
 
-// Intern name and return a fresh symbol cell, bypassing numeric parsing.
-static unsigned make_symbol_cell(const char *name)
-{
-    unsigned symbol_id = (unsigned)intern(name);
-    unsigned res = alloc();
-    CELL_TYPE(res) = BT_ATOM;
-    CELL_ID(res) = symbol_id;
-    return res;
-}
-
 // True for [+-]<digits>/<digits> with an all-zero denominator. Such a token
 // is numeric syntax with no value; read it as an error, not as a symbol.
 static bool token_is_zero_denominator_rational(const char *s)
@@ -1680,7 +1710,7 @@ static unsigned read_escaped_identifier(void)
     }
     // Quoting makes every spelling an identifier, including "123", "+i",
     // and infinity/NaN literals. Do not send it through numeric parsing.
-    unsigned res = make_symbol_cell(sb.data);
+    unsigned res = atom_from_string(sb.data);
     sb_free(&sb);
     return res;
 }
@@ -1746,15 +1776,14 @@ static unsigned read_number_or_symbol_token(int c)
     }
     unsigned res = is_number ? parse_number_string(sb.data, 10) : ctx.atom_false;
     if (res == ctx.atom_false) {
-        // parse_number_string is the authority on numeric syntax. Falling
-        // back to atom_from_string would let its laxer parser accept
-        // spellings such as 1/-2 that string->number rejects.
+        // parse_number_string is the authority on numeric syntax: what it
+        // rejects (1/-2, say) is a symbol, unless the denominator is zero.
         if (token_is_zero_denominator_rational(sb.data)) {
             show_error("division by zero in rational");
             sb_free(&sb);
             return TOK_ERROR;
         }
-        res = make_symbol_cell(sb.data);
+        res = atom_from_string(sb.data);
     }
     sb_free(&sb);
     return res;

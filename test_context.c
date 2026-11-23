@@ -533,11 +533,11 @@ TEST(atom_from_string_creates_atom)
     PASS();
 }
 
-TEST(atom_from_string_parses_number)
+TEST(atom_from_string_keeps_numeric_spellings_as_symbols)
 {
     unsigned x = atom_from_string("42");
-    ASSERT(CELL_TYPE(x) == BT_NUM);
-    ASSERT_EQ(CELL_ID(x), 42);
+    ASSERT(CELL_TYPE(x) == BT_ATOM);
+    ASSERT_STR_EQ(ctx.atom_table[CELL_ID(x)], "42");
     PASS();
 }
 
@@ -4839,7 +4839,7 @@ int main(void)
     RUN_TEST(intern_different_strings);
     RUN_TEST(uninterned_symbols_keep_distinct_identities);
     RUN_TEST(atom_from_string_creates_atom);
-    RUN_TEST(atom_from_string_parses_number);
+    RUN_TEST(atom_from_string_keeps_numeric_spellings_as_symbols);
 
     // Characters
     RUN_TEST(make_char_test);

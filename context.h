@@ -476,7 +476,8 @@ static inline bool core_alias_unbound_fast(int64_t id)
     return !core_alias_bound && atom_is_core_alias(id);
 }
 
-// Convert string to atom or number
+// The interned symbol named s. Numeric spellings are symbols too ("42" names
+// the symbol |42|); parse_number_string reads numbers.
 unsigned atom_from_string(const char *s);
 
 // ============================================================================

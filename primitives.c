@@ -659,13 +659,7 @@ static unsigned make_filled_string(unsigned len_arg, unsigned fill_arg,
 static unsigned make_symbol_from_string(unsigned str, const char *name)
 {
     char *s = require_string_ptr(str, name);
-    if (!s)
-        return TOK_ERROR;
-    int atom_id = intern(s);
-    unsigned result = alloc();
-    CELL_TYPE(result) = BT_ATOM;
-    CELL_ID(result) = atom_id;
-    return result;
+    return s ? atom_from_string(s) : TOK_ERROR;
 }
 
 static unsigned make_string_from_symbol(unsigned sym, const char *name)
@@ -2674,9 +2668,7 @@ unsigned make_error_object_c(const char *msg)
     // and errors stay engine-level.
     if (!ctx.builtin_record_types[BRT_CONDITION])
         return TOK_ERROR;
-    unsigned error_kind = alloc();
-    CELL_TYPE(error_kind) = BT_ATOM;
-    CELL_ID(error_kind) = intern(kind);
+    unsigned error_kind = atom_from_string(kind);
     gc_protect(&error_kind);
     unsigned msg_str = make_string_copy(msg ? msg : "unknown error");
     if (msg_str == TOK_ERROR)
