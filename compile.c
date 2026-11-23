@@ -2118,20 +2118,17 @@ static bool compile_macro_binding(unsigned mac, unsigned expr,
 }
 
 // ============================================================================
-// define-syntax hygiene: resolve free identifiers at definition time
+// Syntax-rules hygiene: resolve free identifiers at definition time
 // ============================================================================
 // A macro's free identifiers must resolve to whatever they meant at the
 // macro's OWN definition point, not to whatever happens to be in scope at
-// each later use site. let-syntax/letrec-syntax already do this (see the
-// block above compiling those forms): they collect the transformer's free
-// identifiers, rename them to gensyms in the template, and emit alias-
-// defining bytecode immediately, before the transformer's own new
-// environment frame's body compiles - i.e. before any subsequent
-// shadowing scope in the program has a chance to exist. This mirrors
-// that mechanism for define-syntax, which previously deferred free-
-// identifier resolution to each macro use site via apply_syntax
-// (macros.c), a point that can be arbitrarily far from the definition
-// and inside arbitrarily many intervening shadowing scopes.
+// each later use site. define-syntax, let-syntax and letrec-syntax collect
+// the transformer's free identifiers, rename them to gensyms in the
+// template, and emit alias-defining bytecode immediately - before any later
+// shadowing scope in the program has a chance to exist - rather than leave
+// their resolution to each use site via apply_syntax (macros.c), a point
+// that can be arbitrarily far from the definition and inside arbitrarily
+// many intervening shadowing scopes.
 
 // A body's internal defines may follow a define-syntax that refers to them:
 // (define-syntax getx (syntax-rules () ((_) x))) (define x 1) ... (getx).
