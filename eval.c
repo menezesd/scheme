@@ -1106,161 +1106,166 @@ static void apply_load(unsigned args, unsigned env, unsigned cont)
     }
 }
 
+// Apply primitive prim_id. The engine's own machinery - call/cc, apply,
+// call-with-values, raise, eval, load and the like - is handled here; the
+// rest go to apply_primitive.
+static void apply_builtin(int64_t prim_id, unsigned args, unsigned env,
+                          unsigned cont)
+{
+    // Special handling for call/cc
+    if (prim_id == PCALLCC) {
+        if (!args || cdr(args)) {
+            show_error("call/cc expects exactly one argument");
+            cps_signal_current_error(env, cont);
+            return;
+        }
+        GC_GUARD;
+        unsigned proc = car(args);
+        gc_protect(&proc);
+        gc_protect(&cont);
+        gc_protect(&env);
+        unsigned cont_args = alloc_cons(cont, 0);
+        apply_function(proc, cont_args, env, cont);
+        return;
+    }
+
+    if (prim_id == PAPPLY) {
+        apply_apply(args, env, cont);
+        return;
+    }
+
+    // Special handling for call-with-values
+    if (prim_id == PCALLWITHVALUES) {
+        if (!args || !cdr(args) || cddr(args)) {
+            show_error("call-with-values expects exactly two arguments");
+            cps_signal_current_error(env, cont);
+            return;
+        }
+        GC_GUARD;
+        unsigned producer = car(args);
+        unsigned consumer = cadr(args);
+        // Protect producer, consumer, env and cont across make_cont
+        gc_protect(&producer);
+        gc_protect(&consumer);
+        gc_protect(&env);
+        gc_protect(&cont);
+        // Create continuation to handle producer's result
+        unsigned k = make_cont(CONT_CALLWITHVALUES, consumer, env, cont);
+        // Call producer with no arguments
+        apply_function(producer, 0, env, k);
+        return;
+    }
+
+    // Special handling for raise - CPS mirror of vm_handle_raise: pass the
+    // object to the current handler with a CONT_ERR_RETURN continuation
+    // whose data records the dispatched handler, so handle_cont_err_return
+    // can tell the default handler (silent unhandled) from a user handler
+    // (R7RS violation). Cannot go through apply_primitive - raising is
+    // engine machinery, not a pure primitive.
+    if (prim_id == PRAISENOW) {
+        if (!args || cdr(args)) {
+            show_error("raise expects exactly one argument");
+            cps_signal_current_error(env, cont);
+            return;
+        }
+        unsigned obj = car(args);
+        unsigned handler = lookup_silent(
+            intern("*current-exception-handler*"),
+            exception_state_env(env));
+        if (handler == TOK_ERROR) {
+            cps_signal_current_error(env, cont);
+            return;
+        }
+        GC_GUARD;
+        gc_protect(&handler);
+        gc_protect(&obj);
+        gc_protect(&env);
+        gc_protect(&cont);
+        cps_capture_backtrace(handler, env, cont);
+        unsigned err_cont = make_cont(CONT_ERR_RETURN, handler, env, cont);
+        unsigned raise_args = alloc_cons(obj, 0);
+        apply_function(handler, raise_args, env, err_cont);
+        return;
+    }
+
+    // Special handling for eval
+    if (prim_id == PEVAL) {
+        if (!args || !cdr(args) || cddr(args)) {
+            show_error("eval expects exactly two arguments");
+            cps_signal_current_error(env, cont);
+            return;
+        }
+        // The expression is evaluated directly in the environment it
+        // was given. The caller's exception handlers stay in effect
+        // without any help from here: the exception machinery reads them
+        // from the interaction environment (exception_state_env), not
+        // from the environment of the code that raised. There used to be
+        // a frame holding copies of them consed in front of eval_env,
+        // and since define binds into the first frame, a definition made
+        // through eval landed in that frame and vanished with it.
+        tramp_eval(car(args), cadr(args), cont);
+        return;
+    }
+
+    // Special handling for interaction-environment
+    if (prim_id == PINTERACTIONENV) {
+        if (args) {
+            show_error("interaction-environment expects no arguments");
+            cps_signal_current_error(env, cont);
+            return;
+        }
+        // The interaction environment is the top-level environment, not
+        // a lexical frame around the call site.  In standalone harnesses
+        // ctx.global_environment is unset, so exception_state_env falls
+        // back to the current environment.
+        tramp_apply(exception_state_env(env), cont);
+        return;
+    }
+
+    // Special handling for gc-flip
+    if (prim_id == PGCFLIP) {
+        if (args) {
+            show_error("gc-flip expects no arguments");
+            cps_signal_current_error(env, cont);
+            return;
+        }
+        // Trigger garbage collection with environment as root
+        // Set tramp state so gc() collects the right things
+        tramp.cont = cont;
+        tramp.env = env;
+        gc(env);
+        // After gc(), use updated tramp values
+        tramp_apply(ctx.atom_true, tramp.cont);
+        return;
+    }
+
+    if (prim_id == PLOAD) {
+        apply_load(args, env, cont);
+        return;
+    }
+
+    // Protect the dynamic environment and continuation across
+    // apply_primitive (which can allocate/trigger GC).  The environment
+    // is needed by the error dispatcher if the primitive fails after GC.
+    GC_GUARD;
+    gc_protect(&args);
+    gc_protect(&env);
+    gc_protect(&cont);
+    unsigned result = apply_primitive(prim_id, args);
+    if (result == TOK_ERROR) {
+        cps_signal_error(ctx.last_error[0] ? ctx.last_error
+                                           : "primitive error",
+                         env, cont);
+        return;
+    }
+    tramp_apply(result, cont);
+}
+
 void apply_function(unsigned fn, unsigned args, unsigned env, unsigned cont)
 {
     if (IS_BUILTIN(fn)) {
-        int64_t prim_id = CELL_ID(fn);
-
-        // Special handling for call/cc
-        if (prim_id == PCALLCC) {
-            if (!args || cdr(args)) {
-                show_error("call/cc expects exactly one argument");
-                cps_signal_current_error(env, cont);
-                return;
-            }
-            GC_GUARD;
-            unsigned proc = car(args);
-            gc_protect(&proc);
-            gc_protect(&cont);
-            gc_protect(&env);
-            unsigned cont_args = alloc_cons(cont, 0);
-            apply_function(proc, cont_args, env, cont);
-            return;
-        }
-
-        if (prim_id == PAPPLY) {
-            apply_apply(args, env, cont);
-            return;
-        }
-
-        // Special handling for call-with-values
-        if (prim_id == PCALLWITHVALUES) {
-            if (!args || !cdr(args) || cddr(args)) {
-                show_error("call-with-values expects exactly two arguments");
-                cps_signal_current_error(env, cont);
-                return;
-            }
-            GC_GUARD;
-            unsigned producer = car(args);
-            unsigned consumer = cadr(args);
-            // Protect producer, consumer, env and cont across make_cont
-            gc_protect(&producer);
-            gc_protect(&consumer);
-            gc_protect(&env);
-            gc_protect(&cont);
-            // Create continuation to handle producer's result
-            unsigned k = make_cont(CONT_CALLWITHVALUES, consumer, env, cont);
-            // Call producer with no arguments
-            apply_function(producer, 0, env, k);
-            return;
-        }
-
-        // Special handling for raise - CPS mirror of vm_handle_raise: pass the
-        // object to the current handler with a CONT_ERR_RETURN continuation
-        // whose data records the dispatched handler, so handle_cont_err_return
-        // can tell the default handler (silent unhandled) from a user handler
-        // (R7RS violation). Cannot go through apply_primitive - raising is
-        // engine machinery, not a pure primitive.
-        if (prim_id == PRAISENOW) {
-            if (!args || cdr(args)) {
-                show_error("raise expects exactly one argument");
-                cps_signal_current_error(env, cont);
-                return;
-            }
-            unsigned obj = car(args);
-            unsigned handler = lookup_silent(
-                intern("*current-exception-handler*"),
-                exception_state_env(env));
-            if (handler == TOK_ERROR) {
-                cps_signal_current_error(env, cont);
-                return;
-            }
-            GC_GUARD;
-            gc_protect(&handler);
-            gc_protect(&obj);
-            gc_protect(&env);
-            gc_protect(&cont);
-            cps_capture_backtrace(handler, env, cont);
-            unsigned err_cont = make_cont(CONT_ERR_RETURN, handler, env, cont);
-            unsigned raise_args = alloc_cons(obj, 0);
-            apply_function(handler, raise_args, env, err_cont);
-            return;
-        }
-
-        // Special handling for eval
-        if (prim_id == PEVAL) {
-            if (!args || !cdr(args) || cddr(args)) {
-                show_error("eval expects exactly two arguments");
-                cps_signal_current_error(env, cont);
-                return;
-            }
-            // The expression is evaluated directly in the environment it
-            // was given. The caller's exception handlers stay in effect
-            // without any help from here: the exception machinery reads them
-            // from the interaction environment (exception_state_env), not
-            // from the environment of the code that raised. There used to be
-            // a frame holding copies of them consed in front of eval_env,
-            // and since define binds into the first frame, a definition made
-            // through eval landed in that frame and vanished with it.
-            tramp_eval(car(args), cadr(args), cont);
-            return;
-        }
-
-        // Special handling for interaction-environment
-        if (prim_id == PINTERACTIONENV) {
-            if (args) {
-                show_error("interaction-environment expects no arguments");
-                cps_signal_current_error(env, cont);
-                return;
-            }
-            // The interaction environment is the top-level environment, not
-            // a lexical frame around the call site.  In standalone harnesses
-            // ctx.global_environment is unset, so exception_state_env falls
-            // back to the current environment.
-            tramp_apply(exception_state_env(env), cont);
-            return;
-        }
-
-        // Special handling for gc-flip
-        if (prim_id == PGCFLIP) {
-            if (args) {
-                show_error("gc-flip expects no arguments");
-                cps_signal_current_error(env, cont);
-                return;
-            }
-            // Trigger garbage collection with environment as root
-            // Set tramp state so gc() collects the right things
-            tramp.cont = cont;
-            tramp.env = env;
-            gc(env);
-            // After gc(), use updated tramp values
-            tramp_apply(ctx.atom_true, tramp.cont);
-            return;
-        }
-
-        if (prim_id == PLOAD) {
-            apply_load(args, env, cont);
-            return;
-        }
-
-        // Protect the dynamic environment and continuation across
-        // apply_primitive (which can allocate/trigger GC).  The environment
-        // is needed by the error dispatcher if the primitive fails after GC.
-        {
-            GC_GUARD;
-            gc_protect(&args);
-            gc_protect(&env);
-            gc_protect(&cont);
-            unsigned result = apply_primitive(prim_id, args);
-            if (result == TOK_ERROR) {
-                cps_signal_error(ctx.last_error[0] ? ctx.last_error
-                                                   : "primitive error",
-                                 env, cont);
-                return;
-            }
-            tramp_apply(result, cont);
-            return;
-        }
+        apply_builtin(CELL_ID(fn), args, env, cont);
+        return;
     }
 
     if (IS_FUNCTION(fn)) {
