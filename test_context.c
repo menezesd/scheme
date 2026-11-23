@@ -2455,6 +2455,47 @@ TEST(vm_lookup_cache_searches_activations_with_conditional_defines)
     PASS();
 }
 
+TEST(vm_lookup_cache_global_seen_from_every_activation)
+{
+    // A binding found in the outermost frame is reused from any other
+    // activation without walking to it - until the name is defined in a
+    // nested frame somewhere, which changes its stamp.
+    GC_GUARD;
+    unsigned x = atom_from_string("ic-global-from-activations");
+    unsigned y = atom_from_string("ic-global-activation-param");
+    gc_protect(&x);
+    gc_protect(&y);
+    unsigned global = empty_environment();
+    gc_protect(&global);
+    defvar(x, store(1), global);
+    unsigned a = push_test_frame(y, store(0), global);
+    gc_protect(&a);
+    unsigned b = push_test_frame(y, store(0), global);
+    gc_protect(&b);
+    code_object *code = make_test_lookup_code(CELL_ID(x), TEST_IC_UNCACHED,
+                                              TEST_IC_UNCACHED);
+
+    ASSERT_EQ(test_lookup_int(code, a), 1);
+    ASSERT_EQ(test_lookup_int(code, b), 1);
+    setvar(CELL_ID(x), store(2), global);
+    ASSERT_EQ(test_lookup_int(code, a), 2);
+    ASSERT_EQ(test_lookup_int(code, b), 2);
+    defvar(x, store(3), global); // redefinition assigns in place
+    ASSERT_EQ(test_lookup_int(code, b), 3);
+    defvar(x, store(10), b); // an internal define in one activation
+    ASSERT_EQ(test_lookup_int(code, b), 10);
+    ASSERT_EQ(test_lookup_int(code, a), 3);
+    unsigned c = push_test_frame(y, store(0), global);
+    gc_protect(&c);
+    ASSERT_EQ(test_lookup_int(code, c), 3);
+    ASSERT_EQ(test_lookup_int(code, b), 10);
+    c = gc(c);
+    ASSERT_EQ(test_lookup_int(code, c), 3);
+    ASSERT_EQ(test_lookup_int(code, a), 3);
+    code_free(code);
+    PASS();
+}
+
 TEST(vm_lookup_cache_rechecks_offset_in_other_activation)
 {
     GC_GUARD;
@@ -3898,6 +3939,30 @@ TEST(gc_preserves_list)
     PASS();
 }
 
+TEST(swept_small_payloads_are_reused_by_their_allocated_length)
+{
+    // Small vector and record payloads are kept for reuse when swept, filed
+    // by the length the registry recorded at allocation - not by what the
+    // payload says by then, which a malformed cell may have overwritten.
+    unsigned v = make_vector(2, ctx.atom_true);
+    vector_data *vd = GET_VECTOR_PTR(v);
+    vd->len = 8; // claims more slots than the block holds
+    minor_gc(0);
+    ASSERT(!vector_is_registered(vd));
+    GC_GUARD;
+    unsigned w = make_vector(8, ctx.atom_false);
+    gc_protect(&w);
+    ASSERT(GET_VECTOR_PTR(w) != vd);
+    unsigned u = make_vector(2, ctx.atom_false);
+    gc_protect(&u);
+    ASSERT(GET_VECTOR_PTR(u) == vd);
+    ASSERT(vector_data_well_formed(GET_VECTOR_PTR(u)));
+    ASSERT_EQ(vector_len(u), 2);
+    ASSERT(vector_data_ptr(u)[0] == ctx.atom_false);
+    ASSERT(vector_data_ptr(u)[1] == ctx.atom_false);
+    PASS();
+}
+
 TEST(gc_preserves_vector)
 {
     unsigned v = make_vector(3, store(42));
@@ -4866,6 +4931,7 @@ int main(void)
     RUN_TEST(vm_lookup_ignores_stale_cached_offset);
     RUN_TEST(vm_lookup_cache_sees_define_in_frame_it_passed);
     RUN_TEST(vm_lookup_cache_searches_activations_with_conditional_defines);
+    RUN_TEST(vm_lookup_cache_global_seen_from_every_activation);
     RUN_TEST(vm_lookup_cache_rechecks_offset_in_other_activation);
     RUN_TEST(vm_lookup_cache_define_in_fresh_frame_keeps_stamp);
     RUN_TEST(vm_lookup_cache_is_dropped_by_collections);
@@ -4947,6 +5013,7 @@ int main(void)
     RUN_TEST(gc_preserves_root);
     RUN_TEST(gc_preserves_list);
     RUN_TEST(gc_preserves_vector);
+    RUN_TEST(swept_small_payloads_are_reused_by_their_allocated_length);
     RUN_TEST(gc_preserves_direct_vector_root);
     RUN_TEST(gc_ignores_malformed_hash_table_payload);
     RUN_TEST(gc_ignores_malformed_vector_payload);

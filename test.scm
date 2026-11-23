@@ -4477,6 +4477,34 @@
 (test "closures over rest-parameter frames" '((1 2) (3) (1 2))
       (let ((a (ic-rest 1 2)) (b (ic-rest 3)))
         (list (a) (b) (a))))
+
+;; A global looked up from one activation is reused from every other one
+;; without walking its frames, until the name is defined in a nested frame.
+(define (ic-make-getter n) (lambda () (list n ic-evaled)))
+(test "eval defining, assigning and redefining a global seen from every activation"
+      '((1 a) (2 a) (1 b) (2 b) (1 c) (2 c) (1 d))
+      (let ((g1 (ic-make-getter 1)) (g2 (ic-make-getter 2)))
+        (eval '(define ic-evaled 'a) (interaction-environment))
+        (let* ((r1 (g1)) (r2 (g2)))
+          (eval '(set! ic-evaled 'b) (interaction-environment))
+          (let* ((r3 (g1)) (r4 (g2)))
+            (eval '(define ic-evaled 'c) (interaction-environment))
+            (let* ((r5 (g1)) (r6 (g2)))
+              (set! ic-evaled 'd)
+              (list r1 r2 r3 r4 r5 r6 (g1)))))))
+
+(define ic-shadowed 'global)
+(define (ic-maybe-shadow flag n)
+  (if flag (define ic-shadowed (list 'local n)))
+  (lambda () (list n ic-shadowed)))
+(test "an activation defining a global's name after others cached the global"
+      '((1 global) (2 global) (3 (local 3)) (1 global) (2 global) (4 global)
+        (3 (local 3)))
+      (let* ((a (ic-maybe-shadow #f 1)) (b (ic-maybe-shadow #f 2))
+             (ra (a)) (rb (b))
+             (c (ic-maybe-shadow #t 3))
+             (rc (c)))
+        (list ra rb rc (a) (b) ((ic-maybe-shadow #f 4)) (c))))
 ;;; ============================================================================
 ;;; car/cdr compositions, memq/memv/member, assq/assv/assoc, list-tail and
 ;;; list-ref as C primitives

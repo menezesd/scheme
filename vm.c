@@ -150,13 +150,12 @@ static bool vm_instruction_starts_at(const code_object *code, unsigned target)
            instruction_boundary(code->instruction_boundaries, target);
 }
 
-static bool vm_code_is_well_formed(code_object *code)
+// vm_code_is_well_formed for a code object already known to be registered -
+// a closure's, which is_bytecode_closure_object has just looked up - so a
+// call does not search the registry twice.
+static bool vm_registered_code_is_well_formed(code_object *code)
 {
-    // Code objects are GC-managed and their backing arrays are only valid
-    // while the object remains registered.  Check the metadata before
-    // inspecting any array so malformed C API inputs cannot cause an
-    // out-of-bounds access below.
-    if (!code || !code_object_is_registered(code) || !code->code ||
+    if (!code->code ||
         code->code_len == 0 || code->code_len > code->code_cap ||
         code->const_len > code->const_cap ||
         code->children_len > code->children_cap ||
@@ -200,6 +199,16 @@ static bool vm_code_is_well_formed(code_object *code)
 invalid:
     free(boundaries);
     return false;
+}
+
+static bool vm_code_is_well_formed(code_object *code)
+{
+    // Code objects are GC-managed and their backing arrays are only valid
+    // while the object remains registered.  Check the metadata before
+    // inspecting any array so malformed C API inputs cannot cause an
+    // out-of-bounds access below.
+    return code && code_object_is_registered(code) &&
+           vm_registered_code_is_well_formed(code);
 }
 
 static bool vm_get_const(code_object *code, unsigned idx, unsigned *val_out)
@@ -332,6 +341,20 @@ static unsigned vm_numeq_zero(unsigned n)
 //   - Once the name has been defined in a nested frame, the frames of this
 //     environment that the validated one does not share are searched for it
 //     as well - which is what every hit used to do for every frame.
+//   - A binding found in the outermost frame, for a name never defined in a
+//     nested frame (`outer`), is the answer from every environment, with no
+//     walk at all. Every activation of a code object ends in the same
+//     outermost frame - the one its top-level unit ran in (see below) - so
+//     the binding frame is the same frame, at the same depth. The frames in
+//     between come from the same lambdas and bodies, hold only the names
+//     they were created with plus what defvar added since, and neither can
+//     be this name: the former because the filling lookup passed over the
+//     same lambdas' frames without finding it, the latter because a define
+//     in a nested frame flags the name and so changes its stamp. Defining
+//     the name afresh in the outermost frame is impossible while it is bound
+//     there (defvar assigns in place), assignment is seen through the cell,
+//     and a collection changes the stamp. This is where most lookups of a
+//     global procedure from inside another procedure land.
 //
 // Anything else falls back to the full lookup, which refills the entry. An
 // entry belongs to the instruction whose cache word indexes it (`word`),
@@ -343,6 +366,8 @@ static unsigned vm_numeq_zero(unsigned n)
 // eval code runs once, in the environment it was compiled for, and a closure
 // runs in its captured environment extended by its own frames, whose
 // variables come from its parameter list (or start empty, for a let body).
+// So every environment a code object runs in ends in the frames of the one
+// its top-level unit (or eval) ran in.
 // After that, environments change shape only through env.c: defvar adds
 // bindings (and changes stamps), nothing removes them. Rewiring a frame or
 // an environment spine with set-car!/set-cdr! is not tracked - as it is not
@@ -357,8 +382,9 @@ struct vm_ic_entry {
     unsigned env;        // environment last validated
     unsigned cell;       // the binding's value cell
     unsigned frame;      // frame holding it, seen from env
-    unsigned depth : 31; // links from env to frame
+    unsigned depth : 30; // links from env to frame
     unsigned probe : 1;  // search unshared frames (env_binding_dynamic)
+    unsigned outer : 1;  // the same cell from every environment (above)
     unsigned offset;     // position of the binding in frame, or IC_NO_OFFSET
 };
 _Static_assert(sizeof(struct vm_ic_entry) == 32, "two entries per cache line");
@@ -495,6 +521,7 @@ static unsigned ic_resolve(int64_t symbol, unsigned env,
             site->cell = cell;
             site->depth = depth;
             site->offset = offset;
+            site->outer = next == 0;
             return value;
         case IC_BAD:
             *cacheable = false;
@@ -554,6 +581,7 @@ ic_lookup_miss(code_object *code, unsigned word, int64_t symbol, unsigned env)
         e->depth = site.depth;
         e->offset = site.offset;
         e->probe = env_binding_dynamic(symbol);
+        e->outer = site.outer && !e->probe;
         if (e->probe)
             env_note_binding_cached(symbol);
     }
@@ -636,8 +664,9 @@ ic_lookup_slow(code_object *code, unsigned word, int64_t symbol, unsigned env)
     if (idx < code->ic_len) {
         struct vm_ic_entry *e = &code->ic_entries[idx];
         if (e->word == word && e->stamp == env_binding_stamp(symbol)) {
-            unsigned cell = env == e->env ? e->cell
-                                          : ic_revalidate(e, symbol, env);
+            unsigned cell = env == e->env || e->outer
+                                ? e->cell
+                                : ic_revalidate(e, symbol, env);
             unsigned value = 0;
             if (cell && vm_try_deref_binding_value(car(cell), &value))
                 return value == CELL_UNASSIGNED ? TOK_ERROR : value;
@@ -658,7 +687,8 @@ static inline unsigned ic_lookup(code_object *code, unsigned word,
     unsigned idx = code->code[word];
     if (__builtin_expect(idx < code->ic_len, 1)) {
         const struct vm_ic_entry *e = &code->ic_entries[idx];
-        if (__builtin_expect(e->word == word && e->env == env &&
+        if (__builtin_expect(e->word == word &&
+                                 (e->env == env || e->outer) &&
                                  e->stamp == env_binding_stamp(symbol),
                              1)) {
             unsigned value = car(e->cell);
@@ -897,6 +927,17 @@ void vm_push(vm_state *vm, unsigned val)
                     "vm_push: sp=%u >= stack_cap=%u", vm->sp, vm->stack_cap);
     vm->stack[vm->sp++] = val;
 }
+
+// Pushes from here on are inlined while the stack has room; only growing it
+// (and the overflow error) goes through the function above.
+static inline void vm_push_inline(vm_state *vm, unsigned val)
+{
+    if (__builtin_expect(vm->sp < vm->stack_cap, 1))
+        vm->stack[vm->sp++] = val;
+    else
+        (vm_push)(vm, val);
+}
+#define vm_push(vm, val) vm_push_inline((vm), (val))
 
 unsigned vm_pop(vm_state *vm)
 {
@@ -2111,8 +2152,9 @@ static void vm_apply(vm_state *vm, unsigned fn, unsigned argc, bool tail)
         code_object *code = GET_CLOSURE_CODE(fn);
         unsigned closure_env = GET_CLOSURE_ENV(fn);
 
-        // Check code object validity
-        if (!vm_code_is_well_formed(code)) {
+        // Check code object validity (is_bytecode_closure_object found it
+        // registered)
+        if (!vm_registered_code_is_well_formed(code)) {
             VM_ERROR(vm, "closure has invalid code object");
             return;
         }

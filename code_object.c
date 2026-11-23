@@ -162,8 +162,19 @@ void code_register(code_object *code)
     code_objects_since_sweep++;
 }
 
+// Every call into a closure confirms its code object is registered. Most
+// calls go to a few code objects at a time, so a small direct-mapped table of
+// recently confirmed members answers them without probing the full set, which
+// is large enough to live outside the first-level cache. An object leaves it
+// when it leaves the registry.
+#define CODE_RECENT_SLOTS 64
+static const code_object *code_recent[CODE_RECENT_SLOTS];
+
 static void code_unregister(code_object *code)
 {
+    size_t recent = code_set_start(CODE_RECENT_SLOTS, code);
+    if (code_recent[recent] == code)
+        code_recent[recent] = NULL;
     code_object **prev = &code_object_registry;
     while (*prev) {
         if (*prev == code) {
@@ -497,17 +508,28 @@ bool code_object_is_registered(const code_object *needle)
     // the marker must never compare as a successful membership-table hit.
     if (!needle || needle == CODE_SET_TOMBSTONE)
         return false;
+    size_t recent = code_set_start(CODE_RECENT_SLOTS, needle);
+    if (code_recent[recent] == needle)
+        return true;
     // Only trust the table while it holds every registered object. A miss in
     // an incomplete table is not an answer: it would report a live object as
     // unregistered, and the GC would then sweep something still reachable.
-    if (code_set_cap && !code_set_incomplete)
-        return code_set[code_set_slot_find(code_set, code_set_cap, needle)] ==
-               needle;
-    for (code_object *code = code_object_registry; code; code = code->gc_next) {
-        if (code == needle)
-            return true;
+    bool found = false;
+    if (code_set_cap && !code_set_incomplete) {
+        found = code_set[code_set_slot_find(code_set, code_set_cap, needle)] ==
+                needle;
+    } else {
+        for (code_object *code = code_object_registry; code;
+             code = code->gc_next) {
+            if (code == needle) {
+                found = true;
+                break;
+            }
+        }
     }
-    return false;
+    if (found)
+        code_recent[recent] = needle;
+    return found;
 }
 
 static void mark_registered_code_object(code_object *code)

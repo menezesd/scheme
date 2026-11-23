@@ -111,6 +111,26 @@ bool panic_jmp_set = false;
 
 #define PTR_REGISTRY_INITIAL_BUCKETS 64
 
+// Every vector, record and string payload registers a node on allocation and
+// drops it when swept - a malloc and a free per short-lived record, on top of
+// the payload's own. Keep a bounded stock of released nodes instead, large
+// enough to cover what a minor collection typically reclaims.
+#define SPARE_REGISTRY_NODES_MAX 65536
+static ptr_registry_node *spare_registry_nodes;
+static unsigned spare_registry_node_count;
+
+static void release_registry_node(ptr_registry_node *node)
+{
+    if (spare_registry_node_count < SPARE_REGISTRY_NODES_MAX) {
+        node->ptr = NULL;
+        node->next = spare_registry_nodes;
+        spare_registry_nodes = node;
+        spare_registry_node_count++;
+    } else {
+        free(node);
+    }
+}
+
 static size_t ptr_registry_hash(const void *ptr, size_t bucket_count)
 {
     // Pointers from malloc are at least a few bits aligned, so shift those
@@ -162,8 +182,14 @@ static void ptr_registry_register(ptr_registry *registry, void *ptr,
         ptr_registry_rehash(registry, registry->bucket_count * 2);
     }
 
-    ptr_registry_node *node = checked_malloc_size(sizeof(*node));
-    LISP_ASSERT_MSG(node != NULL, malloc_error);
+    ptr_registry_node *node = spare_registry_nodes;
+    if (node) {
+        spare_registry_nodes = node->next;
+        spare_registry_node_count--;
+    } else {
+        node = checked_malloc_size(sizeof(*node));
+        LISP_ASSERT_MSG(node != NULL, malloc_error);
+    }
     node->ptr = ptr;
     node->len = len;
     size_t idx = ptr_registry_hash(ptr, registry->bucket_count);
@@ -182,7 +208,7 @@ static void ptr_registry_unregister(ptr_registry *registry, void *ptr)
         ptr_registry_node *node = *prev;
         if (node->ptr == ptr) {
             *prev = node->next;
-            free(node);
+            release_registry_node(node);
             registry->count--;
             return;
         }
@@ -492,6 +518,59 @@ void vector_unregister(vector_data *vector)
 bool vector_is_registered(const vector_data *vector)
 {
     return ptr_registry_find(&vector_registry, vector) != NULL;
+}
+
+// Payloads of small vectors and records, kept for reuse when swept instead of
+// freed: a program making records (promises, say) in a loop otherwise mallocs
+// and frees one per object. Stocked by exact length, so a reused block is the
+// size it was allocated at. The length comes from the registry node, which
+// recorded it at allocation, not from the payload, which a malformed cell
+// could have overwritten.
+// The stock is bounded (a few MB at most) but large enough to cover what one
+// minor collection reclaims of a loop's records.
+#define SPARE_PAYLOAD_MAX_LEN 8
+#define SPARE_PAYLOADS_PER_LEN 32768
+typedef struct {
+    vector_data **blocks;
+    unsigned count;
+    unsigned cap;
+} payload_stock;
+static payload_stock spare_payloads[SPARE_PAYLOAD_MAX_LEN + 1];
+
+// An unregistered payload of len slots, contents uninitialized; NULL if the
+// length is too large or memory is exhausted.
+static vector_data *vector_payload_alloc(unsigned len)
+{
+    if (len <= SPARE_PAYLOAD_MAX_LEN && spare_payloads[len].count)
+        return spare_payloads[len].blocks[--spare_payloads[len].count];
+    return checked_malloc_flex(sizeof(vector_data), len, sizeof(unsigned));
+}
+
+// Release a registered payload: unregister it, then stock or free it.
+static void vector_payload_release(vector_data *vd)
+{
+    const ptr_registry_node *node = ptr_registry_find(&vector_registry, vd);
+    if (!node)
+        return;
+    unsigned len = node->len;
+    vector_unregister(vd);
+    if (len <= SPARE_PAYLOAD_MAX_LEN) {
+        payload_stock *stock = &spare_payloads[len];
+        if (stock->count == stock->cap && stock->cap < SPARE_PAYLOADS_PER_LEN) {
+            unsigned cap = stock->cap ? stock->cap * 2 : 256;
+            vector_data **blocks =
+                checked_realloc_array(stock->blocks, cap, sizeof(*blocks));
+            if (blocks) {
+                stock->blocks = blocks;
+                stock->cap = cap;
+            }
+        }
+        if (stock->count < stock->cap) {
+            stock->blocks[stock->count++] = vd;
+            return;
+        }
+    }
+    free(vd);
 }
 
 void bytevec_register(bytevec_data *bytevec)
@@ -1045,10 +1124,9 @@ static void free_external_cell_data(unsigned x)
                CELL_TYPE(x) == BT_RECORD_TYPE) {
         vector_data *vd = (vector_data *)CELL_PTR(x);
         if (vector_is_registered(vd)) {
-            vector_unregister(vd);
             if (CELL_TYPE(x) != BT_VECTOR && object_hash_registry.count)
                 ptr_registry_unregister(&object_hash_registry, vd);
-            free(vd);
+            vector_payload_release(vd);
         }
         CELL_PTR(x) = NULL;
     } else if (CELL_TYPE(x) == BT_STRING) {
@@ -1857,8 +1935,7 @@ unsigned make_vector(unsigned len, unsigned fill)
         show_error("make-vector: length too large");
         return TOK_ERROR;
     }
-    vector_data *vd =
-        checked_malloc_flex(sizeof(vector_data), len, sizeof(unsigned));
+    vector_data *vd = vector_payload_alloc(len);
     if (!vd) {
         show_error("make-vector: out of memory");
         return TOK_ERROR;
@@ -1888,8 +1965,7 @@ static unsigned make_vector_like(enum lisp_type type, unsigned len,
         show_error("%s: too many fields", who);
         return TOK_ERROR;
     }
-    vector_data *vd =
-        checked_malloc_flex(sizeof(vector_data), len, sizeof(unsigned));
+    vector_data *vd = vector_payload_alloc(len);
     if (!vd) {
         show_error("%s: out of memory", who);
         return TOK_ERROR;
@@ -1953,13 +2029,30 @@ unsigned make_record(unsigned rtd)
     return rec;
 }
 
+// Every record construction and type test checks its type, nearly always one
+// of a handful of long-lived types, and the registry probe is most of that
+// cost. So remember the last type that passed, as its cell and payload, until
+// the next collection - the only thing that moves the cell or frees the
+// payload; a type's payload is never written after make_record_type.
+static unsigned checked_rtd_cell;
+static const vector_data *checked_rtd_payload;
+static uint64_t checked_rtd_epoch;
+
 bool record_type_well_formed(unsigned rtd)
 {
     if (!IS_RECORD_TYPE(rtd))
         return false;
     vector_data *vd = GET_VECTOR_PTR(rtd);
-    return vector_data_well_formed(vd) && vd->len >= RECORD_TYPE_FIELDS_START &&
-           IS_ATOM(vd->data[RECORD_TYPE_NAME_SLOT]);
+    if (rtd == checked_rtd_cell && vd == checked_rtd_payload &&
+        checked_rtd_epoch == env_gc_epoch)
+        return true;
+    if (!vector_data_well_formed(vd) || vd->len < RECORD_TYPE_FIELDS_START ||
+        !IS_ATOM(vd->data[RECORD_TYPE_NAME_SLOT]))
+        return false;
+    checked_rtd_cell = rtd;
+    checked_rtd_payload = vd;
+    checked_rtd_epoch = env_gc_epoch;
+    return true;
 }
 
 unsigned record_type_field_count(unsigned rtd)
