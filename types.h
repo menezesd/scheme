@@ -458,6 +458,11 @@ typedef struct {
     // error, such as compile-time constant folding. Must be saved and
     // restored around the speculative region by the code that sets it.
     bool suppress_error_output;
+    // The located diagnostic ("file:line:col: error: msg") of the latest
+    // show_error, held until it is known whether a Scheme handler takes the
+    // error (see report_error).
+    bool error_diagnostic_pending;
+    char error_diagnostic[512];
 } lisp_context;
 
 // ============================================================================
@@ -876,18 +881,24 @@ const char *reader_get_filename(void);
 // overlaps its destination is undefined behavior.
 #define show_error(...)                                                        \
     do {                                                                       \
-        if (!ctx.suppress_error_output) {                                      \
-            fprintf(stderr, "%s:%d:%d: error: ", reader_get_filename(),        \
-                    reader_get_line(), reader_get_col());                      \
-            fprintf(stderr, __VA_ARGS__);                                      \
-            fprintf(stderr, "\n");                                             \
-        }                                                                      \
         char show_error_message_[sizeof(ctx.last_error)];                      \
         snprintf(show_error_message_, sizeof(show_error_message_),             \
                  __VA_ARGS__);                                                 \
-        snprintf(ctx.last_error, sizeof(ctx.last_error), "%s",                 \
-                 show_error_message_);                                         \
+        report_error(show_error_message_);                                     \
     } while (0)
+
+// show_error's body: records msg in ctx.last_error and holds its located
+// diagnostic for stderr. Raising the error to a Scheme handler drops the
+// diagnostic (discard_error_diagnostic) - the handler decides what the user
+// sees, and an unhandled one is reported as "Unhandled exception: ..." - so
+// an error a guard catches prints nothing, as in MIT. Anything still held
+// when control is back at the top level is printed there
+// (flush_error_diagnostic), as is a held one when a newer error replaces it.
+void report_error(const char *msg);
+// Holds text as the diagnostic, for an error reported without show_error.
+void hold_error_diagnostic(const char *text);
+void discard_error_diagnostic(void);
+void flush_error_diagnostic(void);
 
 #define show_warning(...)                                                      \
     do {                                                                       \

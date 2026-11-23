@@ -733,6 +733,38 @@ void gc_shadow_stack_bad_mark(void)
 // chain points at. Drop both, along with the allocation root, before
 // resuming; the caller re-registers whatever roots it still holds. (A panic
 // inside a collection exits instead, so the collector state is already idle.)
+void report_error(const char *msg)
+{
+    snprintf(ctx.last_error, sizeof(ctx.last_error), "%s", msg);
+    char located[sizeof(ctx.error_diagnostic)];
+    snprintf(located, sizeof(located), "%s:%d:%d: error: %s",
+             reader_get_filename(), reader_get_line(), reader_get_col(), msg);
+    hold_error_diagnostic(located);
+}
+
+void hold_error_diagnostic(const char *text)
+{
+    if (ctx.suppress_error_output)
+        return;
+    flush_error_diagnostic();
+    snprintf(ctx.error_diagnostic, sizeof(ctx.error_diagnostic), "%s", text);
+    ctx.error_diagnostic_pending = true;
+}
+
+void discard_error_diagnostic(void)
+{
+    ctx.error_diagnostic_pending = false;
+}
+
+void flush_error_diagnostic(void)
+{
+    if (!ctx.error_diagnostic_pending)
+        return;
+    ctx.error_diagnostic_pending = false;
+    fflush(stdout);
+    fprintf(stderr, "%s\n", ctx.error_diagnostic);
+}
+
 void gc_recover_after_panic(void)
 {
     gc_shadow_stack_top = 0;

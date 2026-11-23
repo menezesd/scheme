@@ -46,9 +46,7 @@ Usage:
 Known, not yet fixed divergences are listed in KNOWN_BUGS; the generator
 steers clear of each one, or the comparison folds its two spellings together
 (see --known-bugs), so a run reports only new ones. --no-avoid turns that
-off. --stderr also compares standard error (the interpreter currently
-prints a diagnostic for primitive errors a guard goes on to handle; the VM
-does not).
+off. --stderr also compares standard error.
 
 Exit status is 0 when every program agreed, 1 otherwise. The same seed
 always generates the same programs (generation does not depend on run order

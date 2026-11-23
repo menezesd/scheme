@@ -249,6 +249,17 @@ test-repl-exit: $(TARGET)
 		expected_report=$$(printf '%s\n' 'Unhandled exception: boom 1 "two"' \
 			'Unhandled exception: car: not a pair'); \
 		[ "$$report" = "$$expected_report" ] || { echo "FAIL: unhandled error report (mode=$$mode): $$report"; exit 1; }; \
+		caught=$$(printf '%s\n' '(guard (e (#t 0)) (car 1))' \
+			'(guard (e (#t 0)) (string-ref "a" 5))' '(guard (e (#t 0)) (undefined-var))' \
+			'(guard (e (#t 0)) ((lambda (x) x)))' '(guard (e (#t 0)) (error "boom" 1))' \
+			"(guard (e (#t 0)) (eval '(if) (interaction-environment)))" \
+			'(guard (e (#t 0)) (load "/nonexistent/file.scm"))' | \
+			./$(TARGET) $$mode 2>&1 >/dev/null | grep -v '^; CPS interpreter mode'); \
+		[ -z "$$caught" ] || { echo "FAIL: caught errors wrote to stderr (mode=$$mode): $$caught"; exit 1; }; \
+		uncaught=$$(printf '%s\n' '(car 1)' | ./$(TARGET) $$mode 2>&1 | grep -c 'not a pair'); \
+		[ "$$uncaught" = 1 ] || { echo "FAIL: an unhandled error should be reported once (mode=$$mode)"; exit 1; }; \
+		value=$$(printf '%s\n' '(car 1)' | ./$(TARGET) $$mode 2>&1 | grep -c ';Value'); \
+		[ "$$value" = 0 ] || { echo "FAIL: REPL printed a value for an error (mode=$$mode)"; exit 1; }; \
 	done
 	@echo "PASS: REPL exit codes, input boundaries and error reports"
 

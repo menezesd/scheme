@@ -2699,13 +2699,22 @@ unsigned make_error_object_c(const char *msg)
 
 static unsigned report_error_primitive(unsigned argc, unsigned *argv)
 {
-    fprintf(stderr, "error: ");
-    for (unsigned i = 0; i < argc; i++) {
-        display_obj_port(argv[i], stderr);
-        if (i + 1 < argc)
-            fprintf(stderr, " ");
+    // Held like show_error's diagnostic: a handler that takes the error
+    // drops it, so a caught (error ...) prints nothing.
+    char *text = NULL;
+    size_t text_len = 0;
+    FILE *out = open_memstream(&text, &text_len);
+    if (out) {
+        fputs("error: ", out);
+        for (unsigned i = 0; i < argc; i++) {
+            display_obj_port(argv[i], out);
+            if (i + 1 < argc)
+                fputc(' ', out);
+        }
+        if (fclose(out) == 0 && text)
+            hold_error_diagnostic(text);
+        free(text);
     }
-    fprintf(stderr, "\n");
     // Refresh ctx.last_error so a later primitive failure cannot reuse a
     // stale message from an earlier error as its own (see vm_signal_error).
     if (argc > 0 && IS_STRING(argv[0])) {

@@ -1589,6 +1589,8 @@ static bool vm_signal_error(vm_state *vm, const char *msg)
         return false;
     }
     vm_capture_backtrace(vm, handler);
+    // The handler reports the error now, or catches it.
+    discard_error_diagnostic();
     // Run the handler with the marker as its return address.
     vm->signal_handler = handler;
     vm->code = marker;

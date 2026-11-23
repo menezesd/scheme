@@ -247,8 +247,11 @@ static inline compile_result dynamic_result(void)
     return (compile_result){false, 0};
 }
 
+// The error is raised, and reported or caught, where the code runs, so the
+// diagnostic the syntax check just held is dropped.
 static compile_result emit_syntax_error(compile_ctx *cctx, const char *message)
 {
+    discard_error_diagnostic();
     unsigned msg = make_string_copy(message);
     gc_protect(&msg);
     emit2(cctx, OP_CONST, code_add_const(cctx->code, msg));

@@ -119,6 +119,7 @@ static bool eval_pending_batch(unsigned *batch, unsigned *batch_tail,
     if (!*batch)
         return true;
     unsigned result = eval_batch(*batch, env);
+    flush_error_diagnostic();
     if (result == TOK_ERROR) {
         if (warn_on_error)
             fprintf(stderr, "Warning: error during load\n");
@@ -155,6 +156,7 @@ static bool load_from_port(FILE *f, unsigned *env, bool warn_on_error,
     for (;;) {
         unsigned expr = read_obj_port(f);
         if (expr == TOK_ERROR) {
+            flush_error_diagnostic();
             eval_pending_batch(&batch, &batch_tail, *env, warn_on_error);
             restore_reader_context(old_filename);
             return false;
@@ -163,6 +165,7 @@ static bool load_from_port(FILE *f, unsigned *env, bool warn_on_error,
             break;
         if (expr == TOK_CLOSE || expr == TOK_DOT) {
             show_error("unexpected reader token at top level");
+            flush_error_diagnostic();
             eval_pending_batch(&batch, &batch_tail, *env, warn_on_error);
             restore_reader_context(old_filename);
             return false;
@@ -183,6 +186,7 @@ static bool load_from_port(FILE *f, unsigned *env, bool warn_on_error,
             }
             // Evaluate define-syntax immediately
             unsigned result = eval_expr(expr, *env);
+            flush_error_diagnostic();
             if (result == TOK_ERROR) {
                 gc_unprotect(1);
                 restore_reader_context(old_filename);
@@ -279,6 +283,9 @@ static void print_usage(const char *prog)
 int main(int argc, char **argv)
 {
     setlocale(LC_CTYPE, "");
+    // A diagnostic still held when the program exits - (exit) mid-form, a
+    // fatal error - is printed then.
+    atexit(flush_error_diagnostic);
 
     // Parse command line options
     int file_arg = 0;
@@ -469,6 +476,7 @@ int main(int argc, char **argv)
         if (is_eof_object(expr))
             break;
         if (expr == TOK_ERROR) {
+            flush_error_diagnostic();
             had_error = true;
             if (ferror(edited_input ? edited_input : stdin))
                 break;
@@ -476,15 +484,21 @@ int main(int argc, char **argv)
         }
         if (expr == TOK_CLOSE || expr == TOK_DOT) {
             show_error("unexpected reader token at top level");
+            flush_error_diagnostic();
             had_error = true;
             continue;
         }
         unsigned x = eval_expr(expr, env);
-        if (x == TOK_ERROR)
+        flush_error_diagnostic();
+        if (x == TOK_ERROR) {
+            // Already reported, as "Unhandled exception: ..." or by the
+            // diagnostic just printed.
             had_error = true;
-        printf("\n;Value: ");
-        write_obj(x);
-        puts("");
+        } else {
+            printf("\n;Value: ");
+            write_obj(x);
+            puts("");
+        }
         env = gc(env);
     }
 

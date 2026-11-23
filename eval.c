@@ -796,6 +796,8 @@ static void cps_signal_error(const char *msg, unsigned env, unsigned cont)
     gc_protect(&args);
     cps_capture_backtrace(handler, env, cont);
     unsigned err_cont = make_cont(CONT_ERR_RETURN, handler, env, cont);
+    // The handler reports the error now, or catches it.
+    discard_error_diagnostic();
     cps_handler_dispatch_active = true;
     apply_function(handler, args, env, err_cont);
     cps_handler_dispatch_active = false;
