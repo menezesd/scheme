@@ -2742,50 +2742,49 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
                                       &macro_result))
                 return macro_result;
 
-            if (special_binding == TOK_ERROR && kw == ctx.kw_quote) {
-                if (!syntax_arity_checked(expr, 1, 1, "quote"))
-                    return emit_syntax_error(cctx, "quote: invalid syntax");
-                unsigned val = macros_strip_core_aliases(cadr(expr));
-                gc_protect(&val);
-                emit2(cctx, OP_CONST, code_add_const(cctx->code, val));
-                gc_unprotect(1);
-                return const_result(val);
-            }
-            if (special_binding == TOK_ERROR && kw == ctx.kw_if)
-                return compile_if(expr, cctx);
-            if (special_binding == TOK_ERROR && kw == ctx.kw_lambda)
-                return compile_lambda(expr, cctx);
-            if (special_binding == TOK_ERROR && kw == ctx.kw_begin)
-                return compile_begin(cdr(expr), cctx);
-            if (special_binding == TOK_ERROR &&
-                (kw == ctx.kw_let || kw == ctx.kw_letstar ||
-                 kw == ctx.kw_letrec)) {
+            // A core form, unless its name is bound
+            if (special_binding == TOK_ERROR) {
+                if (kw == ctx.kw_quote) {
+                    if (!syntax_arity_checked(expr, 1, 1, "quote"))
+                        return emit_syntax_error(cctx, "quote: invalid syntax");
+                    unsigned val = macros_strip_core_aliases(cadr(expr));
+                    gc_protect(&val);
+                    emit2(cctx, OP_CONST, code_add_const(cctx->code, val));
+                    gc_unprotect(1);
+                    return const_result(val);
+                }
+                if (kw == ctx.kw_if)
+                    return compile_if(expr, cctx);
+                if (kw == ctx.kw_lambda)
+                    return compile_lambda(expr, cctx);
+                if (kw == ctx.kw_begin)
+                    return compile_begin(cdr(expr), cctx);
                 if (kw == ctx.kw_let)
                     return compile_let(expr, cctx);
                 if (kw == ctx.kw_letstar)
                     return compile_letstar(expr, cctx);
-                return compile_letrec(expr, cctx);
+                if (kw == ctx.kw_letrec)
+                    return compile_letrec(expr, cctx);
+                if (kw == ctx.kw_and)
+                    return compile_and(expr, cctx);
+                if (kw == ctx.kw_or)
+                    return compile_or(expr, cctx);
+                if (kw == ctx.kw_cond)
+                    return compile_cond(expr, cctx);
+                if (kw == ctx.kw_cond_expand)
+                    return compile_cond_expand(expr, cctx);
+                if (kw == ctx.kw_define)
+                    return compile_define(expr, cctx);
+                if (kw == ctx.kw_set)
+                    return compile_set(expr, cctx);
+                if (kw == ctx.kw_quasiquote)
+                    return compile_quasiquote(expr, cctx);
+                if (kw == ctx.kw_define_syntax)
+                    return compile_define_syntax(expr, cctx);
+                if (kw == ctx.kw_let_syntax || kw == ctx.kw_letrec_syntax)
+                    return compile_let_syntax(expr, cctx,
+                                              kw == ctx.kw_letrec_syntax);
             }
-            if (special_binding == TOK_ERROR && kw == ctx.kw_and)
-                return compile_and(expr, cctx);
-            if (special_binding == TOK_ERROR && kw == ctx.kw_or)
-                return compile_or(expr, cctx);
-            if (special_binding == TOK_ERROR && kw == ctx.kw_cond)
-                return compile_cond(expr, cctx);
-            if (special_binding == TOK_ERROR && kw == ctx.kw_cond_expand)
-                return compile_cond_expand(expr, cctx);
-            if (special_binding == TOK_ERROR && kw == ctx.kw_define)
-                return compile_define(expr, cctx);
-            if (special_binding == TOK_ERROR && kw == ctx.kw_set)
-                return compile_set(expr, cctx);
-            if (special_binding == TOK_ERROR && kw == ctx.kw_quasiquote)
-                return compile_quasiquote(expr, cctx);
-            if (special_binding == TOK_ERROR && kw == ctx.kw_define_syntax)
-                return compile_define_syntax(expr, cctx);
-            if (special_binding == TOK_ERROR &&
-                (kw == ctx.kw_let_syntax || kw == ctx.kw_letrec_syntax))
-                return compile_let_syntax(expr, cctx,
-                                          kw == ctx.kw_letrec_syntax);
 
             // Check for macro application (silent - don't warn if not found)
             unsigned mac = lookup_silent(kw, cctx->env);
