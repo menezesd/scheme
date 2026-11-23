@@ -330,22 +330,21 @@ bool handle_define(unsigned id, unsigned env, unsigned cont)
     return true;
 }
 
-/**
- * Handle and: (and expr1 expr2 ...)
- *
- * Evaluates expressions left-to-right until one returns #f or all are done.
- * Returns #f if any expression is #f, otherwise returns value of last expr.
- * Empty (and) returns #t. Single expression is a tail call.
- */
-bool handle_and(unsigned id, unsigned env, unsigned cont)
+// (and expr ...) and (or expr ...): evaluate left to right, stopping at the
+// first #f (and) or truthy value (or), whose value is the result, through
+// cont_type's continuation. Otherwise the result is the last expression's
+// value, a tail call, or empty_value for no expressions.
+static bool handle_and_or(unsigned id, unsigned env, unsigned cont,
+                          const char *name, unsigned empty_value,
+                          enum cont_type cont_type)
 {
     unsigned seq = cdr(id);
-    if (!syntax_arity_checked(id, 0, UINT_MAX, "and")) {
+    if (!syntax_arity_checked(id, 0, UINT_MAX, name)) {
         cps_signal_current_error(env, cont);
         return true;
     }
     if (!seq) {
-        tramp_apply(ctx.atom_true, cont);
+        tramp_apply(empty_value, cont);
         return true;
     }
     if (!cdr(seq)) {
@@ -359,43 +358,19 @@ bool handle_and(unsigned id, unsigned env, unsigned cont)
     gc_protect(&rest);
     gc_protect(&env);
     gc_protect(&cont);
-    unsigned k = make_cont(CONT_AND, rest, env, cont);
+    unsigned k = make_cont(cont_type, rest, env, cont);
     tramp_eval(first_expr, env, k);
     return true;
 }
 
-/**
- * Handle or: (or expr1 expr2 ...)
- *
- * Evaluates expressions left-to-right until one returns truthy or all are done.
- * Returns first truthy value, or #f if all are #f.
- * Empty (or) returns #f. Single expression is a tail call.
- */
+bool handle_and(unsigned id, unsigned env, unsigned cont)
+{
+    return handle_and_or(id, env, cont, "and", ctx.atom_true, CONT_AND);
+}
+
 bool handle_or(unsigned id, unsigned env, unsigned cont)
 {
-    unsigned seq = cdr(id);
-    if (!syntax_arity_checked(id, 0, UINT_MAX, "or")) {
-        cps_signal_current_error(env, cont);
-        return true;
-    }
-    if (!seq) {
-        tramp_apply(ctx.atom_false, cont);
-        return true;
-    }
-    if (!cdr(seq)) {
-        tramp_eval(car(seq), env, cont);
-        return true;
-    }
-    GC_GUARD;
-    unsigned first_expr = car(seq);
-    unsigned rest = cdr(seq);
-    gc_protect(&first_expr);
-    gc_protect(&rest);
-    gc_protect(&env);
-    gc_protect(&cont);
-    unsigned k = make_cont(CONT_OR, rest, env, cont);
-    tramp_eval(first_expr, env, k);
-    return true;
+    return handle_and_or(id, env, cont, "or", ctx.atom_false, CONT_OR);
 }
 
 /**

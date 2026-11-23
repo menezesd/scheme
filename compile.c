@@ -710,8 +710,8 @@ static compile_result compile_body(unsigned body, compile_ctx *cctx);
 static compile_result compile_let(unsigned expr, compile_ctx *cctx);
 static compile_result compile_letstar(unsigned expr, compile_ctx *cctx);
 static compile_result compile_letrec(unsigned expr, compile_ctx *cctx);
-static compile_result compile_and(unsigned expr, compile_ctx *cctx);
-static compile_result compile_or(unsigned expr, compile_ctx *cctx);
+static compile_result compile_and_or(unsigned expr, compile_ctx *cctx,
+                                     bool is_and);
 static compile_result compile_cond(unsigned expr, compile_ctx *cctx);
 static compile_result compile_cond_expand(unsigned expr, compile_ctx *cctx);
 static compile_result compile_define(unsigned expr, compile_ctx *cctx);
@@ -2761,10 +2761,8 @@ static compile_result compile_expr_internal(unsigned expr, compile_ctx *cctx)
                     return compile_letstar(expr, cctx);
                 if (kw == ctx.kw_letrec)
                     return compile_letrec(expr, cctx);
-                if (kw == ctx.kw_and)
-                    return compile_and(expr, cctx);
-                if (kw == ctx.kw_or)
-                    return compile_or(expr, cctx);
+                if (kw == ctx.kw_and || kw == ctx.kw_or)
+                    return compile_and_or(expr, cctx, kw == ctx.kw_and);
                 if (kw == ctx.kw_cond)
                     return compile_cond(expr, cctx);
                 if (kw == ctx.kw_cond_expand)
@@ -3169,9 +3167,9 @@ static bool trmc_scan_tail(unsigned expr, compile_ctx *cctx,
                 return trmc_scan_tail(car(e), cctx, st, depth + 1);
             }
             if (kw == ctx.kw_and || kw == ctx.kw_or) {
-                // Only the last operand is in tail position - compile_and and
-                // compile_or both set tail_position = tail && is_last - so a
-                // site can only appear there.
+                // Only the last operand is in tail position - compile_and_or
+                // sets tail_position = tail && is_last - so a site can only
+                // appear there.
                 unsigned e = cdr(expr);
                 if (!IS_PAIR(e))
                     return true;
@@ -4494,20 +4492,25 @@ static compile_result compile_letrec(unsigned expr, compile_ctx *cctx)
     return dynamic_result();
 }
 
-// (and expr ...)
-static compile_result compile_and(unsigned expr, compile_ctx *cctx)
+// (and expr ...) and (or expr ...): every expression but the last that
+// decides the form - one that is false for and, true for or - jumps to the
+// end with its value.
+static compile_result compile_and_or(unsigned expr, compile_ctx *cctx,
+                                     bool is_and)
 {
     unsigned args = cdr(expr);
-    if (!list_length_checked(args, NULL, "and"))
-        return emit_syntax_error(cctx, "and: invalid syntax");
+    if (!list_length_checked(args, NULL, is_and ? "and" : "or"))
+        return emit_syntax_error(cctx, is_and ? "and: invalid syntax"
+                                              : "or: invalid syntax");
 
     GC_GUARD;
     gc_protect(&args);
 
     if (!args) {
-        // (and) => #t
-        emit2(cctx, OP_CONST, code_add_const(cctx->code, ctx.atom_true));
-        return const_result(ctx.atom_true);
+        // (and) => #t, (or) => #f
+        unsigned value = is_and ? ctx.atom_true : ctx.atom_false;
+        emit2(cctx, OP_CONST, code_add_const(cctx->code, value));
+        return const_result(value);
     }
 
     // Count expressions
@@ -4518,9 +4521,9 @@ static compile_result compile_and(unsigned expr, compile_ctx *cctx)
     unsigned saved_pos = cctx->code->code_len;
 
     // Dynamically allocate jump array
-    unsigned *false_jumps = checked_malloc_array(expr_count, sizeof(unsigned));
-    if (!false_jumps) {
-        show_error("and: out of memory");
+    unsigned *exit_jumps = checked_malloc_array(expr_count, sizeof(unsigned));
+    if (!exit_jumps) {
+        show_error(is_and ? "and: out of memory" : "or: out of memory");
         emit(cctx, OP_HALT);
         return dynamic_result();
     }
@@ -4537,124 +4540,35 @@ static compile_result compile_and(unsigned expr, compile_ctx *cctx)
         compile_result result = compile_expr_internal(car(args), cctx);
 
         if (result.is_const) {
-            if (IS_FALSE(result.value)) {
-                // Constant false short-circuits the rest. If no prior runtime
-                // tests were emitted, the whole form is constant; otherwise
-                // keep the already-emitted code so its effects still happen.
-                if (jump_count == 0) {
-                    code_truncate(cctx->code, saved_pos, cctx->code->children_len);
-                    emit2(cctx, OP_CONST,
-                          code_add_const(cctx->code, ctx.atom_false));
-                    free(false_jumps);
-                    return const_result(ctx.atom_false);
-                }
-                break;
-            }
-            // Constant truthy - can skip this expression if not last
-            if (!is_last) {
-                // Rewind bytecode for this constant true, continue with rest
-                code_truncate(cctx->code, expr_saved_pos, cctx->code->children_len);
-                args = cdr(args);
-                continue;
-            }
-            // Last expression is constant true - return it
-        }
-
-        if (!is_last) {
-            // Duplicate to test and preserve value
-            emit(cctx, OP_DUP);
-            false_jumps[jump_count++] = emit_jump(cctx, OP_JUMPIFNOT);
-            if (!has_short_circuit_path) {
-                merge_env = cctx->env;
-                has_short_circuit_path = true;
-            }
-            emit(cctx, OP_POP); // Discard if continuing
-        }
-
-        args = cdr(args);
-    }
-
-    // Patch all false jumps to here
-    for (unsigned i = 0; i < jump_count; i++) {
-        patch_jump(cctx, false_jumps[i]);
-    }
-
-    free(false_jumps);
-    if (has_short_circuit_path)
-        cctx->env = merge_env;
-    return dynamic_result();
-}
-
-// (or expr ...)
-static compile_result compile_or(unsigned expr, compile_ctx *cctx)
-{
-    unsigned args = cdr(expr);
-    if (!list_length_checked(args, NULL, "or"))
-        return emit_syntax_error(cctx, "or: invalid syntax");
-
-    GC_GUARD;
-    gc_protect(&args);
-
-    if (!args) {
-        // (or) => #f
-        emit2(cctx, OP_CONST, code_add_const(cctx->code, ctx.atom_false));
-        return const_result(ctx.atom_false);
-    }
-
-    // Count expressions
-    unsigned expr_count = 0;
-    FORLIST(a, args) { expr_count++; }
-
-    bool tail = cctx->tail_position;
-    unsigned saved_pos = cctx->code->code_len;
-
-    // Dynamically allocate jump array
-    unsigned *true_jumps = checked_malloc_array(expr_count, sizeof(unsigned));
-    if (!true_jumps) {
-        show_error("or: out of memory");
-        emit(cctx, OP_HALT);
-        return dynamic_result();
-    }
-    unsigned jump_count = 0;
-    unsigned merge_env = 0;
-    gc_protect(&merge_env);
-    bool has_short_circuit_path = false;
-
-    while (args) {
-        bool is_last = !cdr(args);
-        cctx->tail_position = tail && is_last;
-
-        unsigned expr_saved_pos = cctx->code->code_len;
-        compile_result result = compile_expr_internal(car(args), cctx);
-
-        if (result.is_const) {
-            if (IS_TRUTHY(result.value)) {
-                // Constant truthy short-circuits the rest. If prior runtime
-                // tests exist, preserve them because they may have effects or
-                // produce the returned truthy value.
+            if (IS_FALSE(result.value) == is_and) {
+                // A constant that decides the form short-circuits the rest.
+                // If no prior runtime tests were emitted, the whole form is
+                // constant; otherwise keep the already-emitted code so its
+                // effects still happen (and or's tests their value).
                 if (jump_count == 0) {
                     code_truncate(cctx->code, saved_pos, cctx->code->children_len);
                     emit2(cctx, OP_CONST,
                           code_add_const(cctx->code, result.value));
-                    free(true_jumps);
+                    free(exit_jumps);
                     return const_result(result.value);
                 }
                 break;
             }
-            // Constant false - can skip this expression if not last
+            // A constant that does not decide it can be skipped if not last
             if (!is_last) {
-                // Rewind bytecode for this constant false, continue with rest
+                // Rewind bytecode for this constant, continue with rest
                 code_truncate(cctx->code, expr_saved_pos, cctx->code->children_len);
                 args = cdr(args);
                 continue;
             }
-            // Last expression is constant false - return it
+            // Last expression is constant - return it
         }
 
         if (!is_last) {
             // Duplicate to test and preserve value
             emit(cctx, OP_DUP);
-            true_jumps[jump_count++] = emit_jump(cctx, OP_JUMPIF);
+            exit_jumps[jump_count++] =
+                emit_jump(cctx, is_and ? OP_JUMPIFNOT : OP_JUMPIF);
             if (!has_short_circuit_path) {
                 merge_env = cctx->env;
                 has_short_circuit_path = true;
@@ -4665,12 +4579,12 @@ static compile_result compile_or(unsigned expr, compile_ctx *cctx)
         args = cdr(args);
     }
 
-    // Patch all true jumps to here
+    // Patch all exit jumps to here
     for (unsigned i = 0; i < jump_count; i++) {
-        patch_jump(cctx, true_jumps[i]);
+        patch_jump(cctx, exit_jumps[i]);
     }
 
-    free(true_jumps);
+    free(exit_jumps);
     if (has_short_circuit_path)
         cctx->env = merge_env;
     return dynamic_result();
