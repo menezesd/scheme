@@ -233,15 +233,6 @@ unsigned pattern_add_var(compiled_pattern *pat, unsigned atom, bool is_ellipsis,
     return pat->var_count++;
 }
 
-int pattern_find_var(compiled_pattern *pat, unsigned atom)
-{
-    for (unsigned i = 0; i < pat->var_count; i++) {
-        if (pat->var_slots[i].atom == atom)
-            return (int)i;
-    }
-    return -1;
-}
-
 // ============================================================================
 // GC Integration
 // ============================================================================

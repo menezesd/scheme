@@ -417,12 +417,6 @@ char *string_cell_data(unsigned value)
     return string_view_is_registered(view) ? view->data : (char *)view;
 }
 
-size_t string_cell_byte_length(unsigned value)
-{
-    char *data = string_cell_data(value);
-    return data ? strlen(data) : 0;
-}
-
 bool string_cell_is_immutable(unsigned value)
 {
     if (string_cell_is_view(value))
@@ -859,13 +853,6 @@ void gc_recover_after_panic(void)
     tramp.expr = tramp.env = tramp.cont = tramp.value = 0;
     vm_reset_after_panic();
     pattern_reset_after_panic();
-}
-
-void trigger_gc(void)
-{
-    if (alloc_gc_root && *alloc_gc_root) {
-        *alloc_gc_root = gc(*alloc_gc_root);
-    }
 }
 
 // After a minor collection, the old generation may be close to full: every

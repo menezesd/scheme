@@ -6477,18 +6477,6 @@ static compile_result compile_quasiquote(unsigned expr, compile_ctx *cctx)
 // Top-Level Compilation
 // ============================================================================
 
-code_object *compile_expr(unsigned expr, compile_ctx *cctx)
-{
-    compile_expr_internal(expr, cctx);
-    return cctx->code;
-}
-
-void compile_sequence(unsigned exprs, compile_ctx *cctx, bool tail)
-{
-    cctx->tail_position = tail;
-    compile_begin(exprs, cctx);
-}
-
 static code_object *compile_unit(unsigned expr, unsigned env,
                                  unsigned terminator)
 {

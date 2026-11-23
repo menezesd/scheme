@@ -588,8 +588,6 @@ unsigned code_line_at(const code_object *code, unsigned ip);
 code_object *compile_toplevel(unsigned expr, unsigned env);
 // Same, ending in RETURN instead of HALT; see compile.c.
 code_object *compile_for_eval(unsigned expr, unsigned env);
-code_object *compile_expr(unsigned expr, compile_ctx *ctx);
-void compile_sequence(unsigned exprs, compile_ctx *ctx, bool tail);
 
 // VM
 void vm_init(vm_state *vm);

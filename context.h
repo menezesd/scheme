@@ -583,7 +583,6 @@ void string_view_unregister(string_view_data *view);
 bool string_view_is_registered(const string_view_data *view);
 bool string_cell_is_view(unsigned value);
 char *string_cell_data(unsigned value);
-size_t string_cell_byte_length(unsigned value);
 bool string_cell_is_immutable(unsigned value);
 void string_views_refresh(unsigned parent);
 void string_mark_immutable(char *string);
@@ -630,9 +629,6 @@ void set_alloc_gc_root(unsigned *root);
 
 // Enable VESPER_GC_STRESS=N (collect every N allocations). Called by init_heap.
 void init_gc_stress(void);
-
-// Trigger GC using the registered alloc root (for escape commands)
-void trigger_gc(void);
 
 // Record that cell now owns a malloc'd payload: a bignum, string, vector,
 // record, record type, bytevector, hash table, port or VM continuation (the

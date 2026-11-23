@@ -233,7 +233,6 @@ unsigned pattern_add_constant(compiled_pattern *pat, unsigned value);
 // Variable slots
 unsigned pattern_add_var(compiled_pattern *pat, unsigned atom, bool is_ellipsis,
                          unsigned depth);
-int pattern_find_var(compiled_pattern *pat, unsigned atom);
 
 // Pattern compilation
 compiled_pattern *compile_pattern(unsigned pattern, unsigned literals,

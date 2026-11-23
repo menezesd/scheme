@@ -1241,11 +1241,6 @@ void write_obj(unsigned s)
     (void)write_obj_port_checked(s, stdout);
 }
 
-void display_obj(unsigned s)
-{
-    (void)display_obj_port_checked(s, stdout);
-}
-
 void write_obj_port(unsigned s, FILE *port)
 {
     (void)write_obj_port_checked(s, port);
@@ -1254,11 +1249,6 @@ void write_obj_port(unsigned s, FILE *port)
 void write_shared_obj_port(unsigned s, FILE *port)
 {
     (void)write_shared_obj_port_checked(s, port);
-}
-
-void write_simple_obj_port(unsigned s, FILE *port)
-{
-    (void)write_simple_obj_port_checked(s, port);
 }
 
 bool write_simple_obj_port_checked(unsigned s, FILE *port)
